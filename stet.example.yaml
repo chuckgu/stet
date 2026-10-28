@@ -1,0 +1,37 @@
+# Stet 설정 예. 형식은 docs/spec-v0.1.md 9장을 따른다.
+
+mode: shadow                 # shadow | enforce
+listen: 0.0.0.0:6432
+upstream: postgres://app@db:5432/crm
+
+model:
+  adapter: jev
+  version: jev-1.13.0        # 고정 필수. latest 같은 별칭은 거부
+  timeout_ms: 800
+  on_failure: pass           # pass | hold
+
+retention: 90d
+
+tables:
+  contacts:
+    pk: id
+    entity: "B2B CRM contact"
+    send_fields: [name, email, company_id, title, status, notes]
+    candidates:              # pg_trgm 필요
+      sql: |
+        SELECT id, name, email, company_id, title, updated_at
+        FROM contacts
+        WHERE lower(email) = lower(:email)
+           OR (company_id = :company_id AND similarity(name, :name) > 0.4)
+        LIMIT 10
+    recent_window: 30m
+    questions: [duplicate, conflict, policy]
+    policy: |
+      Do not set status to 'churned' while the account has an open deal.
+      Do not overwrite a title with an older value from a stale source.
+    thresholds:
+      duplicate: 0.85
+      conflict: 0.80
+      policy: 4              # score >= 4 → hold
+      escalate_below: 0.60
+    unsupported: reject
