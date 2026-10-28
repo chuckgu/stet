@@ -366,6 +366,10 @@ func TestShadowStateIncludesOtherAgentsRecentChanges(t *testing.T) {
 	if c["by_agent"] != "enricher" || !reflect.DeepEqual(c["fields"], map[string]any{"title": "VP"}) {
 		t.Errorf("recent change = %v", c)
 	}
+	// Models compare dates poorly, so the age is computed in code.
+	if c["minutes_before_this_write"] != float64(0) {
+		t.Errorf("minutes_before_this_write = %v, want 0", c["minutes_before_this_write"])
+	}
 }
 
 func TestShadowUnsupportedIsRecordedWithoutModel(t *testing.T) {

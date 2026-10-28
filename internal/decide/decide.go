@@ -12,21 +12,29 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"sync"
 
 	"github.com/stetdb/stet/internal/config"
 )
 
-// Question is one thing the model is asked about a proposed write.
+// Question is one thing the model is asked about a proposed write. Text and
+// descriptions name state fields in backticks so a literal-minded model
+// knows where to look.
 type Question struct {
-	ID      string   `json:"id"`
-	Text    string   `json:"text"`
-	Choices []string `json:"choices"`
+	ID           string            `json:"id"`
+	Type         string            `json:"type"` // choice, or score: Choices are ordered levels
+	Text         string            `json:"text"`
+	Choices      []string          `json:"choices"`
+	Descriptions map[string]string `json:"descriptions"` // what each choice means
 }
 
 type Answer struct {
 	Choice       string             `json:"choice"`
 	Confidence   float64            `json:"confidence"`
 	Distribution map[string]float64 `json:"distribution,omitempty"`
+	// Expected is the probability-weighted level of a score question, on
+	// the same scale as its choices. Thresholds use it when present.
+	Expected *float64 `json:"expected,omitempty"`
 }
 
 type Answers struct {
@@ -44,13 +52,34 @@ type Decider interface {
 // ErrNoModel is returned by the record-only adapter.
 var ErrNoModel = errors.New("no model configured")
 
+// Factory builds an adapter from its config.
+type Factory func(config.Model) (Decider, error)
+
+var (
+	mu        sync.Mutex
+	factories = map[string]Factory{
+		config.RecordOnly: func(config.Model) (Decider, error) { return recordOnly{}, nil },
+	}
+)
+
+// Register makes an adapter available under a model.adapter name. Adapter
+// packages are registered explicitly by the program, so this package never
+// depends on them.
+func Register(name string, f Factory) {
+	mu.Lock()
+	defer mu.Unlock()
+	factories[name] = f
+}
+
 // New returns the adapter named in the config.
 func New(m config.Model) (Decider, error) {
-	switch m.Adapter {
-	case config.RecordOnly:
-		return recordOnly{}, nil
+	mu.Lock()
+	f, ok := factories[m.Adapter]
+	mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("model.adapter: unknown adapter %q", m.Adapter)
 	}
-	return nil, fmt.Errorf("model.adapter: unknown adapter %q", m.Adapter)
+	return f(m)
 }
 
 type recordOnly struct{}
@@ -74,24 +103,43 @@ func Questions(op string, candidateIDs []string, enabled []string, hasPolicy boo
 	var qs []Question
 	on := func(id string) bool { return slices.Contains(enabled, id) }
 	if op == "insert" && len(candidateIDs) > 0 && on(qDuplicate) {
+		desc := map[string]string{"none": "The `proposed` record is a different entity from every candidate."}
+		for _, id := range candidateIDs {
+			desc[id] = fmt.Sprintf("The `proposed` record is the same real-world entity as the candidate whose id is %s.", id)
+		}
 		qs = append(qs, Question{
-			ID:      qDuplicate,
-			Text:    "Does the proposed record refer to the same real-world entity as one of the candidates?",
-			Choices: append(slices.Clone(candidateIDs), "none"),
+			ID:           qDuplicate,
+			Type:         "choice",
+			Text:         "Does the `proposed` record refer to the same real-world entity as one of the `candidates`?",
+			Choices:      append(slices.Clone(candidateIDs), "none"),
+			Descriptions: desc,
 		})
 	}
 	if (op == "update" || op == "delete") && on(qConflict) {
 		qs = append(qs, Question{
 			ID:      qConflict,
-			Text:    "Does the proposed change contradict information in the current state or recent changes that is more recent or more authoritative?",
+			Type:    "choice",
+			Text:    "Does the `proposed` change contradict information in `current` or `recent_changes` that is more recent or more authoritative?",
 			Choices: []string{"yes", "no"},
+			Descriptions: map[string]string{
+				"yes": "The `proposed` change undoes or contradicts a more recent or more authoritative value.",
+				"no":  "The `proposed` change does not contradict more recent or more authoritative information.",
+			},
 		})
 	}
 	if hasPolicy && on(qPolicy) {
 		qs = append(qs, Question{
 			ID:      qPolicy,
-			Text:    "How strongly does the proposed change violate the table policy? 1 means no violation, 5 means a clear violation.",
+			Type:    "score",
+			Text:    "How strongly does the `proposed` change violate the rules in `policy`?",
 			Choices: []string{"1", "2", "3", "4", "5"},
+			Descriptions: map[string]string{
+				"1": "No violation of the rules in `policy`.",
+				"2": "Unlikely to violate the rules in `policy`.",
+				"3": "Possibly violates the rules in `policy`.",
+				"4": "Likely violates the rules in `policy`.",
+				"5": "Clearly violates the rules in `policy`.",
+			},
 		})
 	}
 	return qs
@@ -151,7 +199,11 @@ func Verdict(in Input) (string, []string) {
 		return Hold, []string{"conflict"}
 	}
 	if a, ok := in.Answers[qPolicy]; ok {
-		if score, err := strconv.Atoi(a.Choice); err == nil && score >= in.Thresholds.Policy {
+		score, err := strconv.ParseFloat(a.Choice, 64)
+		if a.Expected != nil {
+			score, err = *a.Expected, nil
+		}
+		if err == nil && score >= float64(in.Thresholds.Policy) {
 			return Hold, []string{"policy"}
 		}
 	}

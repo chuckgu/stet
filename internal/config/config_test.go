@@ -61,7 +61,7 @@ func TestPassthroughNeedsNoModel(t *testing.T) {
 }
 
 func TestRejectsUnpinnedModelVersion(t *testing.T) {
-	for _, v := range []string{"", "latest", "LATEST", "jev-latest", "jev:latest", "jev@stable", "jev"} {
+	for _, v := range []string{"", "latest", "LATEST", "jev-latest", "jev:latest", "jev@stable", "jev", "jev-preview"} {
 		t.Run(v, func(t *testing.T) {
 			_, err := Parse([]byte(minimal + "model: {adapter: jev, version: \"" + v + "\"}\n"))
 			if err == nil || !strings.Contains(err.Error(), "model.version") {

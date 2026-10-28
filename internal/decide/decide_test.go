@@ -156,3 +156,48 @@ func TestNewUnknownAdapter(t *testing.T) {
 		t.Fatalf("err = %v, want unknown adapter error", err)
 	}
 }
+
+func TestQuestionsDescribeEveryChoice(t *testing.T) {
+	all := []string{"duplicate", "conflict", "policy"}
+	for _, q := range append(Questions("insert", []string{"7"}, all, true), Questions("update", nil, all, true)...) {
+		if q.Type != "choice" && q.Type != "score" {
+			t.Errorf("%s: type %q, want choice or score", q.ID, q.Type)
+		}
+		for _, c := range q.Choices {
+			if q.Descriptions[c] == "" {
+				t.Errorf("%s: choice %q has no description", q.ID, c)
+			}
+		}
+	}
+	pol := Questions("update", nil, []string{"policy"}, true)[0]
+	if pol.Type != "score" || !reflect.DeepEqual(pol.Choices, []string{"1", "2", "3", "4", "5"}) {
+		t.Errorf("policy question = %+v, want a 1-5 score", pol)
+	}
+}
+
+func TestPolicyUsesExpectedScoreWhenGiven(t *testing.T) {
+	polQ := Question{ID: "policy", Type: "score", Choices: []string{"1", "2", "3", "4", "5"}}
+	exp := func(v float64) *float64 { return &v }
+	cases := []struct {
+		name    string
+		a       Answer
+		verdict string
+	}{
+		{"expected below threshold", Answer{Choice: "4", Confidence: 0.9, Expected: exp(3.6)}, Commit},
+		{"expected at threshold", Answer{Choice: "4", Confidence: 0.9, Expected: exp(4.0)}, Hold},
+		{"expected over, top level lower", Answer{Choice: "3", Confidence: 0.9, Expected: exp(4.2)}, Hold},
+	}
+	for _, tc := range cases {
+		v, _ := Verdict(Input{Questions: []Question{polQ}, Answers: map[string]Answer{"policy": tc.a}, Thresholds: th})
+		if v != tc.verdict {
+			t.Errorf("%s: verdict %s, want %s", tc.name, v, tc.verdict)
+		}
+	}
+}
+
+func TestRegisteredAdapter(t *testing.T) {
+	Register("test-adapter", func(m config.Model) (Decider, error) { return recordOnly{}, nil })
+	if _, err := New(config.Model{Adapter: "test-adapter"}); err != nil {
+		t.Fatalf("registered adapter not found: %v", err)
+	}
+}

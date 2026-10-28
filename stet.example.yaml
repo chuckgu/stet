@@ -4,11 +4,11 @@ mode: shadow                 # shadow | enforce
 listen: 0.0.0.0:6432
 upstream: postgres://app@db:5432/crm
 
-# 지금 구현된 어댑터는 none(모델 없이 상태·쓰기·결과만 기록)뿐이다.
-# Jev 어댑터 전까지는 model: {adapter: none}으로 둔다.
+# jev는 환경 변수 TYPESAFE_API_KEY가 필요하다. 키는 이 파일에 두지 않는다.
+# 모델 없이 상태·쓰기·결과만 기록하려면 model: {adapter: none}으로 둔다.
 model:
   adapter: jev
-  version: jev-1.13.0        # 고정 필수. latest 같은 별칭은 거부
+  version: jev-1.14.0        # 고정 필수. jev-X.Y.Z 형식만 (latest·preview 거부)
   timeout_ms: 800
   on_failure: pass           # pass | hold
 

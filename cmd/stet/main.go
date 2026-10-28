@@ -15,6 +15,7 @@ import (
 
 	"github.com/stetdb/stet/internal/config"
 	"github.com/stetdb/stet/internal/decide"
+	"github.com/stetdb/stet/internal/decide/jev"
 	"github.com/stetdb/stet/internal/gate"
 	"github.com/stetdb/stet/internal/proxy"
 	"github.com/stetdb/stet/internal/store"
@@ -23,7 +24,8 @@ import (
 const usage = `usage: stet <command> [flags]
 
 commands:
-  proxy    run the pgwire proxy (stet proxy -config stet.yaml)
+  proxy      run the pgwire proxy (stet proxy -config stet.yaml)
+  bench-jev  time single Jev calls (needs TYPESAFE_API_KEY)
 `
 
 func main() {
@@ -31,10 +33,14 @@ func main() {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
+	decide.Register("jev", jev.New)
+
 	var err error
 	switch os.Args[1] {
 	case "proxy":
 		err = runProxy(os.Args[2:])
+	case "bench-jev":
+		err = runBenchJev(os.Args[2:])
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)

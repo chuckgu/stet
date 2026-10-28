@@ -107,7 +107,7 @@ type rawTable struct {
 var (
 	defaultThresholds = Thresholds{Duplicate: 0.85, Conflict: 0.80, Policy: 4, EscalateBelow: 0.60}
 	allQuestions      = []string{"duplicate", "conflict", "policy"}
-	versionAliases    = map[string]bool{"latest": true, "stable": true, "current": true, "default": true}
+	versionAliases    = map[string]bool{"latest": true, "stable": true, "current": true, "default": true, "preview": true}
 )
 
 func Load(path string) (*Config, error) {

@@ -237,10 +237,12 @@ type stateDoc struct {
 }
 
 type recentChange struct {
-	At      time.Time      `json:"at"`
-	ByAgent string         `json:"by_agent"`
-	Op      string         `json:"op"`
-	Fields  map[string]any `json:"fields"`
+	At time.Time `json:"at"`
+	// Computed here because judgment models compare timestamps poorly.
+	MinutesBefore int            `json:"minutes_before_this_write"`
+	ByAgent       string         `json:"by_agent"`
+	Op            string         `json:"op"`
+	Fields        map[string]any `json:"fields"`
 }
 
 var provenance = map[string]string{
@@ -458,7 +460,10 @@ func (g *Gate) recentChanges(ctx context.Context, p *pending, t config.Table) ([
 	}
 	slices.SortFunc(all, func(a, b store.Change) int { return b.At.Compare(a.At) })
 	for _, c := range all[:min(len(all), maxRecent)] {
-		out = append(out, recentChange{At: c.At, ByAgent: c.AgentID, Op: c.Op, Fields: only(c.Proposed, t.SendFields)})
+		out = append(out, recentChange{
+			At: c.At, MinutesBefore: int(p.at.Sub(c.At).Minutes()),
+			ByAgent: c.AgentID, Op: c.Op, Fields: only(c.Proposed, t.SendFields),
+		})
 	}
 	return out, nil
 }

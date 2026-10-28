@@ -145,11 +145,26 @@ type Answer   struct { Choice string; Confidence float64; Distribution map[strin
 type Answers  struct { ByQuestion map[string]Answer; CostUSD float64 }
 ```
 
-모든 질문은 선택형이다. policy 점수도 `"1"`~`"5"` 중 하나를 고르는 질문으로 묻는다.
+질문은 `choice`와 `score` 두 타입이다. 선택지마다 뜻을 적은 설명을 함께 보낸다. policy는 `"1"`~`"5"` 단계의 score 질문이고, `Expected`(확률 가중 평균 단계)가 있으면 6장 규칙이 그 값으로 임계값을 비교한다. 질문과 설명은 상태 필드를 백틱으로 이름 붙여 가리킨다(`proposed`, `candidates` 등).
 
-첫 어댑터는 Jev(TypeSafe API 또는 OpenRouter)다. 비교 실험용으로 LLM 어댑터(JSON 출력)를 같은 인터페이스로 만든다.
+비교 실험용으로 LLM 어댑터(JSON 출력)를 같은 인터페이스로 만든다(미구현).
 
-구현된 어댑터는 `none` 하나다. 모델을 부르지 않고 상태, 쓰기, 실행 결과만 기록한다(verdict `commit`, reason `no_model`). 버전 설정이 필요 없다. 실험 1단계("섀도 모드로 쓰기 스트림 기록")에 쓴다.
+**구현된 어댑터**
+
+- `none`: 모델을 부르지 않고 상태, 쓰기, 실행 결과만 기록한다(verdict `commit`, reason `no_model`). 버전 설정이 필요 없다. 실험 1단계("섀도 모드로 쓰기 스트림 기록")에 쓴다.
+- `jev`: TypeSafe API `POST https://api.typesafe.ai/v1/systemone` (internal/decide/jev). 근거는 docs.typesafe.ai의 OpenAPI 스펙(v0.2.0)이다.
+  - 키는 환경 변수 `TYPESAFE_API_KEY`에서만 읽는다. 설정 파일에 두지 않는다. `TYPESAFE_BASE_URL`로 주소를 바꿀 수 있다.
+  - 버전은 `jev-X.Y.Z` 형식만 받는다. `jev-latest`, `jev-preview`, `jev-1.14`는 거부한다. 응답의 `model`이 요청한 버전과 다르면 그 답을 버리고 모델 오류로 처리한다(규칙 2).
+  - choice 질문은 Jev Choice로 보낸다. criteria는 선택지 이름과 설명의 맵이다. score 질문은 Jev Score로 보낸다. criteria는 단계 설명의 배열이고, Jev의 0부터 시작하는 단계를 질문의 척도(1~5)로 옮긴다. `Choice`는 확률이 가장 높은 단계, `Expected`는 Jev의 `score`(기댓값)다.
+  - 429·529는 한 번만 재시도한다. `Retry-After`를 따르되 마감 시간 안에 들어올 때만 기다린다.
+  - 비용은 입력 토큰당 $42/10억(출력 무료, 2026-10-28 기준 가격)으로 계산해 `cost_usd`에 남긴다.
+  - Jev의 알려진 약점(TypeSafe 문서의 jev-1.13 jaggedness)은 다음과 같다.
+    - 날짜·시각 비교를 잘 못한다. 그래서 `recent_changes`에 `minutes_before_this_write`를 코드로 계산해 넣는다.
+    - 첫 번째 선택지 쪽으로 기운다.
+    - state 안의 적대적 문구에 흔들린다.
+    - 영어가 아닌 언어(CJK 포함)는 정확도가 낮다.
+
+OpenRouter 경유(`typesafe/jev-1.14`)는 쓰지 않는다. 버전 고정과 응답 모델 확인을 TypeSafe API에서 바로 할 수 있기 때문이다.
 
 **기본 질문 세트**
 
@@ -261,7 +276,7 @@ upstream: postgres://app@db:5432/crm
 
 model:
   adapter: jev
-  version: jev-1.13.0        # 고정 필수. latest 거부
+  version: jev-1.14.0        # 고정 필수. jev-X.Y.Z 형식만 (latest·preview 거부)
   timeout_ms: 800
   on_failure: pass           # pass | hold
 
@@ -323,10 +338,29 @@ tables:
 | 항목 | 초기 목표 | 실측 |
 |---|---|---|
 | 게이트 대상 외 문장의 프록시 추가 지연 | p95 < 2ms | 패스스루 p95 +0.02ms, SQL 분류 문장당 0.01~0.02ms |
-| 게이트 대상 쓰기의 추가 지연 (Jev) | p95 < 500ms | 미측정. 섀도 모드에서 클라이언트가 기다리는 건 상태 조립뿐이며, 로컬 실행에서 0~5ms |
+| 게이트 대상 쓰기의 추가 지연 (Jev) | p95 < 500ms | Jev 단건 p50 169ms, p95 196ms (`jev-1.14.0`). 섀도 모드에서 클라이언트가 기다리는 건 상태 조립뿐이며, 로컬 실행에서 0~5ms |
 | 판단 기록 누락 | 0 | 섀도 모드 테스트에서 누락 없음. 저장 실패 시 재시도는 없다 |
 
-패스스루 지연은 `select 1` 2,000회를 직접 연결과 번갈아 돌려 잰 값이다(2026-10-28, 같은 머신의 Postgres 14). `internal/proxy/latency_test.go`가 같은 측정을 하고 2ms 예산을 넘으면 실패한다. Jev 단건 호출 지연은 아직 실측하지 않았다.
+패스스루 지연은 `select 1` 2,000회를 직접 연결과 번갈아 돌려 잰 값이다(2026-10-28, 같은 머신의 Postgres 14). `internal/proxy/latency_test.go`가 같은 측정을 하고 2ms 예산을 넘으면 실패한다.
+
+**Jev 단건 지연** (2026-10-28, 개발 머신에서 `api.typesafe.ai`로 측정, `stet bench-jev`)
+
+측정 방법:
+- 게이트의 실제 상태와 같은 모양인 CRM 사례 두 가지를 번갈아 보냈다. 하나는 오래된 직함으로 덮어쓰는 update(conflict와 policy 질문), 다른 하나는 표기만 다른 중복 연락처 insert(duplicate와 policy 질문)다.
+- 요청은 한 번에 하나씩, 연결을 재사용해 보냈다.
+
+| 모델 | n | p50 | p95 | 최대 | 처음 호출 (TLS 포함) |
+|---|---|---|---|---|---|
+| `jev-1.14.0` | 60 | 169ms | 196ms | 213ms | 204ms |
+| `jev-1.14.0` (재측정) | 40 | 167ms | 199ms | 211ms | 228ms |
+| `jev-1.13.0` | 40 | 186ms | 417ms | 461ms | 205ms |
+| 네트워크 하한: `GET /v1/models` (추론 없음) | 20 | 142ms | 231ms | 252ms | |
+
+해석:
+- 지연의 대부분(약 140ms)은 네트워크 왕복이다. 추론과 처리 몫은 30ms 안팎이다. TypeSafe와 같은 지역에 Stet을 두면 단건 지연이 크게 줄 것으로 보이지만, 아직 재 보지 않았다.
+- 현재 기본 `timeout_ms: 800`을 넘은 호출은 없다.
+- 호출당 비용은 약 $0.000032(입력 약 760토큰)다. 1,000건당 약 $0.03이다.
+- 같은 상태를 반복해 보내면 선택은 매번 같았지만 confidence는 흔들렸다. insert의 policy 답은 0.08~0.62였다. 기록된 판단을 재생하고 재추론하지 않는 이유(규칙 4)가 여기서도 확인된다.
 
 ## 12. 수용 기준
 
