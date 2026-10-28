@@ -75,7 +75,7 @@ Simple Query와 Extended Query(Parse/Bind/Execute) 둘 다 처리한다. 바인�
 - 쓰기는 문장 트리 전체에서 찾는다. 최상위가 `SELECT`여도 CTE 안에서 게이트 대상 테이블을 바꾸면 대상이다.
 - 테이블 이름: 설정 키가 스키마 없는 이름이면 모든 스키마의 같은 이름 테이블에 걸린다. 스키마를 붙인 키(`crm.contacts`)는 같은 스키마의 참조와 스키마 없는 참조에 걸린다. search_path는 파싱 시점에 알 수 없으므로 넓게 잡는다. 넓게 잡으면 판단할 쓰기가 늘어날 뿐이다.
 - 값: 리터럴과 `$n` 파라미터는 값으로, `'x'::text` 같은 캐스트는 안쪽 값으로 기록한다. `now()`, `lower($1)` 같은 표현식은 SQL 텍스트로 기록한다.
-- 한계: 문장에 드러난 쓰기만 본다. 함수, `DO` 블록, 트리거, 룰 안에서 일어나는 쓰기는 보지 못한다. 이런 경로는 Postgres 권한(결정론적 제약)으로 막는다.
+- 한계: 문장에 드러난 쓰기만 본다. 함수, `DO` 블록, 트리거, 다른 연결(dblink), 뷰·파티션 자식 테이블을 통한 쓰기는 보지 못한다. 이런 경로는 Postgres 권한(결정론적 제약)으로 막는다. 경로별 실측과 enforce 전 조치는 10장 "보안 관점"에 정리했다.
 - 문자열 사전 필터(SQL에 테이블 이름이 있는지 먼저 보는 방식)는 쓰지 않는다. 따옴표 식별자나 유니코드 이스케이프로 우회할 수 있다. 파싱 비용은 문장당 10~22µs다.
 
 **트랜잭션**
@@ -344,7 +344,70 @@ tables:
 
 - 상태에 출처(`provenance`)를 표시하고, 에이전트 입력은 `proposed`에만 둔다.
 - 결정론적 제약(UNIQUE, FK, CHECK, 버전 확인)을 판단보다 먼저 적용한다. 판단형 제약은 그 위에 얹는 층이다.
-- 주입 사례를 실험 세트에 포함해 뒤집힘 비율을 측정한다.
+- 판단자 조작(S2)과 출처 위장(S3)을 실험의 보안 레드팀 세트에 넣어, 짝 비교로 뒤집힘 비율을 잰다(experiment.md).
+
+### 보안 관점: 게이트가 보지 못하는 경로
+
+**원칙.** 보안 경계는 결정론적 통제다. DB 권한, 미지원 형태 거부, 실패 시 거부가 여기에 속한다. 분류기와 판단 모델은 기록과 2차 신호다(decisions.md D7, D21).
+
+- 섀도 모드는 아래 경로를 기록하지 못하거나 그대로 통과시켜도 된다. 원래 동작을 바꾸지 않는 것이 섀도 모드의 약속이다(규칙 6).
+- enforce 모드를 내거나 보안을 주장하려면, 아래 표들의 "enforce 전 조치"가 끝나야 한다.
+
+**분류기가 보지 못하는 쓰기 경로** (2026-10-28, 실제 분류기에 넣어 확인)
+
+| 경로 | 예 | 분류 결과 | enforce 전 조치 |
+|---|---|---|---|
+| 함수·프로시저 안의 쓰기 | `select purge_contacts()`, `call purge_contacts()` | pass | 에이전트 역할에서 쓰기 함수의 `EXECUTE` 권한 회수. Postgres는 함수 실행 권한을 기본으로 PUBLIC에 준다 |
+| `DO` 블록 | `do $$ begin update contacts ... end $$` | pass | 에이전트 역할에서 `DO` 거부: 프록시가 `DoStmt`를 미지원으로 처리하거나, plpgsql 언어 `USAGE`를 회수한다(영향 범위 확인 필요) |
+| 다른 연결을 통한 쓰기 | `select dblink_exec(..., 'delete from contacts')` | pass | dblink·postgres_fdw 같은 확장을 에이전트가 쓸 수 없게 한다 |
+| 트리거 함수 본문 | `create function wipe() ... delete from contacts` 후 트리거로 연결 | pass (함수 본문은 문자열이라 안 보임) | 에이전트 역할은 테이블 소유자가 아니고 `TRIGGER`·`CREATE` 권한이 없어야 한다 |
+| 룰 | `create rule ... do also delete from contacts` | unsupported (`nested_write`) | 위와 같음. 룰을 만들려면 테이블 소유권이 필요하다 |
+| 뷰·파티션·상속 자식 테이블 | `insert into contacts_view ...`, `insert into contacts_2026 ...` | pass (이름이 달라서) | 관련 이름을 설정에 모두 등록하거나, 에이전트 권한을 부모 테이블로만 준다 |
+| `PREPARE` 후 `EXECUTE` | `prepare p as delete from contacts ...` → `execute p(1)` | `PREPARE`는 unsupported, `EXECUTE`는 pass | enforce 기본값(`unsupported: reject`)이 `PREPARE`를 막으면 닫힌다. `unsupported: pass`인 테이블에서는 열린다 |
+| DDL | `drop table contacts`, `alter table contacts disable trigger all` | pass | 에이전트 역할은 소유자가 아니고 DDL 권한이 없어야 한다 |
+| 트리거 무력화 | `set session_replication_role = replica` | pass | 에이전트 역할은 superuser가 아니어야 한다. 이 설정은 `stet.decisions`의 append-only 트리거도 끈다 |
+| 서버 파일·대형 객체 | `select lo_import('/etc/passwd')`, `copy contacts from program ...` | `lo_import`는 pass, `COPY`는 unsupported | superuser·`pg_read_server_files` 같은 역할을 주지 않는다 |
+
+우회가 아닌 것도 확인했다.
+- 유니코드 이스케이프 식별자 `U&"\0063ontacts"`는 파서가 `contacts`로 풀어서 잡힌다.
+- `"CONTACTS"`(따옴표 대문자)는 다른 테이블이다.
+- 데이터 변경 CTE, `EXPLAIN ANALYZE`, 주석 뒤에 숨긴 두 번째 문장, `RETURNING` 안의 서브쿼리는 미지원으로 잡힌다.
+
+**실패 시 열림(fail-open) 지점**
+
+섀도 모드에서는 동작을 바꾸지 않으려고 일부러 열어 둔 곳들이다. enforce 모드에서는 공격자가 노릴 수 있는 문이 된다.
+
+| 지점 | 지금 동작 (코드) | enforce 전 조치 |
+|---|---|---|
+| 파싱 실패 | 분류기(pg_query, PG17 문법)가 읽지 못한 문장은 감시하지 않는다(`gate.Inspect`). "Postgres도 거부한다"는 가정은 서버 문법이 파서보다 새로우면 깨진다 | 게이트 대상 테이블이 있는 세션에서 파싱에 실패한 문장은 거부한다. 업스트림 서버 버전과 파서 문법 버전 차이도 시작할 때 경고한다 |
+| 64MiB가 넘는 Query·Parse·Bind | 본문을 검사하지 않고 넘긴다(`proxy.maxInspect`) | 거부한다 |
+| FunctionCall 메시지(`F`) | 함수를 OID로 직접 부르는 프로토콜 메시지를 검사하지 않는다 | 거부한다. 요즘 드라이버는 거의 쓰지 않는다 |
+| 모델 실패 | `on_failure` 기본값은 `pass`다. 모델 입력 한도(64k 토큰)를 넘는 텍스트나 요청 폭주(429)로 실패를 일으키면 판단 없이 통과한다 | 게이트 대상 테이블은 `on_failure: hold`로 둔다. 상태 크기 상한을 구현한다(4장, 미구현) |
+| 상태 조립 실패·시간 초과 | 500ms 상한을 넘거나 조회가 실패하면 `state_error`로 `on_failure`를 따른다. 대상 행에 잠금을 걸어 지연시킬 수 있다 | 위와 같음(`hold`) |
+| 미지원 형태 | 테이블 설정 `unsupported: pass`면 판단 없이 통과한다 | 기본값 `reject`를 유지한다 |
+
+**신원**
+
+- `agent_id`는 접속 파라미터 `application_name`에서 온다. 클라이언트가 스스로 정하는 값이라 **신원이 아니다**. 기록과 집계에만 쓴다. 보안 신원은 접속 계정(startup의 `user`)이므로, 에이전트마다 DB 역할을 따로 줘야 한다.
+- `on_behalf_of`는 `SET`으로 스스로 선언하는 값이다. `set_config()` 호출은 프록시가 보지 못한다. v0.2에서 RLS로 강제하기 전까지는 감사용 표시일 뿐이다. 믿을 수 있게 하려면 앱 서버가 서명한 값 같은 장치가 필요하다(decisions.md 열린 질문).
+
+**Stet 자신의 데이터**
+
+- `stet.decisions`에는 업무 데이터(개인정보 포함 가능)가 담긴 상태가 들어간다.
+- append-only 트리거는 수정과 삭제를 막지만 INSERT는 막지 않는다. 그래서 INSERT 권한이 있으면 가짜 판단 기록을 넣을 수 있다.
+- 에이전트 역할은 `stet` 스키마에 아무 권한도 없어야 한다. INSERT는 Stet 자신의 연결 역할만 갖는다.
+
+**enforce 전 에이전트 역할 기준** (예시)
+
+```sql
+-- 에이전트마다 별도 역할. 필요한 권한만 준다.
+CREATE ROLE agent_enricher LOGIN;
+GRANT SELECT, INSERT, UPDATE ON contacts TO agent_enricher;   -- DELETE·TRUNCATE·DDL 없음
+REVOKE ALL ON SCHEMA stet FROM agent_enricher;
+-- 함수 실행 권한은 기본이 PUBLIC이다. 쓰기 함수는 회수한다.
+REVOKE EXECUTE ON FUNCTION purge_contacts() FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+```
 
 ## 11. 성능 목표 (가설, 1주차 측정 후 확정)
 
