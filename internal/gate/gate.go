@@ -222,21 +222,25 @@ func (g *Gate) ask(p *pending) (decide.Answers, time.Duration, error) {
 	return a, time.Since(start), err
 }
 
-// stateDoc is what the model sees (spec 4). Agent-written values are marked
-// as untrusted (rule 5).
-type stateDoc struct {
+// State is what the model sees (spec 4). Agent-written values are marked as
+// untrusted (rule 5).
+//
+// The field order is part of the format: Jev's confidence moved by up to
+// 0.5 when the same fields were sent in another order. Anything that sends
+// a state (the bench included) must use this type so the order matches.
+type State struct {
 	Table         string            `json:"table"`
 	Entity        string            `json:"entity,omitempty"`
 	Operation     string            `json:"operation"`
 	Proposed      map[string]any    `json:"proposed"`
 	Current       map[string]any    `json:"current"`
 	Candidates    []map[string]any  `json:"candidates"`
-	RecentChanges []recentChange    `json:"recent_changes"`
-	Policy        string            `json:"policy,omitempty"`
+	RecentChanges []RecentChange    `json:"recent_changes"`
+	Policy        string            `json:"policy,omitempty"` // the rules, one per line
 	Provenance    map[string]string `json:"provenance"`
 }
 
-type recentChange struct {
+type RecentChange struct {
 	At time.Time `json:"at"`
 	// Computed here because judgment models compare timestamps poorly.
 	MinutesBefore int            `json:"minutes_before_this_write"`
@@ -245,11 +249,14 @@ type recentChange struct {
 	Fields        map[string]any `json:"fields"`
 }
 
-var provenance = map[string]string{
-	"proposed":       "untrusted_agent_input",
-	"current":        "database",
-	"candidates":     "database",
-	"recent_changes": "earlier_agent_writes",
+// Provenance labels each part of a State by where it came from.
+func Provenance() map[string]string {
+	return map[string]string{
+		"proposed":       "untrusted_agent_input",
+		"current":        "database",
+		"candidates":     "database",
+		"recent_changes": "earlier_agent_writes",
+	}
 }
 
 func (g *Gate) assemble(ctx context.Context, p *pending) error {
@@ -303,7 +310,7 @@ func (g *Gate) assemble(ctx context.Context, p *pending) error {
 		return fmt.Errorf("recent changes: %w", err)
 	}
 
-	doc := stateDoc{
+	doc := State{
 		Table:         p.res.Table,
 		Entity:        t.Entity,
 		Operation:     w.Op,
@@ -311,14 +318,36 @@ func (g *Gate) assemble(ctx context.Context, p *pending) error {
 		Current:       only(current, t.SendFields),
 		Candidates:    cands,
 		RecentChanges: recent,
-		Policy:        strings.TrimSpace(t.Policy),
-		Provenance:    provenance,
+		Policy:        strings.Join(t.PolicyRules, "\n"),
+		Provenance:    Provenance(),
 	}
 	if p.state, err = json.Marshal(doc); err != nil {
 		return err
 	}
-	p.questions = decide.Questions(w.Op, ids, t.Questions, doc.Policy != "")
+	p.questions = decide.Questions(decide.Ask{
+		Op: w.Op, CandidateIDs: ids, Enabled: t.Questions, Rules: t.PolicyRules,
+		Recent: doc.CouldUndoRecent(),
+	})
 	return nil
+}
+
+// CouldUndoRecent reports whether the model can see a recent change this
+// write might undo: one that set a field this update writes, or any change
+// before a delete. Judged on what the model is sent, after send_fields.
+func (s State) CouldUndoRecent() bool {
+	switch s.Operation {
+	case "delete":
+		return len(s.RecentChanges) > 0
+	case "update":
+		for _, c := range s.RecentChanges {
+			for f := range c.Fields {
+				if _, ok := s.Proposed[f]; ok {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // paramTexts turns bind values into text. Binary values are decoded by
@@ -440,8 +469,8 @@ func (g *Gate) candidates(ctx context.Context, p *pending, current map[string]an
 
 // recentChanges merges recorded decisions with writes that ended but whose
 // decisions are still being judged.
-func (g *Gate) recentChanges(ctx context.Context, p *pending, t config.Table) ([]recentChange, error) {
-	out := []recentChange{}
+func (g *Gate) recentChanges(ctx context.Context, p *pending, t config.Table) ([]RecentChange, error) {
+	out := []RecentChange{}
 	if p.pk == nil || t.RecentWindow <= 0 {
 		return out, nil
 	}
@@ -460,7 +489,7 @@ func (g *Gate) recentChanges(ctx context.Context, p *pending, t config.Table) ([
 	}
 	slices.SortFunc(all, func(a, b store.Change) int { return b.At.Compare(a.At) })
 	for _, c := range all[:min(len(all), maxRecent)] {
-		out = append(out, recentChange{
+		out = append(out, RecentChange{
 			At: c.At, MinutesBefore: int(p.at.Sub(c.At).Minutes()),
 			ByAgent: c.AgentID, Op: c.Op, Fields: only(c.Proposed, t.SendFields),
 		})

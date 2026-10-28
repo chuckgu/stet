@@ -215,3 +215,31 @@ func TestNewRequiresPinnedVersionAndKey(t *testing.T) {
 		t.Errorf("err = %v, want a missing key error", err)
 	}
 }
+
+func TestNoulQuestions(t *testing.T) {
+	rule := decide.Question{
+		ID: "policy_2", Type: "noul", Text: "Does the `proposed` change break this rule: X",
+		Choices:      []string{"true", "false"},
+		Descriptions: map[string]string{"true": "breaks it", "false": "follows it"},
+	}
+	var sent map[string]any
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&sent)
+		io.WriteString(w, `{"model":"jev-1.14.0","answers":{"policy_2":{"type":"noul","noul":0.87}},
+			"usage":{"input_tokens":10,"output_tokens":1}}`)
+	})
+	a, err := c.Decide(context.Background(), json.RawMessage(`{}`), []decide.Question{rule})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	q := sent["questions"].(map[string]any)["policy_2"].(map[string]any)
+	if q["type"] != "noul" || q["instructions"] != rule.Text ||
+		!reflect.DeepEqual(q["criteria"], map[string]any{"true": "breaks it", "false": "follows it"}) {
+		t.Errorf("noul question sent as %v", q)
+	}
+	got := a.ByQuestion["policy_2"]
+	if got.Probability == nil || *got.Probability != 0.87 || got.Choice != "true" || got.Confidence != 0 {
+		t.Errorf("noul answer = %+v, want probability 0.87, choice true, no confidence", got)
+	}
+}

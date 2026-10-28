@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -30,6 +32,26 @@ func TestBenchCasesAreRealistic(t *testing.T) {
 		}
 		if len(c.questions) < 2 {
 			t.Errorf("%s: %d questions, want the gate's full set", c.name, len(c.questions))
+		}
+	}
+}
+
+// The bench once sent maps, whose keys Go sorts, and Jev answered
+// differently than it does for the gate's real states.
+func TestBenchStatesUseTheGateFieldOrder(t *testing.T) {
+	want := []string{"table", "entity", "operation", "proposed", "current", "candidates", "recent_changes", "policy", "provenance"}
+	for _, c := range benchCases() {
+		dec := json.NewDecoder(bytes.NewReader(c.state))
+		dec.Token() // {
+		var keys []string
+		for dec.More() {
+			k, _ := dec.Token()
+			keys = append(keys, k.(string))
+			var skip json.RawMessage
+			dec.Decode(&skip)
+		}
+		if !reflect.DeepEqual(keys, want) {
+			t.Errorf("%s: keys %v, want %v", c.name, keys, want)
 		}
 	}
 }

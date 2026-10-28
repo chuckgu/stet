@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -82,7 +84,8 @@ func calm() *fakeDecider {
 	return &fakeDecider{answers: map[string]decide.Answer{
 		"duplicate": {Choice: "none", Confidence: 0.95},
 		"conflict":  {Choice: "no", Confidence: 0.95},
-		"policy":    {Choice: "1", Confidence: 0.95},
+		"policy_1":  {Choice: "false", Probability: ptr(0.05)},
+		"policy_2":  {Choice: "false", Probability: ptr(0.05)},
 	}}
 }
 
@@ -109,7 +112,9 @@ tables:
         select id, name, email from %[2]s
         where lower(email) = lower(:email) or name = :name
     recent_window: 30m
-    policy: "Do not set status to churned."
+    policy: |
+      Do not set status to churned.
+      Do not overwrite a title with an older value from a stale source.
 `
 
 // setup makes a fresh contacts table, a gate over it, and a proxy in front.
@@ -259,8 +264,8 @@ func questionIDs(qs []map[string]any) []string {
 
 func TestShadowRecordsJudgedUpdateAndStillWrites(t *testing.T) {
 	d := &fakeDecider{answers: map[string]decide.Answer{
-		"conflict": {Choice: "yes", Confidence: 0.9},
-		"policy":   {Choice: "1", Confidence: 0.9},
+		"policy_1": {Choice: "true", Probability: ptr(0.9)},
+		"policy_2": {Choice: "false", Probability: ptr(0.05)},
 	}}
 	e := setup(t, d)
 	e.seed(t)
@@ -274,8 +279,8 @@ func TestShadowRecordsJudgedUpdateAndStillWrites(t *testing.T) {
 		t.Fatalf("title = %q: shadow mode must not block the write", title)
 	}
 
-	if r.Verdict != "hold" || !reflect.DeepEqual(r.Reasons, []string{"conflict"}) || !r.Executed {
-		t.Errorf("verdict %s %v executed=%v, want hold [conflict] executed", r.Verdict, r.Reasons, r.Executed)
+	if r.Verdict != "hold" || !reflect.DeepEqual(r.Reasons, []string{"policy:1"}) || !r.Executed {
+		t.Errorf("verdict %s %v executed=%v, want hold [policy:1] executed", r.Verdict, r.Reasons, r.Executed)
 	}
 	if r.Op != "update" || r.TargetPK == nil || *r.TargetPK != "1" || r.AgentID != "enricher" || r.Mode != "shadow" {
 		t.Errorf("op=%s pk=%v agent=%s mode=%s", r.Op, r.TargetPK, r.AgentID, r.Mode)
@@ -289,10 +294,11 @@ func TestShadowRecordsJudgedUpdateAndStillWrites(t *testing.T) {
 	if !reflect.DeepEqual(r.Proposed, map[string]any{"title": "CTO"}) {
 		t.Errorf("proposed = %v", r.Proposed)
 	}
-	if got := questionIDs(r.Questions); !reflect.DeepEqual(got, []string{"conflict", "policy"}) {
+	// Nothing recent touched this row, so there is nothing to undo.
+	if got := questionIDs(r.Questions); !reflect.DeepEqual(got, []string{"policy_1", "policy_2"}) {
 		t.Errorf("questions = %v", got)
 	}
-	if r.Answers["conflict"] == nil || r.LatencyMS == nil || r.ModelLatencyMS == nil {
+	if r.Answers["policy_1"] == nil || r.LatencyMS == nil || r.ModelLatencyMS == nil {
 		t.Errorf("answers=%v latency=%v model_latency=%v", r.Answers, r.LatencyMS, r.ModelLatencyMS)
 	}
 	if r.StateVersion["xmin"] == nil {
@@ -533,5 +539,47 @@ func TestCloseWaitsForPendingJudgments(t *testing.T) {
 	e.admin.QueryRow(context.Background(), "select count(*) from stet.decisions where target_table = $1", e.table).Scan(&n)
 	if n != 1 {
 		t.Errorf("%d decisions after Close, want 1", n)
+	}
+}
+
+func TestShadowHoldsOnTheBrokenRule(t *testing.T) {
+	d := calm()
+	d.answers["policy_2"] = decide.Answer{Choice: "true", Probability: ptr(0.88)}
+	e := setup(t, d)
+	e.seed(t)
+	mustExec(t, e.connect(t, "stale-sync"), "update "+e.table+" set title = 'Engineer' where id = 1")
+
+	r := e.decisions(t, 1)[0]
+	if r.Verdict != "hold" || !reflect.DeepEqual(r.Reasons, []string{"policy:2"}) {
+		t.Errorf("verdict %s %v, want hold [policy:2]", r.Verdict, r.Reasons)
+	}
+	q := d.lastCall(t).questions
+	if q[len(q)-1].Type != "noul" || !strings.Contains(q[len(q)-1].Text, "older value from a stale source") {
+		t.Errorf("last question = %+v, want the second rule as its own yes/no question", q[len(q)-1])
+	}
+	if p := r.State["policy"]; p != "Do not set status to churned.\nDo not overwrite a title with an older value from a stale source." {
+		t.Errorf("state.policy = %q", p)
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
+
+func TestShadowAsksConflictOnlyWhenARecentChangeCouldBeUndone(t *testing.T) {
+	e := setup(t, calm())
+	e.seed(t)
+	mustExec(t, e.connect(t, "enricher"), "update "+e.table+" set title = 'VP' where id = 1")
+	stale := e.connect(t, "stale-sync")
+	mustExec(t, stale, "update "+e.table+" set status = 'inactive' where id = 1") // title was recent, status was not
+	mustExec(t, stale, "update "+e.table+" set title = 'Engineer' where id = 1")  // undoes the enricher
+	mustExec(t, stale, "delete from "+e.table+" where id = 2")                    // nothing recent on row 2
+	mustExec(t, stale, "delete from "+e.table+" where id = 1")                    // row 1 changed moments ago
+
+	rs := e.decisions(t, 5)
+	for i, want := range []bool{false, false, true, false, true} {
+		got := slices.Contains(questionIDs(rs[i].Questions), "conflict")
+		if got != want {
+			t.Errorf("decision %d (%s %v): conflict asked = %v, want %v",
+				i, rs[i].Op, rs[i].Proposed, got, want)
+		}
 	}
 }

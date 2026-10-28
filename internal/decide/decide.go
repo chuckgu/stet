@@ -11,7 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/stetdb/stet/internal/config"
@@ -21,8 +21,10 @@ import (
 // descriptions name state fields in backticks so a literal-minded model
 // knows where to look.
 type Question struct {
-	ID           string            `json:"id"`
-	Type         string            `json:"type"` // choice, or score: Choices are ordered levels
+	ID string `json:"id"`
+	// choice: pick one of Choices. score: Choices are ordered levels.
+	// noul: yes/no, answered with the probability of yes (Choices true, false).
+	Type         string            `json:"type"`
 	Text         string            `json:"text"`
 	Choices      []string          `json:"choices"`
 	Descriptions map[string]string `json:"descriptions"` // what each choice means
@@ -30,11 +32,14 @@ type Question struct {
 
 type Answer struct {
 	Choice       string             `json:"choice"`
-	Confidence   float64            `json:"confidence"`
+	Confidence   float64            `json:"confidence,omitempty"` // choice and score answers
 	Distribution map[string]float64 `json:"distribution,omitempty"`
-	// Expected is the probability-weighted level of a score question, on
-	// the same scale as its choices. Thresholds use it when present.
+	// Expected is the probability-weighted level of a score answer, on the
+	// same scale as its choices.
 	Expected *float64 `json:"expected,omitempty"`
+	// Probability is a noul answer's probability of yes. Noul answers carry
+	// no confidence; the probability itself says how sure the model is.
+	Probability *float64 `json:"probability,omitempty"`
 }
 
 type Answers struct {
@@ -94,14 +99,36 @@ const (
 	qDuplicate = "duplicate"
 	qConflict  = "conflict"
 	qPolicy    = "policy"
+
+	rulePrefix = "policy_" // rule n is asked as policy_n
 )
 
+// Ask describes one write to Questions.
+type Ask struct {
+	Op           string
+	CandidateIDs []string // duplicate choices, for an insert
+	Enabled      []string // the table's configured question list
+	Rules        []string // policy rules
+	// Recent is true when `recent_changes` holds something this write could
+	// undo: a change to a field this update writes, or any change before a
+	// delete.
+	Recent bool
+}
+
 // Questions builds the question set for one write (spec 5): duplicate for
-// inserts with candidates, conflict for updates and deletes, policy when the
-// table has a policy. enabled is the table's configured question list.
-func Questions(op string, candidateIDs []string, enabled []string, hasPolicy bool) []Question {
+// inserts with candidates, conflict for updates and deletes that could undo
+// a recent change, and one yes/no question per policy rule.
+//
+// Each rule is its own question because a single score over the whole
+// policy spread its probability across levels and escalated clear
+// violations; atomic questions also tell the agent which rule it broke.
+//
+// Conflict is asked only when code can see something to undo. Asked about
+// `current` in general, Jev read every ordinary update as a contradiction.
+func Questions(a Ask) []Question {
 	var qs []Question
-	on := func(id string) bool { return slices.Contains(enabled, id) }
+	on := func(id string) bool { return slices.Contains(a.Enabled, id) }
+	op, candidateIDs := a.Op, a.CandidateIDs
 	if op == "insert" && len(candidateIDs) > 0 && on(qDuplicate) {
 		desc := map[string]string{"none": "The `proposed` record is a different entity from every candidate."}
 		for _, id := range candidateIDs {
@@ -115,32 +142,31 @@ func Questions(op string, candidateIDs []string, enabled []string, hasPolicy boo
 			Descriptions: desc,
 		})
 	}
-	if (op == "update" || op == "delete") && on(qConflict) {
+	if (op == "update" || op == "delete") && a.Recent && on(qConflict) {
 		qs = append(qs, Question{
 			ID:      qConflict,
 			Type:    "choice",
-			Text:    "Does the `proposed` change contradict information in `current` or `recent_changes` that is more recent or more authoritative?",
+			Text:    "Does the `proposed` change undo or contradict a value that `recent_changes` shows was set shortly before this write?",
 			Choices: []string{"yes", "no"},
 			Descriptions: map[string]string{
-				"yes": "The `proposed` change undoes or contradicts a more recent or more authoritative value.",
-				"no":  "The `proposed` change does not contradict more recent or more authoritative information.",
+				"yes": "The `proposed` change reverts a value set in `recent_changes`, or replaces it with information that contradicts it.",
+				"no":  "The `proposed` change keeps the meaning of the values set in `recent_changes` (the same value written differently counts as the same), or changes something they did not set.",
 			},
 		})
 	}
-	if hasPolicy && on(qPolicy) {
-		qs = append(qs, Question{
-			ID:      qPolicy,
-			Type:    "score",
-			Text:    "How strongly does the `proposed` change violate the rules in `policy`?",
-			Choices: []string{"1", "2", "3", "4", "5"},
-			Descriptions: map[string]string{
-				"1": "No violation of the rules in `policy`.",
-				"2": "Unlikely to violate the rules in `policy`.",
-				"3": "Possibly violates the rules in `policy`.",
-				"4": "Likely violates the rules in `policy`.",
-				"5": "Clearly violates the rules in `policy`.",
-			},
-		})
+	if on(qPolicy) {
+		for i, rule := range a.Rules {
+			qs = append(qs, Question{
+				ID:      fmt.Sprintf("%s%d", rulePrefix, i+1),
+				Type:    "noul",
+				Text:    "Does the `proposed` change break this rule: " + rule,
+				Choices: []string{"true", "false"},
+				Descriptions: map[string]string{
+					"true":  "The `proposed` change breaks the rule.",
+					"false": "The `proposed` change follows the rule, or the rule is not about this kind of change.",
+				},
+			})
+		}
 	}
 	return qs
 }
@@ -182,9 +208,21 @@ func Verdict(in Input) (string, []string) {
 		return Commit, []string{reason}
 	}
 
+	// Rule 3: an answer the model is unsure of. For choice answers that is
+	// low confidence; for a rule (noul) it is a break probability between
+	// policy_escalate and policy.
 	var low []string
 	for _, q := range in.Questions {
-		if a, ok := in.Answers[q.ID]; !ok || a.Confidence < in.Thresholds.EscalateBelow {
+		a, ok := in.Answers[q.ID]
+		switch {
+		case !ok:
+		case q.Type == "noul":
+			ok = a.Probability != nil &&
+				(*a.Probability < in.Thresholds.PolicyEscalate || *a.Probability >= in.Thresholds.Policy)
+		default:
+			ok = a.Confidence >= in.Thresholds.EscalateBelow
+		}
+		if !ok {
 			low = append(low, "low_confidence:"+q.ID)
 		}
 	}
@@ -198,14 +236,15 @@ func Verdict(in Input) (string, []string) {
 	if a, ok := in.Answers[qConflict]; ok && a.Choice == "yes" && a.Confidence >= in.Thresholds.Conflict {
 		return Hold, []string{"conflict"}
 	}
-	if a, ok := in.Answers[qPolicy]; ok {
-		score, err := strconv.ParseFloat(a.Choice, 64)
-		if a.Expected != nil {
-			score, err = *a.Expected, nil
+	var broken []string
+	for _, q := range in.Questions {
+		n, isRule := strings.CutPrefix(q.ID, rulePrefix)
+		if a := in.Answers[q.ID]; isRule && a.Probability != nil && *a.Probability >= in.Thresholds.Policy {
+			broken = append(broken, "policy:"+n)
 		}
-		if err == nil && score >= float64(in.Thresholds.Policy) {
-			return Hold, []string{"policy"}
-		}
+	}
+	if len(broken) > 0 {
+		return Hold, broken
 	}
 	return Commit, nil
 }

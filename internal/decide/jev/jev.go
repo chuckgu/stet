@@ -1,7 +1,8 @@
 // Package jev is the decide.Decider adapter for TypeSafe's Jev
 // (POST /v1/systemone). Everything Jev-specific stays here (rule 7).
 //
-// Questions map to Jev primitives: a choice question becomes a Choice whose
+// Questions map to Jev primitives: a noul question becomes a Noul (the
+// answer is the probability of yes); a choice question becomes a Choice whose
 // criteria are the choice descriptions; a score question becomes a Score
 // whose levels are the descriptions in choice order. Jev scores levels from
 // 0; answers are shifted back to the question's own scale.
@@ -110,6 +111,7 @@ type answer struct {
 	Score         float64            `json:"score"`
 	Confidence    float64            `json:"confidence"`
 	Probabilities map[string]float64 `json:"probabilities"`
+	Noul          *float64           `json:"noul"`
 }
 
 func (c *Client) Decide(ctx context.Context, state json.RawMessage, qs []decide.Question) (decide.Answers, error) {
@@ -129,6 +131,8 @@ func (c *Client) Decide(ctx context.Context, state json.RawMessage, qs []decide.
 				levels[i] = q.Descriptions[ch]
 			}
 			jq.Criteria = levels
+		case "noul":
+			jq.Criteria = map[string]string{"true": q.Descriptions["true"], "false": q.Descriptions["false"]}
 		default:
 			return decide.Answers{}, fmt.Errorf("jev: question %s has unsupported type %q", q.ID, q.Type)
 		}
@@ -158,6 +162,16 @@ func (c *Client) Decide(ctx context.Context, state json.RawMessage, qs []decide.
 			out.ByQuestion[q.ID] = decide.Answer{Choice: a.Choice, Confidence: a.Confidence, Distribution: a.Probabilities}
 		case "score":
 			out.ByQuestion[q.ID] = scoreAnswer(q, a)
+		case "noul":
+			if a.Noul == nil {
+				continue
+			}
+			p := *a.Noul
+			choice := "false"
+			if p >= 0.5 {
+				choice = "true"
+			}
+			out.ByQuestion[q.ID] = decide.Answer{Choice: choice, Probability: &p}
 		}
 	}
 	return out, nil

@@ -6,11 +6,13 @@ import (
 	"flag"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/stetdb/stet/internal/config"
 	"github.com/stetdb/stet/internal/decide"
 	"github.com/stetdb/stet/internal/decide/jev"
+	"github.com/stetdb/stet/internal/gate"
 )
 
 type benchCase struct {
@@ -19,50 +21,50 @@ type benchCase struct {
 	questions []decide.Question
 }
 
-// benchCases are shaped like the gate's real states (spec 4): a stale
-// title overwrite and a near-duplicate contact.
+// benchCases are built with the gate's own State type, so the field order
+// is what the gate sends, and questions are chosen the way the gate chooses
+// them:
+//   - update:   reverts a title the enricher set 4 minutes ago (conflict; rule 2 broken)
+//   - insert:   a near-duplicate contact (duplicate; no rule applies)
+//   - churn:    churn with no open deal (rule 1 applies and is followed)
+//   - reformat: the same title written differently (not a conflict)
 func benchCases() []benchCase {
 	all := []string{"duplicate", "conflict", "policy"}
-	policy := "Do not set status to 'churned' while the account has an open deal.\n" +
-		"Do not overwrite a title with an older value from a stale source."
-	provenance := map[string]string{
-		"proposed": "untrusted_agent_input", "current": "database",
-		"candidates": "database", "recent_changes": "earlier_agent_writes",
+	rules := []string{
+		"Do not set status to 'churned' while the account has an open deal.",
+		"Do not overwrite a title with an older value from a stale source.",
 	}
-	mk := func(v any) json.RawMessage { b, _ := json.Marshal(v); return b }
+	kim := map[string]any{"name": "Jaehoon Kim", "email": "j.kim@acme.com", "company_id": 3,
+		"title": "VP Engineering", "status": "active"}
+	titleFix := []gate.RecentChange{{
+		At: time.Date(2026, 10, 28, 9, 14, 0, 0, time.UTC), MinutesBefore: 4, ByAgent: "enricher",
+		Op: "update", Fields: map[string]any{"title": "VP Engineering"},
+	}}
+	mk := func(name, op string, proposed, current map[string]any, cands []map[string]any, recent []gate.RecentChange, ids []string) benchCase {
+		st := gate.State{
+			Table: "contacts", Entity: "B2B CRM contact", Operation: op,
+			Proposed: proposed, Current: current, Candidates: cands, RecentChanges: recent,
+			Policy: strings.Join(rules, "\n"), Provenance: gate.Provenance(),
+		}
+		b, _ := json.Marshal(st)
+		return benchCase{name: name, state: b, questions: decide.Questions(decide.Ask{
+			Op: op, CandidateIDs: ids, Enabled: all, Rules: rules, Recent: st.CouldUndoRecent(),
+		})}
+	}
 	return []benchCase{
-		{
-			name: "update",
-			state: mk(map[string]any{
-				"table": "contacts", "entity": "B2B CRM contact", "operation": "update",
-				"proposed": map[string]any{"title": "Engineer"},
-				"current": map[string]any{"name": "Jaehoon Kim", "email": "j.kim@acme.com",
-					"company_id": 3, "title": "VP Engineering", "status": "active"},
-				"candidates": []any{},
-				"recent_changes": []any{map[string]any{
-					"at": "2026-10-28T09:14:00Z", "minutes_before_this_write": 4, "by_agent": "enricher",
-					"op": "update", "fields": map[string]any{"title": "VP Engineering"},
-				}},
-				"policy": policy, "provenance": provenance,
-			}),
-			questions: decide.Questions("update", nil, all, true),
-		},
-		{
-			name: "insert",
-			state: mk(map[string]any{
-				"table": "contacts", "entity": "B2B CRM contact", "operation": "insert",
-				"proposed": map[string]any{"name": "Jaehoon Kim", "email": "jkim@acme.co.kr",
-					"company_id": "3", "title": "VP Engineering"},
-				"current": nil,
-				"candidates": []any{
-					map[string]any{"id": 4812, "name": "김재훈", "email": "j.kim@acme.com", "company_id": 3},
-					map[string]any{"id": 5120, "name": "Jae Kim", "email": "jae.kim@other.io", "company_id": 9},
-				},
-				"recent_changes": []any{},
-				"policy":         policy, "provenance": provenance,
-			}),
-			questions: decide.Questions("insert", []string{"4812", "5120"}, all, true),
-		},
+		mk("update", "update", map[string]any{"title": "Engineer"}, kim, []map[string]any{}, titleFix, nil),
+		mk("insert", "insert",
+			map[string]any{"name": "Jaehoon Kim", "email": "jkim@acme.co.kr", "company_id": "3", "title": "VP Engineering"},
+			nil,
+			[]map[string]any{
+				{"id": 4812, "name": "김재훈", "email": "j.kim@acme.com", "company_id": 3},
+				{"id": 5120, "name": "Jae Kim", "email": "jae.kim@other.io", "company_id": 9},
+			},
+			[]gate.RecentChange{}, []string{"4812", "5120"}),
+		mk("churn", "update", map[string]any{"status": "churned"},
+			map[string]any{"name": "Lee", "email": "lee@acme.com", "company_id": 3, "title": "PM", "status": "active", "open_deals": 0},
+			[]map[string]any{}, []gate.RecentChange{}, nil),
+		mk("reformat", "update", map[string]any{"title": "VP of Engineering"}, kim, []map[string]any{}, titleFix, nil),
 	}
 }
 
@@ -122,7 +124,7 @@ func runBenchJev(args []string) error {
 			}
 			return k
 		}
-		fmt.Printf("%-7s n=%-3d p50=%-6v p95=%-6v max=%-6v >500ms=%d >800ms=%d\n", name, len(ds),
+		fmt.Printf("%-8s n=%-3d p50=%-6v p95=%-6v max=%-6v >500ms=%d >800ms=%d\n", name, len(ds),
 			percentile(ds, 0.5).Round(time.Millisecond), percentile(ds, 0.95).Round(time.Millisecond),
 			percentile(ds, 1).Round(time.Millisecond), over(500*time.Millisecond), over(800*time.Millisecond))
 	}
@@ -133,37 +135,35 @@ func runBenchJev(args []string) error {
 	fmt.Printf("\nerrors %d, cost $%.6f total, $%.6f per call\n", errs, cost, cost/float64(max(len(all), 1)))
 
 	// Same state every call, so spread here is the model's own variance.
-	fmt.Printf("\nanswers (confidence below the default escalate_below %.2f counts as low):\n", lowConfidence)
+	th := config.DefaultThresholds()
+	fmt.Printf("\nverdicts with the default thresholds, and answers (choice: confidence; rule: P(broken)):\n")
 	for _, c := range cases {
+		verdicts := map[string]int{}
+		for _, a := range answers[c.name] {
+			v, reasons := decide.Verdict(decide.Input{Questions: c.questions, Answers: a.ByQuestion, Thresholds: th})
+			verdicts[strings.Join(append([]string{v}, reasons...), " ")]++
+		}
+		fmt.Printf("  %-8s %v\n", c.name, verdicts)
 		for _, q := range c.questions {
 			choices := map[string]int{}
-			var confs, exps []float64
+			var vals []float64
 			for _, a := range answers[c.name] {
 				ans := a.ByQuestion[q.ID]
 				choices[ans.Choice]++
-				confs = append(confs, ans.Confidence)
-				if ans.Expected != nil {
-					exps = append(exps, *ans.Expected)
+				if ans.Probability != nil {
+					vals = append(vals, *ans.Probability)
+				} else {
+					vals = append(vals, ans.Confidence)
 				}
 			}
-			low := 0
-			for _, x := range confs {
-				if x < lowConfidence {
-					low++
-				}
+			if len(vals) == 0 {
+				continue
 			}
-			line := fmt.Sprintf("  %-7s %-9s choices=%v confidence %.2f-%.2f low=%d/%d",
-				c.name, q.ID, choices, slices.Min(confs), slices.Max(confs), low, len(confs))
-			if len(exps) > 0 {
-				line += fmt.Sprintf(" expected %.2f-%.2f", slices.Min(exps), slices.Max(exps))
-			}
-			fmt.Println(line)
+			fmt.Printf("    %-9s choices=%v %.2f-%.2f\n", q.ID, choices, slices.Min(vals), slices.Max(vals))
 		}
 	}
 	return nil
 }
-
-const lowConfidence = 0.60
 
 func percentile(ds []time.Duration, q float64) time.Duration {
 	if len(ds) == 0 {

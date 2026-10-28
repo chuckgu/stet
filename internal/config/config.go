@@ -55,16 +55,19 @@ type Table struct {
 	CandidateSQL string
 	RecentWindow time.Duration
 	Questions    []string
-	Policy       string
+	PolicyRules  []string // one rule each; every rule is asked as its own yes/no question
 	Thresholds   Thresholds
 	Unsupported  string // pass | reject
 }
 
 type Thresholds struct {
-	Duplicate     float64
-	Conflict      float64
-	Policy        int // 1-5, score >= Policy holds
-	EscalateBelow float64
+	Duplicate float64
+	Conflict  float64
+	// A rule whose break probability is >= Policy holds the write; one in
+	// [PolicyEscalate, Policy) escalates it.
+	Policy         float64
+	PolicyEscalate float64
+	EscalateBelow  float64 // for choice answers' confidence
 }
 
 // The file format. Kept separate from Config so durations and defaults are
@@ -94,21 +97,25 @@ type rawTable struct {
 	} `yaml:"candidates"`
 	RecentWindow string   `yaml:"recent_window"`
 	Questions    []string `yaml:"questions"`
-	Policy       string   `yaml:"policy"`
+	Policy       any      `yaml:"policy"` // text, one rule per line, or a list of rules
 	Thresholds   struct {
-		Duplicate     *float64 `yaml:"duplicate"`
-		Conflict      *float64 `yaml:"conflict"`
-		Policy        *int     `yaml:"policy"`
-		EscalateBelow *float64 `yaml:"escalate_below"`
+		Duplicate      *float64 `yaml:"duplicate"`
+		Conflict       *float64 `yaml:"conflict"`
+		Policy         *float64 `yaml:"policy"`
+		PolicyEscalate *float64 `yaml:"policy_escalate"`
+		EscalateBelow  *float64 `yaml:"escalate_below"`
 	} `yaml:"thresholds"`
 	Unsupported string `yaml:"unsupported"`
 }
 
 var (
-	defaultThresholds = Thresholds{Duplicate: 0.85, Conflict: 0.80, Policy: 4, EscalateBelow: 0.60}
+	defaultThresholds = Thresholds{Duplicate: 0.85, Conflict: 0.80, Policy: 0.80, PolicyEscalate: 0.50, EscalateBelow: 0.60}
 	allQuestions      = []string{"duplicate", "conflict", "policy"}
 	versionAliases    = map[string]bool{"latest": true, "stable": true, "current": true, "default": true, "preview": true}
 )
+
+// DefaultThresholds are what a table gets when it sets none.
+func DefaultThresholds() Thresholds { return defaultThresholds }
 
 func Load(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
@@ -206,10 +213,14 @@ func resolveTable(name string, rt rawTable) (Table, []error) {
 		SendFields:   rt.SendFields,
 		CandidateSQL: rt.Candidates.SQL,
 		Questions:    rt.Questions,
-		Policy:       rt.Policy,
 		Thresholds:   defaultThresholds,
 		Unsupported:  rt.Unsupported,
 	}
+	rules, err := policyRules(rt.Policy)
+	if err != nil {
+		fail("policy", "%v", err)
+	}
+	t.PolicyRules = rules
 	if t.PK == "" {
 		fail("pk", "required")
 	}
@@ -249,23 +260,51 @@ func resolveTable(name string, rt rawTable) (Table, []error) {
 	}{
 		{"duplicate", th.Duplicate, &t.Thresholds.Duplicate},
 		{"conflict", th.Conflict, &t.Thresholds.Conflict},
+		{"policy", th.Policy, &t.Thresholds.Policy},
+		{"policy_escalate", th.PolicyEscalate, &t.Thresholds.PolicyEscalate},
 		{"escalate_below", th.EscalateBelow, &t.Thresholds.EscalateBelow},
 	} {
 		if p.src == nil {
 			continue
 		}
 		if *p.src < 0 || *p.src > 1 {
-			fail("thresholds."+p.name, "%v must be between 0 and 1", *p.src)
+			fail("thresholds."+p.name, "%v must be between 0 and 1 (policy thresholds are the probability that a rule is broken)", *p.src)
 		}
 		*p.dst = *p.src
 	}
-	if th.Policy != nil {
-		if *th.Policy < 1 || *th.Policy > 5 {
-			fail("thresholds.policy", "%d must be between 1 and 5", *th.Policy)
-		}
-		t.Thresholds.Policy = *th.Policy
+	if t.Thresholds.PolicyEscalate > t.Thresholds.Policy {
+		fail("thresholds.policy_escalate", "%v must not be above thresholds.policy %v",
+			t.Thresholds.PolicyEscalate, t.Thresholds.Policy)
 	}
 	return t, errs
+}
+
+// policyRules accepts a policy as text, one rule per line, or as a list.
+func policyRules(v any) ([]string, error) {
+	var items []string
+	switch p := v.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		items = strings.Split(p, "\n")
+	case []any:
+		for _, x := range p {
+			s, ok := x.(string)
+			if !ok {
+				return nil, fmt.Errorf("every rule must be text, got %v", x)
+			}
+			items = append(items, s)
+		}
+	default:
+		return nil, errors.New("must be text (one rule per line) or a list of rules")
+	}
+	var rules []string
+	for _, s := range items {
+		if s = strings.TrimSpace(s); s != "" {
+			rules = append(rules, s)
+		}
+	}
+	return rules, nil
 }
 
 // UpstreamAddr is the host:port the proxy dials. Clients authenticate to it

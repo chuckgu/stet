@@ -145,7 +145,12 @@ type Answer   struct { Choice string; Confidence float64; Distribution map[strin
 type Answers  struct { ByQuestion map[string]Answer; CostUSD float64 }
 ```
 
-질문은 `choice`와 `score` 두 타입이다. 선택지마다 뜻을 적은 설명을 함께 보낸다. policy는 `"1"`~`"5"` 단계의 score 질문이고, `Expected`(확률 가중 평균 단계)가 있으면 6장 규칙이 그 값으로 임계값을 비교한다. 질문과 설명은 상태 필드를 백틱으로 이름 붙여 가리킨다(`proposed`, `candidates` 등).
+질문 타입은 세 가지다.
+- `choice`: 선택지 중 하나를 고른다. 답에는 confidence가 붙는다.
+- `noul`: 예/아니오를 묻는다. 답은 "예"일 확률이다(`Answer.Probability`). confidence는 없다.
+- `score`: 순서 있는 단계를 매긴다. 어댑터는 지원하지만 지금 쓰는 질문은 없다.
+
+선택지마다 뜻을 적은 설명을 함께 보낸다. 질문과 설명은 상태 필드를 백틱으로 이름 붙여 가리킨다(`proposed`, `candidates` 등).
 
 비교 실험용으로 LLM 어댑터(JSON 출력)를 같은 인터페이스로 만든다(미구현).
 
@@ -155,7 +160,9 @@ type Answers  struct { ByQuestion map[string]Answer; CostUSD float64 }
 - `jev`: TypeSafe API `POST https://api.typesafe.ai/v1/systemone` (internal/decide/jev). 근거는 docs.typesafe.ai의 OpenAPI 스펙(v0.2.0)이다.
   - 키는 환경 변수 `TYPESAFE_API_KEY`에서만 읽는다. 설정 파일에 두지 않는다. `TYPESAFE_BASE_URL`로 주소를 바꿀 수 있다.
   - 버전은 `jev-X.Y.Z` 형식만 받는다. `jev-latest`, `jev-preview`, `jev-1.14`는 거부한다. 응답의 `model`이 요청한 버전과 다르면 그 답을 버리고 모델 오류로 처리한다(규칙 2).
-  - choice 질문은 Jev Choice로 보낸다. criteria는 선택지 이름과 설명의 맵이다. score 질문은 Jev Score로 보낸다. criteria는 단계 설명의 배열이고, Jev의 0부터 시작하는 단계를 질문의 척도(1~5)로 옮긴다. `Choice`는 확률이 가장 높은 단계, `Expected`는 Jev의 `score`(기댓값)다.
+  - choice 질문은 Jev Choice로 보낸다. criteria는 선택지 이름과 설명의 맵이다.
+  - noul 질문은 Jev Noul로 보낸다. criteria는 `true`/`false` 설명이다. 답의 `noul`이 `Probability`가 되고, 0.5 이상이면 `Choice`는 `true`다.
+  - score 질문은 Jev Score로 보낸다. criteria는 단계 설명의 배열이고, Jev의 0부터 시작하는 단계를 질문의 척도로 옮긴다. `Choice`는 확률이 가장 높은 단계, `Expected`는 Jev의 `score`(기댓값)다.
   - 429·529는 한 번만 재시도한다. `Retry-After`를 따르되 마감 시간 안에 들어올 때만 기다린다.
   - 비용은 입력 토큰당 $42/10억(출력 무료, 2026-10-28 기준 가격)으로 계산해 `cost_usd`에 남긴다.
   - Jev의 알려진 약점(TypeSafe 문서의 jev-1.13 jaggedness)은 다음과 같다.
@@ -171,11 +178,15 @@ OpenRouter 경유(`typesafe/jev-1.14`)는 쓰지 않는다. 버전 고정과 응
 | id | 유형 | 질문 | 선택지 |
 |---|---|---|---|
 | `duplicate` | choice | Does the proposed record refer to the same real-world entity as one of the candidates? | 후보 id들 + `none` |
-| `conflict` | choice | Does the proposed change contradict information in the current state or recent changes that is more recent or more authoritative? | `yes` / `no` |
-| `policy` | score 1–5 | How strongly does the proposed change violate the table policy? | 1 위반 없음 ~ 5 명백한 위반 |
+| `conflict` | choice | Does the `proposed` change undo or contradict a value that `recent_changes` shows was set shortly before this write? ("no" 설명에 "같은 값을 다르게 쓴 것은 같은 값"을 명시) | `yes` / `no` |
+| `policy_1`, `policy_2`, … | noul | Does the `proposed` change break this rule: *(규칙 문장)* | 어길 확률 (`true`: 어김, `false`: 지킴 또는 해당 없음) |
 
 - 한 요청에 질문을 묶어 보낸다. 상태는 한 번만 읽힌다.
-- `duplicate`는 insert에만, `conflict`는 update/delete에만 묻는다.
+- `duplicate`는 insert에만 묻는다.
+- `conflict`는 되돌릴 최근 변경이 모델에게 보일 때만 묻는다. update는 `recent_changes` 중 하나가 이번에 쓰는 필드를 건드렸을 때, delete는 `recent_changes`가 하나라도 있을 때다(`State.CouldUndoRecent`, send_fields를 적용한 뒤 기준).
+  - 이전에는 update/delete마다 "`current`나 `recent_changes`의 더 최근 정보와 모순되나"를 물었다. 그러자 Jev는 값을 바꾸는 평범한 update를 모순으로 읽었다. 최근 변경 없는 이탈 처리, 다른 필드만 최근에 바뀐 경우, 같은 직함의 표기만 바꾼 경우가 모두 confidence 0.0~0.4로 escalate됐다.
+  - 질문을 `recent_changes`로 좁히고 "같은 값을 다르게 쓴 것"을 명시하자 정답이 갈렸다. 되돌리기는 0.96~0.98로 "yes", 나머지는 0.74~1.00으로 "no"였다(사례별 10회, decisions.md D20).
+- 정책은 규칙마다 따로 묻는다. 정책 전체를 1~5 점수 하나로 물었을 때는 문제가 있었다. 명백한 위반에서도 확률이 "아마 위반"과 "명백한 위반" 단계에 나뉘어 confidence가 0.52~0.67로 낮게 나왔고, 10번 중 4번이 hold 대신 escalate가 됐다. 규칙별로 물으면 위반 규칙은 0.86~0.88, 무관한 규칙은 0.04~0.08로 갈렸다(2026-10-28 실측, `jev-1.14.0`, decisions.md D18). 어떤 규칙을 어겼는지도 reason에 남는다.
 - 타임아웃은 설정값(`timeout_ms`)을 따르고, 실패 시 `on_failure` 정책을 적용한다.
 
 ## 6. 정책: 판단을 verdict로 바꾸기
@@ -186,10 +197,10 @@ OpenRouter 경유(`typesafe/jev-1.14`)는 쓰지 않는다. 버전 고정과 응
 |---|---|---|---|
 | 1 | 미지원 문장, 트랜잭션 내 쓰기 | `unsupported` | 형태별 reason(3장) / `in_transaction` |
 | 2 | 상태 조립 실패, 모델 호출 실패, 모델 없음 | `on_failure` 설정값 (`pass`면 `commit`) | `state_error` / `model_error` / `no_model` |
-| 3 | 어떤 답이든 confidence < `escalate_below` | `escalate` | `low_confidence:<q>` |
+| 3 | choice 답의 confidence < `escalate_below`, 또는 규칙(noul) 답의 확률이 `policy_escalate` 이상 `policy` 미만 | `escalate` | `low_confidence:<q>` |
 | 4 | duplicate ≠ none, confidence ≥ τ_dup | `hold` | `duplicate:<id>` |
 | 5 | conflict = yes, confidence ≥ τ_conflict | `hold` | `conflict` |
-| 6 | policy score ≥ τ_policy | `hold` | `policy` |
+| 6 | 어떤 규칙이든 어길 확률 ≥ `policy` (기본 0.8) | `hold` | `policy:<n>` (어긴 규칙마다) |
 | 7 | 그 외 | `commit` | |
 
 - 1번 규칙의 verdict는 `unsupported`로 기록한다. enforce 모드에서 실제로 어떻게 할지는 테이블 설정 `unsupported`가 정하고, `in_transaction`은 항상 `ST002`다. 1·2번 규칙에 걸리면 모델을 부르지 않는다.
@@ -296,18 +307,20 @@ tables:
         LIMIT 10
     recent_window: 30m
     questions: [duplicate, conflict, policy]
-    policy: |
+    policy: |                # 한 줄에 규칙 하나. 규칙마다 따로 묻는다 (목록으로 써도 된다)
       Do not set status to 'churned' while the account has an open deal.
       Do not overwrite a title with an older value from a stale source.
     thresholds:
       duplicate: 0.85
       conflict: 0.80
-      policy: 4              # score >= 4 → hold
-      escalate_below: 0.60
+      policy: 0.8            # 규칙을 어겼을 확률이 0.8 이상이면 hold
+      policy_escalate: 0.5   # 0.5 이상 0.8 미만이면 escalate
+      escalate_below: 0.60   # choice 답(duplicate, conflict)의 confidence 기준
     unsupported: reject
 ```
 
 - `send_fields`는 테이블마다 필수다. 모델이 볼 수 있는 컬럼을 명시적으로 고르게 하기 위해서다.
+- `policy`는 한 줄에 규칙 하나인 텍스트나 규칙 목록이다. 빈 줄은 무시한다. `thresholds.policy`와 `policy_escalate`는 확률(0~1)이다. 예전의 1~5 점수(`policy: 4`)는 설정 검증에서 거부된다.
 - `recent_window`의 기본값은 30분이다.
 - Jev 어댑터 전까지는 `model: {adapter: none}`으로 둔다(5장).
 - `upstream` URL의 계정은 Stet 자신의 연결(상태 조회, 판단 기록)에 쓴다. 이 계정은 게이트 대상 테이블 SELECT 권한과 `stet` 스키마를 만들 권한이 있어야 한다. 비밀번호는 URL이나 `PGPASSWORD`·`.pgpass`로 준다.
@@ -346,21 +359,42 @@ tables:
 **Jev 단건 지연** (2026-10-28, 개발 머신에서 `api.typesafe.ai`로 측정, `stet bench-jev`)
 
 측정 방법:
-- 게이트의 실제 상태와 같은 모양인 CRM 사례 두 가지를 번갈아 보냈다. 하나는 오래된 직함으로 덮어쓰는 update(conflict와 policy 질문), 다른 하나는 표기만 다른 중복 연락처 insert(duplicate와 policy 질문)다.
+- 상태는 게이트의 `State` 타입으로 만들어, 게이트와 같은 필드 순서로 보낸다.
+- 질문은 게이트와 같은 방식으로 고른다.
+- 지금의 측정 사례는 네 가지다.
+  - update: 다른 에이전트가 4분 전에 고친 직함을 오래된 값으로 되돌림. conflict, 규칙 2 위반.
+  - insert: 표기만 다른 중복 연락처. 해당 규칙 없음.
+  - churn: 열린 딜이 없는 이탈 처리. 최근 변경 없음, 규칙 1이 해당되고 지켜짐.
+  - reformat: 같은 직함을 표기만 바꿈. conflict 아님.
 - 요청은 한 번에 하나씩, 연결을 재사용해 보냈다.
 
-| 모델 | n | p50 | p95 | 최대 | 처음 호출 (TLS 포함) |
+| 모델 / 질문 형태 | n | p50 | p95 | 최대 | 처음 호출 (TLS 포함) |
 |---|---|---|---|---|---|
-| `jev-1.14.0` | 60 | 169ms | 196ms | 213ms | 204ms |
-| `jev-1.14.0` (재측정) | 40 | 167ms | 199ms | 211ms | 228ms |
-| `jev-1.13.0` | 40 | 186ms | 417ms | 461ms | 205ms |
+| `jev-1.14.0`, 규칙별 noul, conflict 조건부 (현재) | 80 | 172ms | 195ms | 246ms | 214ms |
+| `jev-1.14.0`, 규칙별 noul, conflict 항상 (이전) | 60 | 170ms | 253ms | 295ms | 225ms |
+| `jev-1.14.0`, policy 1~5 점수 (이전) | 60 | 169ms | 196ms | 213ms | 204ms |
+| `jev-1.14.0`, policy 1~5 점수 (이전, 재측정) | 40 | 167ms | 199ms | 211ms | 228ms |
+| `jev-1.13.0`, policy 1~5 점수 (이전) | 40 | 186ms | 417ms | 461ms | 205ms |
 | 네트워크 하한: `GET /v1/models` (추론 없음) | 20 | 142ms | 231ms | 252ms | |
 
+"이전" 행들은 측정 도구가 상태를 알파벳순 필드로 보내던 때의 값이다. 지연에는 영향이 없지만, 답 분포는 게이트의 실제 순서와 다르다(아래 필드 순서 참고).
+
 해석:
-- 지연의 대부분(약 140ms)은 네트워크 왕복이다. 추론과 처리 몫은 30ms 안팎이다. TypeSafe와 같은 지역에 Stet을 두면 단건 지연이 크게 줄 것으로 보이지만, 아직 재 보지 않았다.
+- 지연의 대부분(약 140ms)은 네트워크 왕복이다. 추론과 처리 몫은 30ms 안팎이다. 규칙을 질문으로 쪼개도 지연은 그대로였다(질문은 병렬로 평가된다). TypeSafe와 같은 지역에 Stet을 두면 단건 지연이 크게 줄 것으로 보이지만, 아직 재 보지 않았다.
 - 현재 기본 `timeout_ms: 800`을 넘은 호출은 없다.
-- 호출당 비용은 약 $0.000032(입력 약 760토큰)다. 1,000건당 약 $0.03이다.
-- 같은 상태를 반복해 보내면 선택은 매번 같았지만 confidence는 흔들렸다. insert의 policy 답은 0.08~0.62였다. 기록된 판단을 재생하고 재추론하지 않는 이유(규칙 4)가 여기서도 확인된다.
+- 호출당 비용은 약 $0.000033이다. 1,000건당 약 $0.03이다.
+- 현재 질문 세트에서 기본 임계값 판정은 다음과 같았다(각 20회).
+  - update: `hold conflict` 20회. conflict "yes" 0.94~0.96, 규칙 2의 어길 확률 0.85~0.89였다.
+  - insert: `hold duplicate:4812` 17회, `commit` 3회. 중복 판단의 confidence가 0.77~0.89로 기본 임계값 0.85에 걸쳐 있다(decisions.md 열린 질문).
+  - churn: `commit` 20회. conflict를 묻지 않고, 규칙은 0.04~0.05였다. conflict를 항상 묻던 이전에는 20회 모두 escalate였다.
+  - reformat: `commit` 20회. conflict "no" 0.86~0.92였다.
+- 같은 상태를 반복해 보내면 선택은 매번 같았지만 confidence와 확률은 흔들렸다. 기록된 판단을 재생하고 재추론하지 않는 이유(규칙 4)가 여기서도 확인된다.
+
+**필드 순서**: 같은 상태도 필드 순서가 다르면 Jev의 답이 달라졌다.
+- 중복 insert에서 policy 1~5 점수의 confidence는 게이트 순서에서 0.77~0.84, 알파벳순에서 0.25~0.50이었다.
+- 규칙별 noul에서도 무관한 규칙의 확률이 0.06에서 0.30으로 올랐다. 다만 hold 기준 0.8과는 여전히 거리가 멀었다.
+
+그래서 상태의 필드 순서는 형식의 일부로 고정한다(`gate.State`). 순서를 바꾸면 임계값을 다시 보정해야 한다. 기록된 판단은 보낸 상태를 그대로 담으므로 재현에는 문제가 없다.
 
 ## 12. 수용 기준
 

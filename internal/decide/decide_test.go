@@ -10,19 +10,24 @@ import (
 	"github.com/stetdb/stet/internal/config"
 )
 
-var th = config.Thresholds{Duplicate: 0.85, Conflict: 0.80, Policy: 4, EscalateBelow: 0.60}
+var th = config.Thresholds{Duplicate: 0.85, Conflict: 0.80, Policy: 0.80, PolicyEscalate: 0.50, EscalateBelow: 0.60}
+
+func choice(c string, conf float64) Answer { return Answer{Choice: c, Confidence: conf} }
+
+func yesno(p float64) Answer {
+	c := "false"
+	if p >= 0.5 {
+		c = "true"
+	}
+	return Answer{Choice: c, Probability: &p}
+}
 
 func TestVerdict(t *testing.T) {
-	dupQ := Question{ID: "duplicate", Choices: []string{"4812", "none"}}
-	conQ := Question{ID: "conflict", Choices: []string{"yes", "no"}}
-	polQ := Question{ID: "policy", Choices: []string{"1", "2", "3", "4", "5"}}
-	ans := func(kv ...any) map[string]Answer {
-		m := map[string]Answer{}
-		for i := 0; i < len(kv); i += 3 {
-			m[kv[i].(string)] = Answer{Choice: kv[i+1].(string), Confidence: kv[i+2].(float64)}
-		}
-		return m
-	}
+	dupQ := Question{ID: "duplicate", Type: "choice", Choices: []string{"4812", "none"}}
+	conQ := Question{ID: "conflict", Type: "choice", Choices: []string{"yes", "no"}}
+	rule1 := Question{ID: "policy_1", Type: "noul", Choices: []string{"true", "false"}}
+	rule2 := Question{ID: "policy_2", Type: "noul", Choices: []string{"true", "false"}}
+	type A = map[string]Answer
 
 	cases := []struct {
 		name    string
@@ -38,48 +43,63 @@ func TestVerdict(t *testing.T) {
 		{"model error, hold", Input{ModelErr: errors.New("timeout"), OnFailure: "hold"}, Hold, []string{"model_error"}},
 		{"record only", Input{ModelErr: ErrNoModel, OnFailure: "pass"}, Commit, []string{"no_model"}},
 		{
-			"low confidence escalates",
-			Input{Questions: []Question{conQ, polQ}, Answers: ans("conflict", "no", 0.55, "policy", "1", 0.9)},
+			"low choice confidence escalates",
+			Input{Questions: []Question{conQ, rule1}, Answers: A{"conflict": choice("no", 0.55), "policy_1": yesno(0.05)}},
 			Escalate, []string{"low_confidence:conflict"},
 		},
 		{
-			"every low answer is named",
-			Input{Questions: []Question{conQ, polQ}, Answers: ans("conflict", "no", 0.5, "policy", "1", 0.4)},
-			Escalate, []string{"low_confidence:conflict", "low_confidence:policy"},
+			"uncertain rule escalates",
+			Input{Questions: []Question{conQ, rule1}, Answers: A{"conflict": choice("no", 0.9), "policy_1": yesno(0.6)}},
+			Escalate, []string{"low_confidence:policy_1"},
+		},
+		{
+			"every uncertain answer is named",
+			Input{Questions: []Question{conQ, rule1}, Answers: A{"conflict": choice("no", 0.5), "policy_1": yesno(0.55)}},
+			Escalate, []string{"low_confidence:conflict", "low_confidence:policy_1"},
+		},
+		{
+			"missing answer escalates",
+			Input{Questions: []Question{conQ, rule1}, Answers: A{"conflict": choice("no", 0.9)}},
+			Escalate, []string{"low_confidence:policy_1"},
 		},
 		{
 			"confident duplicate holds",
-			Input{Questions: []Question{dupQ, polQ}, Answers: ans("duplicate", "4812", 0.93, "policy", "1", 0.9)},
+			Input{Questions: []Question{dupQ, rule1}, Answers: A{"duplicate": choice("4812", 0.93), "policy_1": yesno(0.05)}},
 			Hold, []string{"duplicate:4812"},
 		},
 		{
 			"duplicate below threshold commits",
-			Input{Questions: []Question{dupQ, polQ}, Answers: ans("duplicate", "4812", 0.70, "policy", "1", 0.9)},
+			Input{Questions: []Question{dupQ, rule1}, Answers: A{"duplicate": choice("4812", 0.70), "policy_1": yesno(0.05)}},
 			Commit, nil,
 		},
 		{
 			"no duplicate commits",
-			Input{Questions: []Question{dupQ, polQ}, Answers: ans("duplicate", "none", 0.95, "policy", "1", 0.9)},
+			Input{Questions: []Question{dupQ, rule1}, Answers: A{"duplicate": choice("none", 0.95), "policy_1": yesno(0.05)}},
 			Commit, nil,
 		},
 		{
 			"conflict holds",
-			Input{Questions: []Question{conQ, polQ}, Answers: ans("conflict", "yes", 0.85, "policy", "2", 0.9)},
+			Input{Questions: []Question{conQ, rule1}, Answers: A{"conflict": choice("yes", 0.85), "policy_1": yesno(0.05)}},
 			Hold, []string{"conflict"},
 		},
 		{
-			"policy score at threshold holds",
-			Input{Questions: []Question{conQ, polQ}, Answers: ans("conflict", "no", 0.9, "policy", "4", 0.9)},
-			Hold, []string{"policy"},
+			"broken rule holds and is named",
+			Input{Questions: []Question{conQ, rule1, rule2}, Answers: A{"conflict": choice("no", 0.9), "policy_1": yesno(0.04), "policy_2": yesno(0.87)}},
+			Hold, []string{"policy:2"},
 		},
 		{
-			"policy score below threshold commits",
-			Input{Questions: []Question{conQ, polQ}, Answers: ans("conflict", "no", 0.9, "policy", "3", 0.9)},
+			"every broken rule is named",
+			Input{Questions: []Question{rule1, rule2}, Answers: A{"policy_1": yesno(0.9), "policy_2": yesno(0.8)}},
+			Hold, []string{"policy:1", "policy:2"},
+		},
+		{
+			"unlikely break commits",
+			Input{Questions: []Question{rule1, rule2}, Answers: A{"policy_1": yesno(0.30), "policy_2": yesno(0.05)}},
 			Commit, nil,
 		},
 		{
 			"first matching rule wins",
-			Input{Questions: []Question{dupQ, polQ}, Answers: ans("duplicate", "4812", 0.9, "policy", "5", 0.9)},
+			Input{Questions: []Question{dupQ, rule1}, Answers: A{"duplicate": choice("4812", 0.9), "policy_1": yesno(0.95)}},
 			Hold, []string{"duplicate:4812"},
 		},
 	}
@@ -97,6 +117,7 @@ func TestVerdict(t *testing.T) {
 
 func TestQuestions(t *testing.T) {
 	all := []string{"duplicate", "conflict", "policy"}
+	rules := []string{"Do not churn with an open deal.", "Do not restore a stale title."}
 	ids := func(qs []Question) []string {
 		var out []string
 		for _, q := range qs {
@@ -105,35 +126,64 @@ func TestQuestions(t *testing.T) {
 		return out
 	}
 	cases := []struct {
-		name       string
-		op         string
-		candidates []string
-		enabled    []string
-		hasPolicy  bool
-		want       []string
+		name string
+		ask  Ask
+		want []string
 	}{
-		{"insert with candidates", "insert", []string{"7", "9"}, all, true, []string{"duplicate", "policy"}},
-		{"insert without candidates", "insert", nil, all, true, []string{"policy"}},
-		{"update", "update", []string{"7"}, all, true, []string{"conflict", "policy"}},
-		{"delete", "delete", nil, all, true, []string{"conflict", "policy"}},
-		{"no policy text", "update", nil, all, false, []string{"conflict"}},
-		{"only enabled questions", "update", nil, []string{"policy"}, true, []string{"policy"}},
+		{"insert with candidates", Ask{Op: "insert", CandidateIDs: []string{"7", "9"}, Enabled: all, Rules: rules}, []string{"duplicate", "policy_1", "policy_2"}},
+		{"insert without candidates", Ask{Op: "insert", Enabled: all, Rules: rules}, []string{"policy_1", "policy_2"}},
+		{"update undoing a recent change", Ask{Op: "update", Enabled: all, Rules: rules[:1], Recent: true}, []string{"conflict", "policy_1"}},
+		{"update with nothing recent to undo", Ask{Op: "update", Enabled: all, Rules: rules[:1]}, []string{"policy_1"}},
+		{"delete after a recent change", Ask{Op: "delete", Enabled: all, Recent: true}, []string{"conflict"}},
+		{"delete with nothing recent", Ask{Op: "delete", Enabled: all}, nil},
+		{"insert ignores recent", Ask{Op: "insert", Enabled: all, Recent: true}, nil},
+		{"no policy", Ask{Op: "update", Enabled: all, Recent: true}, []string{"conflict"}},
+		{"only enabled questions", Ask{Op: "update", Enabled: []string{"policy"}, Rules: rules[:1], Recent: true}, []string{"policy_1"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			qs := Questions(tc.op, tc.candidates, tc.enabled, tc.hasPolicy)
-			if got := ids(qs); !reflect.DeepEqual(got, tc.want) {
+			if got := ids(Questions(tc.ask)); !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("questions = %v, want %v", got, tc.want)
 			}
 		})
 	}
 
-	dup := Questions("insert", []string{"7", "9"}, all, false)[0]
+	dup := Questions(Ask{Op: "insert", CandidateIDs: []string{"7", "9"}, Enabled: all})[0]
 	if !reflect.DeepEqual(dup.Choices, []string{"7", "9", "none"}) {
 		t.Errorf("duplicate choices = %v, want candidate ids then none", dup.Choices)
 	}
-	if dup.Text == "" {
-		t.Error("question text is empty")
+	r2 := Questions(Ask{Op: "update", Enabled: []string{"policy"}, Rules: rules})[1]
+	if r2.Type != "noul" || !strings.Contains(r2.Text, rules[1]) {
+		t.Errorf("rule question = %+v, want a yes/no question quoting its rule", r2)
+	}
+}
+
+// The conflict question is about undoing recent changes only; asking about
+// `current` made Jev call every ordinary update a contradiction.
+func TestConflictQuestionIsAboutRecentChanges(t *testing.T) {
+	q := Questions(Ask{Op: "update", Enabled: []string{"conflict"}, Recent: true})[0]
+	if strings.Contains(q.Text, "`current`") || !strings.Contains(q.Text, "`recent_changes`") {
+		t.Errorf("conflict text = %q, want it to point at recent_changes only", q.Text)
+	}
+	if !strings.Contains(q.Descriptions["no"], "written differently") {
+		t.Errorf("no = %q, want the same value written differently to count as the same", q.Descriptions["no"])
+	}
+}
+
+func TestQuestionsDescribeEveryChoice(t *testing.T) {
+	all := []string{"duplicate", "conflict", "policy"}
+	rules := []string{"Do not churn with an open deal."}
+	qs := append(Questions(Ask{Op: "insert", CandidateIDs: []string{"7"}, Enabled: all, Rules: rules}),
+		Questions(Ask{Op: "update", Enabled: all, Rules: rules, Recent: true})...)
+	for _, q := range qs {
+		if q.Text == "" {
+			t.Errorf("%s: no text", q.ID)
+		}
+		for _, c := range q.Choices {
+			if q.Descriptions[c] == "" {
+				t.Errorf("%s: choice %q has no description", q.ID, c)
+			}
+		}
 	}
 }
 
@@ -154,44 +204,6 @@ func TestNewUnknownAdapter(t *testing.T) {
 	_, err := New(config.Model{Adapter: "jevv", Version: "1.0"})
 	if err == nil || !strings.Contains(err.Error(), "jevv") {
 		t.Fatalf("err = %v, want unknown adapter error", err)
-	}
-}
-
-func TestQuestionsDescribeEveryChoice(t *testing.T) {
-	all := []string{"duplicate", "conflict", "policy"}
-	for _, q := range append(Questions("insert", []string{"7"}, all, true), Questions("update", nil, all, true)...) {
-		if q.Type != "choice" && q.Type != "score" {
-			t.Errorf("%s: type %q, want choice or score", q.ID, q.Type)
-		}
-		for _, c := range q.Choices {
-			if q.Descriptions[c] == "" {
-				t.Errorf("%s: choice %q has no description", q.ID, c)
-			}
-		}
-	}
-	pol := Questions("update", nil, []string{"policy"}, true)[0]
-	if pol.Type != "score" || !reflect.DeepEqual(pol.Choices, []string{"1", "2", "3", "4", "5"}) {
-		t.Errorf("policy question = %+v, want a 1-5 score", pol)
-	}
-}
-
-func TestPolicyUsesExpectedScoreWhenGiven(t *testing.T) {
-	polQ := Question{ID: "policy", Type: "score", Choices: []string{"1", "2", "3", "4", "5"}}
-	exp := func(v float64) *float64 { return &v }
-	cases := []struct {
-		name    string
-		a       Answer
-		verdict string
-	}{
-		{"expected below threshold", Answer{Choice: "4", Confidence: 0.9, Expected: exp(3.6)}, Commit},
-		{"expected at threshold", Answer{Choice: "4", Confidence: 0.9, Expected: exp(4.0)}, Hold},
-		{"expected over, top level lower", Answer{Choice: "3", Confidence: 0.9, Expected: exp(4.2)}, Hold},
-	}
-	for _, tc := range cases {
-		v, _ := Verdict(Input{Questions: []Question{polQ}, Answers: map[string]Answer{"policy": tc.a}, Thresholds: th})
-		if v != tc.verdict {
-			t.Errorf("%s: verdict %s, want %s", tc.name, v, tc.verdict)
-		}
 	}
 }
 

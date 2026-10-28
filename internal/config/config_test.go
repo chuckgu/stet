@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -28,6 +29,9 @@ func TestLoadExampleConfig(t *testing.T) {
 	}
 	if c.Retention != 90*24*time.Hour {
 		t.Errorf("retention = %v, want 90d", c.Retention)
+	}
+	if n := len(tbl.PolicyRules); n != 2 {
+		t.Errorf("%d policy rules, want 2", n)
 	}
 }
 
@@ -162,5 +166,72 @@ func TestHashIdentifiesConfigBytes(t *testing.T) {
 	}
 	if a.Hash == b.Hash {
 		t.Error("different configs share a hash")
+	}
+}
+
+func TestPolicyRulesFromTextOrList(t *testing.T) {
+	want := []string{"Do not churn with an open deal.", "Do not restore a stale title."}
+	for name, yaml := range map[string]string{
+		"text": "policy: |\n      Do not churn with an open deal.\n\n      Do not restore a stale title.\n",
+		"list": "policy:\n      - Do not churn with an open deal.\n      - \"  Do not restore a stale title.  \"\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, err := Parse([]byte(minimal + "model: {adapter: none}\ntables:\n  contacts:\n    pk: id\n    send_fields: [name]\n    " + yaml))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := c.Tables["contacts"].PolicyRules; !equalStrings(got, want) {
+				t.Errorf("rules = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestPolicyMustBeTextOrList(t *testing.T) {
+	_, err := Parse([]byte(minimal + "model: {adapter: none}\ntables: {contacts: {pk: id, send_fields: [a], policy: {rule: x}}}\n"))
+	if err == nil || !strings.Contains(err.Error(), "policy") {
+		t.Fatalf("err = %v, want a policy error", err)
+	}
+}
+
+func TestPolicyThresholdsAreProbabilities(t *testing.T) {
+	base := minimal + "model: {adapter: none}\ntables: {contacts: {pk: id, send_fields: [a]%s}}\n"
+	c, err := Parse(fmt.Appendf(nil, base, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if th := c.Tables["contacts"].Thresholds; th.Policy != 0.8 || th.PolicyEscalate != 0.5 {
+		t.Errorf("defaults policy=%v policy_escalate=%v, want 0.8 and 0.5", th.Policy, th.PolicyEscalate)
+	}
+	for name, th := range map[string]string{
+		"old 1-5 score":         ", thresholds: {policy: 4}",
+		"escalate above hold":   ", thresholds: {policy: 0.8, policy_escalate: 0.9}",
+		"escalate out of range": ", thresholds: {policy_escalate: -0.1}",
+	} {
+		if _, err := Parse(fmt.Appendf(nil, base, th)); err == nil || !strings.Contains(err.Error(), "thresholds.policy") {
+			t.Errorf("%s: err = %v, want a thresholds.policy error", name, err)
+		}
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestDefaultThresholdsMatchAnUnconfiguredTable(t *testing.T) {
+	c, err := Parse([]byte(minimal + "model: {adapter: none}\ntables: {contacts: {pk: id, send_fields: [a]}}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := DefaultThresholds(); got != c.Tables["contacts"].Thresholds {
+		t.Errorf("DefaultThresholds() = %+v, want %+v", got, c.Tables["contacts"].Thresholds)
 	}
 }
