@@ -17,9 +17,9 @@ func data() *crm.Dataset {
 	return crm.Generate(crm.Options{Seed: 1, Accounts: 800, Contacts: 5000, KoreanShare: 0.3, Now: now})
 }
 
-func build(d *crm.Dataset) Plan {
-	return Build(d, Options{Seed: 3, Leads: 300, Updates: 300, Meetings: 200, Churns: 60, Injections: 300, Now: now})
-}
+var opts = Options{Seed: 3, Leads: 300, Updates: 300, Meetings: 200, Churns: 60, Injections: 300, TopUp: 100, Now: now}
+
+func build(d *crm.Dataset) Plan { return Build(d, opts) }
 
 type index struct {
 	d         *crm.Dataset
@@ -203,7 +203,10 @@ func TestTrapsDoNotShareRows(t *testing.T) {
 		if l.Source == labels.SourceReplay {
 			continue
 		}
-		if pk := num(l.Match["pk"]); pk > 0 && l.Table == "contacts" {
+		for _, pk := range []int{num(l.Match["pk"]), num(l.Payload["duplicate_of"])} {
+			if pk <= 0 || l.Table != "contacts" {
+				continue
+			}
 			if prev, dup := contacts[pk]; dup {
 				t.Errorf("%s and %s both target contact %d", prev, l.ID, pk)
 			}
@@ -258,12 +261,54 @@ func TestInjectedWrites(t *testing.T) {
 			}
 		}
 	}
-	if len(p.Injected) != 300 {
-		t.Errorf("%d injected writes, want 300", len(p.Injected))
+	if codes["normal"] == 0 {
+		t.Error("no injected normal writes")
 	}
-	for _, c := range []string{"normal", "F1", "F2", "F3", "F4"} {
-		if codes[c] == 0 {
-			t.Errorf("no injected %s writes", c)
+	for _, c := range []string{"F1", "F2", "F3", "F4"} {
+		if codes[c] != opts.TopUp {
+			t.Errorf("%d injected %s writes, want %d after the top-up", codes[c], c, opts.TopUp)
+		}
+	}
+}
+
+// The top-up batch is appended to a recording already made, so the first
+// batch must come out exactly as it did without it, and the top-up must be
+// faults only, sent after the first batch's writes.
+func TestTopUpLeavesFirstBatch(t *testing.T) {
+	d := data()
+	first := opts
+	first.TopUp = 0
+	p0, p := Build(d, first), build(d)
+
+	batch := func(ws []Write, n int) []Write {
+		return slices.DeleteFunc(slices.Clone(ws), func(w Write) bool { return w.Batch != n })
+	}
+	if !reflect.DeepEqual(p.Tasks, p0.Tasks) || !reflect.DeepEqual(p.Poison, p0.Poison) {
+		t.Error("top-up changed the tasks or planted instructions")
+	}
+	if !reflect.DeepEqual(batch(p.Pre, 1), p0.Pre) || !reflect.DeepEqual(batch(p.Injected, 1), p0.Injected) {
+		t.Error("top-up changed the first batch's writes")
+	}
+	if len(p.Labels) <= len(p0.Labels) || !reflect.DeepEqual(p.Labels[:len(p0.Labels)], p0.Labels) {
+		t.Fatal("first batch's labels are not a prefix of the topped-up plan's")
+	}
+
+	byID := map[string]labels.Item{}
+	for _, l := range p.Labels {
+		byID[l.ID] = l
+	}
+	top := batch(p.Injected, 2)
+	if len(top) == 0 || !reflect.DeepEqual(p.Injected[len(p0.Injected):], top) {
+		t.Fatalf("top-up writes must follow the first batch's: %d of them", len(top))
+	}
+	for _, w := range top {
+		if l := byID[w.ID]; l.Code == "normal" || l.Source != labels.SourceInjector {
+			t.Errorf("%s: top-up write is %s/%s, want a fault", w.ID, l.Source, l.Code)
+		}
+	}
+	for _, w := range batch(p.Pre, 2) {
+		if l := byID[strings.TrimPrefix(w.ID, "pre-")]; l.Code != "F2" || slices.IndexFunc(top, func(t Write) bool { return t.ID == l.ID }) < 0 {
+			t.Errorf("%s: top-up fresh change belongs to no top-up F2 write", w.ID)
 		}
 	}
 }
@@ -291,7 +336,7 @@ func TestReplayVariants(t *testing.T) {
 			t.Errorf("%s: %+v", l.ID, l)
 		}
 	}
-	if n["S2"] != 300 || n["S3"] != 300 {
+	if n["S2"] != len(p.Injected) || n["S3"] != len(p.Injected) {
 		t.Errorf("variants = %v, want one S2 and one S3 per injected write", n)
 	}
 }

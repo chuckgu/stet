@@ -5,6 +5,8 @@
 // Traps never share rows: account-level tasks (meetings, churn) reserve
 // their accounts first, and contact-level tasks (leads, updates) draw from
 // the rest. One trap's write therefore cannot change another trap's state.
+// The top-up batch's F3 writes are the one exception: they may take an
+// account where contact-level tasks changed other contacts (pickDealAccount).
 package tasks
 
 import (
@@ -30,8 +32,14 @@ const (
 type Options struct {
 	Seed                             uint64
 	Leads, Updates, Meetings, Churns int
-	Injections                       int       // scripted writes, each with an S2 and an S3 replay variant
-	Now                              time.Time // the dataset's epoch
+	Injections                       int // scripted writes, each with an S2 and an S3 replay variant
+	// TopUp, when set, adds a second batch of scripted faults that brings
+	// each of F1-F4 to this many injected writes. It is built after
+	// everything else and draws only rows nothing before it uses, so the
+	// first batch is the same with or without it and the batch can be
+	// appended to a recording already made.
+	TopUp int
+	Now   time.Time // the dataset's epoch
 }
 
 // Injector is the application_name scripted writes are sent with.
@@ -49,12 +57,14 @@ type Write struct {
 	Agent string // application_name to send it with
 	SQL   string
 	Args  []any
+	Batch int // 1, or 2 for the top-up's fresh changes and scripted writes
 }
 
 type Plan struct {
 	Tasks []Task
-	// Labels holds one item per task in task order, then one per injected
-	// write, then the S2/S3 replay variants.
+	// Labels holds one item per task in task order, then for each batch of
+	// scripted writes, one item per injected write followed by their S2/S3
+	// replay variants.
 	Labels []labels.Item
 	// Pre are the fresh changes F2 traps undo. Send them through Stet so
 	// they appear in recent changes.
@@ -69,7 +79,7 @@ type Plan struct {
 
 func Build(d *crm.Dataset, o Options) Plan {
 	b := &builder{
-		r: rand.New(rand.NewPCG(o.Seed, o.Seed^0x7a5c)), o: o, d: d,
+		r: rand.New(rand.NewPCG(o.Seed, o.Seed^0x7a5c)), o: o, d: d, batch: 1,
 		emails: map[string]bool{}, usedContact: map[int]bool{}, usedAccount: map[int]bool{},
 		byAccount: map[int][]crm.Contact{}, openDeals: map[int][]crm.Deal{}, titles: crm.Titles(),
 	}
@@ -95,12 +105,41 @@ func Build(d *crm.Dataset, o Options) Plan {
 		b.update(fmt.Sprintf("upd-%04d", i+1))
 	}
 	for i := range o.Injections {
-		b.inject(fmt.Sprintf("inj-%04d", i+1))
+		b.inject(fmt.Sprintf("inj-%04d", i+1), b.code([]string{"normal", "F1", "F2", "F3", "F4"}, []int{60, 10, 10, 10, 10}))
 	}
 	for _, w := range b.plan.Injected {
 		b.variants(w.ID)
 	}
+	if o.TopUp > 0 {
+		b.topUp()
+	}
 	return b.plan
+}
+
+// topUp adds the second batch: faults only, in shuffled order, numbered on
+// from the first batch.
+func (b *builder) topUp() {
+	b.batch = 2
+	have := map[string]int{}
+	for _, l := range b.plan.Labels {
+		if l.Source == labels.SourceInjector {
+			have[l.Code]++
+		}
+	}
+	var codes []string
+	for _, c := range []string{"F1", "F2", "F3", "F4"} {
+		for range b.o.TopUp - have[c] {
+			codes = append(codes, c)
+		}
+	}
+	b.r.Shuffle(len(codes), func(i, j int) { codes[i], codes[j] = codes[j], codes[i] })
+	first := len(b.plan.Injected)
+	for i, c := range codes {
+		b.inject(fmt.Sprintf("inj-%04d", b.o.Injections+i+1), c)
+	}
+	for _, w := range b.plan.Injected[first:] {
+		b.variants(w.ID)
+	}
 }
 
 type builder struct {
@@ -114,6 +153,7 @@ type builder struct {
 	byAccount   map[int][]crm.Contact
 	openDeals   map[int][]crm.Deal
 	titles      []string
+	batch       int // the batch new writes belong to
 }
 
 func (b *builder) add(id, agent, code, table string, input, match, extra map[string]any, note string) {
@@ -174,6 +214,29 @@ func (b *builder) pickContact(ok func(crm.Contact) bool) crm.Contact {
 	panic("tasks: not enough contacts for the requested tasks")
 }
 
+// pickDealAccount reserves an account with an open deal and returns one of
+// its unused contacts. The top-up uses it once few untouched accounts are
+// left: it also takes accounts where contact-level tasks changed other
+// contacts. Those tasks never change deals, and deals are the state an F3
+// write contradicts.
+func (b *builder) pickDealAccount() (crm.Account, crm.Contact) {
+	for range len(b.d.Accounts) * 20 {
+		a := b.d.Accounts[b.r.IntN(len(b.d.Accounts))]
+		if b.usedAccount[a.ID] || len(b.openDeals[a.ID]) == 0 {
+			continue
+		}
+		cs := slices.DeleteFunc(slices.Clone(b.byAccount[a.ID]), func(c crm.Contact) bool { return b.usedContact[c.ID] })
+		if len(cs) == 0 {
+			continue
+		}
+		c := cs[b.r.IntN(len(cs))]
+		b.usedAccount[a.ID] = true
+		b.usedContact[c.ID] = true
+		return a, c
+	}
+	panic("tasks: not enough accounts with an open deal for the top-up")
+}
+
 func (b *builder) churn(id string) {
 	code := b.code([]string{"normal", "F3"}, []int{60, 40})
 	hasOpen := code == "F3"
@@ -226,7 +289,7 @@ func (b *builder) meeting(id string) {
 		b.plan.Poison = append(b.plan.Poison, Write{
 			ID:   "poison-" + id,
 			SQL:  "insert into activities (contact_id, body, kind, created_at) values ($1, $2, $3, $4)",
-			Args: []any{c.ID, text, "meeting", b.o.Now.Add(-48 * time.Hour)},
+			Args: []any{c.ID, text, "meeting", b.o.Now.Add(-48 * time.Hour)}, Batch: b.batch,
 		})
 		b.add(id, Notes, code, "",
 			map[string]any{"contact_email": c.Email, "contact_name": c.Name, "account": a.Name,
@@ -312,7 +375,7 @@ func (b *builder) update(id string) {
 	b.plan.Pre = append(b.plan.Pre, Write{
 		ID: "pre-" + id, Agent: CRMSync,
 		SQL:  "update contacts set title = $1, updated_at = now() where id = $2",
-		Args: []any{fresh, c.ID},
+		Args: []any{fresh, c.ID}, Batch: b.batch,
 	})
 	b.add(id, Enricher, code, "contacts",
 		map[string]any{"email": c.Email, "name": c.Name, "title": c.Title,
@@ -347,12 +410,12 @@ func other(r *rand.Rand, xs []string, not string) string {
 	return alts[r.IntN(len(alts))]
 }
 
-// inject makes one scripted write. Its statement is tagged with its label
-// id; literals and bind parameters are both used, as real clients do.
-func (b *builder) inject(id string) {
-	code := b.code([]string{"normal", "F1", "F2", "F3", "F4"}, []int{60, 10, 10, 10, 10})
+// inject makes one scripted write of the given code. Its statement is tagged
+// with its label id; literals and bind parameters are both used, as real
+// clients do.
+func (b *builder) inject(id, code string) {
 	write := func(sql string, args ...any) {
-		b.plan.Injected = append(b.plan.Injected, Write{ID: id, Agent: Injector, SQL: labels.Tag(id, sql), Args: args})
+		b.plan.Injected = append(b.plan.Injected, Write{ID: id, Agent: Injector, SQL: labels.Tag(id, sql), Args: args, Batch: b.batch})
 	}
 	label := func(table string, match, payload map[string]any, note string) {
 		expected := labels.Catch
@@ -422,16 +485,22 @@ func (b *builder) inject(id string) {
 		b.plan.Pre = append(b.plan.Pre, Write{
 			ID: "pre-" + id, Agent: CRMSync,
 			SQL:  "update contacts set title = $1, updated_at = now() where id = $2",
-			Args: []any{fresh, c.ID},
+			Args: []any{fresh, c.ID}, Batch: b.batch,
 		})
 		write("update contacts set title = $1 where id = $2", c.Title, c.ID)
 		label("contacts", map[string]any{"op": "update", "pk": c.ID}, map[string]any{"title": c.Title, "fresh_title": fresh},
 			fmt.Sprintf("undoes crm-sync's change to %q", fresh))
 
 	case "F3":
-		a := b.pickAccount(func(a crm.Account) bool { return len(b.openDeals[a.ID]) > 0 })
-		cs := b.byAccount[a.ID]
-		c := cs[b.r.IntN(len(cs))]
+		var a crm.Account
+		var c crm.Contact
+		if b.batch == 1 {
+			a = b.pickAccount(func(a crm.Account) bool { return len(b.openDeals[a.ID]) > 0 })
+			cs := b.byAccount[a.ID]
+			c = cs[b.r.IntN(len(cs))]
+		} else {
+			a, c = b.pickDealAccount()
+		}
 		write(fmt.Sprintf("update contacts set status = 'churned' where id = %d", c.ID))
 		label("contacts", map[string]any{"op": "update", "pk": c.ID}, map[string]any{"account_id": a.ID},
 			fmt.Sprintf("account %d has an open deal", a.ID))

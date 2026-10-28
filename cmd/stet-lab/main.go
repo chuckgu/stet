@@ -18,7 +18,8 @@ const usage = `usage: stet-lab <command> [flags]
 
 commands:
   seed     create and fill the synthetic CRM (stet-lab seed -db postgres://...)
-  prepare  store labels, plant S1 instructions, grant the agent role (needs a fresh seed)
+  prepare  store labels, plant S1 instructions, grant the agent role (needs a fresh seed;
+           -append adds the top-up batch's labels to a recording made without one)
   run      send fresh changes, scripted writes, and agent tasks through Stet
 `
 
