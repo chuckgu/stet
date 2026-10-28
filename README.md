@@ -4,7 +4,7 @@
 >
 > *Agents propose. Stet decides what stands.*
 
-상태: v0.1 구현 1주차 (2026-10-28). 패스스루 프록시, 설정 로더, 게이트 대상 쓰기 분류까지 구현했고, 판단·기록·섀도 모드는 아직 없다.
+상태: v0.1 구현 1주차 (2026-10-28). 섀도 모드가 동작한다. 게이트 대상 쓰기의 상태를 조립하고 `stet.decisions`에 판단을 기록하며, 원래 쓰기는 바꾸지 않는다. 구현된 모델 어댑터는 기록만 하는 `none`뿐이다. Jev 어댑터와 enforce 모드는 아직 없다.
 
 ## 정의
 
@@ -73,5 +73,10 @@ scripts/testdb.sh stop /tmp/stet-pg
 |---|---|
 | `cmd/stet` | CLI (`stet proxy`) |
 | `internal/config` | `stet.yaml` 로드와 검증. 모델 버전 별칭 거부 |
-| `internal/proxy` | pgwire 패스스루 프록시 |
-| `internal/sqlparse` | 게이트 대상 쓰기 분류 (pass / gated / unsupported) |
+| `internal/proxy` | pgwire 프록시. 세션별로 문장·실행 결과·트랜잭션 상태를 추적하고 `Gate`에 알린다 |
+| `internal/sqlparse` | 게이트 대상 쓰기 분류 (pass / gated / unsupported), `stet.on_behalf_of` |
+| `internal/gate` | 상태 조립, 판단 호출, 기록 (섀도 모드) |
+| `internal/decide` | 모델 중립 `Decider` 인터페이스, 질문 세트, verdict 정책 |
+| `internal/store` | `stet.decisions` 스키마와 기록 |
+
+섀도 모드로 쓰기를 기록해 보려면 `stet.example.yaml`을 복사해 `upstream`, 테이블, `send_fields`를 맞추고 `model: {adapter: none}`으로 둔다. 기록은 `select * from stet.decisions order by created_at desc`로 본다.

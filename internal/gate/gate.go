@@ -1,0 +1,637 @@
+// Package gate connects the proxy to judgment: it assembles state for each
+// gated write, asks the model, applies policy, and records the decision.
+//
+// v0.1 runs in shadow mode only. The write always goes through unchanged
+// (rule 6); state is read just before it is forwarded, and the model is
+// called afterwards, outside any transaction (rule 1).
+package gate
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/stetdb/stet/internal/config"
+	"github.com/stetdb/stet/internal/decide"
+	"github.com/stetdb/stet/internal/proxy"
+	"github.com/stetdb/stet/internal/sqlparse"
+	"github.com/stetdb/stet/internal/store"
+)
+
+const (
+	// stateTimeout bounds how long a client waits while its write's state
+	// is read. Past it, the write goes through and the decision records a
+	// state_error.
+	stateTimeout  = 500 * time.Millisecond
+	maxCandidates = 10
+	maxRecent     = 10
+	maxModelCalls = 8
+	recordTimeout = 5 * time.Second
+)
+
+type Gate struct {
+	cfg     *config.Config
+	tables  map[string]string // config key → pk column
+	cands   map[string]named
+	pool    *pgxpool.Pool
+	store   *store.Store
+	decider decide.Decider
+	log     *slog.Logger
+	recent  *recentLog
+	sem     chan struct{}
+	wg      sync.WaitGroup
+}
+
+type named struct {
+	sql   string
+	names []string
+}
+
+func New(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, d decide.Decider, log *slog.Logger) (*Gate, error) {
+	g := &Gate{
+		cfg:     cfg,
+		tables:  map[string]string{},
+		cands:   map[string]named{},
+		pool:    pool,
+		store:   st,
+		decider: d,
+		log:     log,
+		recent:  &recentLog{byRow: map[string][]store.Change{}},
+		sem:     make(chan struct{}, maxModelCalls),
+	}
+	for key, t := range cfg.Tables {
+		g.tables[key] = t.PK
+		if t.CandidateSQL != "" {
+			sql, names := compileNamed(strings.TrimRight(strings.TrimSpace(t.CandidateSQL), ";"))
+			g.cands[key] = named{sql, names}
+		}
+	}
+	return g, nil
+}
+
+// Close waits for decisions still being judged. Close the proxy first so
+// no new writes arrive.
+func (g *Gate) Close() {
+	g.wg.Wait()
+}
+
+func (g *Gate) Inspect(sql string) proxy.Statement {
+	r, err := sqlparse.Classify(sql, g.tables)
+	if err != nil {
+		// Postgres will reject it too; nothing to judge.
+		return proxy.Statement{SQL: sql}
+	}
+	return proxy.Statement{SQL: sql, Watch: r.Kind != sqlparse.Pass, OnBehalfOf: r.OnBehalfOf, Data: r}
+}
+
+// pending is one watched write between Begin and its recorded decision.
+type pending struct {
+	id       string
+	at       time.Time
+	session  proxy.SessionInfo
+	sql      string
+	res      sqlparse.Result
+	params   []*string      // bind values as text
+	proposed map[string]any // every column written, before send_fields
+	pk       *string
+
+	state        json.RawMessage
+	stateVersion map[string]string
+	questions    []decide.Question
+	stateErr     error
+	added        time.Duration // time the client waited on Begin
+}
+
+func (g *Gate) Begin(s proxy.SessionInfo, st proxy.Statement, ps []proxy.Param) any {
+	start := time.Now()
+	p := &pending{id: store.NewID(), at: start, session: s, sql: st.SQL, res: st.Data.(sqlparse.Result)}
+	ctx, cancel := context.WithTimeout(context.Background(), stateTimeout)
+	defer cancel()
+
+	var err error
+	if p.params, err = g.paramTexts(ctx, st.SQL, ps); err != nil {
+		p.stateErr = fmt.Errorf("bind values: %w", err)
+	}
+	if p.res.Kind == sqlparse.Gated && p.stateErr == nil {
+		if err := g.assemble(ctx, p); err != nil {
+			p.stateErr = err
+		}
+	}
+	if p.stateErr != nil {
+		g.log.Warn("state not assembled", "table", p.res.Table, "err", p.stateErr)
+	}
+	p.added = time.Since(start)
+	return p
+}
+
+func (g *Gate) End(h any, o proxy.Outcome) {
+	p := h.(*pending)
+	if o.Executed && p.res.Kind == sqlparse.Gated && p.pk != nil {
+		g.recent.add(p.res.Table, *p.pk, store.Change{
+			DecisionID: p.id, At: p.at, AgentID: p.session.ApplicationName, Op: p.res.Op, Proposed: p.proposed,
+		}, g.cfg.Tables[p.res.Table].RecentWindow)
+	}
+	g.wg.Add(1)
+	go func() {
+		defer g.wg.Done()
+		g.judge(p, o)
+	}()
+}
+
+// judge decides what enforce mode would have done and records it.
+func (g *Gate) judge(p *pending, o proxy.Outcome) {
+	t := g.cfg.Tables[p.res.Table]
+	in := decide.Input{Thresholds: t.Thresholds, OnFailure: g.cfg.Model.OnFailure, Questions: p.questions}
+	d := &store.Decision{
+		ID:            p.id,
+		CreatedAt:     p.at,
+		Mode:          string(g.cfg.Mode),
+		AgentID:       p.session.ApplicationName,
+		SessionID:     p.session.ID,
+		Statement:     p.sql,
+		StatementFP:   sqlparse.Fingerprint(p.sql),
+		Params:        p.params,
+		Op:            p.res.Op,
+		TargetTable:   p.res.Table,
+		TargetPK:      p.pk,
+		Proposed:      p.proposed,
+		State:         p.state,
+		StateVersion:  p.stateVersion,
+		Model:         g.decider.ModelID(),
+		ModelVersion:  g.decider.ModelVersion(),
+		PolicyVersion: g.cfg.Hash,
+		Executed:      o.Executed,
+		LatencyMS:     ptr(int(p.added.Milliseconds())),
+	}
+	if p.session.OnBehalfOf != "" {
+		d.OnBehalfOf = ptr(p.session.OnBehalfOf)
+	}
+	if o.Error != "" {
+		d.ExecError = ptr(o.Error)
+	}
+
+	switch {
+	case p.res.Kind == sqlparse.Unsupported:
+		in.Unsupported = p.res.Reason
+	case o.InTransaction:
+		in.Unsupported = "in_transaction"
+	case p.stateErr != nil:
+		in.StateErr = p.stateErr
+	case len(p.questions) > 0:
+		d.Questions = p.questions
+		answers, latency, err := g.ask(p)
+		in.ModelErr, in.Answers = err, answers.ByQuestion
+		if err == nil {
+			d.Answers = answers.ByQuestion
+			d.ModelLatencyMS = ptr(int(latency.Milliseconds()))
+			if answers.CostUSD > 0 {
+				d.CostUSD = ptr(answers.CostUSD)
+			}
+		} else if !errors.Is(err, decide.ErrNoModel) {
+			g.log.Warn("model call failed", "table", p.res.Table, "err", err)
+		}
+	}
+	d.Verdict, d.Reasons = decide.Verdict(in)
+
+	ctx, cancel := context.WithTimeout(context.Background(), recordTimeout)
+	defer cancel()
+	if err := g.store.Insert(ctx, d); err != nil {
+		g.log.Error("decision not recorded", "id", d.ID, "table", d.TargetTable, "err", err)
+	}
+}
+
+func (g *Gate) ask(p *pending) (decide.Answers, time.Duration, error) {
+	g.sem <- struct{}{}
+	defer func() { <-g.sem }()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(g.cfg.Model.TimeoutMS)*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	a, err := g.decider.Decide(ctx, p.state, p.questions)
+	return a, time.Since(start), err
+}
+
+// stateDoc is what the model sees (spec 4). Agent-written values are marked
+// as untrusted (rule 5).
+type stateDoc struct {
+	Table         string            `json:"table"`
+	Entity        string            `json:"entity,omitempty"`
+	Operation     string            `json:"operation"`
+	Proposed      map[string]any    `json:"proposed"`
+	Current       map[string]any    `json:"current"`
+	Candidates    []map[string]any  `json:"candidates"`
+	RecentChanges []recentChange    `json:"recent_changes"`
+	Policy        string            `json:"policy,omitempty"`
+	Provenance    map[string]string `json:"provenance"`
+}
+
+type recentChange struct {
+	At      time.Time      `json:"at"`
+	ByAgent string         `json:"by_agent"`
+	Op      string         `json:"op"`
+	Fields  map[string]any `json:"fields"`
+}
+
+var provenance = map[string]string{
+	"proposed":       "untrusted_agent_input",
+	"current":        "database",
+	"candidates":     "database",
+	"recent_changes": "earlier_agent_writes",
+}
+
+func (g *Gate) assemble(ctx context.Context, p *pending) error {
+	t := g.cfg.Tables[p.res.Table]
+	w := p.res.Write
+
+	cols := w.Columns
+	if cols == nil && len(w.Values) > 0 {
+		all, err := g.tableColumns(ctx, p.res.Table)
+		if err != nil {
+			return fmt.Errorf("table columns: %w", err)
+		}
+		if len(all) < len(w.Values) {
+			return fmt.Errorf("table has %d columns, insert gives %d values", len(all), len(w.Values))
+		}
+		cols = all[:len(w.Values)]
+	}
+	p.proposed = map[string]any{}
+	for i, v := range w.Values {
+		p.proposed[cols[i]] = proposedValue(v, p.params)
+	}
+	if w.PK != nil {
+		p.pk = valueText(*w.PK, p.params)
+	}
+
+	var current map[string]any
+	if w.Op != "insert" && p.pk != nil {
+		row, xmin, err := g.currentRow(ctx, p.res.Table, t.PK, *p.pk)
+		if err != nil {
+			return fmt.Errorf("current row: %w", err)
+		}
+		if row != nil {
+			current = row
+			p.stateVersion = map[string]string{"xmin": xmin}
+		}
+	}
+
+	cands, err := g.candidates(ctx, p, current)
+	if err != nil {
+		return fmt.Errorf("candidates: %w", err)
+	}
+	var ids []string
+	for _, c := range cands {
+		if id, ok := c[t.PK]; ok {
+			ids = append(ids, jsonText(id))
+		}
+	}
+
+	recent, err := g.recentChanges(ctx, p, t)
+	if err != nil {
+		return fmt.Errorf("recent changes: %w", err)
+	}
+
+	doc := stateDoc{
+		Table:         p.res.Table,
+		Entity:        t.Entity,
+		Operation:     w.Op,
+		Proposed:      only(p.proposed, t.SendFields),
+		Current:       only(current, t.SendFields),
+		Candidates:    cands,
+		RecentChanges: recent,
+		Policy:        strings.TrimSpace(t.Policy),
+		Provenance:    provenance,
+	}
+	if p.state, err = json.Marshal(doc); err != nil {
+		return err
+	}
+	p.questions = decide.Questions(w.Op, ids, t.Questions, doc.Policy != "")
+	return nil
+}
+
+// paramTexts turns bind values into text. Binary values are decoded by
+// Postgres itself, using the statement's parameter types.
+func (g *Gate) paramTexts(ctx context.Context, sql string, ps []proxy.Param) ([]*string, error) {
+	if len(ps) == 0 {
+		return nil, nil
+	}
+	out := make([]*string, len(ps))
+	binary := false
+	for i, p := range ps {
+		switch {
+		case p.Value == nil:
+		case p.Format == 0:
+			out[i] = ptr(string(p.Value))
+		default:
+			binary = true
+		}
+	}
+	if !binary {
+		return out, nil
+	}
+
+	conn, err := g.pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Release()
+	pg := conn.Conn().PgConn()
+
+	clientOIDs := make([]uint32, len(ps))
+	for i, p := range ps {
+		clientOIDs[i] = p.OID
+	}
+	sd, err := pg.Prepare(ctx, "", sql, clientOIDs)
+	if err != nil {
+		return nil, err
+	}
+	var q strings.Builder
+	q.WriteString("select ")
+	values := make([][]byte, len(ps))
+	formats := make([]int16, len(ps))
+	for i, p := range ps {
+		if i > 0 {
+			q.WriteString(", ")
+		}
+		fmt.Fprintf(&q, "$%d::text", i+1)
+		values[i], formats[i] = p.Value, p.Format
+	}
+	res := pg.ExecParams(ctx, q.String(), values, sd.ParamOIDs, formats, nil).Read()
+	if res.Err != nil {
+		return nil, res.Err
+	}
+	for i, v := range res.Rows[0] {
+		if v != nil {
+			out[i] = ptr(string(v))
+		}
+	}
+	return out, nil
+}
+
+func (g *Gate) currentRow(ctx context.Context, table, pkCol, pk string) (map[string]any, string, error) {
+	q := fmt.Sprintf("select to_jsonb(t)::text, t.xmin::text from %s as t where t.%s = $1",
+		ident(table), pgx.Identifier{pkCol}.Sanitize())
+	rows, err := g.queryText(ctx, q, []*string{&pk})
+	if err != nil || len(rows) == 0 {
+		return nil, "", err
+	}
+	row, err := decodeObject(*rows[0][0])
+	return row, *rows[0][1], err
+}
+
+// candidates runs the table's candidate SQL with named parameters bound
+// from the row as it would look after the write. The row itself is left out.
+func (g *Gate) candidates(ctx context.Context, p *pending, current map[string]any) ([]map[string]any, error) {
+	out := []map[string]any{}
+	c, ok := g.cands[p.res.Table]
+	if !ok {
+		return out, nil
+	}
+	source := map[string]*string{}
+	for k, v := range current {
+		if v != nil {
+			source[k] = ptr(jsonText(v))
+		}
+	}
+	for k, v := range p.proposed {
+		if s, ok := v.(string); ok {
+			source[k] = ptr(s)
+		} else {
+			delete(source, k)
+		}
+	}
+	args := make([]*string, len(c.names))
+	for i, n := range c.names {
+		args[i] = source[n]
+	}
+
+	q := fmt.Sprintf("select to_jsonb(c)::text from (%s) as c limit %d", c.sql, maxCandidates+1)
+	rows, err := g.queryText(ctx, q, args)
+	if err != nil {
+		return nil, err
+	}
+	pkCol := g.tables[p.res.Table]
+	for _, r := range rows {
+		row, err := decodeObject(*r[0])
+		if err != nil {
+			return nil, err
+		}
+		if id, ok := row[pkCol]; ok && p.pk != nil && jsonText(id) == *p.pk {
+			continue
+		}
+		if len(out) < maxCandidates {
+			out = append(out, row)
+		}
+	}
+	return out, nil
+}
+
+// recentChanges merges recorded decisions with writes that ended but whose
+// decisions are still being judged.
+func (g *Gate) recentChanges(ctx context.Context, p *pending, t config.Table) ([]recentChange, error) {
+	out := []recentChange{}
+	if p.pk == nil || t.RecentWindow <= 0 {
+		return out, nil
+	}
+	since := p.at.Add(-t.RecentWindow)
+	stored, err := g.store.RecentChanges(ctx, p.res.Table, *p.pk, since, maxRecent)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var all []store.Change
+	for _, c := range append(g.recent.since(p.res.Table, *p.pk, since), stored...) {
+		if !seen[c.DecisionID] {
+			seen[c.DecisionID] = true
+			all = append(all, c)
+		}
+	}
+	slices.SortFunc(all, func(a, b store.Change) int { return b.At.Compare(a.At) })
+	for _, c := range all[:min(len(all), maxRecent)] {
+		out = append(out, recentChange{At: c.At, ByAgent: c.AgentID, Op: c.Op, Fields: only(c.Proposed, t.SendFields)})
+	}
+	return out, nil
+}
+
+func (g *Gate) tableColumns(ctx context.Context, table string) ([]string, error) {
+	rows, err := g.queryText(ctx, `
+		select attname from pg_attribute
+		where attrelid = $1::regclass and attnum > 0 and not attisdropped
+		order by attnum`, []*string{&table})
+	if err != nil {
+		return nil, err
+	}
+	cols := make([]string, len(rows))
+	for i, r := range rows {
+		cols[i] = *r[0]
+	}
+	return cols, nil
+}
+
+// queryText runs sql with text parameters whose types Postgres infers, and
+// returns text columns (nil for NULL).
+func (g *Gate) queryText(ctx context.Context, sql string, args []*string) ([][]*string, error) {
+	conn, err := g.pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Release()
+	values := make([][]byte, len(args))
+	for i, a := range args {
+		if a != nil {
+			values[i] = []byte(*a)
+		}
+	}
+	res := conn.Conn().PgConn().ExecParams(ctx, sql, values, nil, nil, nil).Read()
+	if res.Err != nil {
+		return nil, res.Err
+	}
+	out := make([][]*string, len(res.Rows))
+	for i, r := range res.Rows {
+		out[i] = make([]*string, len(r))
+		for j, v := range r {
+			if v != nil {
+				out[i][j] = ptr(string(v))
+			}
+		}
+	}
+	return out, nil
+}
+
+func proposedValue(v sqlparse.Value, params []*string) any {
+	switch v.Kind {
+	case sqlparse.Literal:
+		return v.Text
+	case sqlparse.Param:
+		if s := param(params, v.Param); s != nil {
+			return *s
+		}
+		return nil
+	case sqlparse.Default:
+		return map[string]any{"default": true}
+	case sqlparse.Expr:
+		return map[string]any{"expr": inlineParams(v.Text, params)}
+	}
+	return nil
+}
+
+func valueText(v sqlparse.Value, params []*string) *string {
+	switch v.Kind {
+	case sqlparse.Literal:
+		return ptr(v.Text)
+	case sqlparse.Param:
+		return param(params, v.Param)
+	}
+	return nil
+}
+
+func param(params []*string, n int) *string {
+	if n < 1 || n > len(params) {
+		return nil
+	}
+	return params[n-1]
+}
+
+var paramRef = regexp.MustCompile(`\$(\d+)`)
+
+// inlineParams shows an expression with its bind values, so the model reads
+// lower('A@B.com') rather than lower($2).
+func inlineParams(expr string, params []*string) string {
+	return paramRef.ReplaceAllStringFunc(expr, func(m string) string {
+		n, _ := strconv.Atoi(m[1:])
+		if n < 1 || n > len(params) {
+			return m
+		}
+		if params[n-1] == nil {
+			return "NULL"
+		}
+		return "'" + strings.ReplaceAll(*params[n-1], "'", "''") + "'"
+	})
+}
+
+func only(m map[string]any, fields []string) map[string]any {
+	if m == nil {
+		return nil
+	}
+	out := map[string]any{}
+	for _, f := range fields {
+		if v, ok := m[f]; ok {
+			out[f] = v
+		}
+	}
+	return out
+}
+
+func decodeObject(s string) (map[string]any, error) {
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber()
+	var m map[string]any
+	return m, dec.Decode(&m)
+}
+
+// jsonText renders a JSON value as the text Postgres would bind it as.
+func jsonText(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case json.Number:
+		return x.String()
+	case float64:
+		return strconv.FormatFloat(x, 'f', -1, 64)
+	case bool:
+		return strconv.FormatBool(x)
+	}
+	b, _ := json.Marshal(v)
+	return string(bytes.TrimSpace(b))
+}
+
+func ident(table string) string {
+	return pgx.Identifier(strings.Split(table, ".")).Sanitize()
+}
+
+func ptr[T any](v T) *T { return &v }
+
+// recentLog remembers executed writes per row until their decisions are
+// stored, so the next write to the same row sees them at once.
+type recentLog struct {
+	mu    sync.Mutex
+	byRow map[string][]store.Change
+	adds  int
+}
+
+func (l *recentLog) add(table, pk string, c store.Change, keep time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	key := table + "\x00" + pk
+	cutoff := time.Now().Add(-keep)
+	l.byRow[key] = append(prune(l.byRow[key], cutoff), c)
+	if l.adds++; l.adds%1000 == 0 {
+		for k, cs := range l.byRow {
+			if cs = prune(cs, cutoff); len(cs) == 0 {
+				delete(l.byRow, k)
+			} else {
+				l.byRow[k] = cs
+			}
+		}
+	}
+}
+
+func (l *recentLog) since(table, pk string, t time.Time) []store.Change {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return prune(slices.Clone(l.byRow[table+"\x00"+pk]), t)
+}
+
+func prune(cs []store.Change, cutoff time.Time) []store.Change {
+	return slices.DeleteFunc(cs, func(c store.Change) bool { return c.At.Before(cutoff) })
+}

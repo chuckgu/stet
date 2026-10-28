@@ -63,7 +63,18 @@ type Result struct {
 	Kind   Kind
 	Reason string // why Unsupported
 	Write  *Write // set when Gated
+
+	// Table and Op name the first gated write found (Gated or Unsupported).
+	// Op is insert, update, delete, merge, copy, or truncate.
+	Table string
+	Op    string
+
+	// OnBehalfOf is set when the SQL sets or resets stet.on_behalf_of;
+	// "" means reset.
+	OnBehalfOf *string
 }
+
+const onBehalfOfSetting = "stet.on_behalf_of"
 
 // Classify parses sql (the text of one Query or Parse message). gated maps a
 // table name, optionally schema-qualified, to its primary key column.
@@ -77,36 +88,83 @@ func Classify(sql string, gated map[string]string) (Result, error) {
 		return Result{}, err
 	}
 	m := matcher(gated)
-	touching := 0
+	var (
+		touching int
+		target   gatedWrite
+		obo      *string
+	)
 	for _, raw := range tree.Stmts {
-		if writesGated(raw.Stmt, m) {
+		if w, ok := firstGatedWrite(raw.Stmt, m); ok {
+			if touching == 0 {
+				target = w
+			}
 			touching++
 		}
+		if v, ok := onBehalfOf(raw.Stmt); ok {
+			obo = &v
+		}
 	}
-	switch {
-	case touching == 0:
-		return Result{Kind: Pass}, nil
-	case len(tree.Stmts) > 1:
-		// Several statements in one Query run as one implicit transaction.
-		return unsupported("multi_statement"), nil
+	if touching == 0 {
+		return Result{Kind: Pass, OnBehalfOf: obo}, nil
 	}
 
-	n := tree.Stmts[0].Stmt
+	var r Result
+	if len(tree.Stmts) > 1 {
+		// Several statements in one Query run as one implicit transaction.
+		r = unsupported("multi_statement")
+	} else {
+		r = classifyStmt(tree.Stmts[0].Stmt, m)
+	}
+	r.Table, r.Op, r.OnBehalfOf = target.table, target.op, obo
+	return r, nil
+}
+
+func classifyStmt(n *pg.Node, m matchFunc) Result {
 	switch {
 	case n.GetInsertStmt() != nil:
-		return classifyInsert(n.GetInsertStmt(), m), nil
+		return classifyInsert(n.GetInsertStmt(), m)
 	case n.GetUpdateStmt() != nil:
-		return classifyUpdate(n.GetUpdateStmt(), m), nil
+		return classifyUpdate(n.GetUpdateStmt(), m)
 	case n.GetDeleteStmt() != nil:
-		return classifyDelete(n.GetDeleteStmt(), m), nil
+		return classifyDelete(n.GetDeleteStmt(), m)
 	case n.GetCopyStmt() != nil:
-		return unsupported("copy"), nil
+		return unsupported("copy")
 	case n.GetTruncateStmt() != nil:
-		return unsupported("truncate"), nil
+		return unsupported("truncate")
 	case n.GetMergeStmt() != nil:
-		return unsupported("merge"), nil
+		return unsupported("merge")
 	}
-	return unsupported("nested_write"), nil
+	return unsupported("nested_write")
+}
+
+// Fingerprint identifies a statement's shape regardless of its constants,
+// or returns "" if sql does not parse.
+func Fingerprint(sql string) string {
+	fp, err := pg.Fingerprint(sql)
+	if err != nil {
+		return ""
+	}
+	return fp
+}
+
+// onBehalfOf reads SET / RESET of stet.on_behalf_of. "" means reset.
+func onBehalfOf(n *pg.Node) (string, bool) {
+	s := n.GetVariableSetStmt()
+	if s == nil {
+		return "", false
+	}
+	switch s.Kind {
+	case pg.VariableSetKind_VAR_RESET_ALL:
+		return "", true
+	case pg.VariableSetKind_VAR_RESET, pg.VariableSetKind_VAR_SET_DEFAULT:
+		return "", s.Name == onBehalfOfSetting
+	case pg.VariableSetKind_VAR_SET_VALUE:
+		if s.Name != onBehalfOfSetting || len(s.Args) != 1 || s.Args[0].GetAConst() == nil {
+			return "", false
+		}
+		return constant(s.Args[0].GetAConst()).Text, true
+	}
+	return "", false
 }
 
 func unsupported(reason string) Result {
@@ -142,33 +200,43 @@ func matcher(gated map[string]string) matchFunc {
 	}
 }
 
-// writesGated reports whether any statement nested anywhere in n writes a
-// gated table: CTEs, EXPLAIN ANALYZE, PREPARE, and rule actions included.
-func writesGated(n *pg.Node, m matchFunc) bool {
-	gated := func(rv *pg.RangeVar) bool { _, ok := m(rv); return ok }
-	found := false
+type gatedWrite struct{ table, op string }
+
+// firstGatedWrite finds the first statement nested anywhere in n that writes
+// a gated table: CTEs, EXPLAIN ANALYZE, PREPARE, and rule actions included.
+func firstGatedWrite(n *pg.Node, m matchFunc) (gatedWrite, bool) {
+	var found gatedWrite
+	hit := func(rv *pg.RangeVar, op string) bool {
+		if t, ok := m(rv); ok {
+			found = gatedWrite{t.key, op}
+			return true
+		}
+		return false
+	}
+	ok := false
 	walk(n, func(msg proto.Message) bool {
 		switch s := msg.(type) {
 		case *pg.InsertStmt:
-			found = gated(s.Relation)
+			ok = hit(s.Relation, "insert")
 		case *pg.UpdateStmt:
-			found = gated(s.Relation)
+			ok = hit(s.Relation, "update")
 		case *pg.DeleteStmt:
-			found = gated(s.Relation)
+			ok = hit(s.Relation, "delete")
 		case *pg.MergeStmt:
-			found = gated(s.Relation)
+			ok = hit(s.Relation, "merge")
 		case *pg.CopyStmt:
-			found = s.IsFrom && gated(s.Relation)
+			ok = s.IsFrom && hit(s.Relation, "copy")
 		case *pg.TruncateStmt:
 			for _, r := range s.Relations {
-				if gated(r.GetRangeVar()) {
-					found = true
+				if hit(r.GetRangeVar(), "truncate") {
+					ok = true
+					break
 				}
 			}
 		}
-		return !found
+		return !ok
 	})
-	return found
+	return found, ok
 }
 
 func classifyInsert(s *pg.InsertStmt, m matchFunc) Result {

@@ -35,13 +35,13 @@ func upstream(t *testing.T) string {
 	return addr
 }
 
-func startProxy(t *testing.T, upstreamAddr string) (string, *proxy.Server) {
+func startProxy(t *testing.T, upstreamAddr string, gate proxy.Gate) (string, *proxy.Server) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := proxy.New(upstreamAddr, slog.New(slog.DiscardHandler))
+	srv := proxy.New(upstreamAddr, slog.New(slog.DiscardHandler), gate)
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(ln) }()
 	t.Cleanup(func() {
@@ -96,8 +96,45 @@ func pgCode(err error) string {
 	return ""
 }
 
-func TestAuthMethodsPassThrough(t *testing.T) {
-	addr, _ := startProxy(t, upstream(t))
+// Protocol scenarios run twice: as a plain passthrough, and with a gate that
+// watches every write, so inspection is proven not to change traffic.
+var scenarios = []struct {
+	name string
+	run  func(t *testing.T, addr string, srv *proxy.Server)
+}{
+	{"AuthMethodsPassThrough", authMethodsPassThrough},
+	{"WrongPasswordIsRejectedByUpstream", wrongPasswordIsRejectedByUpstream},
+	{"ExtendedQueryWithParameters", extendedQueryWithParameters},
+	{"WritesAndTransactions", writesAndTransactions},
+	{"CopyInAndOut", copyInAndOut},
+	{"LargeResultSet", largeResultSet},
+	{"CancelRequestReachesUpstream", cancelRequestReachesUpstream},
+	{"NotificationReachesIdleClient", notificationReachesIdleClient},
+	{"PipelineFlushWithoutSync", pipelineFlushWithoutSync},
+	{"SSLRequestIsDeclined", sslRequestIsDeclined},
+	{"UpstreamSessionEndsWithClient", upstreamSessionEndsWithClient},
+	{"ServerCloseEndsSessions", serverCloseEndsSessions},
+}
+
+func TestPassthrough(t *testing.T) {
+	for _, sc := range scenarios {
+		t.Run(sc.name, func(t *testing.T) {
+			addr, srv := startProxy(t, upstream(t), nil)
+			sc.run(t, addr, srv)
+		})
+	}
+}
+
+func TestWatchedPassthrough(t *testing.T) {
+	for _, sc := range scenarios {
+		t.Run(sc.name, func(t *testing.T) {
+			addr, srv := startProxy(t, upstream(t), newRecordingGate(isWrite))
+			sc.run(t, addr, srv)
+		})
+	}
+}
+
+func authMethodsPassThrough(t *testing.T, addr string, _ *proxy.Server) {
 	for user := range testUsers {
 		t.Run(user, func(t *testing.T) {
 			conn := connect(t, addr, user, nil)
@@ -112,16 +149,14 @@ func TestAuthMethodsPassThrough(t *testing.T) {
 	}
 }
 
-func TestWrongPasswordIsRejectedByUpstream(t *testing.T) {
-	addr, _ := startProxy(t, upstream(t))
+func wrongPasswordIsRejectedByUpstream(t *testing.T, addr string, _ *proxy.Server) {
 	_, err := pgx.Connect(testCtx(t), connURL(addr, "stet_scram", "wrong", nil))
 	if code := pgCode(err); code != "28P01" {
 		t.Fatalf("err = %v (SQLSTATE %q), want 28P01 invalid_password", err, code)
 	}
 }
 
-func TestExtendedQueryWithParameters(t *testing.T) {
-	addr, _ := startProxy(t, upstream(t))
+func extendedQueryWithParameters(t *testing.T, addr string, _ *proxy.Server) {
 	conn := connect(t, addr, "stet_scram", nil)
 	var got int
 	if err := conn.QueryRow(testCtx(t), "select $1::int + 1", 41).Scan(&got); err != nil {
@@ -132,8 +167,7 @@ func TestExtendedQueryWithParameters(t *testing.T) {
 	}
 }
 
-func TestWritesAndTransactions(t *testing.T) {
-	addr, _ := startProxy(t, upstream(t))
+func writesAndTransactions(t *testing.T, addr string, _ *proxy.Server) {
 	conn := connect(t, addr, "stet_scram", nil)
 	ctx := testCtx(t)
 	mustExec(t, conn, "create temp table t (id int primary key, v text)")
@@ -171,8 +205,7 @@ func TestWritesAndTransactions(t *testing.T) {
 	}
 }
 
-func TestCopyInAndOut(t *testing.T) {
-	addr, _ := startProxy(t, upstream(t))
+func copyInAndOut(t *testing.T, addr string, _ *proxy.Server) {
 	conn := connect(t, addr, "stet_scram", nil)
 	ctx := testCtx(t)
 	mustExec(t, conn, "create temp table c (n int, s text)")
@@ -199,8 +232,7 @@ func TestCopyInAndOut(t *testing.T) {
 	}
 }
 
-func TestLargeResultSet(t *testing.T) {
-	addr, _ := startProxy(t, upstream(t))
+func largeResultSet(t *testing.T, addr string, _ *proxy.Server) {
 	conn := connect(t, addr, "stet_scram", nil)
 	const n = 200_000
 	rows, err := conn.Query(testCtx(t), "select g, repeat('x', 100) from generate_series(1, $1) g", n)
@@ -225,8 +257,7 @@ func TestLargeResultSet(t *testing.T) {
 	}
 }
 
-func TestCancelRequestReachesUpstream(t *testing.T) {
-	addr, _ := startProxy(t, upstream(t))
+func cancelRequestReachesUpstream(t *testing.T, addr string, _ *proxy.Server) {
 	conn := connect(t, addr, "stet_scram", nil)
 
 	errc := make(chan error, 1)
@@ -248,8 +279,7 @@ func TestCancelRequestReachesUpstream(t *testing.T) {
 	}
 }
 
-func TestNotificationReachesIdleClient(t *testing.T) {
-	addr, _ := startProxy(t, upstream(t))
+func notificationReachesIdleClient(t *testing.T, addr string, _ *proxy.Server) {
 	listener := connect(t, addr, "stet_scram", nil)
 	notifier := connect(t, addr, "stet_scram", nil)
 	mustExec(t, listener, "listen stet_test_ch")
@@ -276,8 +306,7 @@ func TestNotificationReachesIdleClient(t *testing.T) {
 
 // A client that sends Flush instead of Sync waits for responses with no
 // ReadyForQuery coming. The proxy must not hold those responses back.
-func TestPipelineFlushWithoutSync(t *testing.T) {
-	addr, _ := startProxy(t, upstream(t))
+func pipelineFlushWithoutSync(t *testing.T, addr string, _ *proxy.Server) {
 	conn := connect(t, addr, "stet_scram", nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -303,8 +332,7 @@ func TestPipelineFlushWithoutSync(t *testing.T) {
 	}
 }
 
-func TestSSLRequestIsDeclined(t *testing.T) {
-	addr, _ := startProxy(t, upstream(t))
+func sslRequestIsDeclined(t *testing.T, addr string, _ *proxy.Server) {
 
 	connect(t, addr, "stet_scram", url.Values{"sslmode": {"prefer"}})
 
@@ -315,16 +343,15 @@ func TestSSLRequestIsDeclined(t *testing.T) {
 }
 
 func TestUnreachableUpstreamReportsError(t *testing.T) {
-	addr, _ := startProxy(t, "127.0.0.1:1")
+	addr, _ := startProxy(t, "127.0.0.1:1", nil)
 	_, err := pgx.Connect(testCtx(t), connURL(addr, "stet_scram", "scram-pw", nil))
 	if code := pgCode(err); code != "08001" {
 		t.Fatalf("err = %v (SQLSTATE %q), want 08001", err, code)
 	}
 }
 
-func TestUpstreamSessionEndsWithClient(t *testing.T) {
+func upstreamSessionEndsWithClient(t *testing.T, addr string, _ *proxy.Server) {
 	up := upstream(t)
-	addr, _ := startProxy(t, up)
 	admin := connect(t, up, "stet_scram", nil)
 
 	conn := connect(t, addr, "stet_scram", url.Values{"application_name": {"stet-test-close"}})
@@ -335,9 +362,8 @@ func TestUpstreamSessionEndsWithClient(t *testing.T) {
 	waitForSessions(t, admin, "stet-test-close", 0)
 }
 
-func TestServerCloseEndsSessions(t *testing.T) {
+func serverCloseEndsSessions(t *testing.T, addr string, srv *proxy.Server) {
 	up := upstream(t)
-	addr, srv := startProxy(t, up)
 	admin := connect(t, up, "stet_scram", nil)
 	conn := connect(t, addr, "stet_scram", url.Values{"application_name": {"stet-test-shutdown"}})
 

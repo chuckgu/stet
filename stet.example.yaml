@@ -4,6 +4,8 @@ mode: shadow                 # shadow | enforce
 listen: 0.0.0.0:6432
 upstream: postgres://app@db:5432/crm
 
+# 지금 구현된 어댑터는 none(모델 없이 상태·쓰기·결과만 기록)뿐이다.
+# Jev 어댑터 전까지는 model: {adapter: none}으로 둔다.
 model:
   adapter: jev
   version: jev-1.13.0        # 고정 필수. latest 같은 별칭은 거부
@@ -16,8 +18,8 @@ tables:
   contacts:
     pk: id
     entity: "B2B CRM contact"
-    send_fields: [name, email, company_id, title, status, notes]
-    candidates:              # pg_trgm 필요
+    send_fields: [name, email, company_id, title, status, notes]   # 필수. 모델이 볼 컬럼
+    candidates:              # pg_trgm 필요. 고른 컬럼이 그대로 모델로 가며, PK를 꼭 고른다
       sql: |
         SELECT id, name, email, company_id, title, updated_at
         FROM contacts

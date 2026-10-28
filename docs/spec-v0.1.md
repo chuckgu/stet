@@ -85,11 +85,15 @@ Simple Query와 Extended Query(Parse/Bind/Execute) 둘 다 처리한다. 바인�
   - 섀도 모드: 통과시키고 기록한다.
   - enforce 모드: `ST002`로 거부한다.
 - 이유: 판단을 트랜잭션 밖에서 하려면 판단과 실행 사이에 트랜잭션이 열려 있으면 안 된다. 다중 문장 트랜잭션 지원은 v0.2에서 제안–확정 방식으로 푼다.
+- 판별: 프록시는 ReadyForQuery 하나로 끝나는 단위(Query 하나, 또는 Sync까지의 확장 프로토콜 메시지)로 메시지를 묶는다. 다음 중 하나면 트랜잭션 안의 쓰기로 본다.
+  - 단위 앞이나 뒤의 ReadyForQuery 상태가 `I`가 아니다(명시적 트랜잭션).
+  - 한 Sync 안에 Execute가 둘 이상 있다(암묵적 트랜잭션. pgx 배치, 파이프라인).
+- 실행 결과도 같은 단위에서 정한다. Execute마다 CommandComplete를 세고, ErrorResponse가 몇 번째 Execute에서 났는지 보고 각 쓰기의 `executed`와 `exec_error`를 정한다. 앞 문장이 실패해 건너뛴 쓰기는 `not executed: an earlier statement in the same Sync failed`로 남는다. `executed`는 문장이 실행됐다는 뜻이고 커밋 여부는 아니다.
 
 **에이전트 식별**
 
 - `agent_id`: 접속 시작 파라미터 `application_name`. enforce 모드에서는 필수.
-- `on_behalf_of`: `SET stet.on_behalf_of = '...'`. 프록시가 가로채 세션 상태로 보관한다.
+- `on_behalf_of`: `SET stet.on_behalf_of = '...'`. Postgres는 점이 들어간 사용자 설정을 그대로 받으므로 문장은 그대로 통과시키고, 프록시는 문장을 보고 세션 값으로 보관한다. `RESET`, `SET ... TO DEFAULT`, `RESET ALL`은 값을 지운다. `set_config()` 함수 호출은 보지 못한다.
 - v0.1은 이 값들을 기록만 하고 권한 강제에는 쓰지 않는다.
 
 ## 4. 상태 조립
@@ -111,16 +115,19 @@ Simple Query와 Extended Query(Parse/Bind/Execute) 둘 다 처리한다. 바인�
   "provenance": {
     "proposed": "untrusted_agent_input",
     "current": "database",
-    "candidates": "database"
+    "candidates": "database",
+    "recent_changes": "earlier_agent_writes"
   }
 }
 ```
 
+- 시점: 상태는 쓰기 메시지(Query 또는 Execute)를 업스트림에 보내기 직전에, Stet 자신의 연결로 읽는다. 쓰기 전 값을 보기 위해서다. 클라이언트는 이 동안만 기다린다(상한 500ms). 넘거나 실패하면 쓰기는 그대로 통과하고 기록에 `state_error`가 남는다.
+- `proposed`: 리터럴과 바인딩 값은 텍스트로 넣는다. 바이너리 바인딩 값은 Postgres가 문장의 파라미터 타입으로 직접 텍스트로 바꾼다. `DEFAULT`는 `{"default": true}`, 표현식은 바인딩 값을 넣은 SQL 텍스트로 `{"expr": "lower('A@B.com')"}`처럼 넣는다. 컬럼 목록 없는 insert는 테이블 컬럼 순서로 이름을 붙인다.
 - `current`: 대상 행을 PK로 조회한다. 이때 행 버전(`xmin`)을 함께 읽어 `state_version`으로 보관한다.
-- `candidates`: 테이블 설정의 후보 조회 SQL을 proposed 값으로 바인딩해 실행한다.
-- `recent_changes`: 같은 엔티티에 대한 최근 판단 기록(`recent_window` 이내)에서 가져온다. 다른 에이전트가 방금 바꾼 것을 판단에 반영하기 위해서다.
-- 필드 허용 목록(`send_fields`)에 있는 컬럼만 모델로 보낸다. 판단 모델 API는 외부 서비스라 데이터가 조직 밖으로 나간다.
-- 상태 크기에 상한을 둔다. 넘으면 후보 수부터 줄인다.
+- `candidates`: 테이블 설정의 후보 조회 SQL을 실행한다. `:name` 파라미터는 쓰기 후의 행(현재 행에 proposed를 덮은 값)으로 채운다. 대상 행 자신은 뺀다. 후보 SQL이 고른 컬럼이 그대로 모델로 가므로, 후보 SQL이 곧 후보의 허용 목록이다. duplicate 질문의 선택지를 만들려면 PK 컬럼을 골라야 한다.
+- `recent_changes`: 같은 행(테이블 + PK)에 대한, 실행된 최근 쓰기다(`recent_window` 이내, 기본 30분, 최대 10개). 기록된 판단과 아직 판단 중인 쓰기(프로세스 메모리)를 합친다. 판단이 비동기라서 메모리 쪽이 없으면 방금 끝난 다른 에이전트의 쓰기를 놓친다.
+- 필드 허용 목록(`send_fields`)에 있는 컬럼만 모델로 보낸다. `proposed`, `current`, `recent_changes`에 적용한다. 판단 모델 API는 외부 서비스라 데이터가 조직 밖으로 나간다. 그래서 `send_fields`는 필수 설정이다.
+- 상태 크기에 상한을 둔다. 넘으면 후보 수부터 줄인다. (미구현)
 
 ## 5. 판단
 
@@ -132,9 +139,17 @@ type Decider interface {
     ModelID() string       // 예: "jev"
     ModelVersion() string  // 고정 버전. "latest" 금지
 }
+
+type Question struct { ID, Text string; Choices []string }
+type Answer   struct { Choice string; Confidence float64; Distribution map[string]float64 }
+type Answers  struct { ByQuestion map[string]Answer; CostUSD float64 }
 ```
 
+모든 질문은 선택형이다. policy 점수도 `"1"`~`"5"` 중 하나를 고르는 질문으로 묻는다.
+
 첫 어댑터는 Jev(TypeSafe API 또는 OpenRouter)다. 비교 실험용으로 LLM 어댑터(JSON 출력)를 같은 인터페이스로 만든다.
+
+구현된 어댑터는 `none` 하나다. 모델을 부르지 않고 상태, 쓰기, 실행 결과만 기록한다(verdict `commit`, reason `no_model`). 버전 설정이 필요 없다. 실험 1단계("섀도 모드로 쓰기 스트림 기록")에 쓴다.
 
 **기본 질문 세트**
 
@@ -154,21 +169,32 @@ type Decider interface {
 
 | 순서 | 조건 | verdict | reason |
 |---|---|---|---|
-| 1 | 미지원 문장, enforce 모드의 트랜잭션 내 쓰기 | `reject` | `unsupported` / `in_transaction` |
-| 2 | 모델 호출 실패 | `on_failure` 설정값 | `model_error` |
+| 1 | 미지원 문장, 트랜잭션 내 쓰기 | `unsupported` | 형태별 reason(3장) / `in_transaction` |
+| 2 | 상태 조립 실패, 모델 호출 실패, 모델 없음 | `on_failure` 설정값 (`pass`면 `commit`) | `state_error` / `model_error` / `no_model` |
 | 3 | 어떤 답이든 confidence < `escalate_below` | `escalate` | `low_confidence:<q>` |
 | 4 | duplicate ≠ none, confidence ≥ τ_dup | `hold` | `duplicate:<id>` |
 | 5 | conflict = yes, confidence ≥ τ_conflict | `hold` | `conflict` |
 | 6 | policy score ≥ τ_policy | `hold` | `policy` |
 | 7 | 그 외 | `commit` | |
 
+- 1번 규칙의 verdict는 `unsupported`로 기록한다. enforce 모드에서 실제로 어떻게 할지는 테이블 설정 `unsupported`가 정하고, `in_transaction`은 항상 `ST002`다. 1·2번 규칙에 걸리면 모델을 부르지 않는다.
+- 물은 질문에 답이 없으면 confidence가 낮은 것으로 보고 3번 규칙(`escalate`)에 건다.
+- 물을 질문이 없으면(후보 없는 insert에 정책도 없는 경우 등) 모델을 부르지 않고 `commit`이다.
 - v0.1에서 `escalate`는 사람 검토용 hold와 같이 처리하되 reason으로 구분한다. LLM 재판단으로 넘기는 캐스케이드는 P1이다.
 - 임계값 초기값은 보수적으로 두고, 섀도 모드 데이터로 보정한다. confidence 0.95를 업무 정확도 95%로 해석하지 않는다.
 - 정책 버전(`policy_version`)은 설정 파일 해시로 남긴다.
 
 ## 7. 실행
 
-**섀도 모드**: verdict와 무관하게 원래 문장을 그대로 실행한다. 판단 기록에 `executed = true`와 "enforce였다면 어땠을지"를 남긴다.
+**섀도 모드**: verdict와 무관하게 원래 문장을 그대로 실행한다. 판단 기록에 실제 실행 결과(`executed`, `exec_error`)와 "enforce였다면 어땠을지"(verdict)를 남긴다.
+
+1. 쓰기 메시지를 보내기 직전에 상태를 조립한다(동기, 4장).
+2. 원래 메시지를 바꾸지 않고 보낸다.
+3. 그 단위의 ReadyForQuery가 오면 실행 결과와 트랜잭션 여부를 정한다(3장).
+4. 모델 호출, 정책 적용, 기록은 별도 고루틴에서 한다. 클라이언트는 모델을 기다리지 않는다. 동시에 부르는 모델 호출은 8개로 제한한다.
+5. 종료할 때는 프록시를 먼저 닫고, 판단 중인 기록이 끝날 때까지 기다린다.
+
+`latency_ms`는 클라이언트가 실제로 기다린 시간이다(섀도 모드에서는 상태 조립 시간).
 
 **enforce 모드**
 
@@ -192,63 +218,25 @@ HINT:   update contacts.id=4812 instead of inserting a new row
 | `ST001` | hold 또는 escalate (검토 대기) |
 | `ST002` | v0.1 미지원 형태 (트랜잭션 내 쓰기 등) |
 | `ST003` | 정책에 따른 reject |
+| `ST004` | `stet.decisions` append-only 위반 (DB 트리거가 냄) |
 
 **보류 건 처리**: `stet.approve(held_write_id)` / `stet.reject(...)` 함수로 처리한다. 승인 시 원래 문장을 버전 확인과 함께 실행한다. 검토 UI는 매니지드 영역이다.
 
 ## 8. 판단 기록 스키마
 
+`stet.decisions`의 정본은 [`internal/store/schema.sql`](../internal/store/schema.sql)이다. Stet은 시작할 때마다 이 파일을 실행한다(advisory lock으로 직렬화, 여러 번 실행해도 안전). 처음 초안에서 바뀐 점은 다음과 같다.
+
+- `params jsonb` 추가: 바인딩 값의 텍스트 배열. 실험에서 쓰기 스트림을 재생하려면 문장과 값이 둘 다 있어야 한다.
+- `op`에 `merge`, `copy`, `truncate` 추가: 미지원 형태도 기록하기 때문이다.
+- `proposed`, `state`, `questions`, `answers`는 NULL 허용: 판단하지 않은 쓰기(미지원, 상태 조립 실패, 모델을 부르지 않은 경우)가 있기 때문이다.
+- `proposed`는 send_fields로 거르기 전의 전체 값이다(같은 DB 안에 남는다). 모델에 실제로 보낸 것은 `state`다.
+- `id`는 Stet이 만든다. 아직 판단 중인 쓰기를 최근 변경 목록에서 중복 없이 합치기 위해서다.
+- `created_at`은 쓰기가 들어온 시각이다(판단이 끝난 시각이 아니다).
+- append-only를 트리거로 강제한다. 라벨 컬럼(`label`, `label_by`, `labeled_at`) 외의 UPDATE, DELETE, TRUNCATE는 `ST004`로 거부된다.
+
+`held_writes`는 enforce 모드에서 만든다(미구현).
+
 ```sql
-CREATE SCHEMA stet;
-
-CREATE TABLE stet.decisions (
-  id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  created_at       timestamptz NOT NULL DEFAULT now(),
-  mode             text NOT NULL CHECK (mode IN ('shadow','enforce')),
-
-  -- 누가
-  agent_id         text NOT NULL,
-  on_behalf_of     text,
-  session_id       text,
-
-  -- 무엇을
-  statement        text NOT NULL,
-  statement_fp     text NOT NULL,               -- 정규화한 문장 지문
-  op               text NOT NULL CHECK (op IN ('insert','update','delete')),
-  target_table     text NOT NULL,
-  target_pk        jsonb,
-  proposed         jsonb NOT NULL,
-
-  -- 무엇을 보고
-  state            jsonb NOT NULL,              -- 모델에 실제로 보낸 상태 그대로
-  state_version    jsonb,                       -- 대상 행 xmin 등
-
-  -- 어떻게 판단했나
-  model            text NOT NULL,
-  model_version    text NOT NULL,               -- 고정 버전
-  questions        jsonb NOT NULL,
-  answers          jsonb NOT NULL,              -- 질문별 선택, 확률 분포, confidence
-  policy_version   text NOT NULL,
-  verdict          text NOT NULL
-                   CHECK (verdict IN ('commit','hold','escalate','reject','unsupported')),
-  reasons          text[] NOT NULL DEFAULT '{}',
-
-  -- 무엇이 일어났나
-  executed         boolean NOT NULL,
-  exec_error       text,
-  latency_ms       integer,                     -- 프록시가 더한 전체 지연
-  model_latency_ms integer,
-  cost_usd         numeric(12,6),
-
-  -- 나중에 붙는 정답
-  label            text CHECK (label IN ('correct','false_hold','missed','unclear')),
-  label_by         text,
-  labeled_at       timestamptz
-);
-
-CREATE INDEX ON stet.decisions (target_table, target_pk, created_at DESC);
-CREATE INDEX ON stet.decisions (verdict, created_at DESC);
-CREATE INDEX ON stet.decisions (agent_id, created_at DESC);
-
 CREATE TABLE stet.held_writes (
   id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   decision_id  uuid NOT NULL REFERENCES stet.decisions(id),
@@ -260,7 +248,7 @@ CREATE TABLE stet.held_writes (
 );
 ```
 
-- `decisions`는 append-only다. 프록시 역할에는 `INSERT`와 라벨 컬럼 `UPDATE`만 허용한다.
+- `decisions`는 append-only다. 트리거와 별개로, 프록시 역할에는 `INSERT`와 라벨 컬럼 `UPDATE`만 허용하는 것을 권한다.
 - `state`에는 업무 데이터(개인정보 포함 가능)가 들어간다. 보존 기간 설정(`retention`)을 둔다.
 - 이 테이블이 학습 루프의 원재료다. 상태–선택지–판단–실행–결과–사람 라벨이 한 행에 묶인다.
 
@@ -304,13 +292,19 @@ tables:
     unsupported: reject
 ```
 
+- `send_fields`는 테이블마다 필수다. 모델이 볼 수 있는 컬럼을 명시적으로 고르게 하기 위해서다.
+- `recent_window`의 기본값은 30분이다.
+- Jev 어댑터 전까지는 `model: {adapter: none}`으로 둔다(5장).
+- `upstream` URL의 계정은 Stet 자신의 연결(상태 조회, 판단 기록)에 쓴다. 이 계정은 게이트 대상 테이블 SELECT 권한과 `stet` 스키마를 만들 권한이 있어야 한다. 비밀번호는 URL이나 `PGPASSWORD`·`.pgpass`로 준다.
+
 ## 10. 실패 처리와 보안
 
 | 상황 | 동작 |
 |---|---|
 | 모델 API 장애·타임아웃 | `on_failure`: 섀도 모드 기본 `pass`, enforce 모드는 테이블별 설정 |
 | 업스트림 Postgres 장애 | 프록시는 에러를 그대로 전달 |
-| 상태 조립 SQL 실패 | 판단 생략, `on_failure` 적용, 기록 |
+| 상태 조립 SQL 실패·지연 | 판단 생략, `on_failure` 적용, reason `state_error`로 기록. 쓰기는 그대로 통과한다. 상한 500ms, Stet 연결의 `lock_timeout`은 200ms라서 클라이언트 자신의 열린 트랜잭션이 상태 조회를 오래 막지 못한다 |
+| 판단 기록 저장 실패 | 에러 로그만 남긴다. 재시도하지 않는다(v0.1 한계) |
 | 프록시 장애 | 클라이언트는 Postgres로 직접 붙는 경로를 운영 측에서 유지 (v0.1은 HA 없음) |
 | 업스트림 접속 실패 | 클라이언트에 `FATAL 08001`과 원인을 돌려준다 |
 
@@ -329,18 +323,18 @@ tables:
 | 항목 | 초기 목표 | 실측 |
 |---|---|---|
 | 게이트 대상 외 문장의 프록시 추가 지연 | p95 < 2ms | 패스스루 p95 +0.02ms, SQL 분류 문장당 0.01~0.02ms |
-| 게이트 대상 쓰기의 추가 지연 (Jev) | p95 < 500ms | 미측정 |
-| 판단 기록 누락 | 0 | 미구현 |
+| 게이트 대상 쓰기의 추가 지연 (Jev) | p95 < 500ms | 미측정. 섀도 모드에서 클라이언트가 기다리는 건 상태 조립뿐이며, 로컬 실행에서 0~5ms |
+| 판단 기록 누락 | 0 | 섀도 모드 테스트에서 누락 없음. 저장 실패 시 재시도는 없다 |
 
 패스스루 지연은 `select 1` 2,000회를 직접 연결과 번갈아 돌려 잰 값이다(2026-10-28, 같은 머신의 Postgres 14). `internal/proxy/latency_test.go`가 같은 측정을 하고 2ms 예산을 넘으면 실패한다. Jev 단건 호출 지연은 아직 실측하지 않았다.
 
 ## 12. 수용 기준
 
-- [ ] 일반 드라이버(psql, pgx, psycopg)가 프록시 경유로 코드 변경 없이 동작한다.
-- [ ] 섀도 모드에서 게이트 대상 쓰기 100%가 기록되고, 원래 동작은 바뀌지 않는다.
+- [x] 일반 드라이버(psql, pgx, psycopg)가 프록시 경유로 코드 변경 없이 동작한다.
+- [x] 섀도 모드에서 게이트 대상 쓰기 100%가 기록되고, 원래 동작은 바뀌지 않는다. (프로토콜 테스트 전체를 감시 게이트를 붙여 다시 돌려 확인)
 - [ ] enforce 모드에서 hold 시 `ST001`이 반환되고 `held_writes`가 생기며, 승인하면 버전 확인과 함께 적용된다.
 - [ ] 판단 기록만으로 모든 결정을 재추론 없이 재구성할 수 있다.
-- [ ] 모델 장애 시 `on_failure` 설정대로 동작한다.
+- [ ] 모델 장애 시 `on_failure` 설정대로 동작한다. (섀도 모드의 기록된 verdict는 확인, enforce는 미구현)
 - [ ] 실험 하네스로 실험의 네 arm을 같은 쓰기 스트림에 대해 실행할 수 있다.
 
 ## 13. 범위 밖 (v0.2 이후)

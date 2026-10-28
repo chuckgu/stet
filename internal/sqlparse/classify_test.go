@@ -186,3 +186,69 @@ func TestClassifyInvalidSQL(t *testing.T) {
 		t.Fatal("want a parse error")
 	}
 }
+
+func TestClassifyReportsTarget(t *testing.T) {
+	cases := []struct {
+		sql, op string
+	}{
+		{"insert into contacts (name) values ('a')", "insert"},
+		{"update contacts set title = 'x' where id = 1", "update"},
+		{"insert into contacts (name) values ('a'), ('b')", "insert"},
+		{"update contacts set status = 'x'", "update"},
+		{"with d as (delete from contacts where id = 1 returning *) select * from d", "delete"},
+		{"copy contacts from stdin", "copy"},
+		{"truncate deals, contacts", "truncate"},
+		{"merge into contacts c using leads l on c.email = l.email when matched then do nothing", "merge"},
+		{"select 1; delete from contacts where id = 1", "delete"},
+	}
+	for _, tc := range cases {
+		r, err := Classify(tc.sql, gated)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Table != "contacts" || r.Op != tc.op {
+			t.Errorf("%s: target = %q/%q, want contacts/%s", tc.sql, r.Table, r.Op, tc.op)
+		}
+	}
+}
+
+func TestClassifyOnBehalfOf(t *testing.T) {
+	str := func(s string) *string { return &s }
+	cases := []struct {
+		sql  string
+		want *string
+	}{
+		{"set stet.on_behalf_of = 'user:42'", str("user:42")},
+		{"SET stet.on_behalf_of TO 'acct-7'", str("acct-7")},
+		{"set local stet.on_behalf_of = 'u1'", str("u1")},
+		{"reset stet.on_behalf_of", str("")},
+		{"set stet.on_behalf_of to default", str("")},
+		{"reset all", str("")},
+		{"set application_name = 'x'", nil},
+		{"select 1", nil},
+	}
+	for _, tc := range cases {
+		r, err := Classify(tc.sql, gated)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case tc.want == nil && r.OnBehalfOf != nil:
+			t.Errorf("%s: OnBehalfOf = %q, want unset", tc.sql, *r.OnBehalfOf)
+		case tc.want != nil && (r.OnBehalfOf == nil || *r.OnBehalfOf != *tc.want):
+			t.Errorf("%s: OnBehalfOf = %v, want %q", tc.sql, r.OnBehalfOf, *tc.want)
+		}
+	}
+}
+
+func TestFingerprintIgnoresConstants(t *testing.T) {
+	a := Fingerprint("update contacts set title = 'CTO' where id = 1")
+	b := Fingerprint("update contacts set title = 'CEO' where id = 2")
+	c := Fingerprint("delete from contacts where id = 1")
+	if a == "" || a != b {
+		t.Errorf("fingerprints %q and %q should match", a, b)
+	}
+	if a == c {
+		t.Error("different statements share a fingerprint")
+	}
+}

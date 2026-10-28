@@ -11,8 +11,13 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/stetdb/stet/internal/config"
+	"github.com/stetdb/stet/internal/decide"
+	"github.com/stetdb/stet/internal/gate"
 	"github.com/stetdb/stet/internal/proxy"
+	"github.com/stetdb/stet/internal/store"
 )
 
 const usage = `usage: stet <command> [flags]
@@ -56,22 +61,70 @@ func runProxy(args []string) error {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
+	if cfg.Mode == config.ModeEnforce {
+		return fmt.Errorf("%s: mode enforce is not implemented yet; use shadow", *path)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var g *gate.Gate
+	if len(cfg.Tables) > 0 {
+		pool, err := openPool(ctx, cfg.Upstream)
+		if err != nil {
+			return err
+		}
+		defer pool.Close()
+		st := store.New(pool)
+		if err := st.Migrate(ctx); err != nil {
+			return err
+		}
+		d, err := decide.New(cfg.Model)
+		if err != nil {
+			return err
+		}
+		if g, err = gate.New(cfg, pool, st, d, log); err != nil {
+			return err
+		}
+		defer g.Close() // after the proxy: lets in-flight decisions finish
+	}
+
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return err
 	}
-	srv := proxy.New(cfg.UpstreamAddr(), log)
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	var pg proxy.Gate
+	if g != nil {
+		pg = g
+	}
+	srv := proxy.New(cfg.UpstreamAddr(), log, pg)
 	go func() {
 		<-ctx.Done()
 		srv.Close()
 	}()
 
-	log.Info("stet proxy listening", "listen", ln.Addr(), "upstream", cfg.UpstreamAddr(), "mode", cfg.Mode)
-	if len(cfg.Tables) > 0 {
-		log.Warn("write gate not implemented yet; every statement passes through unchanged")
-	}
+	log.Info("stet proxy listening", "listen", ln.Addr(), "upstream", cfg.UpstreamAddr(),
+		"mode", cfg.Mode, "gated_tables", len(cfg.Tables), "model", cfg.Model.Adapter)
 	return srv.Serve(ln)
+}
+
+// openPool connects Stet's own sessions: state reads and decision writes.
+// They wait briefly for locks so a client's open transaction cannot stall
+// its own write's state assembly for long.
+func openPool(ctx context.Context, upstream string) (*pgxpool.Pool, error) {
+	pc, err := pgxpool.ParseConfig(upstream)
+	if err != nil {
+		return nil, err
+	}
+	pc.ConnConfig.RuntimeParams["application_name"] = "stet"
+	pc.ConnConfig.RuntimeParams["lock_timeout"] = "200ms"
+	pool, err := pgxpool.NewWithConfig(ctx, pc)
+	if err != nil {
+		return nil, err
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("connect to upstream as Stet: %w", err)
+	}
+	return pool, nil
 }

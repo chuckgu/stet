@@ -3,6 +3,8 @@ package config
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -29,11 +31,19 @@ type Config struct {
 	Model     Model
 	Retention time.Duration // 0 = keep forever
 	Tables    map[string]Table
+
+	// Hash identifies the config file's bytes. Decisions record it as
+	// policy_version.
+	Hash string
 }
+
+// RecordOnly is the adapter that judges nothing: Stet records state and
+// outcomes without calling a model.
+const RecordOnly = "none"
 
 type Model struct {
 	Adapter   string
-	Version   string // pinned; aliases such as "latest" are rejected
+	Version   string // pinned; aliases such as "latest" are rejected. Unused by RecordOnly.
 	TimeoutMS int
 	OnFailure string // pass | hold
 }
@@ -120,7 +130,8 @@ func Parse(b []byte) (*Config, error) {
 		return nil, err
 	}
 
-	c := &Config{Mode: Mode(raw.Mode), Listen: raw.Listen, Upstream: raw.Upstream}
+	sum := sha256.Sum256(b)
+	c := &Config{Mode: Mode(raw.Mode), Listen: raw.Listen, Upstream: raw.Upstream, Hash: hex.EncodeToString(sum[:8])}
 	var errs []error
 	fail := func(format string, args ...any) { errs = append(errs, fmt.Errorf(format, args...)) }
 
@@ -151,8 +162,10 @@ func Parse(b []byte) (*Config, error) {
 		if m.Adapter == "" {
 			fail("model.adapter: required")
 		}
-		if err := validateVersion(m.Version); err != nil {
-			fail("model.version: %v", err)
+		if m.Adapter != RecordOnly {
+			if err := validateVersion(m.Version); err != nil {
+				fail("model.version: %v", err)
+			}
 		}
 		if c.Model.TimeoutMS == 0 {
 			c.Model.TimeoutMS = 800
@@ -200,6 +213,11 @@ func resolveTable(name string, rt rawTable) (Table, []error) {
 	if t.PK == "" {
 		fail("pk", "required")
 	}
+	// The model is an outside service; what it may see is listed, never assumed.
+	if len(t.SendFields) == 0 {
+		fail("send_fields", "required: list the columns the model may see")
+	}
+	t.RecentWindow = 30 * time.Minute
 	if rt.RecentWindow != "" {
 		d, err := parseDuration(rt.RecentWindow)
 		if err != nil {

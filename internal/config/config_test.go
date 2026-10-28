@@ -35,7 +35,7 @@ func TestDefaults(t *testing.T) {
 	c, err := Parse([]byte(minimal + `
 model: {adapter: jev, version: jev-1.13.0}
 tables:
-  contacts: {pk: id}
+  contacts: {pk: id, send_fields: [name]}
 `))
 	if err != nil {
 		t.Fatal(err)
@@ -48,6 +48,9 @@ tables:
 	}
 	if got := c.Model.OnFailure; got != "pass" {
 		t.Errorf("default on_failure = %q, want pass", got)
+	}
+	if got := c.Tables["contacts"].RecentWindow; got != 30*time.Minute {
+		t.Errorf("default recent_window = %v, want 30m", got)
 	}
 }
 
@@ -120,5 +123,44 @@ func TestUpstreamAddr(t *testing.T) {
 		if got := c.UpstreamAddr(); got != want {
 			t.Errorf("UpstreamAddr(%s) = %q, want %q", url, got, want)
 		}
+	}
+}
+
+func TestRecordOnlyAdapterNeedsNoVersion(t *testing.T) {
+	c, err := Parse([]byte(minimal + `
+model: {adapter: none}
+tables:
+  contacts: {pk: id, send_fields: [name]}
+`))
+	if err != nil {
+		t.Fatalf("adapter none should not need a version: %v", err)
+	}
+	if c.Model.Adapter != "none" {
+		t.Errorf("adapter = %q", c.Model.Adapter)
+	}
+}
+
+func TestTablesNeedSendFields(t *testing.T) {
+	_, err := Parse([]byte(minimal + "model: {adapter: none}\ntables: {contacts: {pk: id}}\n"))
+	if err == nil || !strings.Contains(err.Error(), "send_fields") {
+		t.Fatalf("err = %v, want send_fields required", err)
+	}
+}
+
+func TestHashIdentifiesConfigBytes(t *testing.T) {
+	a, err := Parse([]byte(minimal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Parse([]byte(minimal + "retention: 30d\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a2, _ := Parse([]byte(minimal))
+	if a.Hash == "" || a.Hash != a2.Hash {
+		t.Errorf("hash of identical bytes: %q vs %q", a.Hash, a2.Hash)
+	}
+	if a.Hash == b.Hash {
+		t.Error("different configs share a hash")
 	}
 }

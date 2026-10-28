@@ -36,6 +36,7 @@ const (
 type Server struct {
 	upstream string
 	log      *slog.Logger
+	gate     Gate
 
 	mu     sync.Mutex
 	ln     net.Listener
@@ -44,9 +45,10 @@ type Server struct {
 	wg     sync.WaitGroup
 }
 
-// New returns a proxy that forwards clients to upstream (host:port).
-func New(upstream string, log *slog.Logger) *Server {
-	return &Server{upstream: upstream, log: log, conns: make(map[net.Conn]struct{})}
+// New returns a proxy that forwards clients to upstream (host:port). With a
+// nil gate it is a plain passthrough.
+func New(upstream string, log *slog.Logger, gate Gate) *Server {
+	return &Server{upstream: upstream, log: log, gate: gate, conns: make(map[net.Conn]struct{})}
 }
 
 // Serve accepts connections on ln until Close is called, then returns nil.
@@ -162,7 +164,13 @@ func (s *Server) handle(client net.Conn) {
 	}
 	start := time.Now()
 	s.log.Debug("session started", "remote", client.RemoteAddr())
-	relay(client, server)
+	if s.gate == nil {
+		relay(client, server, nil, nil)
+	} else {
+		ss := newSession(s.gate, sessionInfo(pkt))
+		relay(client, server, ss.clientTap(), ss.serverTap())
+		ss.abandon()
+	}
 	s.log.Debug("session ended", "remote", client.RemoteAddr(), "duration", time.Since(start))
 }
 
@@ -227,25 +235,36 @@ func readStartupPacket(r io.Reader) ([]byte, error) {
 	return pkt, nil
 }
 
-// relay copies messages both ways until either side closes.
-func relay(client, server net.Conn) {
+// relay copies messages both ways until either side closes. Taps may be nil.
+func relay(client, server net.Conn, fromClient, fromServer *tap) {
 	done := make(chan struct{}, 2)
-	go func() { pump(server, client); done <- struct{}{} }()
-	go func() { pump(client, server); done <- struct{}{} }()
+	go func() { pump(server, client, fromClient); done <- struct{}{} }()
+	go func() { pump(client, server, fromServer); done <- struct{}{} }()
 	<-done
 	client.Close()
 	server.Close()
 	<-done
 }
 
+// tap observes messages in one direction. For message types it wants, see
+// gets the whole body before the message is forwarded (nil past
+// maxInspect), plus a way to flush what is already queued for the peer.
+type tap struct {
+	want func(t byte) bool
+	see  func(t byte, body []byte, flush func() error)
+}
+
+const maxInspect = 64 << 20
+
 // pump copies whole protocol messages from src to dst. Writes are batched
 // while src already has the next header buffered and flushed before any read
 // that may block, so a peer waiting on a response (after Sync, Flush, or
 // LISTEN) always gets it.
-func pump(dst io.Writer, src io.Reader) error {
+func pump(dst io.Writer, src io.Reader, tp *tap) error {
 	br := bufio.NewReaderSize(src, bufSize)
 	bw := bufio.NewWriterSize(dst, bufSize)
 	var hdr [5]byte // type byte + int32 length (which counts itself)
+	var body []byte
 	for {
 		if br.Buffered() < len(hdr) {
 			if err := bw.Flush(); err != nil {
@@ -259,10 +278,33 @@ func pump(dst io.Writer, src io.Reader) error {
 		if n < 4 {
 			return fmt.Errorf("invalid message length %d", n)
 		}
+		size := int64(n - 4)
+
+		if tp != nil && tp.want(hdr[0]) {
+			if size > maxInspect {
+				tp.see(hdr[0], nil, bw.Flush)
+			} else {
+				if int64(cap(body)) < size {
+					body = make([]byte, size)
+				}
+				body = body[:size]
+				if _, err := io.ReadFull(br, body); err != nil {
+					return err
+				}
+				tp.see(hdr[0], body, bw.Flush)
+				if _, err := bw.Write(hdr[:]); err != nil {
+					return err
+				}
+				if _, err := bw.Write(body); err != nil {
+					return err
+				}
+				continue
+			}
+		}
 		if _, err := bw.Write(hdr[:]); err != nil {
 			return err
 		}
-		if _, err := io.CopyN(bw, br, int64(n-4)); err != nil {
+		if _, err := io.CopyN(bw, br, size); err != nil {
 			return err
 		}
 	}

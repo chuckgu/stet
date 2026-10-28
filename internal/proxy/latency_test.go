@@ -15,7 +15,7 @@ func TestPassthroughLatencyBudget(t *testing.T) {
 		t.Skip("latency measurement skipped in -short mode")
 	}
 	up := upstream(t)
-	addr, _ := startProxy(t, up)
+	addr, _ := startProxy(t, up, nil)
 	direct := connect(t, up, "stet_scram", nil)
 	proxied := connect(t, addr, "stet_scram", nil)
 	ctx := testCtx(t)
