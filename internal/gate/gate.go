@@ -45,6 +45,7 @@ type Gate struct {
 	cfg     *config.Config
 	tables  map[string]string // config key → pk column
 	cands   map[string]named
+	ctxs    map[string]named
 	pool    *pgxpool.Pool
 	store   *store.Store
 	decider decide.Decider
@@ -64,6 +65,7 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, d decide.Decid
 		cfg:     cfg,
 		tables:  map[string]string{},
 		cands:   map[string]named{},
+		ctxs:    map[string]named{},
 		pool:    pool,
 		store:   st,
 		decider: d,
@@ -74,8 +76,10 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, d decide.Decid
 	for key, t := range cfg.Tables {
 		g.tables[key] = t.PK
 		if t.CandidateSQL != "" {
-			sql, names := compileNamed(strings.TrimRight(strings.TrimSpace(t.CandidateSQL), ";"))
-			g.cands[key] = named{sql, names}
+			g.cands[key] = compile(t.CandidateSQL)
+		}
+		if t.ContextSQL != "" {
+			g.ctxs[key] = compile(t.ContextSQL)
 		}
 	}
 	return g, nil
@@ -234,6 +238,7 @@ type State struct {
 	Operation     string            `json:"operation"`
 	Proposed      map[string]any    `json:"proposed"`
 	Current       map[string]any    `json:"current"`
+	Context       map[string]any    `json:"context,omitempty"` // only when the table configures a context query
 	Candidates    []map[string]any  `json:"candidates"`
 	RecentChanges []RecentChange    `json:"recent_changes"`
 	Policy        string            `json:"policy,omitempty"` // the rules, one per line
@@ -305,6 +310,11 @@ func (g *Gate) assemble(ctx context.Context, p *pending) error {
 		}
 	}
 
+	related, err := g.context(ctx, p, current)
+	if err != nil {
+		return fmt.Errorf("context: %w", err)
+	}
+
 	recent, err := g.recentChanges(ctx, p, t)
 	if err != nil {
 		return fmt.Errorf("recent changes: %w", err)
@@ -316,10 +326,14 @@ func (g *Gate) assemble(ctx context.Context, p *pending) error {
 		Operation:     w.Op,
 		Proposed:      only(p.proposed, t.SendFields),
 		Current:       only(current, t.SendFields),
+		Context:       related,
 		Candidates:    cands,
 		RecentChanges: recent,
 		Policy:        strings.Join(t.PolicyRules, "\n"),
 		Provenance:    Provenance(),
+	}
+	if related != nil {
+		doc.Provenance["context"] = "database"
 	}
 	if p.state, err = json.Marshal(doc); err != nil {
 		return err
@@ -420,6 +434,42 @@ func (g *Gate) currentRow(ctx context.Context, table, pkCol, pk string) (map[str
 	return row, *rows[0][1], err
 }
 
+// context runs the table's context query, bound like candidates, and
+// returns its first row: facts the policy needs that the row does not hold,
+// such as the account's open deals. Nil when the table has no context query.
+func (g *Gate) context(ctx context.Context, p *pending, current map[string]any) (map[string]any, error) {
+	c, ok := g.ctxs[p.res.Table]
+	if !ok {
+		return nil, nil
+	}
+	rows, err := g.queryText(ctx, fmt.Sprintf("select to_jsonb(c)::text from (%s) as c limit 1", c.sql),
+		c.bind(rowAfterWrite(current, p.proposed)))
+	if err != nil || len(rows) == 0 {
+		return map[string]any{}, err
+	}
+	return decodeObject(*rows[0][0])
+}
+
+// rowAfterWrite is the row as it would look after the write, as text for
+// binding: the current row with the proposed values over it. Proposed
+// expressions and defaults have no known value and bind as NULL.
+func rowAfterWrite(current, proposed map[string]any) map[string]*string {
+	row := map[string]*string{}
+	for k, v := range current {
+		if v != nil {
+			row[k] = ptr(jsonText(v))
+		}
+	}
+	for k, v := range proposed {
+		if s, ok := v.(string); ok {
+			row[k] = ptr(s)
+		} else {
+			delete(row, k)
+		}
+	}
+	return row
+}
+
 // candidates runs the table's candidate SQL with named parameters bound
 // from the row as it would look after the write. The row itself is left out.
 func (g *Gate) candidates(ctx context.Context, p *pending, current map[string]any) ([]map[string]any, error) {
@@ -428,26 +478,8 @@ func (g *Gate) candidates(ctx context.Context, p *pending, current map[string]an
 	if !ok {
 		return out, nil
 	}
-	source := map[string]*string{}
-	for k, v := range current {
-		if v != nil {
-			source[k] = ptr(jsonText(v))
-		}
-	}
-	for k, v := range p.proposed {
-		if s, ok := v.(string); ok {
-			source[k] = ptr(s)
-		} else {
-			delete(source, k)
-		}
-	}
-	args := make([]*string, len(c.names))
-	for i, n := range c.names {
-		args[i] = source[n]
-	}
-
 	q := fmt.Sprintf("select to_jsonb(c)::text from (%s) as c limit %d", c.sql, maxCandidates+1)
-	rows, err := g.queryText(ctx, q, args)
+	rows, err := g.queryText(ctx, q, c.bind(rowAfterWrite(current, p.proposed)))
 	if err != nil {
 		return nil, err
 	}

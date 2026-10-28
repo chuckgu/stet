@@ -583,3 +583,41 @@ func TestShadowAsksConflictOnlyWhenARecentChangeCouldBeUndone(t *testing.T) {
 		}
 	}
 }
+
+const contextYAML = `
+listen: 127.0.0.1:0
+upstream: postgres://stet_scram@%[1]s/stet_test
+model: {adapter: fake, version: fake-1}
+tables:
+  %[2]s:
+    pk: id
+    send_fields: [name, title, status]
+    context:
+      sql: select count(*) as same_company from %[2]s where company_id = :company_id
+`
+
+// Facts the policy depends on but the row does not hold (an account's open
+// deals, say) reach the model through the table's context query.
+func TestShadowStateIncludesContext(t *testing.T) {
+	e := setup(t, calm(), contextYAML)
+	e.seed(t)
+	mustExec(t, e.connect(t, "a"), "update "+e.table+" set status = 'churned' where id = 1")
+	mustExec(t, e.connect(t, "a"), "insert into "+e.table+" (id, name, company_id) values (9, 'New', 7)")
+
+	rs := e.decisions(t, 2)
+	if got := rs[0].State["context"]; !reflect.DeepEqual(got, map[string]any{"same_company": float64(2)}) {
+		t.Errorf("update context = %v, want same_company 2 (bound from the current row)", got)
+	}
+	if got := rs[1].State["context"]; !reflect.DeepEqual(got, map[string]any{"same_company": float64(0)}) {
+		t.Errorf("insert context = %v, want same_company 0 (bound from the proposed row)", got)
+	}
+}
+
+func TestStateHasNoContextWhenNoneIsConfigured(t *testing.T) {
+	e := setup(t, calm())
+	e.seed(t)
+	mustExec(t, e.connect(t, "a"), "update "+e.table+" set title = 'x' where id = 1")
+	if _, ok := e.decisions(t, 1)[0].State["context"]; ok {
+		t.Error("state has a context field although the table configures none; the format must not change")
+	}
+}

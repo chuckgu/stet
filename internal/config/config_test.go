@@ -235,3 +235,33 @@ func TestDefaultThresholdsMatchAnUnconfiguredTable(t *testing.T) {
 		t.Errorf("DefaultThresholds() = %+v, want %+v", got, c.Tables["contacts"].Thresholds)
 	}
 }
+
+func TestContextSQL(t *testing.T) {
+	c, err := Parse([]byte(minimal + `model: {adapter: none}
+tables:
+  contacts:
+    pk: id
+    send_fields: [status]
+    context:
+      sql: select count(*) as open_deals from deals where account_id = :account_id and stage = 'open'
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Tables["contacts"].ContextSQL; !strings.Contains(got, ":account_id") {
+		t.Errorf("ContextSQL = %q", got)
+	}
+}
+
+func TestLabConfigIsValid(t *testing.T) {
+	c, err := Load("../../lab/stet-lab.yaml")
+	if err != nil {
+		t.Fatalf("lab config must stay valid: %v", err)
+	}
+	if n := len(c.Tables["contacts"].PolicyRules); n != 3 {
+		t.Errorf("%d contact policy rules, want 3", n)
+	}
+	if c.Tables["contacts"].ContextSQL == "" || c.Tables["contacts"].RecentWindow != 6*time.Hour {
+		t.Error("lab config lost its context query or recent window")
+	}
+}

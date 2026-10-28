@@ -1,6 +1,7 @@
 package crm
 
 import (
+	"math/rand/v2"
 	"reflect"
 	"slices"
 	"strings"
@@ -171,5 +172,33 @@ func TestManyAccountsKeepUniqueNames(t *testing.T) {
 			t.Fatalf("account %d repeats name %q or domain %q", a.ID, a.BaseName, a.Domain)
 		}
 		seen[a.BaseName], seen[a.Domain] = true, true
+	}
+}
+
+func TestPromotionFollowsATrack(t *testing.T) {
+	for from, want := range map[string]string{
+		"Software Engineer":        "Senior Software Engineer",
+		"Senior Software Engineer": "Engineering Manager",
+		"VP Engineering":           "CTO",
+		"Account Executive":        "Sales Manager",
+		"CTO":                      "",
+		"Founder":                  "",
+	} {
+		if got := Promotion(from); got != want {
+			t.Errorf("Promotion(%q) = %q, want %q", from, got, want)
+		}
+	}
+	for _, title := range titles {
+		if p := Promotion(title); p != "" && !slices.Contains(titles, p) {
+			t.Errorf("Promotion(%q) = %q, which is not a known title", title, p)
+		}
+	}
+}
+
+func TestNewPersonIsSeeded(t *testing.T) {
+	a := NewPerson(rand.New(rand.NewPCG(1, 2)), true)
+	b := NewPerson(rand.New(rand.NewPCG(1, 2)), true)
+	if !reflect.DeepEqual(a, b) || !a.Korean || a.FamilyRoman == "" {
+		t.Errorf("NewPerson = %+v and %+v", a, b)
 	}
 }

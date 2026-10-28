@@ -17,7 +17,9 @@ import (
 const usage = `usage: stet-lab <command> [flags]
 
 commands:
-  seed   create and fill the synthetic CRM (stet-lab seed -db postgres://...)
+  seed     create and fill the synthetic CRM (stet-lab seed -db postgres://...)
+  prepare  store labels, plant S1 instructions, grant the agent role (needs a fresh seed)
+  run      send fresh changes, scripted writes, and agent tasks through Stet
 `
 
 func main() {
@@ -29,6 +31,10 @@ func main() {
 	switch os.Args[1] {
 	case "seed":
 		err = runSeed(os.Args[2:])
+	case "prepare":
+		err = runPrepare(os.Args[2:])
+	case "run":
+		err = runRun(os.Args[2:])
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)

@@ -53,6 +53,7 @@ type Table struct {
 	Entity       string
 	SendFields   []string
 	CandidateSQL string
+	ContextSQL   string // one row of related facts the row itself does not hold
 	RecentWindow time.Duration
 	Questions    []string
 	PolicyRules  []string // one rule each; every rule is asked as its own yes/no question
@@ -95,6 +96,9 @@ type rawTable struct {
 	Candidates struct {
 		SQL string `yaml:"sql"`
 	} `yaml:"candidates"`
+	Context struct {
+		SQL string `yaml:"sql"`
+	} `yaml:"context"`
 	RecentWindow string   `yaml:"recent_window"`
 	Questions    []string `yaml:"questions"`
 	Policy       any      `yaml:"policy"` // text, one rule per line, or a list of rules
@@ -212,6 +216,7 @@ func resolveTable(name string, rt rawTable) (Table, []error) {
 		Entity:       rt.Entity,
 		SendFields:   rt.SendFields,
 		CandidateSQL: rt.Candidates.SQL,
+		ContextSQL:   rt.Context.SQL,
 		Questions:    rt.Questions,
 		Thresholds:   defaultThresholds,
 		Unsupported:  rt.Unsupported,

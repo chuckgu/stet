@@ -43,7 +43,13 @@ func TestClassifyKinds(t *testing.T) {
 		{"upsert", "insert into contacts (email) values ('a') on conflict (email) do nothing", Unsupported, "on_conflict"},
 		{"range update", "update contacts set status = 'churned' where company_id = 3", Unsupported, "not_single_row"},
 		{"update all rows", "update contacts set status = 'x'", Unsupported, "not_single_row"},
-		{"pk plus extra predicate", "update contacts set title = 'x' where id = 1 and status = 'a'", Unsupported, "not_single_row"},
+		// PK equality ANDed with more conditions still touches at most one row.
+		{"pk plus extra predicate", "update contacts set title = 'x' where id = 1 and status = 'a'", Gated, ""},
+		{"extra predicate first", "update contacts set title = 'x' where status = 'a' and id = $2", Gated, ""},
+		{"several extra predicates", "delete from contacts where id = 7 and status = 'a' and title is not null", Gated, ""},
+		{"pk or other", "update contacts set title = 'x' where id = 1 or status = 'a'", Unsupported, "not_single_row"},
+		{"pk inside an or", "update contacts set title = 'x' where (id = 1 and status = 'a') or id = 2", Unsupported, "not_single_row"},
+		{"pk in list", "update contacts set status = 'churned' where id in (1, 2, 3)", Unsupported, "not_single_row"},
 		{"pk compared to column", "update contacts set title = 'x' where id = company_id", Unsupported, "not_single_row"},
 		{"where current of", "update contacts set title = 'x' where current of c", Unsupported, "not_single_row"},
 		{"delete all rows", "delete from contacts", Unsupported, "not_single_row"},
@@ -133,6 +139,12 @@ func TestClassifyExtractsWrite(t *testing.T) {
 			Write{Op: "update", Table: "contacts", Columns: []string{"title", "status"},
 				Values: []Value{{Kind: Literal, Text: "CTO"}, {Kind: Param, Param: 1}},
 				PK:     &Value{Kind: Param, Param: 2}},
+		},
+		{
+			"update with a guard condition",
+			"update contacts set status = 'churned' where status = 'active' and contacts.id = 245",
+			Write{Op: "update", Table: "contacts", Columns: []string{"status"},
+				Values: []Value{{Kind: Literal, Text: "churned"}}, PK: &Value{Kind: Literal, Text: "245"}},
 		},
 		{
 			"delete",

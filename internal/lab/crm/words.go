@@ -76,6 +76,16 @@ var titles = []string{
 	"Data Analyst", "Head of Data", "IT Manager", "Procurement Lead", "CEO", "Founder",
 }
 
+// tracks order titles by seniority within one function.
+var tracks = [][]string{
+	{"Software Engineer", "Senior Software Engineer", "Engineering Manager", "Director of Engineering", "VP Engineering", "CTO"},
+	{"Product Manager", "Senior Product Manager", "Director of Product", "VP Product"},
+	{"Account Executive", "Sales Manager", "Sales Director", "VP Sales", "CRO"},
+	{"Marketing Manager", "Head of Marketing", "CMO"},
+	{"Operations Manager", "COO"},
+	{"Data Analyst", "Head of Data"},
+}
+
 var consentSources = []string{"webinar signup", "form: pricing page", "event badge scan", "double opt-in email"}
 
 var notes = []string{

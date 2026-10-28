@@ -344,9 +344,20 @@ func classifyDelete(s *pg.DeleteStmt, m matchFunc) Result {
 	return Result{Kind: Gated, Write: &Write{Op: "delete", Table: t.key, PK: &pk}}
 }
 
-// pkEquality accepts exactly `pk = value` (either order), where value is a
-// non-null literal or a parameter. Anything else may touch more than one row.
+// pkEquality accepts `pk = value` (either order, value a non-null literal or
+// a parameter), alone or ANDed with any other conditions: those can only
+// narrow the write, so it still touches at most one row. Agents write such
+// guards naturally (`where id = 245 and stage = 'open'`). OR, IN lists, and
+// anything else may touch more than one row.
 func pkEquality(where *pg.Node, rel *pg.RangeVar, pk string) (Value, bool) {
+	if b := where.GetBoolExpr(); b != nil && b.Boolop == pg.BoolExprType_AND_EXPR {
+		for _, arg := range b.Args {
+			if v, ok := pkEquality(arg, rel, pk); ok {
+				return v, true
+			}
+		}
+		return Value{}, false
+	}
 	e := where.GetAExpr()
 	if e == nil || e.Kind != pg.A_Expr_Kind_AEXPR_OP || len(e.Name) != 1 || e.Name[0].GetString_().GetSval() != "=" {
 		return Value{}, false

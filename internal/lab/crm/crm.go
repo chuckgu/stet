@@ -252,6 +252,24 @@ func Generate(o Options) *Dataset {
 	return d
 }
 
+// NewPerson draws a person from the generator's name lists.
+func NewPerson(r *rand.Rand, korean bool) Person { return newPerson(r, korean) }
+
+// Titles lists every title the generator uses.
+func Titles() []string { return append([]string(nil), titles...) }
+
+// Promotion is the next title up the same track, or "" at the top.
+func Promotion(title string) string {
+	for _, track := range tracks {
+		for i, t := range track {
+			if t == title && i+1 < len(track) {
+				return track[i+1]
+			}
+		}
+	}
+	return ""
+}
+
 func newPerson(r *rand.Rand, korean bool) Person {
 	if korean {
 		f := koFamilies[r.IntN(len(koFamilies))]

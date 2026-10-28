@@ -97,3 +97,19 @@ func compileNamed(sql string) (string, []string) {
 	}
 	return out.String(), names
 }
+
+// compile prepares a configured query: trailing semicolon dropped, :name
+// parameters turned into $n.
+func compile(sql string) named {
+	q, names := compileNamed(strings.TrimRight(strings.TrimSpace(sql), ";"))
+	return named{q, names}
+}
+
+// bind orders a row's values as the query's parameters.
+func (n named) bind(row map[string]*string) []*string {
+	args := make([]*string, len(n.names))
+	for i, name := range n.names {
+		args[i] = row[name]
+	}
+	return args
+}

@@ -45,8 +45,8 @@
 | 문장 | 조건 |
 |---|---|
 | `INSERT` | 단일 행, `VALUES` 리터럴 또는 바인딩 파라미터 |
-| `UPDATE` | `WHERE <pk> = <값>` 형태로 단일 행 지정 |
-| `DELETE` | `WHERE <pk> = <값>` 형태로 단일 행 지정 |
+| `UPDATE` | `WHERE <pk> = <값>`으로 단일 행 지정. `AND`로 다른 조건이 더 붙어도 된다 |
+| `DELETE` | 위와 같음 |
 
 Simple Query와 Extended Query(Parse/Bind/Execute) 둘 다 처리한다. 바인딩 파라미터는 Bind 메시지에서 값을 채운다.
 
@@ -57,7 +57,7 @@ Simple Query와 Extended Query(Parse/Bind/Execute) 둘 다 처리한다. 바인�
 | 다중 행 `INSERT ... VALUES (...), (...)` | `multi_row` |
 | `INSERT ... SELECT` | `insert_select` |
 | `INSERT ... ON CONFLICT` (upsert) | `on_conflict` |
-| PK 등호 하나가 아닌 `WHERE` (범위, 추가 조건, `WHERE` 없음, `CURRENT OF`, `= NULL`) | `not_single_row` |
+| `AND`로 묶인 PK 등호가 없는 `WHERE` (범위, `OR`, `IN` 목록, `WHERE` 없음, `CURRENT OF`, `= NULL`) | `not_single_row` |
 | `UPDATE ... FROM`, `DELETE ... USING` | `join` |
 | `SET (a, b) = (...)` | `multi_assign` |
 | `SET tags[1] = ...` 같은 부분 갱신 | `indirection` |
@@ -71,6 +71,8 @@ Simple Query와 Extended Query(Parse/Bind/Execute) 둘 다 처리한다. 바인�
 - enforce 모드: 테이블별 설정 `unsupported: pass | reject`를 따른다. 기본값은 `reject`다.
 
 **판별 규칙**
+
+- `pk = 값`에 `AND`로 조건이 더 붙은 형태(`where id = 245 and stage = 'open'`)는 한 행 쓰기로 판단한다. 다른 조건은 쓰기를 좁힐 뿐이라 최대 한 행이다. 처음에는 미지원이었으나, 실험의 LLM 에이전트가 이런 안전장치 조건을 자연스럽게 써서 바꿨다(decisions.md D22). 다른 조건은 상태에 넣지 않는다.
 
 - 쓰기는 문장 트리 전체에서 찾는다. 최상위가 `SELECT`여도 CTE 안에서 게이트 대상 테이블을 바꾸면 대상이다.
 - 테이블 이름: 설정 키가 스키마 없는 이름이면 모든 스키마의 같은 이름 테이블에 걸린다. 스키마를 붙인 키(`crm.contacts`)는 같은 스키마의 참조와 스키마 없는 참조에 걸린다. search_path는 파싱 시점에 알 수 없으므로 넓게 잡는다. 넓게 잡으면 판단할 쓰기가 늘어날 뿐이다.
@@ -124,6 +126,11 @@ Simple Query와 Extended Query(Parse/Bind/Execute) 둘 다 처리한다. 바인�
 - 시점: 상태는 쓰기 메시지(Query 또는 Execute)를 업스트림에 보내기 직전에, Stet 자신의 연결로 읽는다. 쓰기 전 값을 보기 위해서다. 클라이언트는 이 동안만 기다린다(상한 500ms). 넘거나 실패하면 쓰기는 그대로 통과하고 기록에 `state_error`가 남는다.
 - `proposed`: 리터럴과 바인딩 값은 텍스트로 넣는다. 바이너리 바인딩 값은 Postgres가 문장의 파라미터 타입으로 직접 텍스트로 바꾼다. `DEFAULT`는 `{"default": true}`, 표현식은 바인딩 값을 넣은 SQL 텍스트로 `{"expr": "lower('A@B.com')"}`처럼 넣는다. 컬럼 목록 없는 insert는 테이블 컬럼 순서로 이름을 붙인다.
 - `current`: 대상 행을 PK로 조회한다. 이때 행 버전(`xmin`)을 함께 읽어 `state_version`으로 보관한다.
+- `context` (선택): 테이블 설정 `context.sql`이 있으면 넣는다. 정책 판단에 필요하지만 행 자체에는 없는 사실이다. 예를 들어 "열린 딜이 있으면 churned 금지"를 판단하려면 그 계정의 열린 딜 수가 필요하다.
+  - 후보 SQL과 같은 방식으로 `:name` 파라미터를 쓰기 후의 행으로 채우고, 결과의 첫 행을 넣는다.
+  - 설정하지 않은 테이블의 상태에는 이 필드가 아예 없어서 형식이 바뀌지 않는다(필드 순서가 답을 바꾸므로, D19).
+  - 위치는 `current` 다음이고, `provenance.context`는 `database`다.
+  - 녹화된 상태를 그대로 재생하므로, 녹화 전에 설정해야 한다.
 - `candidates`: 테이블 설정의 후보 조회 SQL을 실행한다. `:name` 파라미터는 쓰기 후의 행(현재 행에 proposed를 덮은 값)으로 채운다. 대상 행 자신은 뺀다. 후보 SQL이 고른 컬럼이 그대로 모델로 가므로, 후보 SQL이 곧 후보의 허용 목록이다. duplicate 질문의 선택지를 만들려면 PK 컬럼을 골라야 한다.
 - `recent_changes`: 같은 행(테이블 + PK)에 대한, 실행된 최근 쓰기다(`recent_window` 이내, 기본 30분, 최대 10개). 기록된 판단과 아직 판단 중인 쓰기(프로세스 메모리)를 합친다. 판단이 비동기라서 메모리 쪽이 없으면 방금 끝난 다른 에이전트의 쓰기를 놓친다.
 - 필드 허용 목록(`send_fields`)에 있는 컬럼만 모델로 보낸다. `proposed`, `current`, `recent_changes`에 적용한다. 판단 모델 API는 외부 서비스라 데이터가 조직 밖으로 나간다. 그래서 `send_fields`는 필수 설정이다.

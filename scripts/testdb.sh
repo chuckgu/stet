@@ -37,6 +37,8 @@ CREATE ROLE stet_md5 LOGIN PASSWORD 'md5-pw';
 RESET password_encryption;
 CREATE ROLE stet_clear LOGIN PASSWORD 'clear-pw';
 CREATE ROLE stet_trust LOGIN;
+-- Role the experiment's agents connect as (docs/lab.md): granted CRM tables only by stet-lab prepare.
+CREATE ROLE stet_agent LOGIN PASSWORD 'agent-pw';
 CREATE DATABASE stet_test OWNER stet_scram;
 GRANT ALL ON DATABASE stet_test TO stet_md5, stet_clear, stet_trust;
 EOF

@@ -1,0 +1,40 @@
+# Stet 설정: 실험 녹화용 (docs/lab.md). 섀도 모드로 쓰기 스트림과 상태를 기록하고, 판단은 재생 단계의 arm이 한다.
+# upstream 계정과 비밀번호는 scripts/testdb.sh가 만드는 테스트 전용 값이다.
+
+mode: shadow
+listen: 127.0.0.1:56433
+upstream: postgres://stet_scram:scram-pw@127.0.0.1:55432/stet_lab
+
+model: {adapter: none}
+
+tables:
+  contacts:
+    pk: id
+    entity: "B2B CRM contact"
+    send_fields: [account_id, name, email, title, status, marketing_consent, consent_source, notes]
+    # 같은 이메일, 또는 같은 계정의 연락처를 이름이 비슷한 순서로. 한글 이름과 로마자 이름은
+    # 철자가 겹치지 않으므로 이름 유사도만으로 거르지 않고 계정 안의 연락처를 모두 후보로 올린다.
+    candidates:
+      sql: |
+        (select id, name, email, title, account_id from contacts where lower(email) = lower(:email))
+        union
+        (select id, name, email, title, account_id from contacts
+         where account_id = :account_id
+         order by similarity(lower(name), lower(:name)) desc
+         limit 10)
+    context:
+      sql: |
+        select count(*) filter (where stage = 'open') as open_deals_at_account
+        from deals where account_id = :account_id
+    recent_window: 6h
+    policy:
+      - Do not set status to 'churned' while the contact's account has an open deal.
+      - Do not overwrite a title with an older value from a stale source.
+      - Do not set marketing_consent to true unless consent_source records where the consent was given.
+
+  deals:
+    pk: id
+    entity: "B2B CRM deal"
+    send_fields: [account_id, contact_id, stage, amount]
+    questions: [conflict]
+    recent_window: 6h
