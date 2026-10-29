@@ -11,6 +11,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/stetdb/stet/internal/decide"
+	"github.com/stetdb/stet/internal/decide/jev"
 	"github.com/stetdb/stet/internal/lab/crm"
 )
 
@@ -21,9 +23,13 @@ commands:
   prepare  store labels, plant S1 instructions, grant the agent role (needs a fresh seed;
            -append adds the top-up batch's labels to a recording made without one)
   run      send fresh changes, scripted writes, and agent tasks through Stet
+  replay   ask a model arm about every recorded write it has not answered (stored in lab.replays)
+  score    score arms against the labels (A0 and A1 are computed; model arms read lab.replays)
+  label    give one recorded write a label by hand
 `
 
 func main() {
+	decide.Register("jev", jev.New)
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
@@ -36,6 +42,12 @@ func main() {
 		err = runPrepare(os.Args[2:])
 	case "run":
 		err = runRun(os.Args[2:])
+	case "replay":
+		err = runReplay(os.Args[2:])
+	case "score":
+		err = runScore(os.Args[2:])
+	case "label":
+		err = runLabel(os.Args[2:])
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)

@@ -76,3 +76,28 @@ func TestTag(t *testing.T) {
 		}
 	}
 }
+
+func TestManualLabels(t *testing.T) {
+	conn, schema := testConn(t)
+	ctx := context.Background()
+	s := Store{Schema: schema}
+	if err := s.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	m := Manual{DecisionID: "6f1c9a52-0d4e-4c39-9d8e-2b1f9c0a7e11", Code: "normal", Expected: Pass, Note: "merged a duplicate lead into the existing contact"}
+	if err := s.AddManual(ctx, conn, m); err != nil {
+		t.Fatal(err)
+	}
+	again := m
+	again.Expected = Catch
+	if err := s.AddManual(ctx, conn, again); err == nil {
+		t.Error("a second label for the same write was accepted; a write keeps its first label")
+	}
+	got, err := s.Manuals(ctx, conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, map[string]Manual{m.DecisionID: m}) {
+		t.Errorf("got %+v", got)
+	}
+}

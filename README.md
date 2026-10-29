@@ -4,7 +4,7 @@
 >
 > *Agents propose. Stet decides what stands.*
 
-상태: v0.1 구현 1주차 (2026-10-28). 섀도 모드가 동작한다. 게이트 대상 쓰기의 상태를 조립하고 `stet.decisions`에 판단을 기록하며, 원래 쓰기는 바꾸지 않는다. 모델 어댑터는 Jev(`jev`)와 기록만 하는 `none`이 있다. Jev 단건 지연은 p95 약 200ms다. enforce 모드는 아직 없다.
+상태: v0.1 구현 3주차 (2026-10-29). 섀도 모드가 동작한다. 게이트 대상 쓰기의 상태를 조립하고 `stet.decisions`에 판단을 기록하며, 원래 쓰기는 바꾸지 않는다. 모델 어댑터는 Jev(`jev`)와 기록만 하는 `none`이 있다. Jev 단건 지연은 p95 약 200ms다. 실험은 합성 CRM에서 쓰기 1,461건을 녹화했고, arm A0·A1·C(Jev)로 재생해 채점했다(docs/lab.md). LLM arm과 enforce 모드는 아직 없다.
 
 ## 정의
 
@@ -79,6 +79,7 @@ scripts/testdb.sh stop /tmp/stet-pg
 | `internal/decide` | 모델 중립 `Decider` 인터페이스, 질문 세트, verdict 정책 |
 | `internal/decide/jev` | TypeSafe Jev 어댑터 (`TYPESAFE_API_KEY` 필요) |
 | `internal/store` | `stet.decisions` 스키마와 기록 |
+| `cmd/stet-lab`, `internal/lab/*` | 실험 도구: 합성 CRM, 업무·주입·라벨, LLM 에이전트, 재생과 채점 (docs/lab.md) |
 
 섀도 모드로 쓰기를 기록해 보려면 `stet.example.yaml`을 복사해 `upstream`, 테이블, `send_fields`를 맞춘다. Jev로 판단하려면 `TYPESAFE_API_KEY`를 환경 변수로 주고, 모델 없이 기록만 하려면 `model: {adapter: none}`으로 둔다. 기록은 `select * from stet.decisions order by created_at desc`로 본다.
 

@@ -38,6 +38,7 @@ type fakeDecider struct {
 
 type fakeCall struct {
 	state     map[string]any
+	raw       string // the bytes sent
 	questions []decide.Question
 }
 
@@ -46,7 +47,7 @@ func (f *fakeDecider) Decide(ctx context.Context, state json.RawMessage, qs []de
 	var s map[string]any
 	json.Unmarshal(state, &s)
 	f.mu.Lock()
-	f.calls = append(f.calls, fakeCall{s, qs})
+	f.calls = append(f.calls, fakeCall{s, string(state), qs})
 	f.mu.Unlock()
 	if f.err != nil {
 		return decide.Answers{}, f.err
@@ -619,5 +620,67 @@ func TestStateHasNoContextWhenNoneIsConfigured(t *testing.T) {
 	mustExec(t, e.connect(t, "a"), "update "+e.table+" set title = 'x' where id = 1")
 	if _, ok := e.decisions(t, 1)[0].State["context"]; ok {
 		t.Error("state has a context field although the table configures none; the format must not change")
+	}
+}
+
+const replayYAML = `
+listen: 127.0.0.1:0
+upstream: postgres://stet_scram@%[1]s/stet_test
+model: {adapter: fake, version: fake-1, timeout_ms: 2000}
+tables:
+  %[2]s:
+    pk: id
+    entity: "B2B CRM contact"
+    send_fields: [name, email, company_id, title, status]
+    candidates:
+      sql: select id, name, email from %[2]s where lower(email) = lower(:email)
+    context:
+      sql: select count(*) as same_company, 12000.50 as open_amount from %[2]s where company_id = :company_id
+    recent_window: 30m
+    policy: |
+      Do not set status to churned.
+`
+
+// Experiment arms judge recorded states (docs/lab.md). jsonb keeps neither
+// key order nor the text of the state, and the order is part of the format
+// (D19), so a recorded state must rebuild to exactly the bytes sent.
+func TestRecordedStateRebuildsToTheBytesSent(t *testing.T) {
+	d := calm()
+	e := setup(t, d, replayYAML)
+	e.seed(t)
+	mustExec(t, e.connect(t, "enricher"), "update "+e.table+" set title = 'VP' where id = 1")
+	mustExec(t, e.connect(t, "stale-sync"), "update "+e.table+" set title = 'Engineer', name = 'Kim & Co <x>' where id = 1")
+	mustExec(t, e.connect(t, "sales-ops"), "insert into "+e.table+" (id, name, email, company_id) values (3, '김재훈', 'K@ACME.com', 3)")
+	e.decisions(t, 3)
+
+	rows, err := e.admin.Query(context.Background(),
+		"select state::text from stet.decisions where target_table = $1 order by created_at", e.table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorded, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sent, rebuilt []string
+	for _, c := range d.calls {
+		sent = append(sent, c.raw)
+	}
+	reordered := false
+	for _, r := range recorded {
+		b, err := gate.RebuildState([]byte(r))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rebuilt = append(rebuilt, string(b))
+		reordered = reordered || string(b) != r
+	}
+	slices.Sort(sent)
+	slices.Sort(rebuilt)
+	if !reflect.DeepEqual(rebuilt, sent) {
+		t.Errorf("rebuilt states differ from those sent:\nrebuilt %q\nsent    %q", rebuilt, sent)
+	}
+	if !reordered {
+		t.Error("jsonb kept every state as sent; this test no longer covers the rebuild")
 	}
 }

@@ -36,6 +36,15 @@ type Item struct {
 	Note     string
 }
 
+// Manual is a label given by hand to a recorded write no item describes,
+// such as an agent doing something its task did not ask for.
+type Manual struct {
+	DecisionID string
+	Code       string
+	Expected   string // Pass or Catch
+	Note       string // why: the write and what a correct gate does with it
+}
+
 // Store reads and writes labels in one schema (default "lab").
 type Store struct{ Schema string }
 
@@ -62,8 +71,41 @@ func (s Store) Migrate(ctx context.Context, conn *pgx.Conn) error {
 			match    jsonb,
 			payload  jsonb not null,
 			note     text
-		)`, pgx.Identifier{s.schema()}.Sanitize(), s.table()))
+		);
+		create table if not exists %s (
+			decision_id uuid primary key,
+			code        text not null,
+			expected    text not null check (expected in ('pass','catch')),
+			note        text not null,
+			created_at  timestamptz not null default now()
+		)`, pgx.Identifier{s.schema()}.Sanitize(), s.table(), s.manual()))
 	return err
+}
+
+func (s Store) manual() string { return pgx.Identifier{s.schema(), "manual"}.Sanitize() }
+
+// AddManual labels one recorded write. A write keeps its first label.
+func (s Store) AddManual(ctx context.Context, conn *pgx.Conn, m Manual) error {
+	_, err := conn.Exec(ctx, fmt.Sprintf("insert into %s (decision_id, code, expected, note) values ($1, $2, $3, $4)", s.manual()),
+		m.DecisionID, m.Code, m.Expected, m.Note)
+	return err
+}
+
+// Manuals returns the hand labels by decision id.
+func (s Store) Manuals(ctx context.Context, conn *pgx.Conn) (map[string]Manual, error) {
+	rows, err := conn.Query(ctx, fmt.Sprintf("select decision_id::text, code, expected, note from %s", s.manual()))
+	if err != nil {
+		return nil, err
+	}
+	ms, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Manual])
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]Manual{}
+	for _, m := range ms {
+		out[m.DecisionID] = m
+	}
+	return out, nil
 }
 
 func (s Store) Insert(ctx context.Context, conn *pgx.Conn, items []Item) error {

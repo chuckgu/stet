@@ -254,6 +254,19 @@ type RecentChange struct {
 	Fields        map[string]any `json:"fields"`
 }
 
+// RebuildState turns a state recorded in stet.decisions back into the bytes
+// the gate sent. jsonb drops key order, which is part of the format, and
+// numbers are kept as written, as the gate reads them.
+func RebuildState(recorded []byte) (json.RawMessage, error) {
+	dec := json.NewDecoder(bytes.NewReader(recorded))
+	dec.UseNumber()
+	var s State
+	if err := dec.Decode(&s); err != nil {
+		return nil, fmt.Errorf("recorded state: %w", err)
+	}
+	return json.Marshal(s)
+}
+
 // Provenance labels each part of a State by where it came from.
 func Provenance() map[string]string {
 	return map[string]string{
