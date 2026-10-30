@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"slices"
 	"strings"
 	"time"
 
@@ -24,10 +23,10 @@ func runReplay(args []string) error {
 	fs := flag.NewFlagSet("replay", flag.ExitOnError)
 	db := fs.String("db", os.Getenv("STET_LAB_DB"), "database URL as the CRM owner (default $STET_LAB_DB)")
 	arm := fs.String("arm", "C", "arm name the answers are stored under")
-	adapter := fs.String("adapter", "jev", "model adapter")
-	version := fs.String("version", "jev-1.14.0", "pinned model version")
+	adapter := fs.String("adapter", "jev", "model adapter: jev or claude")
+	version := fs.String("version", "jev-1.14.0", "pinned model version; claude takes <model>:<effort>, such as claude-opus-5-5:low")
 	parallel := fs.Int("parallel", 4, "calls in flight")
-	timeout := fs.Duration("timeout", 10*time.Second, "per call; latency is reported apart from answers")
+	timeout := fs.Duration("timeout", 10*time.Second, "per call; a call cut off is retried, so set it above the slowest call (LLM arms: 2m)")
 	retries := fs.Int("retries", 3, "retries per failed call")
 	limit := fs.Int("limit", 0, "writes to ask about (0 = all pending)")
 	fs.Parse(args)
@@ -94,6 +93,7 @@ func runScore(args []string) error {
 	budget := fs.Int("budget-ms", 800, "model timeout a live gate would use, for the latency table")
 	mistakes := fs.String("mistakes", "", "also list this arm's missed faults and false holds")
 	similarity := fs.Float64("a-similarity", replay.A0.NameSimilarity, "A0/A1 name similarity; anything but the default is a sensitivity check, not the registered arm")
+	thresholds := fs.String("model-thresholds", "", "thresholds for every model arm, such as duplicate=0.7,conflict=0.7; a sensitivity check, not the registered arms")
 	fs.Parse(args)
 	if *db == "" {
 		return errors.New("score: -db or STET_LAB_DB is required")
@@ -101,6 +101,12 @@ func runScore(args []string) error {
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		return err
+	}
+	modelCfg := cfg
+	if *thresholds != "" {
+		if modelCfg, err = replay.SetThresholds(cfg, *thresholds); err != nil {
+			return err
+		}
 	}
 	ctx := context.Background()
 	conn, err := pgx.Connect(ctx, *db)
@@ -161,8 +167,11 @@ func runScore(args []string) error {
 			if err != nil {
 				return fmt.Errorf("arm %s: %w", arm, err)
 			}
-			verdicts = replay.ModelVerdicts(cfg, recs, stored)
+			verdicts = replay.ModelVerdicts(modelCfg, recs, stored)
 			perf[arm] = replay.PerfOf(stored, truths, *budget)
+			if *thresholds != "" {
+				name = fmt.Sprintf("%s (%s)", arm, *thresholds)
+			}
 		}
 		sums = append(sums, replay.Summarize(name, truths, recs, verdicts))
 		if arm == *mistakes {
@@ -171,15 +180,40 @@ func runScore(args []string) error {
 	}
 	replay.Report(os.Stdout, sums, perf)
 
-	// The kill comparison (experiment.md) is C against A0.
-	i, j := slices.IndexFunc(sums, func(s replay.Summary) bool { return s.Arm == "C" }),
-		slices.IndexFunc(sums, func(s replay.Summary) bool { return s.Arm == replay.A0.Name })
-	if i >= 0 && j >= 0 {
+	// The go/kill comparisons (experiment.md, decisions.md D26).
+	byArm := map[string]replay.Summary{}
+	for _, s := range sums {
+		byArm[s.Arm] = s
+	}
+	c, haveC := byArm["C"]
+	if !haveC {
+		return nil
+	}
+	fmt.Println()
+	answer := map[bool]string{true: "해당", false: "해당 안 함"}
+	if a, ok := byArm[replay.A0.Name]; ok {
 		rate := func(c replay.Cell) float64 { return 100 * float64(c.Caught) / float64(max(c.N, 1)) }
-		c, a := sums[i], sums[j]
-		fmt.Printf("\n판정 참고: F1~F4 recall C %.1f%% − A0 %.1f%% = %+.1f%%p (kill 기준 15%%p). false hold C %.1f%%, A0 %.1f%% (조건 5%% 이하).\n",
+		fmt.Printf("판정 참고 (kill 기준 1): F1~F4 recall C %.1f%% − A0 %.1f%% = %+.1f%%p (15%%p). false hold C %.1f%%, A0 %.1f%% (조건 5%% 이하).\n",
 			rate(c.Fault("", "")), rate(a.Fault("", "")), rate(c.Fault("", ""))-rate(a.Fault("", "")),
 			rate(c.Ordinary("")), rate(a.Ordinary("")))
+	}
+	pending := func(s replay.Summary, criterion string) bool {
+		if s.Missing > 0 {
+			fmt.Printf("판정 참고 (%s): %s는 아직 %d건에 답이 없어 판정하지 않는다.\n", criterion, s.Arm, s.Missing)
+		}
+		return s.Missing > 0
+	}
+	if b, ok := byArm["B'"]; ok && !pending(b, "kill 기준 2") {
+		x := replay.Compare(b, c, perf["B'"], perf["C"])
+		kill := x.NotWorseBy(5) && x.CostX <= 2 && x.P95X <= 2
+		fmt.Printf("판정 참고 (kill 기준 2): B' − C recall %+.1f%%p, false hold %+.1f%%p (5%%p보다 나쁘지 않은가), 비용 %.1f배, p95 지연 %.1f배 (2배 이내인가) → %s\n",
+			x.RecallPP, x.FalseHoldPP, x.CostX, x.P95X, answer[kill])
+	}
+	if b, ok := byArm["B"]; ok && !pending(b, "go 기준") {
+		x := replay.Compare(c, b, perf["C"], perf["B"])
+		goes := x.NotWorseBy(5) && x.CostX <= 0.1 && perf["C"].P95 <= *budget
+		fmt.Printf("판정 참고 (go 기준): C − B recall %+.1f%%p, false hold %+.1f%%p (5%%p보다 나쁘지 않은가), C 비용은 B의 1/%.0f (10배 이상 싼가), C p95 %dms (%dms 이내인가) → %s\n",
+			x.RecallPP, x.FalseHoldPP, 1/x.CostX, perf["C"].P95, *budget, answer[goes])
 	}
 	return nil
 }

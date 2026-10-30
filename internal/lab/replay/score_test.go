@@ -124,3 +124,63 @@ func TestPerfOf(t *testing.T) {
 		t.Errorf("perf = %+v", p)
 	}
 }
+
+func TestCompare(t *testing.T) {
+	// a catches 9 of 10 faults and holds 2 of 20 ordinary writes; b catches
+	// all faults and holds 1.
+	truths, recs := map[string]Truth{}, []Record{}
+	va, vb := map[string]Judged{}, map[string]Judged{}
+	for i := range 30 {
+		id := fmt.Sprint(i)
+		tr := Truth{Code: "F2", Expected: labels.Catch}
+		if i >= 10 {
+			tr = Truth{Code: "normal", Expected: labels.Pass}
+		}
+		truths[id], recs = tr, append(recs, Record{ID: id})
+		va[id], vb[id] = Judged{Verdict: decide.Commit}, Judged{Verdict: decide.Commit}
+		if i < 9 || i == 10 || i == 11 {
+			va[id] = Judged{Verdict: decide.Hold}
+		}
+		if i < 10 || i == 10 {
+			vb[id] = Judged{Verdict: decide.Hold}
+		}
+	}
+	c := Compare(Summarize("a", truths, recs, va), Summarize("b", truths, recs, vb),
+		Perf{CostPer1000Writes: 0.5, P95: 300}, Perf{CostPer1000Writes: 5, P95: 3000})
+	if math.Abs(c.RecallPP+10) > 1e-9 || math.Abs(c.FalseHoldPP-5) > 1e-9 || c.CostX != 0.1 || c.P95X != 0.1 {
+		t.Errorf("comparison = %+v, want recall -10pp, false hold +5pp, 0.1x cost and p95", c)
+	}
+	if c.NotWorseBy(5) || !c.NotWorseBy(10) {
+		t.Errorf("NotWorseBy: a is 10pp behind on recall and 5pp on false hold")
+	}
+	// Being better by more than the margin is not being worse.
+	if !(Comparison{RecallPP: 20, FalseHoldPP: -20}).NotWorseBy(5) {
+		t.Error("a far better arm counts as worse")
+	}
+}
+
+func TestSetThresholds(t *testing.T) {
+	cfg := &config.Config{Tables: map[string]config.Table{
+		"contacts": {Thresholds: config.DefaultThresholds()},
+		"deals":    {Thresholds: config.DefaultThresholds()},
+	}}
+	got, err := SetThresholds(cfg, "duplicate=0.7, policy=0.6")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := config.DefaultThresholds()
+	want.Duplicate, want.Policy = 0.7, 0.6
+	for name, tb := range got.Tables {
+		if tb.Thresholds != want {
+			t.Errorf("%s thresholds = %+v, want %+v", name, tb.Thresholds, want)
+		}
+	}
+	if cfg.Tables["contacts"].Thresholds != config.DefaultThresholds() {
+		t.Error("the recording's config was changed")
+	}
+	for _, bad := range []string{"duplicat=0.7", "duplicate=high", "duplicate=1.5", "duplicate"} {
+		if _, err := SetThresholds(cfg, bad); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}

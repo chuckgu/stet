@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/stetdb/stet/internal/decide"
+	"github.com/stetdb/stet/internal/decide/claude"
 	"github.com/stetdb/stet/internal/decide/jev"
 	"github.com/stetdb/stet/internal/lab/crm"
 )
@@ -30,6 +31,7 @@ commands:
 
 func main() {
 	decide.Register("jev", jev.New)
+	decide.Register("claude", claude.New)
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)

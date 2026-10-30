@@ -5,6 +5,7 @@ import (
 	"io"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -48,6 +49,34 @@ func ModelVerdicts(cfg *config.Config, recs []Record, stored map[string]Judgment
 		}
 	}
 	return out
+}
+
+// SetThresholds returns a copy of cfg whose tables all use the thresholds
+// in spec ("duplicate=0.7,conflict=0.7"). It is for sensitivity checks of
+// model arms, which share thresholds as the registered arms do.
+func SetThresholds(cfg *config.Config, spec string) (*config.Config, error) {
+	names := []string{"duplicate", "conflict", "policy", "policy_escalate", "escalate_below"}
+	set := map[string]float64{}
+	for _, kv := range strings.Split(spec, ",") {
+		k, v, ok := strings.Cut(strings.TrimSpace(kv), "=")
+		f, err := strconv.ParseFloat(v, 64)
+		if !ok || err != nil || f < 0 || f > 1 || !slices.Contains(names, k) {
+			return nil, fmt.Errorf("thresholds %q: want one of %v = a value from 0 to 1", kv, names)
+		}
+		set[k] = f
+	}
+	out := *cfg
+	out.Tables = map[string]config.Table{}
+	for name, t := range cfg.Tables {
+		th := &t.Thresholds
+		fields := map[string]*float64{"duplicate": &th.Duplicate, "conflict": &th.Conflict, "policy": &th.Policy,
+			"policy_escalate": &th.PolicyEscalate, "escalate_below": &th.EscalateBelow}
+		for k, f := range set {
+			*fields[k] = f
+		}
+		out.Tables[name] = t
+	}
+	return &out, nil
 }
 
 // RuleVerdicts judges every write with a deterministic arm.
@@ -219,6 +248,33 @@ func PerfOf(stored map[string]Judgment, scored map[string]Truth, budgetMS int) P
 	p.CostPer1000Writes = cost / float64(len(scored)) * 1000
 	return p
 }
+
+// Comparison is arm A against arm B for the go/kill criteria
+// (experiment.md, decisions.md D26).
+type Comparison struct {
+	RecallPP, FalseHoldPP float64 // A − B in percentage points, F1~F4 recall and false hold
+	CostX, P95X           float64 // A ÷ B, cost per 1,000 writes and p95 latency
+}
+
+func Compare(a, b Summary, pa, pb Perf) Comparison {
+	rate := func(c Cell) float64 { return 100 * float64(c.Caught) / float64(max(c.N, 1)) }
+	ratio := func(x, y float64) float64 {
+		if y == 0 {
+			return math.Inf(1)
+		}
+		return x / y
+	}
+	return Comparison{
+		RecallPP:    rate(a.Fault("", "")) - rate(b.Fault("", "")),
+		FalseHoldPP: rate(a.Ordinary("")) - rate(b.Ordinary("")),
+		CostX:       ratio(pa.CostPer1000Writes, pb.CostPer1000Writes),
+		P95X:        ratio(float64(pa.P95), float64(pb.P95)),
+	}
+}
+
+// NotWorseBy reports whether A trails B by no more than pp percentage points
+// on recall and on false hold. Doing better by more than pp still counts.
+func (c Comparison) NotWorseBy(pp float64) bool { return c.RecallPP >= -pp && c.FalseHoldPP <= pp }
 
 func pct(k, n int) string {
 	if n == 0 {
