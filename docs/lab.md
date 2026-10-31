@@ -166,7 +166,7 @@ bin/stet-lab replay -arm C          # Jev에 아직 답이 없는 쓰기만 묻�
 source ~/.config/stet/anthropic.env
 bin/stet-lab replay -arm B  -adapter claude -version claude-opus-5-5:low  -timeout 2m   # LLM arm (D26)
 bin/stet-lab replay -arm "B'" -adapter claude -version claude-haiku-5-5:low -timeout 2m
-bin/stet-lab score -arms "A0,A1,C,B,B'"   # 라벨과 비교한 표와 go/kill 참고 줄. -mistakes C를 붙이면 틀린 쓰기 목록
+bin/stet-lab score -arms "A0,A1,C,B,B',D"   # 라벨과 비교한 표와 go/kill 참고 줄. -mistakes C를 붙이면 틀린 쓰기 목록. D·D'는 저장된 답으로 계산한다
 bin/stet-lab label -decision <id> -expected pass -note "..."   # 라벨 없는 쓰기에 손으로 라벨
 ```
 
@@ -263,6 +263,7 @@ F1 나눠 보기:
   - C는 B보다 173배 싸다(쓰기 1,000건당 $0.048 대 $8.31).
   - C의 p95는 249ms로, 게이트의 모델 시간 제한 800ms 안이다.
 - 실험 전에 고정한 기준으로는 **go**다. 다만 아래 "B·B' 읽는 법"의 한계를 함께 본다.
+- 중간 기준(D가 가장 좋으면 제품은 캐스케이드)은 D27의 해석으로 **해당하지 않는다**. D는 품질과 비용 조건을 지키지만 p95가 2,386ms로 800ms를 넘는다. 아래 "arm D 결과"를 본다.
 
 **읽는 법**
 
@@ -314,9 +315,28 @@ F1 나눠 보기:
   - 한글↔로마자 F1은 B가 21건을 모두 잡았다(C는 18건).
   - B는 정상 쓰기를 하나도 막지 않았다. escalate 62건은 모두 결함 쓰기다.
 
+**arm D 결과** (2026-10-31)
+
+- D는 C가 escalate한 쓰기만 B의 저장된 답으로 다시 판단한다(D27). 새 호출은 없다. 두 번째 단계를 B'로 바꾼 D'는 참고다.
+- C가 escalate한 쓰기는 모델에 물은 1,150건 중 89건(7.7%)이다.
+
+| arm | F1~F4 recall | false hold | 남은 escalate | p50 | p95 | 쓰기 1,000건당 |
+|---|---|---|---|---|---|---|
+| C | 97.6% (404/414) | 1.1% (9/851) | 89 | 176ms | 249ms | $0.048 |
+| D (C → B) | 97.6% (404/414) | 0% (0/851) | 50 | 178ms | 2,386ms | $0.767 |
+| D' (C → B') | 88.9% (368/414) | 0.2% (2/851) | 8 | 178ms | 2,366ms | $0.073 |
+| B | 99.5% (412/414) | 0% (0/851) | 62 | 2,283ms | 5,443ms | $8.31 |
+
+- D는 C의 false hold 9건을 모두 없앴다. 9건 모두 C가 escalate한 정상 쓰기였고, B가 모두 commit했다.
+- recall은 C와 같다. C가 escalate한 결함은 B가 모두 hold하거나 escalate했다. C가 놓친(commit한) 10건은 D도 다시 묻지 않으므로 그대로 놓친다.
+- 사람 검토로 갈 escalate가 89건에서 50건으로 줄었다. 남은 50건은 모두 결함 쓰기다.
+- 비용은 C의 16배이고, B보다는 11배 싸다(10배 조건을 겨우 넘는다).
+- p95가 800ms를 넘는 이유는 escalate된 7.7%가 LLM 호출 하나를 기다리기 때문이다. 5%가 넘으므로 p95가 LLM 지연 구간에 들어간다. 나머지 92%는 C와 지연이 같다.
+- 그래서 캐스케이드는 동기 경로에 그대로 넣을 수 없다. escalate된 쓰기를 hold한 채 LLM의 답을 기다리는 비동기 처리여야 한다. v0.1의 escalate는 이미 사람 검토 hold이므로, 그 검토자를 LLM이 먼저 맡는 형태다(decisions.md 열린 질문 "escalate 처리").
+- D'는 F2를 60%만 잡는다. B'가 C의 escalate를 낮은 confidence로 commit했기 때문이다(위 "B·B' 읽는 법"). 저가 LLM을 두 번째 단계로 쓰려면 임계값 보정이 먼저다.
+
 **남은 일**
 
-- arm D(캐스케이드): C가 escalate한 89건만 LLM에 다시 묻는다. B가 모든 쓰기에 답해 두었으므로, 저장된 B 답으로 새 호출 없이 계산할 수 있다(규칙 4).
 - C의 보정 곡선(confidence 구간별 실제 정확도). LLM arm의 임계값 보정도 판정에 쓰지 않은 데이터로 따로 한다.
 - S2·S3 변형 재생(보안 지표). 이제 B·B'에도 돌릴 수 있다.
 - hard negative를 넣은 데이터로 A1과 다시 비교

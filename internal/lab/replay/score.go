@@ -51,6 +51,35 @@ func ModelVerdicts(cfg *config.Config, recs []Record, stored map[string]Judgment
 	return out
 }
 
+// Cascade is arm D (decisions.md D27): first's verdict, except that a write
+// first escalates takes second's verdict. It also returns what PerfOf
+// measures: first's latency and cost, plus second's where second was asked.
+// An escalated write second has not answered gets no verdict.
+func Cascade(cfg *config.Config, recs []Record, first, second map[string]Judgment) (map[string]Judged, map[string]Judgment) {
+	v1, v2 := ModelVerdicts(cfg, recs, first), ModelVerdicts(cfg, recs, second)
+	verdicts, judged := map[string]Judged{}, map[string]Judgment{}
+	for id, v := range v1 {
+		j, asked := first[id]
+		if v.Verdict != decide.Escalate {
+			verdicts[id] = v
+			if asked {
+				judged[id] = j
+			}
+			continue
+		}
+		w, ok := v2[id]
+		if !ok {
+			continue
+		}
+		// The first stage's reasons say why the write went on.
+		verdicts[id] = Judged{Verdict: w.Verdict, Reasons: append(slices.Clone(v.Reasons), w.Reasons...)}
+		j.LatencyMS += second[id].LatencyMS
+		j.CostUSD += second[id].CostUSD
+		judged[id] = j
+	}
+	return verdicts, judged
+}
+
 // SetThresholds returns a copy of cfg whose tables all use the thresholds
 // in spec ("duplicate=0.7,conflict=0.7"). It is for sensitivity checks of
 // model arms, which share thresholds as the registered arms do.

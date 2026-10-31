@@ -4,7 +4,7 @@
 >
 > *Agents propose. Stet decides what stands.*
 
-상태: v0.1 구현 3주차 (2026-10-31). 섀도 모드가 동작한다. 게이트 대상 쓰기의 상태를 조립하고 `stet.decisions`에 판단을 기록하며, 원래 쓰기는 바꾸지 않는다. 모델 어댑터는 Jev(`jev`)와 기록만 하는 `none`이 있고, 실험용으로 Claude(`claude`)가 있다. Jev 단건 지연은 p95 약 200ms다. 실험은 합성 CRM에서 쓰기 1,461건을 녹화했고, arm A0·A1·B·B'·C로 재생해 채점했다. 실험 전에 고정한 기준으로는 go다(docs/lab.md). enforce 모드는 아직 없다.
+상태: v0.1 구현 3주차 (2026-10-31). 섀도 모드가 동작한다. 게이트 대상 쓰기의 상태를 조립하고 `stet.decisions`에 판단을 기록하며, 원래 쓰기는 바꾸지 않는다. 모델 어댑터는 Jev(`jev`)와 기록만 하는 `none`이 있고, 실험용으로 Claude(`claude`)가 있다. Jev 단건 지연은 p95 약 200ms다. 실험은 합성 CRM에서 쓰기 1,461건을 녹화했고, arm A0·A1·B·B'·C·D로 재생해 채점했다. 실험 전에 고정한 기준으로는 go다(docs/lab.md). enforce 모드는 아직 없다.
 
 ## 정의
 

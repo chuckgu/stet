@@ -184,3 +184,46 @@ func TestSetThresholds(t *testing.T) {
 		}
 	}
 }
+
+func TestCascade(t *testing.T) {
+	cfg := &config.Config{Model: config.Model{OnFailure: "pass"},
+		Tables: map[string]config.Table{"contacts": {Thresholds: config.DefaultThresholds()}}}
+	dup := []decide.Question{{ID: "duplicate", Type: "choice", Choices: []string{"7", "none"}}}
+	recs := []Record{
+		{ID: "esc", Table: "contacts", Questions: dup},
+		{ID: "esc-both", Table: "contacts", Questions: dup},
+		{ID: "held", Table: "contacts", Questions: dup},
+		{ID: "esc-unanswered", Table: "contacts", Questions: dup},
+		{ID: "unasked", Table: "contacts"},
+	}
+	unsure := Judgment{LatencyMS: 100, CostUSD: 0.001, Answers: map[string]decide.Answer{"duplicate": {Choice: "7", Confidence: 0.4}}}
+	first := map[string]Judgment{
+		"esc": unsure, "esc-both": unsure, "esc-unanswered": unsure,
+		"held": {LatencyMS: 100, CostUSD: 0.001, Answers: map[string]decide.Answer{"duplicate": {Choice: "7", Confidence: 0.95}}},
+	}
+	second := map[string]Judgment{
+		"esc":      {LatencyMS: 2000, CostUSD: 0.01, Answers: map[string]decide.Answer{"duplicate": {Choice: "none", Confidence: 0.95}}},
+		"esc-both": {LatencyMS: 2000, CostUSD: 0.01, Answers: map[string]decide.Answer{"duplicate": {Choice: "7", Confidence: 0.5}}},
+		"held":     {LatencyMS: 2000, CostUSD: 0.01, Answers: map[string]decide.Answer{"duplicate": {Choice: "none", Confidence: 0.95}}},
+	}
+	verdicts, judged := Cascade(cfg, recs, first, second)
+	want := map[string]string{"esc": decide.Commit, "esc-both": decide.Escalate, "held": decide.Hold, "unasked": decide.Commit}
+	if len(verdicts) != len(want) {
+		t.Errorf("verdicts = %v; a write the second stage has not answered gets none", verdicts)
+	}
+	for id, v := range want {
+		if verdicts[id].Verdict != v {
+			t.Errorf("%s: verdict %s, want %s", id, verdicts[id].Verdict, v)
+		}
+	}
+	// The second stage's latency and cost count only where it was asked.
+	if j := judged["esc"]; j.LatencyMS != 2100 || math.Abs(j.CostUSD-0.011) > 1e-12 {
+		t.Errorf("esc = %+v, want both stages' latency and cost", j)
+	}
+	if j := judged["held"]; j.LatencyMS != 100 || j.CostUSD != 0.001 {
+		t.Errorf("held = %+v, want the first stage only", j)
+	}
+	if _, ok := judged["esc-unanswered"]; ok {
+		t.Error("a write without a second-stage answer has a judgment")
+	}
+}

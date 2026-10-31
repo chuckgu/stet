@@ -33,8 +33,9 @@ func runReplay(args []string) error {
 	if *db == "" {
 		return errors.New("replay: -db or STET_LAB_DB is required")
 	}
-	if *arm == replay.A0.Name || *arm == replay.A1.Name {
-		return fmt.Errorf("replay: %s is a rule arm; stet-lab score computes it", *arm)
+	switch *arm {
+	case replay.A0.Name, replay.A1.Name, "D", "D'":
+		return fmt.Errorf("replay: stet-lab score computes arm %s from rules or stored answers", *arm)
 	}
 	ctx := context.Background()
 	conn, err := pgx.Connect(ctx, *db)
@@ -89,7 +90,7 @@ func runScore(args []string) error {
 	fs := flag.NewFlagSet("score", flag.ExitOnError)
 	db := fs.String("db", os.Getenv("STET_LAB_DB"), "database URL as the CRM owner (default $STET_LAB_DB)")
 	cfgPath := fs.String("config", "lab/stet-lab.yaml", "Stet config of the recording: thresholds and on_failure for model arms")
-	arms := fs.String("arms", "A0,A1,C", "comma-separated arms; A0 and A1 are computed, others read from lab.replays")
+	arms := fs.String("arms", "A0,A1,C", "comma-separated arms; A0 and A1 are computed, D and D' cascade C into B and B', others read from lab.replays")
 	budget := fs.Int("budget-ms", 800, "model timeout a live gate would use, for the latency table")
 	mistakes := fs.String("mistakes", "", "also list this arm's missed faults and false holds")
 	similarity := fs.Float64("a-similarity", replay.A0.NameSimilarity, "A0/A1 name similarity; anything but the default is a sensitivity check, not the registered arm")
@@ -162,6 +163,18 @@ func runScore(args []string) error {
 				name = fmt.Sprintf("%s (유사도 %.2f)", arm, *similarity)
 			}
 			verdicts = replay.RuleVerdicts(a, recs)
+		case "D", "D'": // cascades of stored answers (D27): C, then B or B' where C escalates
+			first, err := store.Load(ctx, conn, "C")
+			if err != nil {
+				return fmt.Errorf("arm %s: %w", arm, err)
+			}
+			second, err := store.Load(ctx, conn, map[string]string{"D": "B", "D'": "B'"}[arm])
+			if err != nil {
+				return fmt.Errorf("arm %s: %w", arm, err)
+			}
+			var judged map[string]replay.Judgment
+			verdicts, judged = replay.Cascade(modelCfg, recs, first, second)
+			perf[arm] = replay.PerfOf(judged, truths, *budget)
 		default:
 			stored, err := store.Load(ctx, conn, arm)
 			if err != nil {
@@ -169,9 +182,9 @@ func runScore(args []string) error {
 			}
 			verdicts = replay.ModelVerdicts(modelCfg, recs, stored)
 			perf[arm] = replay.PerfOf(stored, truths, *budget)
-			if *thresholds != "" {
-				name = fmt.Sprintf("%s (%s)", arm, *thresholds)
-			}
+		}
+		if _, isModel := perf[arm]; isModel && *thresholds != "" {
+			name = fmt.Sprintf("%s (%s)", arm, *thresholds)
 		}
 		sums = append(sums, replay.Summarize(name, truths, recs, verdicts))
 		if arm == *mistakes {
@@ -209,11 +222,19 @@ func runScore(args []string) error {
 		fmt.Printf("판정 참고 (kill 기준 2): B' − C recall %+.1f%%p, false hold %+.1f%%p (5%%p보다 나쁘지 않은가), 비용 %.1f배, p95 지연 %.1f배 (2배 이내인가) → %s\n",
 			x.RecallPP, x.FalseHoldPP, x.CostX, x.P95X, answer[kill])
 	}
-	if b, ok := byArm["B"]; ok && !pending(b, "go 기준") {
+	b, haveB := byArm["B"]
+	if haveB && !pending(b, "go 기준") {
 		x := replay.Compare(c, b, perf["C"], perf["B"])
 		goes := x.NotWorseBy(5) && x.CostX <= 0.1 && perf["C"].P95 <= *budget
 		fmt.Printf("판정 참고 (go 기준): C − B recall %+.1f%%p, false hold %+.1f%%p (5%%p보다 나쁘지 않은가), C 비용은 B의 1/%.0f (10배 이상 싼가), C p95 %dms (%dms 이내인가) → %s\n",
 			x.RecallPP, x.FalseHoldPP, 1/x.CostX, perf["C"].P95, *budget, answer[goes])
+	}
+	if d, ok := byArm["D"]; ok && haveB && !pending(d, "중간 기준") && !pending(b, "중간 기준") {
+		x, y := replay.Compare(d, c, perf["D"], perf["C"]), replay.Compare(d, b, perf["D"], perf["B"])
+		better := x.RecallPP >= 0 && x.FalseHoldPP <= 0 && (x.RecallPP > 0 || x.FalseHoldPP < 0)
+		best := better && y.CostX <= 0.1 && perf["D"].P95 <= *budget
+		fmt.Printf("판정 참고 (중간 기준, D27): D − C recall %+.1f%%p, false hold %+.1f%%p (C보다 나은가), D 비용은 B의 1/%.0f (10배 이상 싼가), D p95 %dms (%dms 이내인가) → %s\n",
+			x.RecallPP, x.FalseHoldPP, 1/y.CostX, perf["D"].P95, *budget, answer[best])
 	}
 	return nil
 }
