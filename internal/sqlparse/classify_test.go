@@ -208,6 +208,14 @@ func TestClassifyCursors(t *testing.T) {
 		{"close c", Pass, nil, &Cursor{CursorClose, "c", false}},
 		{`close "My C"`, Pass, nil, &Cursor{CursorClose, "My C", false}},
 		{"close all", Pass, nil, &Cursor{CursorCloseAll, "", false}},
+		// DISCARD ALL closes every cursor, held ones included (poolers send
+		// it when a connection is handed back). Its other forms keep them.
+		{"discard all", Pass, nil, &Cursor{CursorCloseAll, "", false}},
+		{"DISCARD ALL", Pass, nil, &Cursor{CursorCloseAll, "", false}},
+		{"discard plans", Pass, nil, nil},
+		{"discard sequences", Pass, nil, nil},
+		{"discard temp", Pass, nil, nil},
+		{"discard temporary", Pass, nil, nil},
 		{"fetch 1 from c; fetch 1 from d", Pass, nil, nil},
 		{"declare c cursor for select * from contacts; fetch 1 from c", Read, []string{"contacts"}, nil},
 	}

@@ -32,6 +32,12 @@ func cursor(n *pg.Node) *Cursor {
 			return &Cursor{Op: CursorClose, Name: name}
 		}
 		return &Cursor{Op: CursorCloseAll}
+	case n.GetDiscardStmt() != nil:
+		// DISCARD ALL runs CLOSE ALL among its steps, so held cursors go too.
+		// Poolers send it when they hand a connection back.
+		if n.GetDiscardStmt().Target == pg.DiscardMode_DISCARD_ALL {
+			return &Cursor{Op: CursorCloseAll}
+		}
 	}
 	return nil
 }

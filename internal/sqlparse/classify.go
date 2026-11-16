@@ -47,7 +47,7 @@ const (
 	CursorDeclare  CursorOp = iota + 1
 	CursorFetch             // FETCH; MOVE sends no rows and is not one
 	CursorClose             // CLOSE name
-	CursorCloseAll          // CLOSE ALL
+	CursorCloseAll          // CLOSE ALL, or DISCARD ALL
 )
 
 // Cursor says what a statement does to a SQL cursor.
@@ -120,9 +120,9 @@ type Result struct {
 	// a gated table is classified as that write; what it reads is not kept.
 	Reads []string
 
-	// Cursor is set when the SQL is a single DECLARE CURSOR, FETCH, or
-	// CLOSE that writes no gated table. A DECLARE is Read or Pass by what
-	// its query reads; FETCH and CLOSE are Pass.
+	// Cursor is set when the SQL is a single DECLARE CURSOR, FETCH, CLOSE,
+	// or DISCARD ALL that writes no gated table. A DECLARE is Read or Pass
+	// by what its query reads; the others are Pass.
 	Cursor *Cursor
 
 	// OnBehalfOf is set when the SQL sets or resets stet.on_behalf_of;
