@@ -595,6 +595,35 @@ func TestCursorStatementsAmongSeveral(t *testing.T) {
 			t.Errorf("%d decisions, want the write's", len(a))
 		}
 	})
+	// The server refuses the second DECLARE of a name it holds (42P03) and
+	// keeps the held cursor, in a transaction that rolls back too.
+	for _, tc := range []struct {
+		name          string
+		before, after string
+	}{
+		{"redeclare in a Query that failed", "", ""},
+		{"redeclare in a Query that failed in a transaction", "begin", "rollback"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := setupReads(t, readsYAML)
+			e.seedMany(t)
+			conn := e.connect(t, "agent")
+			held := "declare c cursor with hold for select * from " + e.table
+			mustSimple(t, conn, held, 0)
+			if tc.before != "" {
+				mustSimple(t, conn, tc.before, 0)
+			}
+			if _, code := simple(t, conn, "declare c cursor for select * from "+e.table+"; select 1"); code != "42P03" {
+				t.Fatalf("SQLSTATE %q, want 42P03", code)
+			}
+			if tc.after != "" {
+				mustSimple(t, conn, tc.after, 0)
+			}
+			mustSimple(t, conn, "fetch 2 from c", 2) // the server still holds c
+			mustSimple(t, conn, "close c", 0)
+			wantReads(t, e, 1, 2)
+		})
+	}
 	t.Run("close in a Query that failed", func(t *testing.T) {
 		e := setupReads(t, readsYAML)
 		e.seedMany(t)

@@ -52,14 +52,18 @@ type declared struct {
 // A Query of one statement failed in that statement. Of a Query of several,
 // the proxy cannot tell which statements ran, nor whether one of them
 // committed. When unsure the table remembers: what forgets a name (a CLOSE,
-// an unobserved DECLARE) is undone, so the older meaning comes back, and an
-// observed DECLARE is kept.
+// an unobserved DECLARE) is undone, so the older meaning comes back. An
+// observed DECLARE is kept when the name meant nothing before it, and undone
+// when it did: the server refuses a DECLARE of a name it holds (42P03), and
+// keeping the new entry would drop the cursor the server still has. If the
+// server took it (the older one was gone), its FETCHes count as reads of the
+// older DECLARE.
 func (d *declared) undone(head *unit) bool {
 	switch {
 	case !head.query:
 		return d.idx >= head.errAt
 	case d.st.Several:
-		return !d.st.Observe
+		return !d.st.Observe || d.prev != nil
 	}
 	return true
 }

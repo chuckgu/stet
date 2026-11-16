@@ -495,3 +495,39 @@ func TestDeclaringMessageCountsTowardItsCursor(t *testing.T) {
 		t.Errorf("rows before = %v, want %v", g.before, want)
 	}
 }
+
+// A Query of several statements that declares a remembered name again and
+// fails leaves the name as it was: the server refused that DECLARE (42P03)
+// and still holds the cursor, also after the transaction around it rolled
+// back.
+func TestFailedRedeclareAmongSeveralKeepsTheOldCursor(t *testing.T) {
+	for name, inTx := range map[string]bool{"outside a transaction": false, "in a transaction": true} {
+		t.Run(name, func(t *testing.T) {
+			g := &cursorGate{fakeGate: newFakeGate()}
+			s := readySession(g)
+			flush := func() error { return nil }
+			query := func(sql string) { s.fromClient('Q', body(&pgproto3.Query{String: sql}), flush) }
+			exists := &pgproto3.ErrorResponse{Code: "42P03", Message: `cursor "c" already exists`}
+
+			held := "declare c cursor with hold for select * from t"
+			query(held)
+			serve(s, tag("DECLARE CURSOR"), readyWith('I'))
+			status := byte('I')
+			if inTx {
+				query("begin")
+				serve(s, tag("BEGIN"), readyWith('T'))
+				status = 'E'
+			}
+			query("declare c cursor for select * from t; select 1")
+			serve(s, exists, readyWith(status))
+			if inTx {
+				query("rollback")
+				serve(s, tag("ROLLBACK"), readyWith('I'))
+			}
+			query("fetch 1 from c")
+			serve(s, &pgproto3.RowDescription{}, row, tag("FETCH 1"), readyWith('I'))
+
+			g.wantReads(t, held, 1)
+		})
+	}
+}
