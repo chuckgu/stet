@@ -93,7 +93,7 @@ CREATE TABLE IF NOT EXISTS stet.reads (
   target_table  text NOT NULL,                 -- 설정의 테이블 키
   statements    bigint NOT NULL,
   rows          bigint NOT NULL,               -- 클라이언트에게 나간 행 수
-  max_rows      bigint NOT NULL DEFAULT 0,     -- 한 문장이 내보낸 가장 큰 행 수
+  max_rows      bigint NOT NULL DEFAULT 0,     -- 한 읽기가 내보낸 가장 큰 행 수. 커서와 포털은 그때까지의 합계
   PRIMARY KEY (bucket, login_role, target_table)
 );
 
