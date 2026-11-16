@@ -6,9 +6,9 @@ import (
 	"testing"
 )
 
-// gated maps config keys to primary keys. "Contacts" is a second table,
-// reached only by a quoted reference.
-var gated = map[string]string{"contacts": "id", "Contacts": "id"}
+// gated maps config keys to primary keys, and records reads. "Contacts" is
+// a second table, reached only by a quoted reference.
+var gated = Tables{PK: map[string]string{"contacts": "id", "Contacts": "id"}, Reads: true}
 
 func TestClassifyKinds(t *testing.T) {
 	cases := []struct {
@@ -98,7 +98,7 @@ func TestClassifyKinds(t *testing.T) {
 }
 
 // gated2 adds a second gated table, so a statement can read two.
-var gated2 = map[string]string{"contacts": "id", "deals": "id"}
+var gated2 = Tables{PK: map[string]string{"contacts": "id", "deals": "id"}, Reads: true}
 
 func TestClassifyReads(t *testing.T) {
 	cases := []struct {
@@ -185,6 +185,43 @@ func TestClassifyReads(t *testing.T) {
 			}
 			if r.Cursor != nil {
 				t.Errorf("Cursor = %+v, want nil", *r.Cursor)
+			}
+		})
+	}
+}
+
+// With no table recording reads, statements are not examined for reads: a
+// statement that reads a gated table is Pass, as before reads were counted.
+// Writes and cursor statements are classified as usual.
+func TestClassifySkipsReadsWhenNoTableRecordsThem(t *testing.T) {
+	off := Tables{PK: gated2.PK}
+	cases := []struct {
+		sql    string
+		kind   Kind
+		cursor *Cursor
+	}{
+		{"select * from contacts", Pass, nil},
+		{"select c.name from contacts c join deals d on d.contact_id = c.id", Pass, nil},
+		{"copy contacts to stdout", Pass, nil},
+		{"insert into log select * from contacts", Pass, nil},
+		{"select 1; select * from deals", Pass, nil},
+		{"declare c cursor for select * from contacts", Pass, &Cursor{CursorDeclare, "c", false}},
+		{"fetch 10 from c", Pass, &Cursor{CursorFetch, "c", false}},
+		{"close c", Pass, &Cursor{CursorClose, "c", false}},
+		{"delete from contacts where id = 1", Gated, nil},
+		{"update contacts set status = 'x' where company_id = 3", Measured, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.sql, func(t *testing.T) {
+			r, err := Classify(tc.sql, off)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r.Kind != tc.kind || r.Reads != nil {
+				t.Errorf("got %v reads %v, want %v and no reads", r.Kind, r.Reads, tc.kind)
+			}
+			if !reflect.DeepEqual(r.Cursor, tc.cursor) {
+				t.Errorf("Cursor = %s, want %s", cursorString(r.Cursor), cursorString(tc.cursor))
 			}
 		})
 	}
@@ -456,7 +493,7 @@ func TestClassifyExtractsWrite(t *testing.T) {
 }
 
 func TestClassifyTableMatching(t *testing.T) {
-	qualified := map[string]string{"crm.contacts": "id"}
+	qualified := Tables{PK: map[string]string{"crm.contacts": "id"}}
 	cases := []struct {
 		sql  string
 		kind Kind

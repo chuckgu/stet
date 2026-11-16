@@ -118,6 +118,7 @@ type Result struct {
 	// Reads holds the config keys of the gated tables the statements read,
 	// sorted, and is set exactly when Kind is Read. A statement that writes
 	// a gated table is classified as that write; what it reads is not kept.
+	// Reads are looked for only when Tables.Reads is set.
 	Reads []string
 
 	// Cursor is set when the SQL is a single DECLARE CURSOR, FETCH, CLOSE,
@@ -132,22 +133,31 @@ type Result struct {
 
 const onBehalfOfSetting = "stet.on_behalf_of"
 
-// Classify parses sql (the text of one Query or Parse message). gated maps a
-// table name, optionally schema-qualified, to its primary key column.
+// Tables are the gated tables Classify looks for.
+type Tables struct {
+	// PK maps a table name, optionally schema-qualified (the config key), to
+	// its primary key column.
+	PK map[string]string
+	// Reads says whether any of them records reads. Without it no statement
+	// is examined for reads, so none is Read.
+	Reads bool
+}
+
+// Classify parses sql (the text of one Query or Parse message).
 //
 // SQL that writes no gated table is Read when any of its statements reads
-// one, and Pass otherwise.
+// one and tables.Reads is set, and Pass otherwise.
 //
 // An unqualified config name matches the table in any schema, and a
 // qualified one also matches unqualified references, since search_path may
 // resolve them there. Over-matching only means more writes get judged and
 // more reads counted.
-func Classify(sql string, gated map[string]string) (Result, error) {
+func Classify(sql string, tables Tables) (Result, error) {
 	tree, err := pg.Parse(sql)
 	if err != nil {
 		return Result{}, err
 	}
-	m := matcher(gated)
+	m := matcher(tables.PK)
 	var (
 		touching int
 		target   gatedWrite
@@ -166,8 +176,12 @@ func Classify(sql string, gated map[string]string) (Result, error) {
 	}
 	if touching == 0 {
 		r := Result{Kind: Pass, OnBehalfOf: obo}
-		if reads := readTables(tree.Stmts, m); reads != nil {
-			r.Kind, r.Reads = Read, reads
+		// With nothing to record them, reads are not looked for: the walk
+		// would cost every statement.
+		if tables.Reads {
+			if reads := readTables(tree.Stmts, m); reads != nil {
+				r.Kind, r.Reads = Read, reads
+			}
 		}
 		if len(tree.Stmts) == 1 {
 			r.Cursor = cursor(tree.Stmts[0].Stmt)

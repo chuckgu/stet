@@ -44,6 +44,7 @@ const (
 type Gate struct {
 	cfg     *config.Config
 	tables  map[string]string // config key → pk column
+	gated   sqlparse.Tables   // what Inspect hands the classifier
 	cands   map[string]named
 	ctxs    map[string]named
 	pool    *pgxpool.Pool
@@ -94,6 +95,9 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, d decide.Decid
 	if g.reads = newReadStats(readsOn, st.AddReads); g.reads != nil {
 		go g.record(readFlushEvery)
 	}
+	// With no table recording reads, statements are not examined for them:
+	// that walk would cost every statement and record nothing.
+	g.gated = sqlparse.Tables{PK: g.tables, Reads: g.reads != nil}
 	return g, nil
 }
 
@@ -109,7 +113,7 @@ func (g *Gate) Close() {
 // reads to be observed. A cursor statement always carries its cursor, so the
 // proxy can follow the names a DECLARE it observes binds.
 func (g *Gate) Inspect(sql string) proxy.Statement {
-	r, err := sqlparse.Classify(sql, g.tables)
+	r, err := sqlparse.Classify(sql, g.gated)
 	if err != nil {
 		// Postgres will reject it too; nothing to judge.
 		return proxy.Statement{SQL: sql}

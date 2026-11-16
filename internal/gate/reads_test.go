@@ -15,6 +15,7 @@ import (
 
 	"github.com/stetdb/stet/internal/gate"
 	"github.com/stetdb/stet/internal/proxy"
+	"github.com/stetdb/stet/internal/sqlparse"
 )
 
 // readsYAML records reads of the table: each one is counted, and one that
@@ -272,6 +273,23 @@ func TestReadsWithoutTheBlockAreNotSeen(t *testing.T) {
 		t.Errorf("stet.reads has %+v, want nothing", rows)
 	}
 	e.wantNoDecisions(t)
+}
+
+// When no table records reads, Inspect does not have statements examined for
+// reads: a read of a gated table classifies as Pass, as before reads were
+// counted. Cursor statements still carry their cursor.
+func TestInspectSkipsReadsWhenNoTableRecordsThem(t *testing.T) {
+	read := func(e *env) sqlparse.Result { return e.gate.Inspect("select * from " + e.table).Data.(sqlparse.Result) }
+	off := setupReads(t, tableYAML)
+	if r := read(off); r.Kind != sqlparse.Pass || r.Reads != nil {
+		t.Errorf("no table records reads: %v reads %v, want pass and no reads", r.Kind, r.Reads)
+	}
+	if st := off.gate.Inspect("fetch 10 from c"); st.Cursor == nil {
+		t.Error("no table records reads: a FETCH carries no cursor")
+	}
+	if r := read(setupReads(t, readsYAML)); r.Kind != sqlparse.Read {
+		t.Errorf("the table records reads: %v, want read", r.Kind)
+	}
 }
 
 func TestReadOfTwoTablesCountsOnlyTheOneTurnedOn(t *testing.T) {
