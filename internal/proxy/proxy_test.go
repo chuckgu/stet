@@ -37,11 +37,16 @@ func upstream(t *testing.T) string {
 
 func startProxy(t *testing.T, upstreamAddr string, gate proxy.Gate) (string, *proxy.Server) {
 	t.Helper()
+	return startProxyWith(t, upstreamAddr, gate, proxy.Policy{})
+}
+
+func startProxyWith(t *testing.T, upstreamAddr string, gate proxy.Gate, policy proxy.Policy) (string, *proxy.Server) {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := proxy.New(upstreamAddr, slog.New(slog.DiscardHandler), gate)
+	srv := proxy.New(upstreamAddr, slog.New(slog.DiscardHandler), gate, policy)
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(ln) }()
 	t.Cleanup(func() {

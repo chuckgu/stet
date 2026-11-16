@@ -1040,33 +1040,7 @@ func (e *env) rawSimpleQuery(t *testing.T, protocol uint32, user, sql string) st
 	if _, err := conn.Write(append(startup, params...)); err != nil {
 		t.Fatal(err)
 	}
-
-	// untilReady reads messages up to ReadyForQuery and returns the SQLSTATE
-	// of an ErrorResponse seen on the way.
-	untilReady := func() string {
-		code := ""
-		for {
-			var hdr [5]byte
-			if _, err := io.ReadFull(conn, hdr[:]); err != nil {
-				t.Fatalf("read: %v (SQLSTATE so far %q)", err, code)
-			}
-			body := make([]byte, binary.BigEndian.Uint32(hdr[1:])-4)
-			if _, err := io.ReadFull(conn, body); err != nil {
-				t.Fatal(err)
-			}
-			switch hdr[0] {
-			case 'E':
-				for _, field := range bytes.Split(body, []byte{0}) {
-					if len(field) > 1 && field[0] == 'C' {
-						code = string(field[1:])
-					}
-				}
-			case 'Z':
-				return code
-			}
-		}
-	}
-	if code := untilReady(); code != "" {
+	if code := untilReady(t, conn); code != "" {
 		t.Fatalf("startup failed with SQLSTATE %s", code)
 	}
 	query := append([]byte(sql), 0)
@@ -1074,7 +1048,69 @@ func (e *env) rawSimpleQuery(t *testing.T, protocol uint32, user, sql string) st
 	if _, err := conn.Write(append(msg, query...)); err != nil {
 		t.Fatal(err)
 	}
-	return untilReady()
+	return untilReady(t, conn)
+}
+
+// earlyQuery sends the startup packet of user, a role that needs no
+// password, and a simple query in one write, reads up to the second
+// ReadyForQuery, and returns the SQLSTATE of the query's error, or "" when it
+// succeeded.
+//
+// The proxy reads the query before the server's first ReadyForQuery reaches
+// it: the bytes are already waiting when the proxy starts relaying, while the
+// server first starts a new process for the connection and authenticates it.
+// So the statement reaches the gate with no login role, and the server runs
+// it once the session has authenticated.
+func (e *env) earlyQuery(t *testing.T, user, sql string) string {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", e.addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	params := "user\x00" + user + "\x00database\x00stet_test\x00\x00"
+	msg := binary.BigEndian.AppendUint32(nil, uint32(8+len(params)))
+	msg = binary.BigEndian.AppendUint32(msg, 3<<16)
+	msg = append(msg, params...)
+	query := append([]byte(sql), 0)
+	msg = append(msg, 'Q')
+	msg = binary.BigEndian.AppendUint32(msg, uint32(4+len(query)))
+	if _, err := conn.Write(append(msg, query...)); err != nil {
+		t.Fatal(err)
+	}
+	if code := untilReady(t, conn); code != "" {
+		t.Fatalf("startup failed with SQLSTATE %s", code)
+	}
+	return untilReady(t, conn)
+}
+
+// untilReady reads messages from conn up to ReadyForQuery and returns the
+// SQLSTATE of an ErrorResponse seen on the way.
+func untilReady(t *testing.T, conn net.Conn) string {
+	t.Helper()
+	code := ""
+	for {
+		var hdr [5]byte
+		if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+			t.Fatalf("read: %v (SQLSTATE so far %q)", err, code)
+		}
+		body := make([]byte, binary.BigEndian.Uint32(hdr[1:])-4)
+		if _, err := io.ReadFull(conn, body); err != nil {
+			t.Fatal(err)
+		}
+		switch hdr[0] {
+		case 'E':
+			for _, field := range bytes.Split(body, []byte{0}) {
+				if len(field) > 1 && field[0] == 'C' {
+					code = string(field[1:])
+				}
+			}
+		case 'Z':
+			return code
+		}
+	}
 }
 
 // unauthenticatedQuery opens a session through the proxy with the startup
@@ -1122,17 +1158,17 @@ func TestImpactIsNotMeasuredBeforeAuthentication(t *testing.T) {
 	wantNoModel(t, d)
 }
 
-// A session whose login role Stet does not know is not measured. Postgres
-// serves protocol 3.1 by negotiating it down, but the proxy cannot read that
-// startup packet, so the session has no role to measure as. Measuring anyway
-// would count as Stet's own account.
+// A write whose login role Stet does not know is not measured: here it is
+// sent before the session authenticated, so it has no role to measure as,
+// and the server still runs it. Measuring anyway would count as Stet's own
+// account.
 func TestImpactIsNotMeasuredWithoutALoginRole(t *testing.T) {
 	d := calm()
 	e := setup(t, d, impactYAML)
 	e.seedMany(t)
 	mustExec(t, e.admin, "grant all on "+e.table+" to stet_trust")
 
-	if code := e.rawSimpleQuery(t, 3<<16|1, "stet_trust", "update "+e.table+" set status = 'x' where company_id = 9"); code != "" {
+	if code := e.earlyQuery(t, "stet_trust", "update "+e.table+" set status = 'x' where company_id = 9"); code != "" {
 		t.Fatalf("the write failed with SQLSTATE %s", code)
 	}
 

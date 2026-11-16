@@ -2,8 +2,6 @@ package proxy
 
 import (
 	"bytes"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"slices"
 	"strconv"
@@ -48,6 +46,8 @@ type Statement struct {
 	Cursors []Cursor
 	// Several says the message holds more than one statement.
 	Several bool
+	// Clean marks a message whose statements are all BEGIN, START TRANSACTION, SET or SHOW.
+	Clean bool
 }
 
 type Param struct {
@@ -68,13 +68,18 @@ type SessionInfo struct {
 	// TxOpen means an explicit transaction was already open when the statement
 	// arrived (the last ReadyForQuery status was not idle).
 	TxOpen bool
+	// TxDirty means a statement other than BEGIN, START TRANSACTION, SET or
+	// SHOW has been sent since the server last reported the session idle,
+	// whether or not the server has answered it yet (spec 4).
+	TxDirty bool
 }
 
 type Outcome struct {
 	// Executed means the statement ran. It does not mean it was committed.
 	Executed bool
 	// Error holds the SQLSTATE and message when the statement failed or was
-	// skipped because an earlier one in the same Sync failed.
+	// skipped because an earlier one in the same Sync failed, or, when Lost,
+	// says the connection closed first.
 	Error string
 	// InTransaction means the statement ran inside an explicit transaction,
 	// or next to other statements under one Sync (an implicit transaction).
@@ -82,9 +87,10 @@ type Outcome struct {
 	// Rows is the row count from the statement's CommandComplete tag; nil when
 	// it did not complete or the tag carries no count.
 	Rows *int64
-	// Lost means the connection ended before the server answered. The
-	// statement may have run and committed; Executed is false because nothing
-	// said so.
+	// Lost means the connection ended before the server's ReadyForQuery for
+	// the statement. It may have run and committed. A watched write whose
+	// completion the server had already sent is Executed, with its Rows;
+	// otherwise Executed is false because nothing said it ran.
 	Lost bool
 	// Sent is how many row messages (DataRow, CopyData) went to the client in
 	// answer to the statement, also when it failed or was cancelled. Set only
@@ -116,10 +122,13 @@ type session struct {
 	// stopped: row messages sent since the last completion or error.
 	sent int64
 
-	mu      sync.Mutex
-	units   []*unit              // sent, not yet answered by ReadyForQuery; oldest first
-	ready   bool                 // the post-startup ReadyForQuery has arrived
-	status  byte                 // transaction status from the last ReadyForQuery
+	mu     sync.Mutex
+	units  []*unit // sent, not yet answered by ReadyForQuery; oldest first
+	ready  bool    // the post-startup ReadyForQuery has arrived
+	status byte    // transaction status from the last ReadyForQuery
+	// dirty: a unit answered since the last idle ReadyForQuery held a
+	// statement that is not clean. The units still waiting carry their own.
+	dirty   bool
 	cursors map[string]*declared // SQL cursors by name; nil until a DECLARE needs it
 	// unsettled holds the names in cursors whose newest entry can still change
 	// at a ReadyForQuery: all but held cursors that outlived their transaction.
@@ -144,8 +153,9 @@ type bound struct {
 type unit struct {
 	closed      bool // its Query or Sync was sent; nothing more joins it
 	query       bool
-	executes    int // Execute messages so far
-	completions int // CommandComplete, EmptyQueryResponse, PortalSuspended
+	dirty       bool // it holds a statement that is not clean (see Statement.Clean)
+	executes    int  // Execute messages so far
+	completions int  // CommandComplete, EmptyQueryResponse, PortalSuspended
 	err         string
 	errAt       int // the Execute the error belongs to (1-based)
 	writes      []watchedWrite
@@ -157,6 +167,9 @@ type unit struct {
 type watchedWrite struct {
 	handle any
 	idx    int // which Execute in the unit; 0 for a Query
+	// several: a Query of several statements, whose completions do not say
+	// which statement ran
+	several bool
 }
 
 type observedRead struct {
@@ -182,23 +195,6 @@ func newSession(g Gate, info SessionInfo) *session {
 		portals: map[string]bound{},
 		status:  'I',
 	}
-}
-
-// sessionInfo reads identity from the StartupMessage packet.
-func sessionInfo(pkt []byte) SessionInfo {
-	var id [16]byte
-	rand.Read(id[:])
-	info := SessionInfo{ID: hex.EncodeToString(id[:])}
-	var m pgproto3.StartupMessage
-	if m.Decode(pkt[4:]) == nil {
-		info.User = m.Parameters["user"]
-		info.Database = m.Parameters["database"]
-		if info.Database == "" {
-			info.Database = info.User
-		}
-		info.ApplicationName = m.Parameters["application_name"]
-	}
-	return info
 }
 
 func (s *session) clientTap() *tap {
@@ -238,6 +234,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 		u := s.push(&unit{closed: true, query: true})
 		var m pgproto3.Query
 		if body == nil || m.Decode(body) != nil {
+			s.markDirty(u) // it may hold anything
 			return
 		}
 		st := s.gate.Inspect(m.String)
@@ -253,6 +250,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 		case st.Observe:
 			s.observe(u, 0, st, nil)
 		}
+		s.dirties(u, st)
 
 	case 'P':
 		s.open()
@@ -268,8 +266,10 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 		if body == nil || m.Decode(body) != nil {
 			return
 		}
+		// A portal is remembered when its Execute does something beyond
+		// leaving the transaction dirty; one not remembered dirties it.
 		p, ok := s.stmts[m.PreparedStatement]
-		if !ok || (!p.st.Watch && !p.st.Observe && p.st.OnBehalfOf == nil && len(p.st.Cursors) == 0) {
+		if !ok || (!p.st.Watch && !p.st.Observe && !p.st.Clean && p.st.OnBehalfOf == nil && len(p.st.Cursors) == 0) {
 			delete(s.portals, m.DestinationPortal)
 			return
 		}
@@ -290,10 +290,12 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 		s.mu.Unlock()
 		var m pgproto3.Execute
 		if body == nil || m.Decode(body) != nil {
+			s.markDirty(u) // it may run anything
 			return
 		}
 		b, ok := s.portals[m.Portal]
 		if !ok {
+			s.markDirty(u) // a portal of no statement Stet follows
 			return
 		}
 		s.apply(b.st)
@@ -308,6 +310,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 		case b.st.Observe:
 			s.observe(u, idx, b.st, b.rows)
 		}
+		s.dirties(u, b.st)
 
 	case 'C':
 		s.open()
@@ -334,7 +337,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 		s.mu.Unlock()
 
 	case 'F':
-		s.push(&unit{closed: true})
+		s.push(&unit{closed: true, dirty: true}) // the function may change anything
 	}
 }
 
@@ -342,6 +345,45 @@ func (s *session) apply(st Statement) {
 	if st.OnBehalfOf != nil {
 		s.info.OnBehalfOf = *st.OnBehalfOf
 	}
+}
+
+// dirties marks u when the message st stands for, sent as part of u, is not
+// clean: the transaction it runs in is dirty from then on. A watched write
+// is never clean; it marks u only here, after Begin was told whether the
+// transaction was clean when it arrived.
+func (s *session) dirties(u *unit, st Statement) {
+	if st.Watch || !st.Clean {
+		s.markDirty(u)
+	}
+}
+
+// markDirty notes that u holds a statement that is not clean.
+func (s *session) markDirty(u *unit) {
+	s.mu.Lock()
+	u.dirty = true
+	s.mu.Unlock()
+}
+
+// carry moves the transaction marks of u, which is no longer waiting while
+// the transaction it ran in may still be open, to the session. It runs with
+// s.mu held.
+func (s *session) carry(u *unit) {
+	s.dirty = s.dirty || u.dirty
+}
+
+// txDirty reports whether a statement that is not clean was sent since the
+// server last reported the session idle: in a unit answered since then, or in
+// one still waiting. It runs with s.mu held.
+func (s *session) txDirty() bool {
+	if s.dirty {
+		return true
+	}
+	for _, u := range s.units {
+		if u.dirty {
+			return true
+		}
+	}
+	return false
 }
 
 // begin hands a watched write to the gate. Messages already queued go out
@@ -353,7 +395,7 @@ func (s *session) begin(u *unit, idx int, st Statement, ps []Param, flush func()
 	s.mu.Unlock()
 	h := s.gate.Begin(info, st, ps)
 	s.mu.Lock()
-	u.writes = append(u.writes, watchedWrite{handle: h, idx: idx})
+	u.writes = append(u.writes, watchedWrite{handle: h, idx: idx, several: st.Several})
 	s.mu.Unlock()
 }
 
@@ -377,13 +419,16 @@ func (s *session) arriving(st Statement, idx int, total *int64) observedRead {
 // identity is the session as the gate is told of a statement arriving now.
 // Until the server's first ReadyForQuery the client has not authenticated,
 // so the role its startup packet names is not passed on. TxOpen is whether
-// the last ReadyForQuery left a transaction open. It runs with s.mu held.
+// the last ReadyForQuery left a transaction open, TxDirty whether a statement
+// that is not clean was sent since the last idle one; the statement arriving
+// has not marked its unit yet. It runs with s.mu held.
 func (s *session) identity() SessionInfo {
 	info := s.info
 	if !s.ready {
 		info.User = ""
 	}
 	info.TxOpen = s.status != 'I'
+	info.TxDirty = s.txDirty()
 	return info
 }
 
@@ -443,6 +488,11 @@ func (s *session) fromServer(t byte, body []byte) {
 		}
 		before := s.status
 		s.status = status
+		if status == 'I' {
+			// No transaction is open: what was answered before cannot
+			// make the next one dirty. The units still waiting keep theirs.
+			s.dirty = false
+		}
 		if !s.ready {
 			s.ready = true
 			s.mu.Unlock()
@@ -453,6 +503,9 @@ func (s *session) fromServer(t byte, body []byte) {
 			return
 		}
 		s.units = s.units[1:]
+		if status != 'I' {
+			s.carry(head)
+		}
 		if len(s.unsettled) > 0 {
 			s.cursorsAnswered(head, status)
 		}
@@ -595,7 +648,7 @@ func (s *session) abandon() {
 		u.tally()
 		inTx := status != 'I' || u.executes > 1
 		for _, w := range u.writes {
-			s.gate.End(w.handle, u.unanswered(w.idx, inTx))
+			s.gate.End(w.handle, u.unansweredWrite(w, inTx))
 		}
 		for _, r := range u.reads {
 			o := u.unanswered(r.idx, inTx)
@@ -617,6 +670,22 @@ func (u *unit) unanswered(idx int, inTx bool) Outcome {
 	} else {
 		o.Error = "connection closed before ReadyForQuery"
 		o.Lost = true
+	}
+	return o
+}
+
+// unansweredWrite is unanswered for the watched write w. Once the server
+// completed it, it ran: Executed and Rows are set, and it stays Lost, since
+// nothing said whether its unit committed. A Query of several statements is
+// left as it is: a completion does not say which of them ran.
+func (u *unit) unansweredWrite(w watchedWrite, inTx bool) Outcome {
+	o := u.unanswered(w.idx, inTx)
+	switch {
+	case !o.Lost: // the server's error
+	case u.query && !w.several && u.completions > 0:
+		o.Executed, o.Rows = true, u.rowsAt(1)
+	case !u.query && u.completions >= w.idx:
+		o.Executed, o.Rows = true, u.rowsAt(w.idx)
 	}
 	return o
 }

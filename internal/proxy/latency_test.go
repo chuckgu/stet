@@ -17,13 +17,20 @@ const latencyWarmUp, latencyTrips = 200, 2000
 // returns how much the proxy adds at p95. label names the case in the log.
 func addedLatency(t *testing.T, gate proxy.Gate, label string) time.Duration {
 	t.Helper()
+	return addedLatencyWith(t, gate, proxy.Policy{}, "stet_scram", label)
+}
+
+// addedLatencyWith is addedLatency through a proxy with policy, both
+// connections logged in as user.
+func addedLatencyWith(t *testing.T, gate proxy.Gate, policy proxy.Policy, user, label string) time.Duration {
+	t.Helper()
 	if testing.Short() {
 		t.Skip("latency measurement skipped in -short mode")
 	}
 	up := upstream(t)
-	addr, _ := startProxy(t, up, gate)
-	direct := connect(t, up, "stet_scram", nil)
-	proxied := connect(t, addr, "stet_scram", nil)
+	addr, _ := startProxyWith(t, up, gate, policy)
+	direct := connect(t, up, user, nil)
+	proxied := connect(t, addr, user, nil)
 	ctx := testCtx(t)
 
 	roundTrip := func(conn *pgx.Conn) time.Duration {
@@ -74,5 +81,19 @@ func TestObservedReadLatencyBudget(t *testing.T) {
 	}
 	if added > 2*time.Millisecond {
 		t.Errorf("an observed read adds %v at p95, budget is 2ms", added)
+	}
+}
+
+// Spec 3 of the enforce spec: the session of a role not listed as an agent's
+// is relayed as if there were no gate. It stays inside the 2ms budget at p95
+// and the gate never hears of it.
+func TestUnwatchedSessionLatencyBudget(t *testing.T) {
+	g := newRecordingGate(isWrite)
+	added := addedLatencyWith(t, g, proxy.Policy{Agents: []string{"stet_md5"}}, "stet_scram", "unwatched select 1")
+	if n := g.inspectCount(); n != 0 {
+		t.Errorf("Inspect ran %d times for a session that is not watched, want never", n)
+	}
+	if added > 2*time.Millisecond {
+		t.Errorf("an unwatched session adds %v at p95, budget is 2ms", added)
 	}
 }

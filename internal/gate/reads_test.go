@@ -710,14 +710,14 @@ func TestDiscardAllForgetsHeldCursors(t *testing.T) {
 	wantCounts(t, e.reads(t), map[string]count{"stet_scram": {Statements: 1, Rows: 2, MaxRows: 2}})
 }
 
-// A session whose startup packet the proxy cannot read has no login role;
-// its reads are counted under the empty role "". Its large reads leave
-// login_role NULL, as stet.decisions does.
+// A read with no login role (here, sent before the session authenticated) is
+// counted under the empty role "". Its large reads leave login_role NULL, as
+// stet.decisions does.
 func TestReadsWithoutALoginRoleUseAnEmptyRole(t *testing.T) {
 	e := setupReads(t, readsYAML)
 	e.seedMany(t)
 	mustExec(t, e.admin, "grant select on "+e.table+" to stet_trust")
-	if code := e.rawSimpleQuery(t, 3<<16|1, "stet_trust", "select * from "+e.table); code != "" {
+	if code := e.earlyQuery(t, "stet_trust", "select * from "+e.table); code != "" {
 		t.Fatalf("the read failed with SQLSTATE %s", code)
 	}
 

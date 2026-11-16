@@ -115,10 +115,11 @@ func (g *Gate) Close() {
 func (g *Gate) Inspect(sql string) proxy.Statement {
 	r, err := sqlparse.Classify(sql, g.gated)
 	if err != nil {
-		// Postgres will reject it too; nothing to judge.
+		// Postgres will reject it too; nothing to judge. Not Clean: what
+		// cannot be read leaves the transaction dirty.
 		return proxy.Statement{SQL: sql}
 	}
-	st := proxy.Statement{SQL: sql, Watch: r.Kind == sqlparse.Gated || r.Kind == sqlparse.Measured || r.Kind == sqlparse.Unsupported, OnBehalfOf: r.OnBehalfOf}
+	st := proxy.Statement{SQL: sql, Watch: r.Kind == sqlparse.Gated || r.Kind == sqlparse.Measured || r.Kind == sqlparse.Unsupported, OnBehalfOf: r.OnBehalfOf, Clean: r.Clean}
 	if r.Kind == sqlparse.Read {
 		st.Observe = g.recordsAny(r.Reads)
 	}

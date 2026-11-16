@@ -75,7 +75,7 @@ func (e *env) restart(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := proxy.New(os.Getenv("STET_TEST_PG"), slog.New(slog.DiscardHandler), g)
+	srv := proxy.New(os.Getenv("STET_TEST_PG"), slog.New(slog.DiscardHandler), g, proxy.Policy{Agents: e.cfg.AgentRoles})
 	go srv.Serve(ln)
 	t.Cleanup(func() {
 		srv.Close()
@@ -492,15 +492,15 @@ func TestCumulativeKeepsALostWrite(t *testing.T) {
 	wantUsage(t, 1, e.accounts(t, 2)[1], 2, 1)
 }
 
-// Postgres serves protocol 3.1 by negotiating it down, but the proxy cannot
-// read that startup packet, so the session has no login role to count for.
+// A write sent before its session authenticated has no login role to count
+// for, although the server runs it once the session has.
 func TestCumulativeIsNotAppliedWithoutALoginRole(t *testing.T) {
 	e := setup(t, calm(), cumYAML)
 	e.seedMany(t)
 	mustExec(t, e.admin, "grant all on "+e.table+" to stet_trust")
 	for i := range 6 {
 		sql := fmt.Sprintf("update %s set title = 't%d' where id = %d", e.table, i, i+1)
-		if code := e.rawSimpleQuery(t, 3<<16|1, "stet_trust", sql); code != "" {
+		if code := e.earlyQuery(t, "stet_trust", sql); code != "" {
 			t.Fatalf("write %d failed with SQLSTATE %s", i, code)
 		}
 	}

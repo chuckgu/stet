@@ -103,7 +103,7 @@ func runProxy(args []string) error {
 	if g != nil {
 		pg = g
 	}
-	srv := proxy.New(cfg.UpstreamAddr(), log, pg)
+	srv := proxy.New(cfg.UpstreamAddr(), log, pg, proxy.Policy{Agents: cfg.AgentRoles})
 	closed := make(chan struct{})
 	go func() {
 		<-ctx.Done()

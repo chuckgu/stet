@@ -31,10 +31,11 @@ type recordingGate struct {
 	// observeMatch chooses the statements observed as reads; nil observes none.
 	observeMatch func(sql string) bool
 
-	mu     sync.Mutex
-	begins []began
-	ends   map[int]proxy.Outcome
-	reads  []observation
+	mu       sync.Mutex
+	inspects int // Inspect calls
+	begins   []began
+	ends     map[int]proxy.Outcome
+	reads    []observation
 }
 
 type observation struct {
@@ -54,10 +55,18 @@ func newRecordingGate(match func(string) bool) *recordingGate {
 	return &recordingGate{match: match, ends: map[int]proxy.Outcome{}}
 }
 
-var oboRE = regexp.MustCompile(`(?i)^\s*(?:set\s+stet\.on_behalf_of\s*=\s*'([^']*)'|reset\s+stet\.on_behalf_of)`)
+var (
+	oboRE = regexp.MustCompile(`(?i)^\s*(?:set\s+stet\.on_behalf_of\s*=\s*'([^']*)'|reset\s+stet\.on_behalf_of)`)
+	// The statements that leave a transaction clean, as the classifier marks
+	// them; the test double reads one statement per message.
+	cleanRE = regexp.MustCompile(`(?i)^\s*(begin|start\s+transaction|set|show)\b`)
+)
 
 func (g *recordingGate) Inspect(sql string) proxy.Statement {
-	st := proxy.Statement{SQL: sql, Watch: g.match(sql), Observe: g.observeMatch != nil && g.observeMatch(sql)}
+	g.mu.Lock()
+	g.inspects++
+	g.mu.Unlock()
+	st := proxy.Statement{SQL: sql, Watch: g.match(sql), Observe: g.observeMatch != nil && g.observeMatch(sql), Clean: cleanRE.MatchString(sql)}
 	if m := oboRE.FindStringSubmatch(sql); m != nil {
 		st.OnBehalfOf = &m[1]
 	}
@@ -143,6 +152,12 @@ func (g *recordingGate) beginCount() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return len(g.begins)
+}
+
+func (g *recordingGate) inspectCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.inspects
 }
 
 // outcomes waits until n writes have ended and returns them in Begin order.
@@ -395,6 +410,138 @@ func TestGateSeesOpenTransaction(t *testing.T) {
 	}
 }
 
+// A write is in a clean transaction when nothing but BEGIN, SET or SHOW was
+// sent since the server last reported the session idle, whether answered or
+// not (spec 4). TxOpen keeps its meaning: the last ReadyForQuery was not idle.
+func TestGateSeesCleanTransactions(t *testing.T) {
+	table := watchedTable(t)
+	g := newRecordingGate(watches(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+	ctx := testCtx(t)
+	exec := func(tx pgx.Tx, sql string) {
+		t.Helper()
+		if _, err := tx.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	insert := func(id int) string { return fmt.Sprintf("insert into %s values (%d, 'x')", table, id) }
+
+	mustExec(t, conn, insert(1))
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(tx, insert(2))
+	exec(tx, insert(3))
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if tx, err = conn.Begin(ctx); err != nil {
+		t.Fatal(err)
+	}
+	exec(tx, "select 1")
+	exec(tx, insert(4))
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// BEGIN and the write under one Sync, as pgjdbc sends them.
+	p := conn.PgConn().StartPipeline(ctx)
+	p.SendQueryParams("begin", nil, nil, nil, nil)
+	p.SendQueryParams(insert(5), nil, nil, nil, nil)
+	p.SendPipelineSync()
+	if err := p.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	for synced := false; !synced; {
+		res, err := p.GetResults()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch r := res.(type) {
+		case *pgconn.ResultReader:
+			if _, err := r.Close(); err != nil {
+				t.Fatal(err)
+			}
+		case *pgconn.PipelineSync:
+			synced = true
+		case nil:
+			t.Fatal("the pipeline ended before its Sync was answered")
+		}
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, "commit")
+
+	bs, _ := g.outcomes(t, 5)
+	wantDirty := []bool{false, false, true, true, false}
+	wantOpen := []bool{false, true, true, true, false}
+	for i, b := range bs {
+		if b.info.TxDirty != wantDirty[i] || b.info.TxOpen != wantOpen[i] {
+			t.Errorf("write %d (%s): TxDirty %v TxOpen %v, want %v and %v", i+1, b.st.SQL, b.info.TxDirty, b.info.TxOpen, wantDirty[i], wantOpen[i])
+		}
+	}
+}
+
+// Only the sessions of the listed login roles are shown to the gate. Another
+// role's session is relayed without it: nothing is inspected or begun.
+func TestSessionsOfOtherRolesAreNotSeen(t *testing.T) {
+	table := watchedTable(t)
+	admin := connect(t, upstream(t), "stet_scram", nil)
+	mustExec(t, admin, "grant insert on "+table+" to stet_md5") // dropped with the table
+	g := newRecordingGate(watches(table))
+	addr, _ := startProxyWith(t, upstream(t), g, proxy.Policy{Agents: []string{"stet_md5"}})
+	ctx := testCtx(t)
+
+	other := connect(t, addr, "stet_scram", nil)
+	mustExec(t, other, "insert into "+table+" values (1, 'simple')")
+	if _, err := other.Exec(ctx, "insert into "+table+" values ($1, $2)", 2, "extended"); err != nil {
+		t.Fatal(err)
+	}
+	other.Close(ctx)
+	if n, b := g.inspectCount(), g.beginCount(); n != 0 || b != 0 {
+		t.Errorf("a role not listed: Inspect ran %d times and Begin %d, want never", n, b)
+	}
+
+	agent := connect(t, addr, "stet_md5", nil)
+	mustExec(t, agent, "insert into "+table+" values (3, 'agent')")
+	bs, os := g.outcomes(t, 1)
+	if len(bs) != 1 || bs[0].info.User != "stet_md5" || !os[0].Executed {
+		t.Errorf("writes begun: %+v, outcomes %+v; want the agent's one, as stet_md5, executed", bs, os)
+	}
+
+	var n int
+	if err := admin.QueryRow(ctx, "select count(*) from "+table).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Errorf("%d rows in the table, want 3: every write runs", n)
+	}
+}
+
+// The server serves a protocol 3.1 startup packet by negotiating the version
+// down; the proxy reads the login role from it all the same.
+func TestProtocol31SessionHasItsLoginRole(t *testing.T) {
+	table := watchedTable(t)
+	admin := connect(t, upstream(t), "stet_scram", nil)
+	mustExec(t, admin, "grant insert on "+table+" to stet_trust") // dropped with the table
+	g := newRecordingGate(watches(table))
+	addr, _ := startProxy(t, upstream(t), g)
+
+	fe := rawSession(t, addr, "stet_trust", 3<<16|1)
+	fe.Send(&pgproto3.Query{String: "insert into " + table + " values (1, 'x')"})
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	untilReady(t, fe)
+
+	if bs, _ := g.outcomes(t, 1); bs[0].info.User != "stet_trust" {
+		t.Errorf("login role %q, want stet_trust", bs[0].info.User)
+	}
+}
+
 func TestGateSeesLostWrites(t *testing.T) {
 	table := watchedTable(t)
 	g := newRecordingGate(watches(table))
@@ -617,7 +764,7 @@ func TestGateObservesPortalFetchedInParts(t *testing.T) {
 	g := newObservingGate(readsOf(table))
 	addr, _ := startProxy(t, upstream(t), g)
 
-	fe := rawSession(t, addr, "stet_trust")
+	fe := rawSession(t, addr, "stet_trust", pgproto3.ProtocolVersionNumber)
 	fe.Send(&pgproto3.Parse{Query: "select * from " + table + " order by id"})
 	fe.Send(&pgproto3.Bind{})
 	for range 3 {
@@ -669,7 +816,7 @@ func TestReadsInPartsCarryTheRowsBefore(t *testing.T) {
 	mustExec(t, conn, "commit")
 	mustExec(t, conn, "select * from "+table+" where id <= 10")
 
-	fe := rawSession(t, addr, "stet_trust")
+	fe := rawSession(t, addr, "stet_trust", pgproto3.ProtocolVersionNumber)
 	fe.Send(&pgproto3.Parse{Query: "select * from " + table + " order by id"})
 	fe.Send(&pgproto3.Bind{})
 	for range 3 {
@@ -906,9 +1053,9 @@ func TestLoginRoleIsPassedOnlyOnceAuthenticated(t *testing.T) {
 }
 
 // rawSession opens a session through the proxy as a role that needs no
-// password and returns a frontend past startup, for messages pgx has no API
-// for.
-func rawSession(t *testing.T, addr, user string) *pgproto3.Frontend {
+// password, with a startup packet of the given protocol version, and returns
+// a frontend past startup, for messages pgx has no API for.
+func rawSession(t *testing.T, addr, user string, protocol uint32) *pgproto3.Frontend {
 	t.Helper()
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
@@ -919,7 +1066,7 @@ func rawSession(t *testing.T, addr, user string) *pgproto3.Frontend {
 
 	fe := pgproto3.NewFrontend(conn, conn)
 	fe.Send(&pgproto3.StartupMessage{
-		ProtocolVersion: pgproto3.ProtocolVersionNumber,
+		ProtocolVersion: protocol,
 		Parameters:      map[string]string{"user": user, "database": "stet_test"},
 	})
 	if err := fe.Flush(); err != nil {

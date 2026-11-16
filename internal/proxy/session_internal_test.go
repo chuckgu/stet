@@ -87,16 +87,137 @@ func TestAbandonLosesUnansweredWrites(t *testing.T) {
 	if o := g.ends[0]; !o.Lost || o.Executed || o.Error != "connection closed before ReadyForQuery" {
 		t.Errorf("unanswered write: %+v, want lost", o)
 	}
+}
 
-	// CommandComplete arrived but ReadyForQuery did not: nothing says the
-	// unit committed.
-	g = newFakeGate()
-	s = readySession(g)
+// CommandComplete arrived but ReadyForQuery did not: the write ran, and
+// nothing says whether its unit committed, so it is lost as well.
+func TestAbandonKnowsACompletedWriteRan(t *testing.T) {
+	g := newFakeGate()
+	s := readySession(g)
+	flush := func() error { return nil }
 	s.fromClient('Q', body(&pgproto3.Query{String: "insert into t values (1)"}), flush)
 	s.fromServer('C', body(&pgproto3.CommandComplete{CommandTag: []byte("INSERT 0 1")}))
 	s.abandon()
-	if o := g.ends[0]; !o.Lost || o.Executed {
-		t.Errorf("completed but unconfirmed write: %+v, want lost", o)
+	if o := g.ends[0]; !o.Lost || !o.Executed || o.Rows == nil || *o.Rows != 1 {
+		t.Errorf("completed but unconfirmed write: %+v, want executed, lost, 1 row", o)
+	}
+
+	// Under one Sync the first write completed and the second had not.
+	g = newFakeGate()
+	s = readySession(g)
+	sendWrite(s, "a")
+	sendWrite(s, "b")
+	s.fromClient('S', nil, flush)
+	serve(s, &pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, tag("INSERT 0 1"),
+		&pgproto3.ParseComplete{}, &pgproto3.BindComplete{})
+	s.abandon()
+	if o := g.ends[0]; !o.Lost || !o.Executed || o.Rows == nil || *o.Rows != 1 {
+		t.Errorf("completed write under a Sync: %+v, want executed, lost, 1 row", o)
+	}
+	if o := g.ends[1]; !o.Lost || o.Executed || o.Rows != nil {
+		t.Errorf("unanswered write under a Sync: %+v, want lost and not executed", o)
+	}
+
+	// A completion in a Query of several statements does not say which one
+	// ran.
+	tg := &txGate{fakeGate: newFakeGate()}
+	s = readySession(tg)
+	s.fromClient('Q', body(&pgproto3.Query{String: "select 1; insert into t values (1)"}), flush)
+	serve(s, &pgproto3.RowDescription{}, row, tag("SELECT 1"))
+	s.abandon()
+	if o := tg.ends[0]; !o.Lost || o.Executed {
+		t.Errorf("write among several statements: %+v, want lost and not executed", o)
+	}
+}
+
+// txGate marks begin, set and show clean and watches every message that
+// mentions insert, recording the session as each write arrived. The
+// statements of a message are separated by "; ".
+type txGate struct {
+	*fakeGate
+	infos []SessionInfo
+}
+
+func (g *txGate) Inspect(sql string) Statement {
+	st := Statement{SQL: sql, Several: strings.Contains(sql, "; "), Watch: strings.Contains(sql, "insert")}
+	switch first, _, _ := strings.Cut(sql, " "); first {
+	case "begin", "set", "show":
+		st.Clean = !st.Several
+	}
+	return st
+}
+
+func (g *txGate) Begin(info SessionInfo, st Statement, ps []Param) any {
+	g.infos = append(g.infos, info)
+	return g.fakeGate.Begin(info, st, ps)
+}
+
+// drive sends steps through s. A word is a Query of that SQL; Z(x) is the
+// server's ReadyForQuery with status x; E:sql is a Parse, Bind and Execute of
+// sql, unnamed, in the open unit; E? is an Execute of a portal no Bind named;
+// Q! and E! are a Query and an Execute whose bodies could not be read; S is a
+// Sync and F a FunctionCall.
+func drive(s *session, steps string) {
+	flush := func() error { return nil }
+	for _, step := range strings.Fields(steps) {
+		switch {
+		case strings.HasPrefix(step, "Z("):
+			s.fromServer('Z', []byte{step[2]})
+		case strings.HasPrefix(step, "E:"):
+			execute(s, "", step[2:])
+		case step == "E?":
+			s.fromClient('E', body(&pgproto3.Execute{Portal: "nowhere"}), flush)
+		case step == "E!":
+			s.fromClient('E', nil, flush)
+		case step == "Q!":
+			s.fromClient('Q', nil, flush)
+		case step == "S":
+			s.fromClient('S', nil, flush)
+		case step == "F":
+			s.fromClient('F', body(&pgproto3.FunctionCall{Function: 1}), flush)
+		default:
+			s.fromClient('Q', body(&pgproto3.Query{String: step}), flush)
+		}
+	}
+}
+
+// A write's TxDirty says whether anything but BEGIN, SET or SHOW was sent
+// since the server last reported the session idle, answered or not (spec 4).
+func TestTxDirtyFollowsWhatWasSent(t *testing.T) {
+	for _, c := range []struct {
+		sent string
+		want []bool // TxDirty of each insert, in order
+	}{
+		{"insert", []bool{false}},
+		{"begin Z(T) insert Z(T) insert", []bool{false, true}},
+		{"begin Z(T) set Z(T) show Z(T) insert", []bool{false}},
+		{"begin Z(T) select Z(T) insert", []bool{true}},
+		{"begin insert", []bool{false}},
+		{"select insert Z(I) Z(I) insert", []bool{true, false}},
+		{"select begin Z(I) insert", []bool{false}},
+		{"select begin select Z(I) insert", []bool{true}},
+		{"E:begin E:insert E:insert S", []bool{false, true}},
+		{"E:select E:insert S", []bool{true}},
+		{"E? E:insert S", []bool{true}},
+		{"F insert", []bool{true}},
+		{"begin Z(T) garbage Z(T) insert", []bool{true}},
+		{"commit Z(I) insert", []bool{false}},
+		// Beyond the plan's table: dirt carried by the session until an idle
+		// ReadyForQuery, and messages the proxy could not read.
+		{"begin Z(T) select Z(T) commit Z(I) insert", []bool{false}},
+		{"begin Z(T) select Z(E) insert", []bool{true}},
+		{"begin Z(T) Q! Z(T) insert", []bool{true}},
+		{"E:begin E! E:insert S", []bool{true}},
+	} {
+		g := &txGate{fakeGate: newFakeGate()}
+		drive(readySession(g), c.sent)
+		var got []bool
+		for _, info := range g.infos {
+			got = append(got, info.TxDirty)
+		}
+		if !slices.Equal(got, c.want) {
+			t.Errorf("%s: TxDirty %v, want %v", c.sent, got, c.want)
+		}
 	}
 }
 

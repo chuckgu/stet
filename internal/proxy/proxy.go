@@ -37,6 +37,7 @@ type Server struct {
 	upstream string
 	log      *slog.Logger
 	gate     Gate
+	policy   Policy
 
 	mu     sync.Mutex
 	ln     net.Listener
@@ -45,10 +46,11 @@ type Server struct {
 	wg     sync.WaitGroup
 }
 
-// New returns a proxy that forwards clients to upstream (host:port). With a
-// nil gate it is a plain passthrough.
-func New(upstream string, log *slog.Logger, gate Gate) *Server {
-	return &Server{upstream: upstream, log: log, gate: gate, conns: make(map[net.Conn]struct{})}
+// New returns a proxy that forwards clients to upstream (host:port). The gate
+// is shown the sessions policy watches; the others, and every session when
+// gate is nil, are a plain passthrough.
+func New(upstream string, log *slog.Logger, gate Gate, policy Policy) *Server {
+	return &Server{upstream: upstream, log: log, gate: gate, policy: policy, conns: make(map[net.Conn]struct{})}
 }
 
 // Serve accepts connections on ln until Close is called, then returns nil.
@@ -164,14 +166,27 @@ func (s *Server) handle(client net.Conn) {
 	}
 	start := time.Now()
 	s.log.Debug("session started", "remote", client.RemoteAddr())
-	if s.gate == nil {
+	if ss := s.watch(pkt); ss == nil {
 		relay(client, server, nil, nil)
 	} else {
-		ss := newSession(s.gate, sessionInfo(pkt))
 		relay(client, server, ss.clientTap(), ss.serverTap())
 		ss.abandon()
 	}
 	s.log.Debug("session ended", "remote", client.RemoteAddr(), "duration", time.Since(start))
+}
+
+// watch returns the session to tap when the gate is shown the session that
+// startup packet pkt opens, and nil when the proxy only relays it.
+func (s *Server) watch(pkt []byte) *session {
+	if s.gate == nil {
+		return nil
+	}
+	info, ok := startupInfo(pkt)
+	if !s.policy.watches(info, ok) {
+		return nil
+	}
+	info.ID = newSessionID()
+	return newSession(s.gate, info)
 }
 
 // forwardCancel passes a CancelRequest to upstream on a fresh connection.
