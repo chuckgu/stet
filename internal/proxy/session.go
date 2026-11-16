@@ -368,8 +368,8 @@ func (s *session) observe(u *unit, idx int, st Statement, rows *int64) {
 
 // arriving records a read reported as st, arriving now from the client as
 // Execute idx of its unit (0 for a Query), that counts toward total (nil for
-// a read in one go). It runs on the client side with
-// s.mu held, and only for reads, so no other statement pays for the clock.
+// a read in one go). It runs on the client side with s.mu held, and only for
+// reads, so no other statement pays for the clock.
 func (s *session) arriving(st Statement, idx int, total *int64) observedRead {
 	return observedRead{info: s.identity(), st: st, idx: idx, at: time.Now(), total: total}
 }
