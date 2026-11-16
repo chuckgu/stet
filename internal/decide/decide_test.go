@@ -213,3 +213,47 @@ func TestRegisteredAdapter(t *testing.T) {
 		t.Fatalf("registered adapter not found: %v", err)
 	}
 }
+
+func TestVerdictImpact(t *testing.T) {
+	n := func(v int64) *int64 { return &v }
+	f := func(v float64) *float64 { return &v }
+	lim := &config.Impact{MaxRows: 100, MaxShare: 0.5}
+	cases := []struct {
+		name    string
+		in      Input
+		verdict string
+		reasons []string
+	}{
+		{"counted, within limits", Input{Op: "update", ImpactLimit: lim,
+			Impact: &Impact{Method: "count", Rows: n(99), TableRows: n(1000), Share: f(0.099)}}, Commit, nil},
+		{"zero rows", Input{Op: "delete", ImpactLimit: lim, Impact: &Impact{Method: "count", Rows: n(0)}}, Commit, nil},
+		{"capped", Input{Op: "delete", ImpactLimit: lim,
+			Impact: &Impact{Method: "count", Rows: n(101), Capped: true, Cap: 101}}, Hold, []string{"impact:rows"}},
+		{"estimate over the row limit", Input{Op: "update", ImpactLimit: lim,
+			Impact: &Impact{Method: "estimate", Rows: n(150)}}, Hold, []string{"impact:rows"}},
+		{"share over the limit", Input{Op: "delete", ImpactLimit: lim,
+			Impact: &Impact{Method: "count", Rows: n(40), TableRows: n(50), Share: f(0.8)}}, Hold, []string{"impact:share"}},
+		{"rows and share both over: rows wins", Input{Op: "delete", ImpactLimit: lim,
+			Impact: &Impact{Method: "count", Rows: n(101), Capped: true, Share: f(0.9)}}, Hold, []string{"impact:rows"}},
+		{"share does not apply to inserts", Input{Op: "insert", ImpactLimit: lim,
+			Impact: &Impact{Method: "syntax", Rows: n(40), Share: f(0.8)}}, Commit, nil},
+		{"table never analyzed: no share", Input{Op: "delete", ImpactLimit: lim,
+			Impact: &Impact{Method: "count", Rows: n(40)}}, Commit, nil},
+		{"no share limit configured", Input{Op: "delete", ImpactLimit: &config.Impact{MaxRows: 100},
+			Impact: &Impact{Method: "count", Rows: n(40), Share: f(0.8)}}, Commit, nil},
+		{"estimate only, within limits", Input{Op: "update", ImpactLimit: lim,
+			Impact: &Impact{Method: "estimate", Rows: n(50)}}, Escalate, []string{"impact:uncertain"}},
+		{"measuring failed", Input{Op: "update", ShapeReason: "not_single_row", ImpactLimit: lim,
+			Impact: &Impact{Error: "set role: permission denied"}}, Unsupported, []string{"not_single_row"}},
+		{"unsupported wins over impact", Input{Unsupported: "in_transaction", Op: "update", ImpactLimit: lim,
+			Impact: &Impact{Method: "count", Rows: n(500), Capped: true}}, Unsupported, []string{"in_transaction"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v, reasons := Verdict(tc.in)
+			if v != tc.verdict || !reflect.DeepEqual(reasons, tc.reasons) {
+				t.Errorf("got %s %v, want %s %v", v, reasons, tc.verdict, tc.reasons)
+			}
+		})
+	}
+}

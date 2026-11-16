@@ -187,12 +187,20 @@ type Input struct {
 	Answers     map[string]Answer
 	Thresholds  config.Thresholds
 	OnFailure   string // pass | hold
+
+	Op          string         // insert | update | delete; the share limit skips inserts
+	ShapeReason string         // the reason a measured write had before; used when measuring failed
+	Impact      *Impact        // set for a measured write on a table with impact limits
+	ImpactLimit *config.Impact // the table's limits
 }
 
 // Verdict applies spec 6: the first matching rule decides.
 func Verdict(in Input) (string, []string) {
 	if in.Unsupported != "" {
 		return Unsupported, []string{in.Unsupported}
+	}
+	if in.Impact != nil {
+		return impactVerdict(in)
 	}
 	if in.StateErr != nil || in.ModelErr != nil {
 		reason := "model_error"
