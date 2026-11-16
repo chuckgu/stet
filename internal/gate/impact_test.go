@@ -1077,6 +1077,51 @@ func (e *env) rawSimpleQuery(t *testing.T, protocol uint32, user, sql string) st
 	return untilReady()
 }
 
+// unauthenticatedQuery opens a session through the proxy with the startup
+// packet of user, sends sql instead of the password the server asks for, and
+// reads until the server hangs up.
+func (e *env) unauthenticatedQuery(t *testing.T, user, sql string) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", e.addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	params := "user\x00" + user + "\x00database\x00stet_test\x00\x00"
+	msg := binary.BigEndian.AppendUint32(nil, uint32(8+len(params)))
+	msg = binary.BigEndian.AppendUint32(msg, 3<<16)
+	msg = append(msg, params...)
+	query := append([]byte(sql), 0)
+	msg = append(msg, 'Q')
+	msg = binary.BigEndian.AppendUint32(msg, uint32(4+len(query)))
+	if _, err := conn.Write(append(msg, query...)); err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, conn)
+}
+
+// A write sent before the session authenticated has no login role either:
+// its startup packet names a role nobody has proved. It is not measured, and
+// the decision says why.
+func TestImpactIsNotMeasuredBeforeAuthentication(t *testing.T) {
+	d := calm()
+	e := setup(t, d, impactYAML)
+	e.seedMany(t)
+	e.unauthenticatedQuery(t, "stet_scram", "update "+e.table+" set status = 'x' where company_id = 9")
+
+	r := e.impacts(t, 1)[0]
+	wantVerdict(t, r, "unsupported", "not_single_row")
+	if msg, _ := r.Impact["error"].(string); !strings.Contains(msg, "login role") || !strings.Contains(msg, "authenticated") {
+		t.Errorf("impact = %v, want an error naming the missing login role and the session not yet authenticated", r.Impact)
+	}
+	wantNoKeys(t, r.Impact, "method", "rows", "cap")
+	if r.Executed {
+		t.Error("the write ran without a password")
+	}
+	wantNoModel(t, d)
+}
+
 // A session whose login role Stet does not know is not measured. Postgres
 // serves protocol 3.1 by negotiating it down, but the proxy cannot read that
 // startup packet, so the session has no role to measure as. Measuring anyway

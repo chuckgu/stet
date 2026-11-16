@@ -75,10 +75,12 @@ func (g *Gate) measure(ctx context.Context, p *pending, lim *config.Impact) *dec
 // paramTexts, which prepares the statement as Stet's own account, also in a
 // read-only transaction under the timeout.
 func (g *Gate) queryImpact(ctx context.Context, p *pending, m *sqlparse.Measure, lim *config.Impact, im *decide.Impact) error {
-	// The proxy could not read the startup packet, so there is no role to
-	// measure as. Measuring anyway would count as Stet's own account.
+	// No role to measure as: the proxy could not read the startup packet, or
+	// the statement came before the session authenticated, so the role the
+	// packet names is unproved. Measuring anyway would count as Stet's own
+	// account.
 	if p.session.User == "" {
-		return errors.New("no login role: the session's startup packet could not be read")
+		return errors.New("no login role: the startup packet could not be read, or the session had not authenticated yet")
 	}
 	pg, done, err := g.txConn(ctx)
 	if err != nil {
