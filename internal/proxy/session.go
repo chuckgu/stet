@@ -340,27 +340,40 @@ func (s *session) fromServer(t byte, body []byte) {
 
 // finish reports the writes of an answered unit. before and after are the
 // transaction status around it.
+// refusal reports the server's error for w when the server already said the
+// write failed or was skipped because an earlier statement in the same Sync
+// failed. It reports nothing when the server has not spoken for w.
+func (u *unit) refusal(w watchedWrite) (string, bool) {
+	switch {
+	case u.err == "":
+		return "", false
+	case u.query, w.idx == u.errAt:
+		return u.err, true
+	case w.idx > u.errAt:
+		return "not executed: an earlier statement in the same Sync failed: " + u.err, true
+	}
+	return "", false
+}
+
 func (s *session) finish(u *unit, before, after byte) {
 	inTx := before != 'I' || after != 'I' || u.executes > 1
 	for _, w := range u.writes {
 		o := Outcome{InTransaction: inTx}
-		switch {
-		case u.query && u.err != "":
-			o.Error = u.err
-		case u.query:
-			o.Executed = true
-			if u.completions == 1 { // several statements: no single count
-				o.Rows = u.rowsAt(1)
+		if text, ok := u.refusal(w); ok {
+			o.Error = text
+		} else {
+			switch {
+			case u.query:
+				o.Executed = true
+				if u.completions == 1 { // several statements: no single count
+					o.Rows = u.rowsAt(1)
+				}
+			case u.completions >= w.idx:
+				o.Executed = true
+				o.Rows = u.rowsAt(w.idx)
+			default:
+				o.Error = "no completion before ReadyForQuery"
 			}
-		case u.err != "" && w.idx == u.errAt:
-			o.Error = u.err
-		case u.err != "" && w.idx > u.errAt:
-			o.Error = "not executed: an earlier statement in the same Sync failed: " + u.err
-		case u.completions >= w.idx:
-			o.Executed = true
-			o.Rows = u.rowsAt(w.idx)
-		default:
-			o.Error = "no completion before ReadyForQuery"
 		}
 		s.gate.End(w.handle, o)
 	}
@@ -398,11 +411,14 @@ func (s *session) abandon() {
 	s.mu.Unlock()
 	for _, u := range units {
 		for _, w := range u.writes {
-			s.gate.End(w.handle, Outcome{
-				Error:         "connection closed before ReadyForQuery",
-				Lost:          true,
-				InTransaction: status != 'I' || u.executes > 1,
-			})
+			o := Outcome{InTransaction: status != 'I' || u.executes > 1}
+			if text, ok := u.refusal(w); ok {
+				o.Error = text // the server answered before the connection ended
+			} else {
+				o.Error = "connection closed before ReadyForQuery"
+				o.Lost = true
+			}
+			s.gate.End(w.handle, o)
 		}
 	}
 }
