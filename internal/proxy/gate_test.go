@@ -781,6 +781,69 @@ func TestGateSeesWhenReadsArrived(t *testing.T) {
 	}
 }
 
+// A client that sends a statement before it authenticated has not proved it
+// is the role its startup packet names, so the gate gets no login role for
+// it. Once the session has authenticated, the role is passed.
+func TestLoginRoleIsPassedOnlyOnceAuthenticated(t *testing.T) {
+	table := readTable(t)
+	// unauthenticated sends the startup packet of a role that needs a
+	// password, then sql instead of the password, and waits for the end.
+	unauthenticated := func(t *testing.T, addr, sql string) {
+		t.Helper()
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(10 * time.Second))
+		fe := pgproto3.NewFrontend(conn, conn)
+		fe.Send(&pgproto3.StartupMessage{
+			ProtocolVersion: pgproto3.ProtocolVersionNumber,
+			Parameters:      map[string]string{"user": "stet_scram", "database": "stet_test"},
+		})
+		fe.Send(&pgproto3.Query{String: sql})
+		if err := fe.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			msg, err := fe.Receive()
+			if err != nil {
+				return // the server hung up
+			}
+			if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+				t.Fatalf("the session became ready without a password")
+			}
+		}
+	}
+
+	t.Run("watched write", func(t *testing.T) {
+		g := newRecordingGate(watches(table))
+		addr, _ := startProxy(t, upstream(t), g)
+		unauthenticated(t, addr, "insert into "+table+" values (5000, 'forged')")
+		mustExec(t, connect(t, addr, "stet_scram", nil), "insert into "+table+" values (5001, 'signed in')")
+
+		bs, _ := g.outcomes(t, 2)
+		for i, want := range []string{"", "stet_scram"} {
+			if got := bs[i].info.User; got != want {
+				t.Errorf("write %d (%s): login role %q, want %q", i, bs[i].st.SQL, got, want)
+			}
+		}
+	})
+	t.Run("observed read", func(t *testing.T) {
+		g := newObservingGate(readsOf(table))
+		addr, _ := startProxy(t, upstream(t), g)
+		unauthenticated(t, addr, "select * from "+table)
+		mustExec(t, connect(t, addr, "stet_scram", nil), "select * from "+table+" where id = 1")
+
+		obs := g.observed(t, 2)
+		for i, want := range []string{"", "stet_scram"} {
+			if got := obs[i].info.User; got != want {
+				t.Errorf("read %d (%s): login role %q, want %q", i, obs[i].st.SQL, got, want)
+			}
+		}
+	})
+}
+
 // rawSession opens a session through the proxy as a role that needs no
 // password and returns a frontend past startup, for messages pgx has no API
 // for.

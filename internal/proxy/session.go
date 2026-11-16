@@ -52,7 +52,10 @@ type Param struct {
 }
 
 type SessionInfo struct {
-	ID              string
+	ID string
+	// User is the role the startup packet names. The gate is handed it only
+	// once the server has authenticated the session (its first ReadyForQuery);
+	// a statement sent before that has User "".
 	User            string
 	Database        string
 	ApplicationName string
@@ -316,9 +319,8 @@ func (s *session) apply(st Statement) {
 // first so they are not held back while the gate reads state.
 func (s *session) begin(u *unit, idx int, st Statement, ps []Param, flush func() error) {
 	flush()
-	info := s.info
 	s.mu.Lock()
-	info.TxOpen = s.status != 'I'
+	info := s.identity()
 	s.mu.Unlock()
 	h := s.gate.Begin(info, st, ps)
 	s.mu.Lock()
@@ -338,9 +340,20 @@ func (s *session) observe(u *unit, idx int, st Statement) {
 // Execute idx of its unit (0 for a Query). It runs on the client side with
 // s.mu held, and only for reads, so no other statement pays for the clock.
 func (s *session) arriving(st Statement, idx int) observedRead {
-	r := observedRead{info: s.info, st: st, idx: idx, at: time.Now()}
-	r.info.TxOpen = s.status != 'I' // as begin takes it for a write
-	return r
+	return observedRead{info: s.identity(), st: st, idx: idx, at: time.Now()}
+}
+
+// identity is the session as the gate is told of a statement arriving now.
+// Until the server's first ReadyForQuery the client has not authenticated,
+// so the role its startup packet names is not passed on. TxOpen is whether
+// the last ReadyForQuery left a transaction open. It runs with s.mu held.
+func (s *session) identity() SessionInfo {
+	info := s.info
+	if !s.ready {
+		info.User = ""
+	}
+	info.TxOpen = s.status != 'I'
+	return info
 }
 
 func (s *session) push(u *unit) *unit {
