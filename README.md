@@ -1,3 +1,5 @@
+![Stet concept: agents send queries through rules, judgment, and recording to Postgres; database evidence informs Stet, while people set policy and review exceptions. Shadow mode today.](docs/assets/stet-concept.png)
+
 # Stet
 
 **Runtime control for agentic queries. Stet asks the database instead of guessing from the SQL.**
@@ -5,6 +7,8 @@
 > *Agents propose. Stet decides what stands.*
 
 AI agents now write SQL at run time and send it with nobody reading it first. Stet is a Postgres wire-protocol proxy that stands on the one path those agents use to reach your database. Before an agent's write goes through, Stet asks the database what the write would actually do, decides whether it should commit, hold, escalate or be rejected, and records why.
+
+The point is delegation. The more work a company hands to agents, the less of it a person checks. Stet puts that check back at the moment of execution and keeps people in charge of the policy, not of every query.
 
 Integration is a connection string. Agents connect to Stet as if it were Postgres. Your services keep connecting to Postgres directly, so Stet adds nothing to their latency and cannot take them down.
 
@@ -45,6 +49,22 @@ Stet asks the database first and a model last.
 - **Every verdict has a reason an agent can act on.** `duplicate:4812` names the row it collides with. `policy:2` names the rule it breaks.
 - **Every decision is recorded.** `stet.decisions` is an append-only log of who wrote, on whose behalf, what the database looked like, which pinned model version judged it, and what was decided. Replays read the recorded judgment and never ask the model again.
 
+### People stay in charge
+
+Human in the loop does not have to mean an approve button on every query. That design does not survive volume, and people who are asked too often stop reading what they approve.
+
+| Who | Responsibility |
+|---|---|
+| Deterministic controls | Enforce the limits nothing may cross: permissions, impact limits, forbidden statement shapes |
+| Judgment model | Judge what needs meaning, and say so when it is not sure |
+| People | Set what is delegated and under which policy, review exceptions and outcomes, adjust the policy, stop or undo |
+
+- In normal operation Stet acts inside the policy and limits people set.
+- A write goes to a person when it is uncertain, large, or hard to undo. Stet weighs all three, and all three come from the database.
+- The person sees the same evidence Stet used: "48,211 rows, 24% of the table, cascades into `deals`", not "risk: high".
+
+The decision log and the label columns for human review exist today. Approving and rejecting held writes is on the roadmap, straight after enforce mode.
+
 ## Where it sits
 
 ```
@@ -57,6 +77,7 @@ Stet asks the database first and a model last.
 - **Agents only.** High-volume service traffic never passes through Stet. An agent step takes seconds, so a judgment that takes a quarter of a second fits.
 - **On the database side.** A control that lives on the agent's machine can be skipped by the agent. A control next to the database sees every agent at once, which is the only place conflicts between agents are visible.
 - **Identity comes from the database role, not from what the agent says about itself.** Agent roles are set up so they only work through Stet. This arrives with enforce mode. Today Stet selects what to judge by table.
+- **Which paths go through Stet is the company's rule to set.** That includes services that run queries on an agent's behalf, such as an MCP server: they connect with an agent role, through Stet. The statement shape is then written by a person and only the values come from the agent, and value-level judgment and impact limits still apply.
 
 ## What we measured
 
@@ -95,6 +116,7 @@ Pass and fail criteria were fixed before we looked at results. The data is synth
 | Append-only decision log, replay and scoring lab | Working |
 | Impact measurement for multi-row writes | Spec drafted |
 | Enforce mode: block the write and return the reason | Next |
+| Human review: approve or reject a held write, with a row-version re-check | Planned, after enforce |
 | Reversal, stale-write detection | Planned |
 | TLS, role-based identity, credential custody | Planned |
 | Reads: recording, limits, masking | Planned |
@@ -109,12 +131,13 @@ What that means in practice today:
 
 1. Impact measurement, in shadow mode.
 2. Minimal enforce: block, return a structured reason, fail closed by default.
-3. A head-to-head benchmark against statement-level guardrails, including an attack set, with criteria fixed in advance.
-4. Reversal: before-values for every affected row, undo by session.
-5. Stale-write detection.
-6. TLS, role-based identity, credential custody, availability.
-7. Breadth: approvals, masking, a control plane, more protocols, then other data platforms.
-8. Quality: a cache that knows when it is stale, and hints drawn from the session record.
+3. A minimal path for people: see a held write with its evidence, approve or reject it, re-check row versions on approval.
+4. A head-to-head benchmark against statement-level guardrails, including an attack set, with criteria fixed in advance.
+5. Reversal: before-values for every affected row, undo by session.
+6. Stale-write detection.
+7. TLS, role-based identity, credential custody, availability.
+8. Breadth: a review UI and alerts, masking, a control plane, more protocols, then other data platforms.
+9. Quality: a cache that knows when it is stale, and hints drawn from the session record.
 
 The destination is one control layer for every agentic query, reads as well as writes, whoever sends it: an agent that made a mistake, an agent that was fed an injected instruction, or an agent run by an attacker. At the database they look the same, so Stet does not guess intent. It bounds what any session can do and keeps a record of what it did. The reasoning is in [docs/concept-v0.2.md](docs/concept-v0.2.md).
 
