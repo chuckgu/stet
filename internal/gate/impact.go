@@ -53,7 +53,9 @@ func (g *Gate) measure(ctx context.Context, p *pending, lim *config.Impact) *dec
 			im.Method, im.Rows, im.Capped, im.Error = "", nil, false, err.Error()
 		}
 	}
-	if p.res.Op != "insert" && im.Rows != nil && im.TableRows != nil {
+	// A capped count's rows is the cap, so its share would not be the write's.
+	// The verdict needs none: a capped count is already over max_rows.
+	if p.res.Op != "insert" && im.Rows != nil && im.TableRows != nil && !im.Capped {
 		im.Share = ptr(float64(*im.Rows) / float64(*im.TableRows))
 	}
 	im.MeasureMS = int(time.Since(start).Milliseconds())

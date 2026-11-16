@@ -152,11 +152,14 @@ func TestImpactHoldsOverTheRowLimit(t *testing.T) {
 	d := calm()
 	e := setup(t, d, impactYAML)
 	e.seedMany(t)
+	mustExec(t, e.admin, "analyze "+e.table)
 	mustExec(t, e.connect(t, "bulk"), "update "+e.table+" set status = 'x' where company_id = 3")
 
 	r := e.impacts(t, 1)[0]
 	wantVerdict(t, r, "hold", "impact:rows")
-	wantImpact(t, r.Impact, map[string]any{"method": "count", "rows": 4.0, "capped": true, "cap": 4.0, "actual_rows": 5.0})
+	wantImpact(t, r.Impact, map[string]any{"method": "count", "rows": 4.0, "capped": true, "cap": 4.0, "table_rows": 7.0, "actual_rows": 5.0})
+	// rows is the cap, not the count: a share of it would not be the write's.
+	wantNoKeys(t, r.Impact, "share")
 	if n := e.rowsWhere(t, "status = 'x'"); n != 5 || !r.Executed {
 		t.Errorf("%d rows changed, executed=%v: shadow mode must not block the write", n, r.Executed)
 	}
