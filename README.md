@@ -1,4 +1,4 @@
-![Stet concept: agents send queries through rules, judgment, and recording to Postgres; database evidence informs Stet, while people set policy and review exceptions. Shadow mode today.](docs/assets/stet-concept.png)
+![Stet concept: a decision model at the heart of Stet judges agent queries using database evidence, alongside deterministic rules and decision records; people set policy and review exceptions. Shadow mode today.](docs/assets/stet-concept-v2.png)
 
 # Stet
 
