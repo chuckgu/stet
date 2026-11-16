@@ -31,6 +31,9 @@ type fakeDecider struct {
 	answers map[string]decide.Answer
 	err     error
 	delay   time.Duration
+	// onDecide, when set, is called inside Decide with the call's number,
+	// counted from 1, before it answers.
+	onDecide func(call int)
 
 	mu    sync.Mutex
 	calls []fakeCall
@@ -48,17 +51,30 @@ func (f *fakeDecider) Decide(ctx context.Context, state json.RawMessage, qs []de
 	json.Unmarshal(state, &s)
 	f.mu.Lock()
 	f.calls = append(f.calls, fakeCall{s, string(state), qs})
+	call, hook := len(f.calls), f.onDecide
 	f.mu.Unlock()
+	if hook != nil {
+		hook(call)
+	}
 	if f.err != nil {
 		return decide.Answers{}, f.err
 	}
 	out := map[string]decide.Answer{}
+	f.mu.Lock()
 	for _, q := range qs {
 		if a, ok := f.answers[q.ID]; ok {
 			out[q.ID] = a
 		}
 	}
+	f.mu.Unlock()
 	return decide.Answers{ByQuestion: out, CostUSD: 0.0002}, nil
+}
+
+// setAnswers replaces the table f answers from, between calls.
+func (f *fakeDecider) setAnswers(answers map[string]decide.Answer) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.answers = answers
 }
 
 func (f *fakeDecider) ModelID() string      { return "fake" }

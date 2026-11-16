@@ -99,6 +99,22 @@ func SetUsageRetry(d time.Duration) (restore func()) {
 	return func() { usageRetry = old }
 }
 
+// FailHeldWrites makes g's next n inserts into stet.held_writes fail.
+func FailHeldWrites(g *Gate, n int) {
+	insert := g.insertHeld
+	var mu sync.Mutex
+	g.insertHeld = func(ctx context.Context, h *store.HeldWrite) error {
+		mu.Lock()
+		fail := n > 0
+		n--
+		mu.Unlock()
+		if fail {
+			return errors.New("injected failure")
+		}
+		return insert(ctx, h)
+	}
+}
+
 // HoldInflight takes every slot of g's inflight limit until release is called.
 func HoldInflight(g *Gate) (release func()) {
 	for range cap(g.inflight) {

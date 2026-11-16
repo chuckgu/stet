@@ -1,9 +1,16 @@
 // Package gate connects the proxy to judgment: it assembles state for each
 // gated write, asks the model, applies policy, and records the decision.
 //
-// v0.1 runs in shadow mode only. The write always goes through unchanged
-// (rule 6); state is read just before it is forwarded, and the model is
-// called afterwards, outside any transaction (rule 1).
+// In shadow mode the write always goes through unchanged (rule 6); state is
+// read just before it is forwarded, and the model is called afterwards.
+//
+// In enforce mode (enforce.go) the client waits while Begin judges the write
+// before it is sent: the deterministic rules first, the model only when they
+// do not decide (rule 5). A write Begin does not let through is refused by
+// the proxy, and a held one is stored in stet.held_writes. Either way Stet
+// holds no transaction of its own open while the model is asked, and a
+// write in a transaction that already changed something is refused before
+// anything is read for it (rule 1). End records the decision in both modes.
 package gate
 
 import (
@@ -32,8 +39,8 @@ import (
 
 const (
 	// stateTimeout bounds how long a client waits while its write's state
-	// is read. Past it, the write goes through and the decision records a
-	// state_error.
+	// is read, and in enforce mode each re-read of its row version. Past it,
+	// the write is a state_error, which on_failure decides.
 	stateTimeout  = 500 * time.Millisecond
 	maxCandidates = 10
 	maxRecent     = 10
@@ -53,12 +60,17 @@ type Gate struct {
 	log     *slog.Logger
 	recent  *recentLog
 	usage   *usage
-	reads   *readStats // nil when no table records reads
-	sem     chan struct{}
+	reads   *readStats    // nil when no table records reads
+	sem     chan struct{} // shadow mode's model calls, made after the write
 	// inflight holds a slot for each write being judged (limits.max_inflight):
-	// in shadow mode, while its Begin reads state or measures.
+	// while its Begin reads state or measures, and in enforce mode until its
+	// Begin ends, its model call included.
 	inflight chan struct{}
 	wg       sync.WaitGroup
+
+	// insertHeld stores a held write (store.InsertHeldWrite); a field so
+	// tests can make it fail.
+	insertHeld func(context.Context, *store.HeldWrite) error
 
 	warnedRoles sync.Map // client roles Stet could not assume, logged once each
 }
@@ -85,6 +97,8 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, d decide.Decid
 		recent:   &recentLog{byRow: map[string][]store.Change{}},
 		sem:      make(chan struct{}, maxModelCalls),
 		inflight: make(chan struct{}, cfg.MaxInflight),
+
+		insertHeld: st.InsertHeldWrite,
 	}
 	g.usage = newUsage(st.UsageBySecond, &g.wg)
 	readsOn := map[string]int{}
@@ -202,8 +216,22 @@ type pending struct {
 	state        json.RawMessage
 	stateVersion map[string]string
 	questions    []decide.Question
+	candidateIDs []string // the keys of the candidates in state, the duplicate question's choices
 	stateErr     error
 	added        time.Duration // time the client waited on Begin
+
+	// Set by Begin in enforce mode, which judges the write before it is
+	// sent; judge records them and asks the model nothing.
+	decided      bool
+	verdict      string
+	reasons      []string
+	asked        bool // the model was asked about the write's last state
+	answers      decide.Answers
+	modelErr     error
+	modelLatency time.Duration
+	costUSD      float64        // every model call made for the write
+	refused      *proxy.Refusal // what the client was given instead; nil when the write was sent
+	heldID       string         // its stet.held_writes row; "" when not held or not stored
 }
 
 // errBusy is the state error of a write that found every inflight slot taken
@@ -212,28 +240,49 @@ type pending struct {
 // measurement, which the table's unsupported setting would decide.
 var errBusy = errors.New("too many writes are being judged")
 
+// Begin runs while the client waits, just before a watched write is sent. In
+// shadow mode it reads what the write's judgment needs and never refuses. In
+// enforce mode it judges the write too, and returns the refusal the client
+// gets when the write must not be sent (see enforce).
 func (g *Gate) Begin(s proxy.SessionInfo, st proxy.Statement, ps []proxy.Param) (any, *proxy.Refusal) {
 	start := time.Now()
 	p := &pending{id: store.NewID(), at: start, session: s, sql: st.SQL, res: st.Data.(sqlparse.Result)}
 	for _, x := range ps {
 		p.oids = append(p.oids, x.OID)
 	}
+	if g.cfg.Mode == config.ModeEnforce {
+		refuse := g.enforce(p, ps)
+		p.added = time.Since(start)
+		return p, refuse
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), stateTimeout)
 	defer cancel()
+	// In shadow mode the slot is let go when Begin returns; the model is
+	// asked after the write, under maxModelCalls instead.
+	release := g.read(ctx, p, ps)
+	p.added = time.Since(start)
+	release()
+	return p, nil
+}
 
+// read gathers, under ctx, what the verdict rules need of p, the same way in
+// both modes: an inflight slot, the bind values, the state of a single-row
+// write or the measurement of a multi-row one, and a reservation against its
+// login role's cumulative limit. It returns the func that gives the slot back.
+func (g *Gate) read(ctx context.Context, p *pending, ps []proxy.Param) (release func()) {
 	// First, a slot: the wait counts toward the state read's bound (spec 10).
-	// In shadow mode the slot is let go when Begin returns; the model is asked
-	// after the write, under maxModelCalls instead.
+	release = func() {}
 	select {
 	case g.inflight <- struct{}{}:
-		defer func() { <-g.inflight }()
+		release = func() { <-g.inflight }
 	case <-ctx.Done():
 		p.stateErr = errBusy
 	}
 
 	// Text values need no database; binary ones cannot be decoded once the
 	// time is up, and then the decision records no values.
-	params, err := g.paramTexts(ctx, st.SQL, ps)
+	params, err := g.paramTexts(ctx, p.sql, ps)
 	p.params = params
 	if err != nil && p.stateErr == nil {
 		p.stateErr = fmt.Errorf("bind values: %w", err)
@@ -247,7 +296,7 @@ func (g *Gate) Begin(s proxy.SessionInfo, st proxy.Statement, ps []proxy.Param) 
 	// In a dirty transaction the verdict is in_transaction anyway, and Stet's
 	// connection cannot see what the transaction changed before the write
 	// (spec 4): the impact stays NULL.
-	if p.res.Kind == sqlparse.Measured && lim != nil && !s.TxDirty {
+	if p.res.Kind == sqlparse.Measured && lim != nil && !p.session.TxDirty {
 		switch {
 		case p.stateErr == nil:
 			p.impact = g.measure(ctx, p, lim)
@@ -262,8 +311,7 @@ func (g *Gate) Begin(s proxy.SessionInfo, st proxy.Statement, ps []proxy.Param) 
 	if lim != nil && lim.Cumulative != nil {
 		g.reserve(ctx, p, lim.Cumulative)
 	}
-	p.added = time.Since(start)
-	return p, nil
+	return release
 }
 
 // reserve counts the write toward its login role's cumulative limit before it
@@ -315,8 +363,16 @@ func rowsAffected(r sqlparse.Result, o proxy.Outcome) *int64 {
 	return o.Rows
 }
 
+// End records how the write ended, in the background: it does not block. A
+// write Begin refused is recorded as not sent whatever else o says: it did
+// not run, and its reservation goes as for a write the server refused, also
+// when the connection was lost (spec 11). When the client was not given the
+// refusal, its held write is marked undelivered (spec 9).
 func (g *Gate) End(h any, o proxy.Outcome) {
 	p := h.(*pending)
+	if p.refused != nil {
+		o = proxy.Outcome{Refused: true, Undelivered: o.Undelivered, InTransaction: o.InTransaction, Error: refusalText(p.refused)}
+	}
 	if o.Executed && p.res.Kind == sqlparse.Gated && p.pk != nil {
 		g.recent.add(p.res.Table, *p.pk, store.Change{
 			DecisionID: p.id, At: p.at, AgentID: p.session.ApplicationName, Op: p.res.Op, Proposed: p.proposed,
@@ -374,8 +430,19 @@ func asksInShadow(in decide.Input) bool {
 	return !decided
 }
 
-// judge decides what enforce mode would have done and records it.
+// judge records the decision on p. In shadow mode it decides what enforce
+// mode would have done, asking the model now; in enforce mode Begin decided,
+// and what the model answered then is recorded as it is (rule 4). It also
+// marks a refused write's held write undelivered when the client was not
+// given the refusal.
 func (g *Gate) judge(p *pending, o proxy.Outcome) {
+	if o.Undelivered && p.heldID != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), recordTimeout)
+		if err := g.store.MarkUndelivered(ctx, p.heldID); err != nil {
+			g.log.Error("held write not marked undelivered", "id", p.heldID, "decision", p.id, "err", err)
+		}
+		cancel()
+	}
 	in := g.input(p)
 	d := &store.Decision{
 		ID:            p.id,
@@ -412,19 +479,38 @@ func (g *Gate) judge(p *pending, o proxy.Outcome) {
 		d.Cumulative = p.cumulative
 	}
 
-	if asksInShadow(in) {
-		d.Questions = p.questions
-		answers, latency, err := g.ask(p)
-		in.ModelErr, in.Answers = err, answers.ByQuestion
-		if err == nil {
-			d.Answers = answers.ByQuestion
-			d.ModelLatencyMS = ptr(int(latency.Milliseconds()))
-			if answers.CostUSD > 0 {
-				d.CostUSD = ptr(answers.CostUSD)
+	switch {
+	case p.decided:
+		d.Verdict, d.Reasons = p.verdict, p.reasons
+		if p.asked {
+			d.Questions = p.questions
+			if p.modelErr == nil {
+				d.Answers = p.answers.ByQuestion
+				d.ModelLatencyMS = ptr(int(p.modelLatency.Milliseconds()))
 			}
-		} else if !errors.Is(err, decide.ErrNoModel) {
-			g.log.Warn("model call failed", "table", p.res.Table, "err", err)
 		}
+		if p.costUSD > 0 {
+			d.CostUSD = ptr(p.costUSD)
+		}
+		if p.refused != nil {
+			d.Refused = ptr(p.refused.Code)
+		}
+	default:
+		if asksInShadow(in) {
+			d.Questions = p.questions
+			answers, latency, err := g.ask(p)
+			in.ModelErr, in.Answers = err, answers.ByQuestion
+			if err == nil {
+				d.Answers = answers.ByQuestion
+				d.ModelLatencyMS = ptr(int(latency.Milliseconds()))
+				if answers.CostUSD > 0 {
+					d.CostUSD = ptr(answers.CostUSD)
+				}
+			} else if !errors.Is(err, decide.ErrNoModel) {
+				g.log.Warn("model call failed", "table", p.res.Table, "err", err)
+			}
+		}
+		d.Verdict, d.Reasons = decide.Verdict(in)
 	}
 	// Recorded whenever a measurement was taken or failed, also for a write
 	// whose verdict another rule decided (spec-v0.2-impact 6).
@@ -432,13 +518,37 @@ func (g *Gate) judge(p *pending, o proxy.Outcome) {
 		p.impact.ActualRows = o.Rows
 		d.Impact = p.impact
 	}
-	d.Verdict, d.Reasons = decide.Verdict(in)
+	g.exceededAfter(p, d)
 
 	ctx, cancel := context.WithTimeout(context.Background(), recordTimeout)
 	defer cancel()
 	if err := g.store.Insert(ctx, d); err != nil {
 		g.log.Error("decision not recorded", "id", d.ID, "table", d.TargetTable, "err", err)
 	}
+}
+
+// exceededAfter marks d, in either mode, when p was measured and judged
+// commit but changed more rows than the table's max_rows once it ran (spec
+// 5): the measurement and the write saw different rows. The write is not
+// undone; a warning says so.
+func (g *Gate) exceededAfter(p *pending, d *store.Decision) {
+	lim := g.cfg.Tables[p.res.Table].Impact
+	if d.Verdict != decide.Commit || p.impact == nil || p.impact.Method == "" || lim == nil ||
+		d.RowsAffected == nil || *d.RowsAffected <= int64(lim.MaxRows) {
+		return
+	}
+	d.Reasons = append(slices.Clone(d.Reasons), "impact:exceeded_after")
+	g.log.Warn("write changed more rows than its limit after it was judged",
+		"decision", d.ID, "table", p.res.Table, "rows", *d.RowsAffected, "max_rows", lim.MaxRows,
+		"measured", deref(p.impact.Rows), "login_role", p.session.User)
+}
+
+// deref is the value p points to, or nil.
+func deref[T any](p *T) any {
+	if p == nil {
+		return nil
+	}
+	return *p
 }
 
 func (g *Gate) ask(p *pending) (decide.Answers, time.Duration, error) {
@@ -547,6 +657,7 @@ func (g *Gate) assemble(ctx context.Context, p *pending) error {
 			ids = append(ids, jsonText(id))
 		}
 	}
+	p.candidateIDs = ids
 
 	related, err := g.context(ctx, p, current)
 	if err != nil {
@@ -611,23 +722,11 @@ func (s State) CouldUndoRecent() bool {
 // read-only transaction under the timeout, then rolled back. No role is
 // assumed: tables without impact limits need no role membership.
 func (g *Gate) paramTexts(ctx context.Context, sql string, ps []proxy.Param) ([]*string, error) {
-	if len(ps) == 0 {
-		return nil, nil
-	}
-	out := make([]*string, len(ps))
-	binary := false
-	for i, p := range ps {
-		switch {
-		case p.Value == nil:
-		case p.Format == 0:
-			out[i] = ptr(string(p.Value))
-		default:
-			binary = true
-		}
-	}
-	if !binary {
+	if out := textParams(ps); out != nil || len(ps) == 0 {
 		return out, nil
 	}
+	// A value is binary: every value is read back from the database.
+	out := make([]*string, len(ps))
 
 	pg, done, err := g.txConn(ctx)
 	if err != nil {
