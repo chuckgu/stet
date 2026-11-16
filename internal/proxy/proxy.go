@@ -278,8 +278,10 @@ func relay(client, server net.Conn, fromClient, fromServer *tap, ended func() []
 	}
 	server.Close()
 	client.SetReadDeadline(time.Now()) // stops the pump reading the client
-	<-done
+	// A client that stopped reading does not hold the pump writing to it,
+	// nor the error, past the deadline.
 	client.SetWriteDeadline(time.Now().Add(fatalTimeout))
+	<-done
 	client.Write(fatal)
 	client.Close()
 }
