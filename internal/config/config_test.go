@@ -133,6 +133,12 @@ func TestInvalidConfigs(t *testing.T) {
 		"max_inflight zero":                           {minimal + "limits: {max_inflight: 0}\n", "limits.max_inflight"},
 		"agents unknown key":                          {minimal + "agents: {role: [a]}\n", "role"},
 		"limits unknown key":                          {minimal + "limits: {inflight: 4}\n", "inflight"},
+		"expire_after too short":                      {minimal + "held: {expire_after: 59s}\n", "held.expire_after"},
+		"expire_after too long":                       {minimal + "held: {expire_after: 31d}\n", "held.expire_after"},
+		"expire_after not a duration":                 {minimal + "held: {expire_after: soon}\n", "held.expire_after"},
+		"apply_timeout too short":                     {minimal + "held: {apply_timeout: 999ms}\n", "held.apply_timeout"},
+		"apply_timeout too long":                      {minimal + "held: {apply_timeout: 10m1s}\n", "held.apply_timeout"},
+		"held unknown key":                            {minimal + "held: {expire: 1h}\n", "expire"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -499,5 +505,41 @@ func TestAgentRolesAndLimits(t *testing.T) {
 	// Roles are compared as written, case included.
 	if _, err := Parse([]byte(minimal + "agents: {roles: [App]}\n")); err != nil {
 		t.Errorf("App is not Stet's account app: %v", err)
+	}
+}
+
+func TestHeldDefaults(t *testing.T) {
+	for name, src := range map[string]string{
+		"shadow":  minimal,
+		"enforce": enforceBase + "model: {adapter: none, on_failure: pass}\n",
+	} {
+		c, err := Parse([]byte(src))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if want := (Held{ExpireAfter: 24 * time.Hour, ApplyTimeout: 30 * time.Second}); c.Held != want {
+			t.Errorf("%s: Held = %+v, want %+v", name, c.Held, want)
+		}
+	}
+}
+
+func TestHeldSettings(t *testing.T) {
+	for _, tc := range []struct {
+		held string
+		want Held
+	}{
+		{"{expire_after: 2d, apply_timeout: 5s}", Held{48 * time.Hour, 5 * time.Second}},
+		{"{expire_after: 1m, apply_timeout: 1s}", Held{time.Minute, time.Second}},
+		{"{expire_after: 30d, apply_timeout: 10m}", Held{30 * 24 * time.Hour, 10 * time.Minute}},
+		{"{expire_after: 90m}", Held{90 * time.Minute, 30 * time.Second}},
+		{"{apply_timeout: 2m}", Held{24 * time.Hour, 2 * time.Minute}},
+	} {
+		c, err := Parse([]byte(minimal + "held: " + tc.held + "\n"))
+		if err != nil {
+			t.Fatalf("%s: %v", tc.held, err)
+		}
+		if c.Held != tc.want {
+			t.Errorf("%s: Held = %+v, want %+v", tc.held, c.Held, tc.want)
+		}
 	}
 }

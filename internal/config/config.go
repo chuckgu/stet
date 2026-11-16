@@ -37,11 +37,29 @@ type Config struct {
 	AgentRoles []string
 	// MaxInflight is how many writes are judged at once.
 	MaxInflight int
+	// Held bounds the approval of held writes.
+	Held Held
 
 	// Hash identifies the config file's bytes. Decisions record it as
 	// policy_version.
 	Hash string
 }
+
+// Held bounds the approval of held writes (spec-v0.2-approve 9). Validated in
+// both modes; used in enforce only.
+type Held struct {
+	ExpireAfter  time.Duration // held.expire_after: how long a held write can be approved; default 24h
+	ApplyTimeout time.Duration // held.apply_timeout: the bound on running one approved write; default 30s
+}
+
+const (
+	defaultExpireAfter  = 24 * time.Hour
+	minExpireAfter      = time.Minute
+	maxExpireAfter      = 30 * 24 * time.Hour
+	defaultApplyTimeout = 30 * time.Second
+	minApplyTimeout     = time.Second
+	maxApplyTimeout     = 10 * time.Minute
+)
 
 // RecordOnly is the adapter that judges nothing: Stet records state and
 // outcomes without calling a model.
@@ -122,6 +140,10 @@ type rawConfig struct {
 	Limits *struct {
 		MaxInflight *int `yaml:"max_inflight"`
 	} `yaml:"limits"`
+	Held *struct {
+		ExpireAfter  string `yaml:"expire_after"`
+		ApplyTimeout string `yaml:"apply_timeout"`
+	} `yaml:"held"`
 }
 
 type rawModel struct {
@@ -288,6 +310,12 @@ func Parse(b []byte) (*Config, error) {
 		}
 	}
 
+	c.Held = Held{ExpireAfter: defaultExpireAfter, ApplyTimeout: defaultApplyTimeout}
+	if raw.Held != nil {
+		heldDuration("held.expire_after", raw.Held.ExpireAfter, minExpireAfter, maxExpireAfter, &c.Held.ExpireAfter, fail)
+		heldDuration("held.apply_timeout", raw.Held.ApplyTimeout, minApplyTimeout, maxApplyTimeout, &c.Held.ApplyTimeout, fail)
+	}
+
 	c.Tables = make(map[string]Table, len(raw.Tables))
 	for name, rt := range raw.Tables {
 		reads, cumulative := keys.present(name)
@@ -300,6 +328,22 @@ func Parse(b []byte) (*Config, error) {
 		return nil, errors.Join(errs...)
 	}
 	return c, nil
+}
+
+// heldDuration reads one held.* duration into dst. Empty keeps the default.
+func heldDuration(field, s string, lo, hi time.Duration, dst *time.Duration, fail func(string, ...any)) {
+	if s == "" {
+		return
+	}
+	d, err := parseDuration(s)
+	switch {
+	case err != nil:
+		fail("%s: %v", field, err)
+	case d < lo || d > hi:
+		fail("%s: %s must be between %s and %s", field, s, lo, hi)
+	default:
+		*dst = d
+	}
 }
 
 // maxRoleName is Postgres's identifier limit in bytes.
