@@ -49,6 +49,9 @@ CREATE TABLE IF NOT EXISTS stet.decisions (
   labeled_at       timestamptz
 );
 
+-- 다중 행 쓰기의 영향 측정 (docs/spec-v0.2-impact.md 6장). 측정하지 않은 쓰기는 NULL.
+ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS impact jsonb;
+
 CREATE INDEX IF NOT EXISTS decisions_target_idx ON stet.decisions (target_table, target_pk, created_at DESC);
 CREATE INDEX IF NOT EXISTS decisions_verdict_idx ON stet.decisions (verdict, created_at DESC);
 CREATE INDEX IF NOT EXISTS decisions_agent_idx ON stet.decisions (agent_id, created_at DESC);

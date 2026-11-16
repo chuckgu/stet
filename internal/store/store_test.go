@@ -204,3 +204,38 @@ func TestRecentChanges(t *testing.T) {
 		t.Errorf("at = %v, want %v", c.At, want.CreatedAt)
 	}
 }
+
+func TestInsertRecordsImpact(t *testing.T) {
+	s, pool := testStore(t)
+	d := sample(uniqueTable(t))
+	d.Impact = map[string]any{"method": "count", "rows": 99, "capped": false}
+	if err := s.Insert(context.Background(), d); err != nil {
+		t.Fatal(err)
+	}
+	var method string
+	var rows int
+	err := pool.QueryRow(context.Background(),
+		`select impact->>'method', (impact->>'rows')::int from stet.decisions where id = $1`, d.ID).Scan(&method, &rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if method != "count" || rows != 99 {
+		t.Errorf("impact = %s %d", method, rows)
+	}
+}
+
+func TestInsertWithoutImpactLeavesItNull(t *testing.T) {
+	s, pool := testStore(t)
+	d := sample(uniqueTable(t))
+	if err := s.Insert(context.Background(), d); err != nil {
+		t.Fatal(err)
+	}
+	var isNull bool
+	if err := pool.QueryRow(context.Background(),
+		`select impact is null from stet.decisions where id = $1`, d.ID).Scan(&isNull); err != nil {
+		t.Fatal(err)
+	}
+	if !isNull {
+		t.Error("impact is set for a write that was not measured")
+	}
+}

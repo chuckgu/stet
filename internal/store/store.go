@@ -73,6 +73,9 @@ type Decision struct {
 	LatencyMS      *int
 	ModelLatencyMS *int
 	CostUSD        *float64
+
+	// Impact is the measured effect of a multi-row write; nil is stored as NULL.
+	Impact any
 }
 
 func (s *Store) Insert(ctx context.Context, d *Decision) error {
@@ -103,17 +106,17 @@ func (s *Store) Insert(ctx context.Context, d *Decision) error {
 			id, created_at, mode, agent_id, on_behalf_of, session_id,
 			statement, statement_fp, params, op, target_table, target_pk, proposed,
 			state, state_version, model, model_version, questions, answers, policy_version,
-			verdict, reasons, executed, exec_error, latency_ms, model_latency_ms, cost_usd
+			verdict, reasons, executed, exec_error, latency_ms, model_latency_ms, cost_usd, impact
 		) values (
 			$1, $2, $3, $4, $5, $6,
 			$7, $8, $9::jsonb, $10, $11, $12::jsonb, $13::jsonb,
 			$14::jsonb, $15::jsonb, $16, $17, $18::jsonb, $19::jsonb, $20,
-			$21, $22, $23, $24, $25, $26, $27
+			$21, $22, $23, $24, $25, $26, $27, $28::jsonb
 		)`,
 		d.ID, d.CreatedAt, d.Mode, d.AgentID, d.OnBehalfOf, d.SessionID,
 		d.Statement, d.StatementFP, params, d.Op, d.TargetTable, pk, proposed,
 		state, stateVersion, d.Model, d.ModelVersion, jsonArg(d.Questions), jsonArg(d.Answers), d.PolicyVersion,
-		d.Verdict, reasons, d.Executed, d.ExecError, d.LatencyMS, d.ModelLatencyMS, d.CostUSD,
+		d.Verdict, reasons, d.Executed, d.ExecError, d.LatencyMS, d.ModelLatencyMS, d.CostUSD, jsonArg(d.Impact),
 	)
 	return err
 }
