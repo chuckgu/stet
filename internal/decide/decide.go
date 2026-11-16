@@ -194,49 +194,49 @@ type Input struct {
 	ImpactLimit *config.Impact // the table's limits
 
 	Cumulative *Cumulative // the login role's usage in the window; nil when no limit applies
+
+	InTransaction bool // the write arrived in a transaction that had already run something else
+	NoLoginRole   bool // the session's login role is not known
 }
 
 // Verdict applies spec 6, with the cumulative limit of spec-v0.2-accounting
-// 4: the first matching rule decides, in this order.
+// 4 and the rules of spec-v0.2-enforce 3 and 7. Shadow and enforce mode use
+// it alike. The first matching rule decides, in this order.
 //
-//  1. A shape v0.1 does not judge, or a write in a transaction: unsupported.
-//  2. A measured write (Impact set) goes by its measurement: measuring
+//  1. A shape that is not judged: unsupported, with the shape's reason.
+//  2. A write in a transaction that had already run something else
+//     (InTransaction): unsupported, in_transaction.
+//  3. A session whose login role is not known: unsupported, no_login_role.
+//  4. A measured write (Impact set) goes by its measurement: measuring
 //     failed is unsupported; too many rows, then too large a share, hold;
-//     then over the cumulative limit, hold; an estimate escalates; else
-//     commit.
-//  3. A single-row write over the cumulative limit: hold, impact:cumulative.
-//     Its questions were still asked; the answers are recorded, not used.
-//  4. State or model failure: on_failure decides.
-//  5. An answer the model is unsure of: escalate.
-//  6. A duplicate, a conflict, or a broken rule: hold.
-//  7. Otherwise commit.
+//     then over the cumulative limit, then a cumulative usage that could
+//     not be read, hold; an estimate escalates; else commit.
+//  5. A single-row write over the cumulative limit, hold impact:cumulative;
+//     or whose usage could not be read, hold impact:cumulative_unknown. In
+//     shadow mode its questions were still asked; the answers are
+//     recorded, not used.
+//  6. State failure: on_failure decides.
+//  7. Model failure: on_failure decides.
+//  8. An answer the model is unsure of: escalate.
+//  9. A duplicate, a conflict, or a broken rule: hold.
+//  10. Otherwise commit.
 //
-// A cumulative limit whose usage is unknown (Cumulative.Error) is not applied.
+// Rules 1 to 6 need no model answer; they are Deterministic's (CLAUDE.md
+// rule 5), and the model's answers are not looked at when one of them
+// decides.
 func Verdict(in Input) (string, []string) {
-	if in.Unsupported != "" {
-		return Unsupported, []string{in.Unsupported}
+	if v, reasons, ok := deterministic(in); ok {
+		return v, reasons
 	}
-	if in.Impact != nil {
-		return impactVerdict(in)
-	}
-	if in.Cumulative.Over() {
-		return Hold, []string{"impact:cumulative"}
-	}
-	if in.StateErr != nil || in.ModelErr != nil {
+	if in.ModelErr != nil {
 		reason := "model_error"
-		switch {
-		case in.StateErr != nil:
-			reason = "state_error"
-		case errors.Is(in.ModelErr, ErrNoModel):
+		if errors.Is(in.ModelErr, ErrNoModel) {
 			reason = "no_model"
 		}
-		if in.OnFailure == "hold" {
-			return Hold, []string{reason}
-		}
-		return Commit, []string{reason}
+		return onFailure(in, reason)
 	}
 
-	// Rule 3: an answer the model is unsure of. For choice answers that is
+	// Rule 8: an answer the model is unsure of. For choice answers that is
 	// low confidence; for a rule (noul) it is a break probability between
 	// policy_escalate and policy.
 	var low []string
@@ -275,4 +275,54 @@ func Verdict(in Input) (string, []string) {
 		return Hold, broken
 	}
 	return Commit, nil
+}
+
+// Deterministic applies the rules that need no model answer (spec 3, step 6).
+// ok is false when the write's questions must be answered first. A write
+// with no questions is decided here.
+//
+// Whatever it decides, Verdict decides the same; enforce mode calls it
+// before the model, and does not call the model when it decides.
+func Deterministic(in Input) (verdict string, reasons []string, ok bool) {
+	if verdict, reasons, ok = deterministic(in); ok {
+		return verdict, reasons, true
+	}
+	if len(in.Questions) > 0 {
+		return "", nil, false
+	}
+	// Nothing to ask: no model is called, so Verdict has nothing to wait for.
+	verdict, reasons = Verdict(in)
+	return verdict, reasons, true
+}
+
+// deterministic is the front of Verdict: rules 1 to 6, in their order.
+func deterministic(in Input) (string, []string, bool) {
+	switch {
+	case in.Unsupported != "":
+		return Unsupported, []string{in.Unsupported}, true
+	case in.InTransaction:
+		return Unsupported, []string{"in_transaction"}, true
+	case in.NoLoginRole:
+		return Unsupported, []string{"no_login_role"}, true
+	case in.Impact != nil:
+		v, reasons := impactVerdict(in)
+		return v, reasons, true
+	case in.Cumulative.Over():
+		return Hold, []string{"impact:cumulative"}, true
+	case in.Cumulative.Unknown():
+		return Hold, []string{"impact:cumulative_unknown"}, true
+	case in.StateErr != nil:
+		v, reasons := onFailure(in, "state_error")
+		return v, reasons, true
+	}
+	return "", nil, false
+}
+
+// onFailure is the verdict when state or the model failed: the table's
+// on_failure decides whether the write goes through.
+func onFailure(in Input, reason string) (string, []string) {
+	if in.OnFailure == "hold" {
+		return Hold, []string{reason}
+	}
+	return Commit, []string{reason}
 }

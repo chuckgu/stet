@@ -38,6 +38,18 @@ func TestVerdict(t *testing.T) {
 	}{
 		{"unsupported shape", Input{Unsupported: "multi_row"}, Unsupported, []string{"multi_row"}},
 		{"in transaction", Input{Unsupported: "in_transaction"}, Unsupported, []string{"in_transaction"}},
+		{"in a dirty transaction", Input{InTransaction: true}, Unsupported, []string{"in_transaction"}},
+		{"no login role", Input{NoLoginRole: true}, Unsupported, []string{"no_login_role"}},
+		{"shape before transaction and role", Input{Unsupported: "multi_row", InTransaction: true, NoLoginRole: true},
+			Unsupported, []string{"multi_row"}},
+		{"transaction before role", Input{InTransaction: true, NoLoginRole: true}, Unsupported, []string{"in_transaction"}},
+		{"no login role before unknown usage", Input{NoLoginRole: true, Cumulative: &Cumulative{Error: "no login role"}},
+			Unsupported, []string{"no_login_role"}},
+		{
+			"transaction before the model's answers",
+			Input{InTransaction: true, Questions: []Question{dupQ}, Answers: A{"duplicate": choice("4812", 0.93)}},
+			Unsupported, []string{"in_transaction"},
+		},
 		{"state error, pass", Input{StateErr: errors.New("x"), OnFailure: "pass"}, Commit, []string{"state_error"}},
 		{"state error, hold", Input{StateErr: errors.New("x"), OnFailure: "hold"}, Hold, []string{"state_error"}},
 		{"model error, pass", Input{ModelErr: errors.New("timeout"), OnFailure: "pass"}, Commit, []string{"model_error"}},
@@ -248,6 +260,10 @@ func TestVerdictImpact(t *testing.T) {
 			Impact: &Impact{Error: "set role: permission denied"}}, Unsupported, []string{"not_single_row"}},
 		{"unsupported wins over impact", Input{Unsupported: "in_transaction", Op: "update", ImpactLimit: lim,
 			Impact: &Impact{Method: "count", Rows: n(500), Capped: true}}, Unsupported, []string{"in_transaction"}},
+		{"transaction wins over impact", Input{InTransaction: true, Op: "update", ImpactLimit: lim,
+			Impact: &Impact{Method: "count", Rows: n(500), Capped: true}}, Unsupported, []string{"in_transaction"}},
+		{"login role wins over impact", Input{NoLoginRole: true, Op: "update", ImpactLimit: lim,
+			Impact: &Impact{Method: "count", Rows: n(500), Capped: true}}, Unsupported, []string{"no_login_role"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -295,7 +311,19 @@ func TestVerdictCumulative(t *testing.T) {
 			Cumulative: cum(480, 50)}, Hold, []string{"impact:cumulative"}},
 		{"estimate within cumulative", Input{Op: "update", ImpactLimit: lim, Impact: &Impact{Method: "estimate", Rows: n(5)},
 			Cumulative: cum(0, 5)}, Escalate, []string{"impact:uncertain"}},
-		{"unknown usage is not applied", Input{Op: "insert", Cumulative: &Cumulative{Error: "no login role"}}, Commit, nil},
+		{"unknown usage holds", Input{Op: "insert", Cumulative: &Cumulative{Error: "x"}}, Hold, []string{"impact:cumulative_unknown"}},
+		{"unknown usage wins over a model hold", Input{Op: "insert", Thresholds: th, Questions: []Question{dupQ}, Answers: holdAnswers,
+			Cumulative: &Cumulative{Error: "x"}}, Hold, []string{"impact:cumulative_unknown"}},
+		{"unknown usage wins over state error", Input{Op: "insert", StateErr: errors.New("x"), OnFailure: "pass",
+			Cumulative: &Cumulative{Error: "x"}}, Hold, []string{"impact:cumulative_unknown"}},
+		{"measured, unknown usage", Input{Op: "update", ImpactLimit: lim, Impact: &Impact{Method: "count", Rows: n(20)},
+			Cumulative: &Cumulative{Error: "x"}}, Hold, []string{"impact:cumulative_unknown"}},
+		{"rows limit wins over unknown usage", Input{Op: "update", ImpactLimit: lim,
+			Impact: &Impact{Method: "count", Rows: n(101), Capped: true}, Cumulative: &Cumulative{Error: "x"}}, Hold, []string{"impact:rows"}},
+		{"unknown usage before uncertain", Input{Op: "update", ImpactLimit: lim, Impact: &Impact{Method: "estimate", Rows: n(5)},
+			Cumulative: &Cumulative{Error: "x"}}, Hold, []string{"impact:cumulative_unknown"}},
+		{"failed measure wins over unknown usage", Input{Op: "update", ShapeReason: "not_single_row", ImpactLimit: lim,
+			Impact: &Impact{Error: "x"}, Cumulative: &Cumulative{Error: "x"}}, Unsupported, []string{"not_single_row"}},
 		{"unsupported stays", Input{Unsupported: "multi_row", Cumulative: cum(500, 1)}, Unsupported, []string{"multi_row"}},
 		{"failed measure stays", Input{Op: "update", ShapeReason: "not_single_row", ImpactLimit: lim,
 			Impact: &Impact{Error: "x"}, Cumulative: cum(500, 1)}, Unsupported, []string{"not_single_row"}},
@@ -305,6 +333,103 @@ func TestVerdictCumulative(t *testing.T) {
 			v, reasons := Verdict(tc.in)
 			if v != tc.verdict || !reflect.DeepEqual(reasons, tc.reasons) {
 				t.Errorf("got %s %v, want %s %v", v, reasons, tc.verdict, tc.reasons)
+			}
+		})
+	}
+}
+
+func TestCumulativeUnknown(t *testing.T) {
+	n := func(v int64) *int64 { return &v }
+	cases := []struct {
+		name string
+		c    *Cumulative
+		want bool
+	}{
+		{"no limit", nil, false},
+		{"usage read", &Cumulative{Used: n(3), Planned: n(1), Limit: 5, WindowS: 60}, false},
+		{"usage not read", &Cumulative{Error: "usage not loaded: timeout"}, true},
+	}
+	for _, tc := range cases {
+		if got := tc.c.Unknown(); got != tc.want {
+			t.Errorf("%s: Unknown() = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Deterministic is the front of Verdict: whatever it decides, Verdict decides
+// the same, and it never looks at what the model said.
+func TestDeterministic(t *testing.T) {
+	n := func(v int64) *int64 { return &v }
+	lim := &config.Impact{MaxRows: 100, MaxShare: 0.5}
+	cum := func(used, planned int64) *Cumulative {
+		return &Cumulative{Used: n(used), Planned: n(planned), Limit: 500, WindowS: 600}
+	}
+	dupQ := Question{ID: "duplicate", Type: "choice", Choices: []string{"4812", "none"}}
+	rule1 := Question{ID: "policy_1", Type: "noul", Choices: []string{"true", "false"}}
+	qs := []Question{dupQ, rule1}
+	hold := map[string]Answer{"duplicate": choice("4812", 0.95), "policy_1": yesno(0.9)}
+
+	decided := []struct {
+		name    string
+		in      Input
+		verdict string
+		reasons []string
+	}{
+		{"shape", Input{Unsupported: "multi_row", Questions: qs}, Unsupported, []string{"multi_row"}},
+		{"transaction", Input{InTransaction: true, Questions: qs}, Unsupported, []string{"in_transaction"}},
+		{"login role", Input{NoLoginRole: true, Questions: qs}, Unsupported, []string{"no_login_role"}},
+		{"measured, within", Input{Op: "update", ImpactLimit: lim, Impact: &Impact{Method: "count", Rows: n(3)}}, Commit, nil},
+		{"measured, over", Input{Op: "delete", ImpactLimit: lim,
+			Impact: &Impact{Method: "count", Rows: n(101), Capped: true}}, Hold, []string{"impact:rows"}},
+		{"measured, estimate", Input{Op: "update", ImpactLimit: lim,
+			Impact: &Impact{Method: "estimate", Rows: n(5)}}, Escalate, []string{"impact:uncertain"}},
+		{"measuring failed", Input{Op: "update", ShapeReason: "not_single_row", ImpactLimit: lim,
+			Impact: &Impact{Error: "x"}}, Unsupported, []string{"not_single_row"}},
+		{"cumulative over", Input{Op: "insert", Questions: qs, Cumulative: cum(500, 1)}, Hold, []string{"impact:cumulative"}},
+		{"cumulative unknown", Input{Op: "insert", Questions: qs, Cumulative: &Cumulative{Error: "x"}},
+			Hold, []string{"impact:cumulative_unknown"}},
+		{"state error, hold", Input{Op: "update", Questions: qs, StateErr: errors.New("x"), OnFailure: "hold"},
+			Hold, []string{"state_error"}},
+		{"state error, pass", Input{Op: "update", Questions: qs, StateErr: errors.New("x"), OnFailure: "pass"},
+			Commit, []string{"state_error"}},
+		{"no questions", Input{Op: "insert", Cumulative: cum(10, 1)}, Commit, nil},
+		{"no questions, no limit", Input{Op: "delete"}, Commit, nil},
+	}
+	for _, tc := range decided {
+		t.Run(tc.name, func(t *testing.T) {
+			in := tc.in
+			in.Thresholds = th
+			v, reasons, ok := Deterministic(in)
+			if !ok || v != tc.verdict || !reflect.DeepEqual(reasons, tc.reasons) {
+				t.Errorf("Deterministic = %s %v %v, want %s %v true", v, reasons, ok, tc.verdict, tc.reasons)
+			}
+			// Had the model been asked and answered hold, Verdict would still
+			// decide the same.
+			if len(in.Questions) > 0 {
+				in.Answers = hold
+			}
+			if v2, r2 := Verdict(in); v2 != v || !reflect.DeepEqual(r2, reasons) {
+				t.Errorf("Verdict = %s %v, want what Deterministic decided: %s %v", v2, r2, v, reasons)
+			}
+		})
+	}
+
+	open := []struct {
+		name string
+		in   Input
+	}{
+		{"questions to ask", Input{Op: "insert", Questions: qs}},
+		{"questions, within the cumulative limit", Input{Op: "insert", Questions: qs, Cumulative: cum(10, 1)}},
+		// What the model said is not Deterministic's to read.
+		{"answers already in", Input{Op: "insert", Questions: qs, Answers: hold}},
+		{"model failed", Input{Op: "insert", Questions: qs, ModelErr: errors.New("timeout"), OnFailure: "hold"}},
+	}
+	for _, tc := range open {
+		t.Run(tc.name, func(t *testing.T) {
+			in := tc.in
+			in.Thresholds = th
+			if v, reasons, ok := Deterministic(in); ok || v != "" || reasons != nil {
+				t.Errorf("Deterministic = %q %v %v, want undecided", v, reasons, ok)
 			}
 		})
 	}

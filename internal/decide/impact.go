@@ -46,6 +46,9 @@ func impactVerdict(in Input) (string, []string) {
 	if in.Cumulative.Over() {
 		return Hold, []string{"impact:cumulative"}
 	}
+	if in.Cumulative.Unknown() {
+		return Hold, []string{"impact:cumulative_unknown"}
+	}
 	if im.Method == "estimate" {
 		return Escalate, []string{"impact:uncertain"}
 	}

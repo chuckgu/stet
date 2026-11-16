@@ -406,7 +406,7 @@ func TestCumulativeLoadsAgainAfterAFailedLoad(t *testing.T) {
 	if want := map[string]any{"error": "usage not loaded: injected failure"}; !reflect.DeepEqual(first.Cumulative, want) {
 		t.Errorf("cumulative = %v, want %v", first.Cumulative, want)
 	}
-	wantAccount(t, 1, first, "commit")
+	wantAccount(t, 1, first, "hold", "impact:cumulative_unknown")
 	wantRows(t, 1, first, ptr(int64(1)))
 
 	mustExec(t, conn, "update "+e.table+" set title = 'b' where id = 2")

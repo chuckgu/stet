@@ -1,0 +1,316 @@
+package decide
+
+import (
+	"fmt"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+
+	"github.com/stetdb/stet/internal/config"
+)
+
+// SQLSTATEs of the errors enforce mode returns (spec-v0.2-enforce 6). ST003,
+// a rejection by policy, keeps its place from spec-v0.1 but is not returned.
+const (
+	CodeHeld        = "ST001" // hold, escalate: the write waits for a human
+	CodeUnsupported = "ST002" // unsupported, and the closed points of spec 7
+)
+
+// Facts are what an error message may mention. Nothing else of a write's
+// state reaches the client: not its statement or bind values, which the
+// agent wrote, and no value of any row. A duplicate candidate is named by
+// its key alone.
+type Facts struct {
+	Table         string   // the table's key in the config
+	PK            string   // the table's primary-key column name from the config (pk:), not the row's key value
+	Op            string   // insert | update | delete
+	Unsupported   string   // the table's unsupported setting: reject | pass
+	Rules         []string // the table's policy rules
+	Impact        *Impact
+	Limit         *config.Impact
+	Cumulative    *Cumulative
+	InTransaction bool // the write arrived in a transaction that had already run something else
+	NoLoginRole   bool // the session's login role is not known
+}
+
+// Action is what enforce mode does with a write once its verdict is known (spec 5).
+type Action struct {
+	Forward bool   // send the statement; the other fields are empty
+	Code    string // CodeHeld or CodeUnsupported
+	Held    bool   // keep the write in stet.held_writes (verdict hold or escalate)
+	Message string // the error's first line
+	hint    string // the HINT line, with heldMark where the held write is named
+}
+
+// heldMark stands for the held write in a hint until Hint names it. Every
+// value put into a message goes through clean, which removes control
+// characters, so no value can contain it.
+const heldMark = "\x00"
+
+const approve = "ask a human to approve " + heldMark
+
+// Act turns a verdict into what enforce mode does (spec 5). The sentence of
+// a refusal is chosen by the first reason; a reason the table does not know,
+// or one whose sentence needs a fact f lacks, gets the generic sentence.
+//
+// An unsupported write in a dirty transaction, or of a session whose login
+// role is not known, is always refused (spec 4, 7), whatever the table's
+// unsupported setting, and also when its shape reason came first in the
+// rule order. Its sentence is then the transaction's or the login role's:
+// changing the shape would not let it through.
+func Act(verdict string, reasons []string, f Facts) Action {
+	var a Action
+	switch verdict {
+	case Commit:
+		return Action{Forward: true}
+	case Hold, Escalate:
+		a = Action{Code: CodeHeld, Held: true, Message: "write held by stet: "}
+	case Unsupported:
+		switch {
+		case f.InTransaction:
+			reasons = []string{"in_transaction"}
+		case f.NoLoginRole:
+			reasons = []string{"no_login_role"}
+		case f.Unsupported == "pass" && !slices.ContainsFunc(reasons, alwaysRefused):
+			return Action{Forward: true}
+		}
+		a = Action{Code: CodeUnsupported, Message: "write refused by stet: "}
+	default:
+		// No rule returns another verdict (reject is reserved). A verdict
+		// this table does not know is refused, never let through.
+		a = Action{Code: CodeUnsupported, Message: "write refused by stet: "}
+	}
+	p, ok := explain(reasons, f)
+	if !ok {
+		p = generic(reasons)
+	}
+	a.Message += p.msg
+	a.hint = p.hint
+	return a
+}
+
+// alwaysRefused reports the reasons the table's unsupported: pass does not
+// let through (spec 5).
+func alwaysRefused(reason string) bool {
+	return reason == "in_transaction" || reason == "no_login_role"
+}
+
+// Hint is the HINT line. heldWrite is the stet.held_writes id; "" when the
+// write is not held or its row could not be stored.
+func (a Action) Hint(heldWrite string) string {
+	held := "this write"
+	if heldWrite != "" {
+		held = "held_write " + clean(heldWrite)
+	}
+	return strings.Replace(a.hint, heldMark, held, 1)
+}
+
+// Detail is the DETAIL line: "decision=<id> held_write=<id> reasons=<a,b>",
+// without held_write when it is "". A part with nothing to say is left out.
+func Detail(decision, heldWrite string, reasons []string) string {
+	var parts []string
+	if decision != "" {
+		parts = append(parts, "decision="+clean(decision))
+	}
+	if heldWrite != "" {
+		parts = append(parts, "held_write="+clean(heldWrite))
+	}
+	if len(reasons) > 0 {
+		rs := make([]string, len(reasons))
+		for i, r := range reasons {
+			rs[i] = clean(r)
+		}
+		parts = append(parts, "reasons="+strings.Join(rs, ","))
+	}
+	return strings.Join(parts, " ")
+}
+
+// Blocked is the refusal of a message the proxy does not forward and no
+// decision records (spec 7). Its Code is CodeUnsupported.
+func Blocked(reason string) Action {
+	if p, ok := blocked[reason]; ok {
+		return Action{Code: CodeUnsupported, Message: p.msg, hint: p.hint}
+	}
+	msg := "refused by stet"
+	if reason != "" {
+		msg += " (" + clean(reason) + ")"
+	}
+	return Action{Code: CodeUnsupported, Message: msg}
+}
+
+// phrase is the sentence after the message's prefix, and the hint.
+type phrase struct{ msg, hint string }
+
+// blocked are the closed points of spec 7; their messages are whole.
+var blocked = map[string]phrase{
+	"unparsed": {"statement refused by stet: it could not be parsed, so it cannot be checked",
+		"send standard PostgreSQL syntax, up to version 17"},
+	"too_large": {"message refused by stet: it is larger than 64 MiB and cannot be inspected",
+		"send the data in smaller statements"},
+	"function_call": {"function call refused by stet: the FunctionCall message cannot be inspected",
+		"call the function with SELECT"},
+	"do_block": {"DO block refused by stet: what it writes cannot be seen",
+		"send its statements one by one"},
+	"prepared_write": {"statement refused by stet: it runs a prepared write by name, which cannot be judged",
+		"run the write with Bind and Execute, or send it as SQL"},
+	"unsettled_name": {"statement refused by stet: the name it runs was changed by a message the server has not answered yet",
+		"wait for the answer to Parse or Bind before running the name"},
+	"protocol_order": {"connection closed by stet: a message arrived during COPY FROM STDIN that it cannot follow",
+		"send only copy data until the copy ends"},
+	"copy_extended": {"connection closed by stet: COPY FROM STDIN through the extended protocol is not supported here",
+		"send COPY ... FROM STDIN as a simple query"},
+}
+
+// fixed are the reasons whose sentence needs no fact.
+var fixed = map[string]phrase{
+	"state_error":       {"the state needed to judge it could not be read in time", "retry shortly, or " + approve},
+	"model_error":       {"the judgment model did not answer", "retry shortly, or " + approve},
+	"no_model":          {"it needs a judgment and no model is configured", approve},
+	"conflict":          {"it would undo a value another write set recently", "read the row again and keep the recent value, or " + approve},
+	"concurrent_change": {"the row changed while the write was being judged", "read the row again and retry"},
+	"in_transaction": {"it came after another statement in the same transaction and cannot be judged there",
+		"ROLLBACK, then send this write as its own statement or as the first statement after BEGIN"},
+	"no_login_role": {"the session had not finished logging in, so its login role is not known",
+		"wait until the connection is ready before sending statements"},
+	"multi_statement": {"several statements were sent in one query", "send each statement as its own query"},
+	"on_conflict": {"INSERT ... ON CONFLICT cannot be judged",
+		"check whether the row exists, then send a plain INSERT or UPDATE"},
+	"indirection":  {"this form of SET cannot be judged", "set each column to a whole value, one column per assignment"},
+	"multi_assign": {"this form of SET cannot be judged", "set each column to a whole value, one column per assignment"},
+}
+
+// ofTable are the reasons whose sentence names the table, at its %s.
+var ofTable = map[string]phrase{
+	"impact:cumulative_unknown": {"the rows this role has touched in %s could not be read, so its cumulative limit cannot be checked",
+		"retry shortly, or " + approve},
+	"not_single_row": manyRows,
+	"join":           manyRows,
+	"subquery":       manyRows,
+	"with":           manyRows,
+	"multi_row":      manyRows,
+	"insert_select":  manyRows,
+	"copy":           {"COPY into %s cannot be judged", "use INSERT statements"},
+	"truncate":       {"TRUNCATE of %s cannot be judged", "delete rows by primary key"},
+	"merge":          {"MERGE into %s cannot be judged", "send separate INSERT and UPDATE statements"},
+	"nested_write":   {"a write to %s inside another statement cannot be judged", "send it as a plain INSERT, UPDATE or DELETE"},
+}
+
+var manyRows = phrase{"it may touch more than one row of %s and its rows could not be counted",
+	"write one row at a time, selected by primary key"}
+
+var verbs = map[string]string{"insert": "inserted", "update": "updated", "delete": "deleted"}
+
+// explain is the sentence for a refused write, chosen by its first reason.
+// ok is false when the reason is not known here, or a fact its sentence
+// needs is missing; a sentence is never written without its numbers.
+func explain(reasons []string, f Facts) (phrase, bool) {
+	if len(reasons) == 0 {
+		return phrase{}, false
+	}
+	first := reasons[0]
+	if p, ok := fixed[first]; ok {
+		return p, true
+	}
+	table := clean(f.Table)
+	if p, ok := ofTable[first]; ok {
+		if table == "" {
+			return phrase{}, false
+		}
+		return phrase{fmt.Sprintf(p.msg, table), p.hint}, true
+	}
+	verb, hasVerb := verbs[f.Op]
+	narrow := "narrow the WHERE clause, or " + approve
+	if f.Op == "insert" {
+		narrow = "insert fewer rows in one statement, or " + approve
+	}
+	im, lim, cum := f.Impact, f.Limit, f.Cumulative
+	switch {
+	case first == "impact:rows":
+		switch {
+		case im == nil || lim == nil || !hasVerb:
+		case im.Capped:
+			return phrase{fmt.Sprintf("more than %d rows would be %s, over the limit of %d", lim.MaxRows, verb, lim.MaxRows), narrow}, true
+		case im.Rows != nil:
+			return phrase{fmt.Sprintf("%d rows would be %s, over the limit of %d", *im.Rows, verb, lim.MaxRows), narrow}, true
+		}
+	case first == "impact:share":
+		if im != nil && im.Share != nil && lim != nil && lim.MaxShare > 0 && table != "" && hasVerb {
+			return phrase{fmt.Sprintf("%.3g%% of %s would be %s, over the limit of %.3g%%",
+				*im.Share*100, table, verb, lim.MaxShare*100), narrow}, true
+		}
+	case first == "impact:cumulative":
+		if cum != nil && cum.Used != nil && cum.Planned != nil && cum.Limit > 0 && cum.WindowS > 0 && table != "" {
+			window := (time.Duration(cum.WindowS) * time.Second).String()
+			return phrase{fmt.Sprintf("this role has touched %d rows of %s in the last %s, and %d more would pass the limit of %d",
+				*cum.Used, table, window, *cum.Planned, cum.Limit), "wait until earlier writes leave the window, or " + approve}, true
+		}
+	case first == "impact:uncertain":
+		if im != nil && im.Rows != nil {
+			return phrase{fmt.Sprintf("the rows it would touch could only be estimated (about %d)", *im.Rows),
+				"use a WHERE clause of plain comparisons on the table's own columns, or " + approve}, true
+		}
+	case strings.HasPrefix(first, "low_confidence:"):
+		return phrase{"the judgment was not confident enough to let it through", approve}, true
+	case strings.HasPrefix(first, "duplicate:"):
+		// The candidate's key, never its values.
+		pk, id := clean(f.PK), clean(strings.TrimPrefix(first, "duplicate:"))
+		if table != "" && pk != "" && id != "" {
+			key := table + "." + pk + "=" + id
+			return phrase{"possible duplicate of " + key, "update " + key + " instead of inserting a new row, or " + approve}, true
+		}
+	case strings.HasPrefix(first, "policy:"):
+		if msg, ok := brokenRules(reasons, f.Rules); ok {
+			return phrase{msg, "change the write to follow the rule, or " + approve}, true
+		}
+	}
+	return phrase{}, false
+}
+
+// brokenRules names every broken rule among reasons, in their order, with
+// its text. ok is false when a rule is not among the table's rules.
+func brokenRules(reasons, rules []string) (string, bool) {
+	var b strings.Builder
+	b.WriteString("it breaks policy ")
+	for _, r := range reasons {
+		n, isRule := strings.CutPrefix(r, "policy:")
+		if !isRule {
+			continue
+		}
+		i, err := strconv.Atoi(n)
+		if err != nil || i < 1 || i > len(rules) {
+			return "", false
+		}
+		text := strings.Join(strings.Fields(clean(rules[i-1])), " ")
+		if text == "" {
+			return "", false
+		}
+		if b.Len() > len("it breaks policy ") {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "rule %d (\"%s\")", i, text)
+	}
+	return b.String(), true
+}
+
+// generic is the sentence for a reason explain cannot phrase.
+func generic(reasons []string) phrase {
+	p := phrase{"this statement shape cannot be judged", "send a plain single-row INSERT, UPDATE or DELETE"}
+	if len(reasons) > 0 && reasons[0] != "" {
+		p.msg += " (" + clean(reasons[0]) + ")"
+	}
+	return p
+}
+
+// clean makes a value safe to put in a message, which the proxy builds into
+// a protocol ErrorResponse whose fields end at a zero byte: valid UTF-8,
+// with every control character made a space.
+func clean(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, strings.ToValidUTF8(s, "�"))
+}
