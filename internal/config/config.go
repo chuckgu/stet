@@ -32,6 +32,12 @@ type Config struct {
 	Retention time.Duration // 0 = keep forever
 	Tables    map[string]Table
 
+	// AgentRoles are the login roles whose sessions Stet watches. Empty
+	// (shadow only): every session.
+	AgentRoles []string
+	// MaxInflight is how many writes are judged at once.
+	MaxInflight int
+
 	// Hash identifies the config file's bytes. Decisions record it as
 	// policy_version.
 	Hash string
@@ -109,6 +115,13 @@ type rawConfig struct {
 	Model     *rawModel           `yaml:"model"`
 	Retention string              `yaml:"retention"`
 	Tables    map[string]rawTable `yaml:"tables"`
+	Agents    *struct {
+		Roles []string `yaml:"roles"`
+	} `yaml:"agents"`
+	// A pointer: max_inflight: 0 must be told apart from absence.
+	Limits *struct {
+		MaxInflight *int `yaml:"max_inflight"`
+	} `yaml:"limits"`
 }
 
 type rawModel struct {
@@ -248,12 +261,31 @@ func Parse(b []byte) (*Config, error) {
 		switch c.Model.OnFailure {
 		case "":
 			c.Model.OnFailure = "pass"
+			if c.Mode == ModeEnforce {
+				c.Model.OnFailure = "hold"
+			}
 		case "pass", "hold":
 		default:
 			fail("model.on_failure: %q must be pass or hold", m.OnFailure)
 		}
+		// Without a model every write that needs a value judgment fails, so
+		// the file must say that only the impact limits are wanted.
+		if c.Mode == ModeEnforce && m.Adapter == RecordOnly && m.OnFailure != "pass" {
+			fail("model.on_failure: adapter %q judges nothing; in enforce mode write on_failure: pass to use only the impact limits", RecordOnly)
+		}
 	} else if len(raw.Tables) > 0 {
 		fail("model: required when tables are configured")
+	}
+
+	c.AgentRoles = resolveRoles(raw.Agents, c.Mode, c.Upstream, fail)
+
+	c.MaxInflight = 32
+	if raw.Limits != nil && raw.Limits.MaxInflight != nil {
+		if *raw.Limits.MaxInflight < 1 {
+			fail("limits.max_inflight: %d must be at least 1", *raw.Limits.MaxInflight)
+		} else {
+			c.MaxInflight = *raw.Limits.MaxInflight
+		}
 	}
 
 	c.Tables = make(map[string]Table, len(raw.Tables))
@@ -268,6 +300,46 @@ func Parse(b []byte) (*Config, error) {
 		return nil, errors.Join(errs...)
 	}
 	return c, nil
+}
+
+// maxRoleName is Postgres's identifier limit in bytes.
+const maxRoleName = 63
+
+// resolveRoles checks agents.roles. Names are compared exactly, case
+// included. Stet's own account is known here only when the upstream URL
+// names a user; otherwise the startup check looks at it.
+func resolveRoles(agents *struct {
+	Roles []string `yaml:"roles"`
+}, mode Mode, upstream string, fail func(string, ...any)) []string {
+	var roles []string
+	if agents != nil {
+		roles = agents.Roles
+	}
+	if len(roles) == 0 {
+		if mode == ModeEnforce {
+			fail("agents.roles: required in enforce mode; list the login roles of the agents")
+		}
+		return nil
+	}
+	var own string
+	if u, err := url.Parse(upstream); err == nil && u.User != nil {
+		own = u.User.Username()
+	}
+	seen := map[string]bool{}
+	for _, r := range roles {
+		switch {
+		case r == "":
+			fail("agents.roles: a role name is empty")
+		case len(r) > maxRoleName:
+			fail("agents.roles: role name %q is longer than %d bytes", r, maxRoleName)
+		case seen[r]:
+			fail("agents.roles: %q is listed twice", r)
+		case own != "" && r == own:
+			fail("agents.roles: %q is Stet's own account (the upstream user)", r)
+		}
+		seen[r] = true
+	}
+	return roles
 }
 
 // resolveTable checks one table. hasReads and hasCumulative say whether its

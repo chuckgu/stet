@@ -112,16 +112,27 @@ func TestInvalidConfigs(t *testing.T) {
 		"impact max_share infinite":      {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 1, max_share: .inf}}}\n", "impact.max_share"},
 		"impact max_rows over a billion": {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 1000000001}}}\n", "impact.max_rows"},
 		// max_rows + 1 is the count's LIMIT; at the largest int it overflows.
-		"impact max_rows largest int":          {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 9223372036854775807}}}\n", "impact.max_rows"},
-		"cumulative needs max_rows":            {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 100, cumulative: {window: 10m}}}}\n", "cumulative.max_rows"},
-		"cumulative needs window":              {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 100, cumulative: {max_rows: 500}}}}\n", "cumulative.window"},
-		"cumulative below the statement limit": {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 100, cumulative: {max_rows: 50, window: 10m}}}}\n", "cumulative.max_rows"},
-		"cumulative above a billion":           {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 100, cumulative: {max_rows: 1000000001, window: 10m}}}}\n", "cumulative.max_rows"},
-		"window zero":                          {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 100, cumulative: {max_rows: 500, window: 0s}}}}\n", "cumulative.window"},
-		"window above a day":                   {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 100, cumulative: {max_rows: 500, window: 25h}}}}\n", "cumulative.window"},
-		"cumulative without impact max_rows":   {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {cumulative: {max_rows: 5, window: 1m}}}}\n", "impact.max_rows"},
-		"log_above zero":                       {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], reads: {log_above: 0}}}\n", "reads.log_above"},
-		"reads unknown key":                    {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], reads: {sample: 1}}}\n", "sample"},
+		"impact max_rows largest int":                 {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 9223372036854775807}}}\n", "impact.max_rows"},
+		"cumulative needs max_rows":                   {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 100, cumulative: {window: 10m}}}}\n", "cumulative.max_rows"},
+		"cumulative needs window":                     {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 100, cumulative: {max_rows: 500}}}}\n", "cumulative.window"},
+		"cumulative below the statement limit":        {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 100, cumulative: {max_rows: 50, window: 10m}}}}\n", "cumulative.max_rows"},
+		"cumulative above a billion":                  {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 100, cumulative: {max_rows: 1000000001, window: 10m}}}}\n", "cumulative.max_rows"},
+		"window zero":                                 {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 100, cumulative: {max_rows: 500, window: 0s}}}}\n", "cumulative.window"},
+		"window above a day":                          {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 100, cumulative: {max_rows: 500, window: 25h}}}}\n", "cumulative.window"},
+		"cumulative without impact max_rows":          {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {cumulative: {max_rows: 5, window: 1m}}}}\n", "impact.max_rows"},
+		"log_above zero":                              {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], reads: {log_above: 0}}}\n", "reads.log_above"},
+		"reads unknown key":                           {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], reads: {sample: 1}}}\n", "sample"},
+		"enforce needs agent roles":                   {minimal + "mode: enforce\n" + "model: {adapter: jev, version: jev-1.13.0}\n", "agents.roles"},
+		"enforce with no roles listed":                {minimal + "mode: enforce\nagents: {roles: []}\n" + "model: {adapter: jev, version: jev-1.13.0}\n", "agents.roles"},
+		"empty role name":                             {minimal + "agents: {roles: [\"\"]}\n", "agents.roles"},
+		"role listed twice":                           {minimal + "agents: {roles: [a, a]}\n", "agents.roles"},
+		"role name over 63 bytes":                     {minimal + "agents: {roles: [" + strings.Repeat("r", 64) + "]}\n", "agents.roles"},
+		"Stet's own account listed":                   {minimal + "agents: {roles: [app]}\n", "agents.roles"},
+		"record-only in enforce, on_failure left out": {minimal + "mode: enforce\nagents: {roles: [a]}\nmodel: {adapter: none}\n", "model.on_failure"},
+		"record-only in enforce, on_failure hold":     {minimal + "mode: enforce\nagents: {roles: [a]}\nmodel: {adapter: none, on_failure: hold}\n", "model.on_failure"},
+		"max_inflight zero":                           {minimal + "limits: {max_inflight: 0}\n", "limits.max_inflight"},
+		"agents unknown key":                          {minimal + "agents: {role: [a]}\n", "role"},
+		"limits unknown key":                          {minimal + "limits: {inflight: 4}\n", "inflight"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -432,5 +443,61 @@ func TestCumulativeAndReads(t *testing.T) {
 	}
 	if got := parse("    reads: {log_above: 1000}\n"); got.Reads == nil || *got.Reads != (Reads{LogAbove: 1000}) {
 		t.Errorf("reads = %+v", got.Reads)
+	}
+}
+
+const enforceBase = minimal + "mode: enforce\nagents: {roles: [agent_a, agent_b]}\n"
+
+func TestEnforceDefaults(t *testing.T) {
+	const tbl = "\ntables:\n  contacts: {pk: id, send_fields: [name]}\n"
+	c, err := Parse([]byte(enforceBase + "model: {adapter: jev, version: jev-1.13.0}" + tbl))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Model.OnFailure != "hold" {
+		t.Errorf("enforce on_failure = %q, want hold", c.Model.OnFailure)
+	}
+	if got := strings.Join(c.AgentRoles, ","); got != "agent_a,agent_b" {
+		t.Errorf("AgentRoles = %v", c.AgentRoles)
+	}
+	if c.MaxInflight != 32 {
+		t.Errorf("MaxInflight = %d, want 32", c.MaxInflight)
+	}
+	c, err = Parse([]byte(enforceBase + "model: {adapter: jev, version: jev-1.13.0, on_failure: pass}" + tbl))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Model.OnFailure != "pass" {
+		t.Errorf("explicit on_failure = %q, want pass", c.Model.OnFailure)
+	}
+	if _, err := Parse([]byte(enforceBase + "model: {adapter: none, on_failure: pass}\n")); err != nil {
+		t.Errorf("record-only with on_failure pass must be valid in enforce: %v", err)
+	}
+}
+
+func TestAgentRolesAndLimits(t *testing.T) {
+	c, err := Parse([]byte(minimal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AgentRoles != nil {
+		t.Errorf("shadow without agents: AgentRoles = %v, want nil", c.AgentRoles)
+	}
+	if c.MaxInflight != 32 {
+		t.Errorf("default MaxInflight = %d, want 32", c.MaxInflight)
+	}
+	c, err = Parse([]byte(minimal + "agents: {roles: [x, Y]}\nlimits: {max_inflight: 4}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(c.AgentRoles, ","); got != "x,Y" {
+		t.Errorf("AgentRoles = %v, want [x Y]", c.AgentRoles)
+	}
+	if c.MaxInflight != 4 {
+		t.Errorf("MaxInflight = %d, want 4", c.MaxInflight)
+	}
+	// Roles are compared as written, case included.
+	if _, err := Parse([]byte(minimal + "agents: {roles: [App]}\n")); err != nil {
+		t.Errorf("App is not Stet's account app: %v", err)
 	}
 }
