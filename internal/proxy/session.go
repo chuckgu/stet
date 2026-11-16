@@ -1,10 +1,12 @@
 package proxy
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"slices"
+	"strconv"
 	"sync"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -42,6 +44,9 @@ type SessionInfo struct {
 	Database        string
 	ApplicationName string
 	OnBehalfOf      string
+	// TxOpen means an explicit transaction was already open when the statement
+	// arrived (the last ReadyForQuery status was not idle).
+	TxOpen bool
 }
 
 type Outcome struct {
@@ -53,6 +58,9 @@ type Outcome struct {
 	// InTransaction means the statement ran inside an explicit transaction,
 	// or next to other statements under one Sync (an implicit transaction).
 	InTransaction bool
+	// Rows is the row count from the statement's CommandComplete tag; nil when
+	// it did not complete or the tag carries no count.
+	Rows *int64
 }
 
 // session follows one client connection closely enough to tell the gate
@@ -92,6 +100,7 @@ type unit struct {
 	err         string
 	errAt       int // the Execute the error belongs to (1-based)
 	writes      []watchedWrite
+	rows        map[int]int64 // row counts by completion (1-based); kept only once a watched write joined
 }
 
 type watchedWrite struct {
@@ -245,7 +254,11 @@ func (s *session) apply(st Statement) {
 // first so they are not held back while the gate reads state.
 func (s *session) begin(u *unit, idx int, st Statement, ps []Param, flush func() error) {
 	flush()
-	h := s.gate.Begin(s.info, st, ps)
+	info := s.info
+	s.mu.Lock()
+	info.TxOpen = s.status != 'I'
+	s.mu.Unlock()
+	h := s.gate.Begin(info, st, ps)
 	s.mu.Lock()
 	u.writes = append(u.writes, watchedWrite{handle: h, idx: idx})
 	s.mu.Unlock()
@@ -281,6 +294,16 @@ func (s *session) fromServer(t byte, body []byte) {
 	case 'C', 'I', 's':
 		if head != nil {
 			head.completions++
+			// A watched write's CommandComplete always follows its Begin, so
+			// units without watched writes never need their tags read.
+			if t == 'C' && len(head.writes) > 0 {
+				if n, ok := tagRows(body); ok {
+					if head.rows == nil {
+						head.rows = map[int]int64{}
+					}
+					head.rows[head.completions] = n
+				}
+			}
 		}
 	case 'E':
 		if head != nil && head.err == "" {
@@ -322,17 +345,44 @@ func (s *session) finish(u *unit, before, after byte) {
 			o.Error = u.err
 		case u.query:
 			o.Executed = true
+			if u.completions == 1 { // several statements: no single count
+				o.Rows = u.rowsAt(1)
+			}
 		case u.err != "" && w.idx == u.errAt:
 			o.Error = u.err
 		case u.err != "" && w.idx > u.errAt:
 			o.Error = "not executed: an earlier statement in the same Sync failed: " + u.err
 		case u.completions >= w.idx:
 			o.Executed = true
+			o.Rows = u.rowsAt(w.idx)
 		default:
 			o.Error = "no completion before ReadyForQuery"
 		}
 		s.gate.End(w.handle, o)
 	}
+}
+
+// rowsAt returns the row count of the unit's k-th completion, or nil when its
+// tag carried none.
+func (u *unit) rowsAt(k int) *int64 {
+	if n, ok := u.rows[k]; ok {
+		return &n
+	}
+	return nil
+}
+
+// tagRows reads the row count from a CommandComplete body.
+func tagRows(body []byte) (int64, bool) {
+	tag, _, _ := bytes.Cut(body, []byte{0})
+	i := bytes.LastIndexByte(tag, ' ')
+	if i < 0 {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(string(tag[i+1:]), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // abandon reports writes still waiting when the connection ended.

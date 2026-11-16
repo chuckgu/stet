@@ -252,3 +252,76 @@ func TestGateTracksOnBehalfOf(t *testing.T) {
 		}
 	}
 }
+
+func TestGateSeesRowCounts(t *testing.T) {
+	table := watchedTable(t)
+	g := newRecordingGate(watches(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+	ctx := testCtx(t)
+
+	simple := func(sql string) {
+		t.Helper()
+		if _, err := conn.PgConn().Exec(ctx, sql).ReadAll(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	simple("insert into " + table + " values (1, 'a'), (2, 'a'), (3, 'b')")                         // simple query: 3
+	if _, err := conn.Exec(ctx, "update "+table+" set v = $1 where v = $2", "c", "a"); err != nil { // extended: 2
+		t.Fatal(err)
+	}
+	simple("delete from " + table + " where v = 'nobody'")    // 0, not nil
+	b := &pgx.Batch{}                                         // two Executes, one Sync
+	b.Queue("update "+table+" set v = 'd' where v = $1", "c") // 2
+	b.Queue("delete from "+table+" where id = $1", 3)         // 1
+	if err := conn.SendBatch(ctx, b).Close(); err != nil {
+		t.Fatal(err)
+	}
+	conn.Exec(ctx, "insert into "+table+" values ($1, 'dup')", 1) // fails: nil
+
+	_, os := g.outcomes(t, 6)
+	want := []*int64{ptr(int64(3)), ptr(int64(2)), ptr(int64(0)), ptr(int64(2)), ptr(int64(1)), nil}
+	for i, o := range os {
+		if (o.Rows == nil) != (want[i] == nil) || (o.Rows != nil && *o.Rows != *want[i]) {
+			t.Errorf("write %d: rows %v, want %v", i, deref(o.Rows), deref(want[i]))
+		}
+	}
+}
+
+func TestGateSeesOpenTransaction(t *testing.T) {
+	table := watchedTable(t)
+	g := newRecordingGate(watches(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+	ctx := testCtx(t)
+
+	mustExec(t, conn, "insert into "+table+" values (1, 'autocommit')")
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "insert into "+table+" values (2, 'in tx')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, "insert into "+table+" values (3, 'autocommit again')")
+
+	bs, _ := g.outcomes(t, 3)
+	for i, want := range []bool{false, true, false} {
+		if bs[i].info.TxOpen != want {
+			t.Errorf("write %d: TxOpen = %v, want %v", i, bs[i].info.TxOpen, want)
+		}
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
+
+// deref is for messages: the pointed-to value, or "nil".
+func deref[T any](p *T) any {
+	if p == nil {
+		return "nil"
+	}
+	return *p
+}
