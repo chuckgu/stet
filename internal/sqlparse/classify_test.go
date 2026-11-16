@@ -51,7 +51,7 @@ func TestClassifyKinds(t *testing.T) {
 		{"pk inside an or", "update contacts set title = 'x' where (id = 1 and status = 'a') or id = 2", Measured, "not_single_row"},
 		{"pk in list", "update contacts set status = 'churned' where id in (1, 2, 3)", Measured, "not_single_row"},
 		{"pk compared to column", "update contacts set title = 'x' where id = company_id", Measured, "not_single_row"},
-		{"where current of", "update contacts set title = 'x' where current of c", Measured, "not_single_row"},
+		{"where current of", "update contacts set title = 'x' where current of c", Unsupported, "not_single_row"},
 		{"delete all rows", "delete from contacts", Measured, "not_single_row"},
 		{"update from", "update contacts set title = l.title from leads l where contacts.id = 1", Unsupported, "join"},
 		{"delete using", "delete from contacts using leads where contacts.id = 1", Unsupported, "join"},
@@ -115,8 +115,6 @@ func TestClassifyMeasured(t *testing.T) {
 			Measure{Method: MethodEstimate}},
 		{"schema-qualified operator", "delete from contacts where company_id operator(public.=) 3", "not_single_row",
 			Measure{Method: MethodEstimate}},
-		{"where current of", "update contacts set title = 'x' where current of c", "not_single_row",
-			Measure{Method: MethodEstimate}},
 		// JSON_ARRAY(query) holds a bare SelectStmt, not a SubLink.
 		{"query outside a sublink", "delete from contacts where json_array(select 1) is not null", "not_single_row",
 			Measure{Method: MethodEstimate}},
@@ -160,6 +158,9 @@ func TestClassifyStaysUnsupported(t *testing.T) {
 		"single row with join":            {"update contacts set title = l.title from leads l where contacts.id = 1", "join"},
 		"single row insert with a with":   {"with x as (select 1) insert into contacts (name) values ('a')", "with"},
 		"cte also writes the gated table": {"with d as (delete from contacts where company_id = 9 returning id) update contacts set status = 'x' where company_id = 3", "with"},
+		// One row, chosen by a cursor: as many rows as a pk equality.
+		"where current of":        {"update contacts set title = 'x' where current of c", "not_single_row"},
+		"delete where current of": {"delete from contacts where current of c", "not_single_row"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

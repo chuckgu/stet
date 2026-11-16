@@ -73,10 +73,13 @@ func mayTouchManyRows(n *pg.Node, m matchFunc) bool {
 }
 
 // spansRows reports whether where may match more than one row of the gated
-// table rel: it does not pin the primary key (see pkEquality).
+// table rel: it neither pins the primary key (see pkEquality) nor names a
+// cursor's current row. WHERE CURRENT OF touches one row whose values cannot
+// be read; measuring it would find one row and skip value-level judgment.
+// The grammar only allows CURRENT OF as the whole WHERE clause.
 func spansRows(rel *pg.RangeVar, where *pg.Node, m matchFunc) bool {
 	t, ok := m(rel)
-	if !ok {
+	if !ok || where.GetCurrentOfExpr() != nil {
 		return false
 	}
 	_, single := pkEquality(where, rel, t.pk)
