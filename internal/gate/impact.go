@@ -1,0 +1,208 @@
+package gate
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"strconv"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/stetdb/stet/internal/config"
+	"github.com/stetdb/stet/internal/decide"
+	"github.com/stetdb/stet/internal/sqlparse"
+)
+
+// countTimeout is the statement_timeout of a measurement's queries. A count
+// that runs past it falls back to the planner's estimate (spec 4).
+var countTimeout = 200 * time.Millisecond // a var so tests can shorten it (Task 7)
+
+// rollbackTimeout bounds the rollback that ends every measurement. It has its
+// own context because the measurement's may already have expired.
+const rollbackTimeout = time.Second
+
+var onDelete = map[string]string{"c": "cascade", "n": "set_null", "d": "set_default"}
+
+// measure asks the database what a measured write would touch. It never
+// returns nil: a failure is reported in Impact.Error.
+func (g *Gate) measure(ctx context.Context, p *pending, lim *config.Impact) *decide.Impact {
+	start := time.Now()
+	im := &decide.Impact{}
+	switch m := p.res.Measure; {
+	case m == nil:
+		im.Error = "no measure"
+	case m.Method == sqlparse.MethodSyntax:
+		im.Method, im.Rows = string(m.Method), ptr(int64(m.Rows))
+	default:
+		err := g.queryImpact(ctx, p, m, lim, im)
+		if ctx.Err() != nil {
+			err = errors.New("timeout")
+		}
+		if err != nil {
+			im.Method, im.Rows, im.Capped, im.Error = "", nil, false, err.Error()
+		}
+	}
+	if p.res.Op != "insert" && im.Rows != nil && im.TableRows != nil {
+		im.Share = ptr(float64(*im.Rows) / float64(*im.TableRows))
+	}
+	im.MeasureMS = int(time.Since(start).Milliseconds())
+	return im
+}
+
+// queryImpact fills im from the database, on one pooled connection, in a
+// read-only transaction as the client's role.
+//
+// SET LOCAL ROLE is not a security boundary: a predicate can undo it with
+// built-in functions. The boundary is what runs here. The agent's statement
+// is only prepared and EXPLAINed (never with ANALYZE), which does not execute
+// it; the only predicate executed is Measure.CountSQL, which sqlparse builds
+// for vetted predicates only, and only when the method is count.
+func (g *Gate) queryImpact(ctx context.Context, p *pending, m *sqlparse.Measure, lim *config.Impact, im *decide.Impact) error {
+	conn, err := g.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire: %w", err)
+	}
+	defer conn.Release()
+	pg := conn.Conn().PgConn()
+	// Runs before Release on every path. A connection the rollback did not
+	// return to idle is closed, so no transaction or role reaches the pool.
+	defer func() {
+		rctx, cancel := context.WithTimeout(context.Background(), rollbackTimeout)
+		defer cancel()
+		if err := pg.Exec(rctx, "rollback").Close(); err != nil || pg.TxStatus() != 'I' {
+			pg.Close(rctx)
+		}
+	}()
+
+	begin := fmt.Sprintf("begin read only; set local role %s; set local statement_timeout = '%dms'",
+		pgx.Identifier{p.session.User}.Sanitize(), max(countTimeout.Milliseconds(), 1))
+	if err := pg.Exec(ctx, begin).Close(); err != nil {
+		// Never retried without the role.
+		return fmt.Errorf("set role: %w", err)
+	}
+
+	// The count query keeps only the WHERE clause, so some parameters may go
+	// unused there; Postgres needs their types, inferred from the statement.
+	// Prepared here rather than first so that the agent's statement is only
+	// ever parsed as the client's role, read-only, under the timeout.
+	var values [][]byte
+	var oids []uint32
+	if len(p.params) > 0 {
+		sd, err := pg.Prepare(ctx, "", p.sql, p.oids)
+		if err != nil {
+			return fmt.Errorf("prepare: %w", err)
+		}
+		oids = sd.ParamOIDs
+		values = make([][]byte, len(p.params))
+		for i, v := range p.params {
+			if v != nil {
+				values[i] = []byte(*v)
+			}
+		}
+	}
+
+	rows, err := rowsOf(ctx, pg, "select reltuples::bigint from pg_class where oid = $1::regclass",
+		[][]byte{[]byte(p.res.Table)}, nil)
+	if err != nil {
+		return fmt.Errorf("table rows: %w", err)
+	}
+	if len(rows) == 1 {
+		if n, err := strconv.ParseInt(string(rows[0][0]), 10, 64); err == nil && n > 0 {
+			im.TableRows = &n
+		}
+	}
+
+	if p.res.Op == "delete" {
+		rows, err := rowsOf(ctx, pg, `
+			select c.conrelid::regclass::text, c.confdeltype
+			from pg_constraint c
+			where c.contype = 'f' and c.confrelid = $1::regclass and c.confdeltype in ('c', 'n', 'd')
+			order by 1`, [][]byte{[]byte(p.res.Table)}, nil)
+		if err != nil {
+			return fmt.Errorf("cascades: %w", err)
+		}
+		for _, r := range rows {
+			im.Cascades = append(im.Cascades, decide.Cascade{Table: string(r[0]), OnDelete: onDelete[string(r[1])]})
+		}
+	}
+
+	est, err := estimate(ctx, pg, p.sql, values, oids)
+	if err != nil {
+		return fmt.Errorf("estimate: %w", err)
+	}
+	im.Estimate = &est
+
+	// Last: a count past the timeout aborts the transaction.
+	if m.Method != sqlparse.MethodCount {
+		im.Method, im.Rows = string(sqlparse.MethodEstimate), &est
+		return nil
+	}
+	limit := lim.MaxRows + 1
+	im.Cap = limit
+	rows, err = rowsOf(ctx, pg, fmt.Sprintf("select count(*) from (%s limit %d) s", m.CountSQL, limit), values, oids)
+	var pgErr *pgconn.PgError
+	switch {
+	case errors.As(err, &pgErr) && pgErr.Code == "57014": // statement_timeout
+		im.Method, im.Rows = string(sqlparse.MethodEstimate), &est
+		return nil
+	case err != nil:
+		return fmt.Errorf("count: %w", err)
+	case len(rows) != 1:
+		return fmt.Errorf("count: %d rows", len(rows))
+	}
+	n, err := strconv.ParseInt(string(rows[0][0]), 10, 64)
+	if err != nil {
+		return fmt.Errorf("count: %w", err)
+	}
+	if n >= int64(limit) {
+		im.Capped, n = true, int64(limit)
+	}
+	im.Method, im.Rows = string(sqlparse.MethodCount), &n
+	return nil
+}
+
+// estimate returns the planner's row estimate for the statement, from
+// EXPLAIN without ANALYZE, which plans the statement but does not run it.
+func estimate(ctx context.Context, pg *pgconn.PgConn, sql string, values [][]byte, oids []uint32) (int64, error) {
+	// Sent as one extended-protocol statement, which Postgres refuses to
+	// split, so nothing after the agent's statement can run.
+	rows, err := rowsOf(ctx, pg, "EXPLAIN (FORMAT JSON) "+sql, values, oids)
+	if err != nil {
+		return 0, err
+	}
+	if len(rows) != 1 {
+		return 0, fmt.Errorf("%d plan rows", len(rows))
+	}
+	type node struct {
+		Type   string  `json:"Node Type"`
+		Parent string  `json:"Parent Relationship"`
+		Rows   float64 `json:"Plan Rows"`
+		Plans  []node  `json:"Plans"`
+	}
+	var plans []struct{ Plan node }
+	if err := json.Unmarshal(rows[0][0], &plans); err != nil {
+		return 0, err
+	}
+	if len(plans) != 1 || plans[0].Plan.Type != "ModifyTable" {
+		return 0, errors.New("plan is not a single ModifyTable")
+	}
+	// Writes inside WITH hang off the top node as InitPlans; they are not
+	// the rows this statement touches.
+	var sum float64
+	for _, c := range plans[0].Plan.Plans {
+		if c.Parent != "InitPlan" && c.Parent != "SubPlan" {
+			sum += c.Rows
+		}
+	}
+	return int64(math.Round(sum)), nil
+}
+
+// rowsOf runs sql with text parameters and returns its rows as text.
+func rowsOf(ctx context.Context, pg *pgconn.PgConn, sql string, values [][]byte, oids []uint32) ([][][]byte, error) {
+	res := pg.ExecParams(ctx, sql, values, oids, nil, nil).Read()
+	return res.Rows, res.Err
+}

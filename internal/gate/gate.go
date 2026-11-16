@@ -108,8 +108,10 @@ type pending struct {
 	sql      string
 	res      sqlparse.Result
 	params   []*string      // bind values as text
+	oids     []uint32       // parameter types the client gave in Parse; 0 left to the server
 	proposed map[string]any // every column written, before send_fields
 	pk       *string
+	impact   *decide.Impact // set when Begin measured a Measured write
 
 	state        json.RawMessage
 	stateVersion map[string]string
@@ -121,6 +123,9 @@ type pending struct {
 func (g *Gate) Begin(s proxy.SessionInfo, st proxy.Statement, ps []proxy.Param) any {
 	start := time.Now()
 	p := &pending{id: store.NewID(), at: start, session: s, sql: st.SQL, res: st.Data.(sqlparse.Result)}
+	for _, x := range ps {
+		p.oids = append(p.oids, x.OID)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), stateTimeout)
 	defer cancel()
 
@@ -131,6 +136,13 @@ func (g *Gate) Begin(s proxy.SessionInfo, st proxy.Statement, ps []proxy.Param) 
 	if p.res.Kind == sqlparse.Gated && p.stateErr == nil {
 		if err := g.assemble(ctx, p); err != nil {
 			p.stateErr = err
+		}
+	}
+	// Inside an explicit transaction the verdict is in_transaction anyway,
+	// and Stet's connection cannot see the session's uncommitted rows.
+	if p.res.Kind == sqlparse.Measured && p.stateErr == nil && !s.TxOpen {
+		if lim := g.cfg.Tables[p.res.Table].Impact; lim != nil {
+			p.impact = g.measure(ctx, p, lim)
 		}
 	}
 	if p.stateErr != nil {
@@ -187,10 +199,16 @@ func (g *Gate) judge(p *pending, o proxy.Outcome) {
 	}
 
 	switch {
-	case p.res.Kind == sqlparse.Unsupported, p.res.Kind == sqlparse.Measured:
-		in.Unsupported = p.res.Reason
+	case p.res.Kind == sqlparse.Unsupported,
+		p.res.Kind == sqlparse.Measured && t.Impact == nil:
+		in.Unsupported = p.res.Reason // shape first, as before
 	case o.InTransaction:
 		in.Unsupported = "in_transaction"
+	case p.res.Kind == sqlparse.Measured:
+		if p.impact == nil { // skipped in Begin but the write turned out not to be in a transaction
+			p.impact = &decide.Impact{Error: "not measured"}
+		}
+		in.Op, in.ShapeReason, in.Impact, in.ImpactLimit = p.res.Op, p.res.Reason, p.impact, t.Impact
 	case p.stateErr != nil:
 		in.StateErr = p.stateErr
 	case len(p.questions) > 0:
@@ -206,6 +224,12 @@ func (g *Gate) judge(p *pending, o proxy.Outcome) {
 		} else if !errors.Is(err, decide.ErrNoModel) {
 			g.log.Warn("model call failed", "table", p.res.Table, "err", err)
 		}
+	}
+	// Recorded whenever a measurement was taken, also for a write that
+	// turned out to share an implicit transaction (spec 4, 6).
+	if p.impact != nil {
+		p.impact.ActualRows = o.Rows
+		d.Impact = p.impact
 	}
 	d.Verdict, d.Reasons = decide.Verdict(in)
 
