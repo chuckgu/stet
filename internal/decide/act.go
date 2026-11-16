@@ -2,6 +2,7 @@ package decide
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -52,8 +53,9 @@ const heldMark = "\x00"
 const approve = "ask a human to approve " + heldMark
 
 // Act turns a verdict into what enforce mode does (spec 5). The sentence of
-// a refusal is chosen by the first reason; a reason the table does not know,
-// or one whose sentence needs a fact f lacks, gets the generic sentence.
+// a refusal is chosen by the first reason. A reason the table does not know,
+// or one whose sentence needs a fact f lacks, gets a generic sentence: "it
+// needs review" for a held write, the shape sentence for a refused one.
 //
 // An unsupported write in a dirty transaction, or of a session whose login
 // role is not known, is always refused (spec 4, 7), whatever the table's
@@ -83,7 +85,11 @@ func Act(verdict string, reasons []string, f Facts) Action {
 		a = Action{Code: CodeUnsupported, Message: "write refused by stet: "}
 	}
 	p, ok := explain(reasons, f)
-	if !ok {
+	switch {
+	case ok:
+	case a.Held:
+		p = needsReview(reasons)
+	default:
 		p = generic(reasons)
 	}
 	a.Message += p.msg
@@ -236,9 +242,9 @@ func explain(reasons []string, f Facts) (phrase, bool) {
 			return phrase{fmt.Sprintf("%d rows would be %s, over the limit of %d", *im.Rows, verb, lim.MaxRows), narrow}, true
 		}
 	case first == "impact:share":
-		if im != nil && im.Share != nil && lim != nil && lim.MaxShare > 0 && table != "" && hasVerb {
-			return phrase{fmt.Sprintf("%.3g%% of %s would be %s, over the limit of %.3g%%",
-				*im.Share*100, table, verb, lim.MaxShare*100), narrow}, true
+		if im != nil && finite(im.Share) && lim != nil && lim.MaxShare > 0 && table != "" && hasVerb {
+			return phrase{fmt.Sprintf("%s%% of %s would be %s, over the limit of %s%%",
+				percent(*im.Share), table, verb, percent(lim.MaxShare)), narrow}, true
 		}
 	case first == "impact:cumulative":
 		if cum != nil && cum.Used != nil && cum.Planned != nil && cum.Limit > 0 && cum.WindowS > 0 && table != "" {
@@ -253,12 +259,21 @@ func explain(reasons []string, f Facts) (phrase, bool) {
 		}
 	case strings.HasPrefix(first, "low_confidence:"):
 		return phrase{"the judgment was not confident enough to let it through", approve}, true
-	case strings.HasPrefix(first, "duplicate:"):
+	case first == "duplicate" || strings.HasPrefix(first, "duplicate:"):
 		// The candidate's key, never its values.
 		pk, id := clean(f.PK), clean(strings.TrimPrefix(first, "duplicate:"))
-		if table != "" && pk != "" && id != "" {
+		if first == "duplicate" {
+			id = ""
+		}
+		switch {
+		case table != "" && pk != "" && id != "":
 			key := table + "." + pk + "=" + id
 			return phrase{"possible duplicate of " + key, "update " + key + " instead of inserting a new row, or " + approve}, true
+		case table != "":
+			// No key to name: the id was left out (it was not one of the
+			// candidates), or the key column is not known.
+			return phrase{"possible duplicate of another row in " + table,
+				"check whether the row already exists, or " + approve}, true
 		}
 	case strings.HasPrefix(first, "policy:"):
 		if msg, ok := brokenRules(reasons, f.Rules); ok {
@@ -294,13 +309,37 @@ func brokenRules(reasons, rules []string) (string, bool) {
 	return b.String(), true
 }
 
-// generic is the sentence for a reason explain cannot phrase.
+// generic is the sentence for a refused write whose reason explain cannot
+// phrase.
 func generic(reasons []string) phrase {
-	p := phrase{"this statement shape cannot be judged", "send a plain single-row INSERT, UPDATE or DELETE"}
+	return phrase{withReason("this statement shape cannot be judged", reasons), "send a plain single-row INSERT, UPDATE or DELETE"}
+}
+
+// needsReview is the sentence for a held write whose reason explain cannot
+// phrase. Its shape was judged, so it never gets the shape sentence, and a
+// human approving it is its way forward.
+func needsReview(reasons []string) phrase {
+	return phrase{withReason("it needs review", reasons), approve}
+}
+
+// withReason names the first reason after msg, when there is one.
+func withReason(msg string, reasons []string) string {
 	if len(reasons) > 0 && reasons[0] != "" {
-		p.msg += " (" + clean(reasons[0]) + ")"
+		msg += " (" + clean(reasons[0]) + ")"
 	}
-	return p
+	return msg
+}
+
+// finite reports whether a share is known and is a number.
+func finite(v *float64) bool {
+	return v != nil && !math.IsNaN(*v) && !math.IsInf(*v, 0)
+}
+
+// percent writes a share as a percentage to three significant digits, never
+// in exponent notation: stale statistics can give a share of 10 or more.
+func percent(share float64) string {
+	v, _ := strconv.ParseFloat(strconv.FormatFloat(share*100, 'g', 3, 64), 64)
+	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
 // clean makes a value safe to put in a message, which the proxy builds into

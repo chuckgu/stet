@@ -1,6 +1,7 @@
 package decide
 
 import (
+	"math"
 	"strings"
 	"testing"
 
@@ -52,6 +53,19 @@ func TestAct(t *testing.T) {
 				f.Impact.Share, f.Limit = &s, &config.Impact{MaxRows: 1000, MaxShare: 0.1}
 			}),
 			held + "12.3% of contacts would be updated, over the limit of 10%",
+			"narrow the WHERE clause, or " + approve},
+		// Stale statistics can put the share far above 100%; it is still
+		// written as a plain number, never in exponent notation.
+		{"share, stale statistics", Hold, []string{"impact:share"},
+			with(facts("delete"), func(f *Facts) { s := 12.5; f.Impact.Share = &s }),
+			held + "1250% of contacts would be deleted, over the limit of 50%",
+			"narrow the WHERE clause, or " + approve},
+		{"share, small", Hold, []string{"impact:share"},
+			with(facts("delete"), func(f *Facts) {
+				s := 0.000123456
+				f.Impact.Share, f.Limit = &s, &config.Impact{MaxRows: 1000, MaxShare: 0.0000001}
+			}),
+			held + "0.0123% of contacts would be deleted, over the limit of 0.00001%",
 			"narrow the WHERE clause, or " + approve},
 		{"cumulative", Hold, []string{"impact:cumulative"}, facts("update"),
 			held + "this role has touched 480 rows of contacts in the last 10m0s, and 21 more would pass the limit of 500",
@@ -261,53 +275,65 @@ func TestActNamesOnlyTheKeyOfADuplicate(t *testing.T) {
 }
 
 // A reason the table does not know, or a number the facts lack, still
-// refuses with a message and a hint: the generic row, never a panic or an
-// empty error.
+// refuses with a message and a hint, never a panic or an empty error. A held
+// write falls back to "it needs review", never to the shape sentence: its
+// shape was judged, and a human approving it is its way forward.
 func TestActFallsBackToTheGenericRow(t *testing.T) {
 	n := func(v int64) *int64 { return &v }
-	const generic = "send a plain single-row INSERT, UPDATE or DELETE"
+	const (
+		review  = "write held by stet: it needs review"
+		approve = "ask a human to approve held_write H1"
+		shape   = "write refused by stet: this statement shape cannot be judged"
+		generic = "send a plain single-row INSERT, UPDATE or DELETE"
+	)
+	const keyless = "check whether the row already exists, or " + approve
 	cases := []struct {
 		name    string
 		verdict string
 		reasons []string
 		facts   Facts
 		message string
+		hint    string
 	}{
-		{"unknown reason, held", Hold, []string{"impact:future"}, facts("update"),
-			"write held by stet: this statement shape cannot be judged (impact:future)"},
-		{"unknown reason, refused", Unsupported, []string{"window_function"}, facts("update"),
-			"write refused by stet: this statement shape cannot be judged (window_function)"},
-		{"no reasons, held", Hold, nil, facts("update"),
-			"write held by stet: this statement shape cannot be judged"},
-		{"no reasons, refused", Unsupported, []string{}, facts("update"),
-			"write refused by stet: this statement shape cannot be judged"},
+		{"unknown reason, held", Hold, []string{"impact:future"}, facts("update"), review + " (impact:future)", approve},
+		{"unknown reason, escalated", Escalate, []string{"impact:future"}, facts("update"), review + " (impact:future)", approve},
+		{"unknown reason, refused", Unsupported, []string{"window_function"}, facts("update"), shape + " (window_function)", generic},
+		{"no reasons, held", Hold, nil, facts("update"), review, approve},
+		{"no reasons, refused", Unsupported, []string{}, facts("update"), shape, generic},
 		{"rows without an impact", Hold, []string{"impact:rows"}, Facts{Table: "contacts", Op: "delete", Limit: &config.Impact{MaxRows: 1000}},
-			"write held by stet: this statement shape cannot be judged (impact:rows)"},
+			review + " (impact:rows)", approve},
 		{"rows without a limit", Hold, []string{"impact:rows"}, Facts{Table: "contacts", Op: "delete",
-			Impact: &Impact{Method: "count", Rows: n(5000)}}, "write held by stet: this statement shape cannot be judged (impact:rows)"},
-		{"rows without an op", Hold, []string{"impact:rows"}, with(facts(""), nil),
-			"write held by stet: this statement shape cannot be judged (impact:rows)"},
+			Impact: &Impact{Method: "count", Rows: n(5000)}}, review + " (impact:rows)", approve},
+		{"rows without an op", Hold, []string{"impact:rows"}, with(facts(""), nil), review + " (impact:rows)", approve},
 		{"share without a share", Hold, []string{"impact:share"}, Facts{Table: "contacts", Op: "delete",
 			Impact: &Impact{Method: "count", Rows: n(5)}, Limit: &config.Impact{MaxRows: 1000, MaxShare: 0.5}},
-			"write held by stet: this statement shape cannot be judged (impact:share)"},
+			review + " (impact:share)", approve},
+		{"share that is not a number", Hold, []string{"impact:share"},
+			with(facts("delete"), func(f *Facts) { s := math.NaN(); f.Impact.Share = &s }),
+			review + " (impact:share)", approve},
 		{"cumulative without usage", Hold, []string{"impact:cumulative"}, Facts{Table: "contacts", Op: "update",
-			Cumulative: &Cumulative{Error: "x"}}, "write held by stet: this statement shape cannot be judged (impact:cumulative)"},
+			Cumulative: &Cumulative{Error: "x"}}, review + " (impact:cumulative)", approve},
 		{"cumulative without a table", Hold, []string{"impact:cumulative_unknown"}, Facts{Op: "update"},
-			"write held by stet: this statement shape cannot be judged (impact:cumulative_unknown)"},
+			review + " (impact:cumulative_unknown)", approve},
 		{"uncertain without rows", Escalate, []string{"impact:uncertain"}, Facts{Table: "contacts", Op: "update"},
-			"write held by stet: this statement shape cannot be judged (impact:uncertain)"},
-		{"duplicate without a key column", Hold, []string{"duplicate:4812"}, Facts{Table: "contacts", Op: "insert"},
-			"write held by stet: this statement shape cannot be judged (duplicate:4812)"},
+			review + " (impact:uncertain)", approve},
+		// A duplicate whose key cannot be named is still a duplicate.
 		{"duplicate without an id", Hold, []string{"duplicate:"}, facts("insert"),
-			"write held by stet: this statement shape cannot be judged (duplicate:)"},
-		{"rule the table does not have", Hold, []string{"policy:1", "policy:3"}, facts("update"),
-			"write held by stet: this statement shape cannot be judged (policy:1)"},
-		{"rule that is not a number", Hold, []string{"policy:x"}, facts("update"),
-			"write held by stet: this statement shape cannot be judged (policy:x)"},
-		{"shape without a table", Unsupported, []string{"multi_row"}, Facts{Op: "update"},
-			"write refused by stet: this statement shape cannot be judged (multi_row)"},
+			"write held by stet: possible duplicate of another row in contacts", keyless},
+		{"duplicate with no id at all", Hold, []string{"duplicate"}, facts("insert"),
+			"write held by stet: possible duplicate of another row in contacts", keyless},
+		{"duplicate without a key column", Hold, []string{"duplicate:4812"}, Facts{Table: "contacts", Op: "insert"},
+			"write held by stet: possible duplicate of another row in contacts", keyless},
+		{"duplicate without a table", Hold, []string{"duplicate:"}, Facts{PK: "id", Op: "insert"},
+			review + " (duplicate:)", approve},
+		{"rule the table does not have", Hold, []string{"policy:1", "policy:3"}, facts("update"), review + " (policy:1)", approve},
+		{"rule that is not a number", Hold, []string{"policy:x"}, facts("update"), review + " (policy:x)", approve},
+		{"shape without a table", Unsupported, []string{"multi_row"}, Facts{Op: "update"}, shape + " (multi_row)", generic},
 		{"a verdict this table does not know", "maybe", []string{"in_transaction"}, facts("update"),
-			"write refused by stet: it came after another statement in the same transaction and cannot be judged there"},
+			"write refused by stet: it came after another statement in the same transaction and cannot be judged there",
+			"ROLLBACK, then send this write as its own statement or as the first statement after BEGIN"},
+		{"a verdict this table does not know, unknown reason", "maybe", []string{"impact:future"}, facts("update"),
+			shape + " (impact:future)", generic},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -315,14 +341,25 @@ func TestActFallsBackToTheGenericRow(t *testing.T) {
 			if a.Forward {
 				t.Fatalf("Act = forward, want a refusal")
 			}
+			wantCode, wantHeld := CodeUnsupported, false
+			if tc.verdict == Hold || tc.verdict == Escalate {
+				wantCode, wantHeld = CodeHeld, true
+			}
+			if a.Code != wantCode || a.Held != wantHeld {
+				t.Errorf("code %q held %v, want %q %v", a.Code, a.Held, wantCode, wantHeld)
+			}
 			if a.Message != tc.message {
 				t.Errorf("message\n got %q\nwant %q", a.Message, tc.message)
 			}
-			if strings.HasPrefix(tc.message, "write refused") && a.Code != CodeUnsupported {
-				t.Errorf("code = %q, want %s", a.Code, CodeUnsupported)
+			if got := a.Hint("H1"); got != tc.hint {
+				t.Errorf("Hint(H1)\n got %q\nwant %q", got, tc.hint)
 			}
-			if strings.Contains(tc.message, "this statement shape") && a.Hint("H1") != generic {
-				t.Errorf("hint = %q, want %q", a.Hint("H1"), generic)
+			want := strings.Replace(tc.hint, "held_write H1", "this write", 1)
+			if got := a.Hint(""); got != want {
+				t.Errorf("Hint(\"\")\n got %q\nwant %q", got, want)
+			}
+			if wantHeld && (strings.Contains(a.Message, "statement shape") || a.Hint("H1") == generic) {
+				t.Errorf("held write got the shape sentence: %q / %q", a.Message, a.Hint("H1"))
 			}
 		})
 	}
