@@ -62,7 +62,7 @@ func (g *recordingGate) Inspect(sql string) proxy.Statement {
 		st.OnBehalfOf = &m[1]
 	}
 	if c, query := cursorOf(sql); c != nil {
-		st.Cursor = c
+		st.Cursors = []proxy.Cursor{*c}
 		if c.Op == proxy.CursorDeclare { // remembered when its query is an observed read
 			st.Observe = g.observeMatch != nil && g.observeMatch(query)
 		}

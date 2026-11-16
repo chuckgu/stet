@@ -121,10 +121,14 @@ type Result struct {
 	// Reads are looked for only when Tables.Reads is set.
 	Reads []string
 
-	// Cursor is set when the SQL is a single DECLARE CURSOR, FETCH, CLOSE,
-	// or DISCARD ALL that writes no gated table. A DECLARE is Read or Pass
-	// by what its query reads; the others are Pass.
-	Cursor *Cursor
+	// Cursors lists what the statements do to SQL cursors, in statement
+	// order: each DECLARE CURSOR, FETCH, CLOSE, and DISCARD ALL (as CLOSE
+	// ALL). A DECLARE alone is Read or Pass by what its query reads; the
+	// others alone are Pass.
+	Cursors []Cursor
+
+	// Statements is how many statements the SQL holds.
+	Statements int
 
 	// OnBehalfOf is set when the SQL sets or resets stet.on_behalf_of;
 	// "" means reset.
@@ -162,6 +166,7 @@ func Classify(sql string, tables Tables) (Result, error) {
 		touching int
 		target   gatedWrite
 		obo      *string
+		cursors  []Cursor
 	)
 	for _, raw := range tree.Stmts {
 		if w, ok := firstGatedWrite(raw.Stmt, m); ok {
@@ -173,18 +178,18 @@ func Classify(sql string, tables Tables) (Result, error) {
 		if v, ok := onBehalfOf(raw.Stmt); ok {
 			obo = &v
 		}
+		if c, ok := cursor(raw.Stmt); ok {
+			cursors = append(cursors, c)
+		}
 	}
 	if touching == 0 {
-		r := Result{Kind: Pass, OnBehalfOf: obo}
+		r := Result{Kind: Pass, OnBehalfOf: obo, Cursors: cursors, Statements: len(tree.Stmts)}
 		// With nothing to record them, reads are not looked for: the walk
 		// would cost every statement.
 		if tables.Reads {
 			if reads := readTables(tree.Stmts, m); reads != nil {
 				r.Kind, r.Reads = Read, reads
 			}
-		}
-		if len(tree.Stmts) == 1 {
-			r.Cursor = cursor(tree.Stmts[0].Stmt)
 		}
 		return r, nil
 	}
@@ -198,6 +203,7 @@ func Classify(sql string, tables Tables) (Result, error) {
 		r = measured(n, m, classifyStmt(n, m))
 	}
 	r.Table, r.Op, r.OnBehalfOf = target.table, target.op, obo
+	r.Cursors, r.Statements = cursors, len(tree.Stmts)
 	return r, nil
 }
 

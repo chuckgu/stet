@@ -39,10 +39,15 @@ type Statement struct {
 	Observe    bool
 	OnBehalfOf *string // set when the statement sets stet.on_behalf_of; "" resets it
 	Data       any     // the gate's own classification, handed back in Begin and Observe
-	// Cursor is set when the statement declares, fetches from or closes a SQL
-	// cursor. A FETCH is reported through Observe with the Statement that
-	// declared its cursor. Watch wins over Cursor, and Cursor over Observe.
-	Cursor *Cursor
+	// Cursors lists what the message does to SQL cursors, in statement
+	// order. A FETCH is reported through Observe with the Statement that
+	// declared its cursor. With Cursors set, Observe decides what the message
+	// remembers and how it is reported (see applyCursors) instead of making it
+	// a read by itself. A watched message is a watched write, and its cursor
+	// statements still apply.
+	Cursors []Cursor
+	// Several says the message holds more than one statement.
+	Several bool
 }
 
 type Param struct {
@@ -152,6 +157,9 @@ type observedRead struct {
 	st   Statement
 	idx  int       // which Execute in the unit; 0 for a Query
 	at   time.Time // when the statement arrived
+	// ifRows: reported only if it sent rows (a message of several statements
+	// that declares a cursor; its rows are read through the FETCHes).
+	ifRows bool
 }
 
 func newSession(g Gate, info SessionInfo) *session {
@@ -225,8 +233,11 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 		switch {
 		case st.Watch:
 			s.begin(u, 0, st, nil, flush)
-		case st.Cursor != nil:
-			s.cursor(u, 0, st)
+			if len(st.Cursors) > 0 { // a write among cursor statements
+				s.applyCursors(u, 0, st)
+			}
+		case len(st.Cursors) > 0:
+			s.applyCursors(u, 0, st)
 		case st.Observe:
 			s.observe(u, 0, st)
 		}
@@ -246,7 +257,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 			return
 		}
 		p, ok := s.stmts[m.PreparedStatement]
-		if !ok || (!p.st.Watch && !p.st.Observe && p.st.OnBehalfOf == nil && p.st.Cursor == nil) {
+		if !ok || (!p.st.Watch && !p.st.Observe && p.st.OnBehalfOf == nil && len(p.st.Cursors) == 0) {
 			delete(s.portals, m.DestinationPortal)
 			return
 		}
@@ -274,8 +285,11 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 		switch {
 		case b.st.Watch:
 			s.begin(u, idx, b.st, b.params, flush)
-		case b.st.Cursor != nil:
-			s.cursor(u, idx, b.st)
+			if len(b.st.Cursors) > 0 {
+				s.applyCursors(u, idx, b.st)
+			}
+		case len(b.st.Cursors) > 0:
+			s.applyCursors(u, idx, b.st)
 		case b.st.Observe:
 			s.observe(u, idx, b.st)
 		}
@@ -465,6 +479,9 @@ func (s *session) finish(u *unit, before, after byte) {
 	for _, r := range u.reads {
 		o := u.answered(r.idx, inTx)
 		o.Sent, o.Arrived = u.sent[r.idx], r.at
+		if r.ifRows && o.Sent == 0 {
+			continue
+		}
 		s.gate.Observe(r.info, r.st, o)
 	}
 }
@@ -551,6 +568,9 @@ func (s *session) abandon() {
 		for _, r := range u.reads {
 			o := u.unanswered(r.idx, inTx)
 			o.Sent, o.Arrived = u.sent[r.idx], r.at
+			if r.ifRows && o.Sent == 0 {
+				continue
+			}
 			s.gate.Observe(r.info, r.st, o)
 		}
 	}

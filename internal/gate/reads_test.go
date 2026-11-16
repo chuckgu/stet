@@ -284,7 +284,7 @@ func TestInspectSkipsReadsWhenNoTableRecordsThem(t *testing.T) {
 	if r := read(off); r.Kind != sqlparse.Pass || r.Reads != nil {
 		t.Errorf("no table records reads: %v reads %v, want pass and no reads", r.Kind, r.Reads)
 	}
-	if st := off.gate.Inspect("fetch 10 from c"); st.Cursor == nil {
+	if st := off.gate.Inspect("fetch 10 from c"); len(st.Cursors) != 1 {
 		t.Error("no table records reads: a FETCH carries no cursor")
 	}
 	if r := read(setupReads(t, readsYAML)); r.Kind != sqlparse.Read {
@@ -397,6 +397,119 @@ func TestCursorReadsAreCounted(t *testing.T) {
 	if len(logs) != 1 || logs[0].Statement != declare || logs[0].Rows != 5 || !reflect.DeepEqual(logs[0].Tables, []string{e.table}) {
 		t.Errorf("read_log = %+v, want one 5-row line holding %q", logs, declare)
 	}
+}
+
+// Cursor statements inside a Query of several statements (as an agent's
+// generic "run SQL" tool sends them) are followed like single ones. The
+// message is reported once at most, and a DECLARE in it is remembered with the
+// whole message as its statement.
+func TestCursorStatementsAmongSeveral(t *testing.T) {
+	// simple sends sql as one Query and returns the rows the client got.
+	simple := func(t *testing.T, conn *pgx.Conn, sql string) (int, string) {
+		t.Helper()
+		results, err := conn.PgConn().Exec(context.Background(), sql).ReadAll()
+		n := 0
+		for _, r := range results {
+			n += len(r.Rows)
+		}
+		return n, sqlstate(err)
+	}
+	mustSimple := func(t *testing.T, conn *pgx.Conn, sql string, rows int) {
+		t.Helper()
+		if n, code := simple(t, conn, sql); n != rows || code != "" {
+			t.Fatalf("%s: %d rows, SQLSTATE %q; want %d rows and no error", sql, n, code, rows)
+		}
+	}
+	wantReads := func(t *testing.T, e *env, statements, rows int64) {
+		t.Helper()
+		e.gate.FlushReads()
+		if c := perRole(e.reads(t))["stet_scram"]; c.Statements != statements || c.Rows != rows {
+			t.Errorf("counted %d statements and %d rows, want %d and %d", c.Statements, c.Rows, statements, rows)
+		}
+	}
+	wantLogged := func(t *testing.T, e *env, statement string, rows int64) {
+		t.Helper()
+		logs := e.readLog(t)
+		if len(logs) != 1 || logs[0].Statement != statement || logs[0].Rows != rows {
+			t.Errorf("read_log = %+v, want one %d-row line holding %q", logs, rows, statement)
+		}
+	}
+
+	t.Run("begin and declare in one Query", func(t *testing.T) {
+		e := setupReads(t, readsYAML)
+		e.seedMany(t)
+		conn := e.connect(t, "agent")
+		declare := "begin; declare c cursor for select * from " + e.table
+		mustSimple(t, conn, declare, 0)
+		mustSimple(t, conn, "fetch 5 from c", 5)
+		mustSimple(t, conn, "fetch 5 from c", 2)
+		mustSimple(t, conn, "commit", 0)
+		wantReads(t, e, 2, 7) // the FETCHes; the DECLARE's message sent nothing
+		wantLogged(t, e, declare, 5)
+	})
+	t.Run("fetch among other statements", func(t *testing.T) {
+		e := setupReads(t, readsYAML)
+		e.seedMany(t)
+		conn := e.connect(t, "agent")
+		declare := "declare c cursor with hold for select * from " + e.table
+		mustSimple(t, conn, declare, 0)
+		mustSimple(t, conn, "fetch 7 from c; select 1", 8)
+		mustSimple(t, conn, "close c", 0)
+		wantReads(t, e, 1, 8) // every row of the message (spec 9)
+		wantLogged(t, e, declare, 8)
+	})
+	t.Run("declare and fetch in one Query", func(t *testing.T) {
+		e := setupReads(t, readsYAML)
+		e.seedMany(t)
+		conn := e.connect(t, "agent")
+		both := "declare c cursor for select * from " + e.table + "; fetch 5 from c"
+		mustSimple(t, conn, both, 5)
+		wantReads(t, e, 1, 5) // one read, not one for the DECLARE and one for the FETCH
+		wantLogged(t, e, both, 5)
+	})
+	t.Run("held cursor committed in a Query that failed", func(t *testing.T) {
+		e := setupReads(t, readsYAML)
+		e.seedMany(t)
+		conn := e.connect(t, "agent")
+		failing := "begin; declare c cursor with hold for select * from " + e.table + "; commit; select 1/0"
+		if _, code := simple(t, conn, failing); code != "22012" {
+			t.Fatalf("SQLSTATE %q, want 22012", code)
+		}
+		mustSimple(t, conn, "fetch 7 from c", 7) // the server kept the cursor
+		mustSimple(t, conn, "close c", 0)
+		wantReads(t, e, 1, 7)
+		wantLogged(t, e, failing, 7)
+	})
+	t.Run("fetch next to a gated write", func(t *testing.T) {
+		e := setupReads(t, readsYAML)
+		e.seedMany(t)
+		conn := e.connect(t, "agent")
+		declare := "declare c cursor with hold for select * from " + e.table
+		mustSimple(t, conn, declare, 0)
+		mustSimple(t, conn, "fetch 5 from c; update "+e.table+" set title = 'x' where id = 1", 5)
+		mustSimple(t, conn, "close c", 0)
+		wantReads(t, e, 1, 5) // the write is judged as before, and the FETCH is still a read
+		wantLogged(t, e, declare, 5)
+		if a := e.accounts(t, 1); len(a) != 1 {
+			t.Errorf("%d decisions, want the write's", len(a))
+		}
+	})
+	t.Run("close in a Query that failed", func(t *testing.T) {
+		e := setupReads(t, readsYAML)
+		e.seedMany(t)
+		conn := e.connect(t, "agent")
+		mustSimple(t, conn, "declare c cursor with hold for select * from "+e.table, 0)
+		if _, code := simple(t, conn, "close c; select 1/0"); code != "22012" {
+			t.Fatalf("SQLSTATE %q, want 22012", code)
+		}
+		// The server closed c. Stet cannot tell which statements of a failed
+		// Query ran, so it keeps c: the FETCH fails and counts as one
+		// statement with no rows.
+		if n, code := simple(t, conn, "fetch 1 from c"); n != 0 || code != "34000" {
+			t.Fatalf("FETCH after the CLOSE: %d rows, SQLSTATE %q; want 34000", n, code)
+		}
+		wantReads(t, e, 1, 0)
+	})
 }
 
 // DISCARD ALL closes held cursors too, so a FETCH after it is not a read.

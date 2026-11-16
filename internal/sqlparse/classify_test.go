@@ -1,7 +1,6 @@
 package sqlparse
 
 import (
-	"fmt"
 	"reflect"
 	"testing"
 )
@@ -183,8 +182,8 @@ func TestClassifyReads(t *testing.T) {
 			if r.Kind != tc.kind || r.Reason != tc.reason || !reflect.DeepEqual(r.Reads, tc.reads) {
 				t.Errorf("got %v/%q reads %v, want %v/%q reads %v", r.Kind, r.Reason, r.Reads, tc.kind, tc.reason, tc.reads)
 			}
-			if r.Cursor != nil {
-				t.Errorf("Cursor = %+v, want nil", *r.Cursor)
+			if r.Cursors != nil {
+				t.Errorf("Cursors = %+v, want nil", r.Cursors)
 			}
 		})
 	}
@@ -196,18 +195,18 @@ func TestClassifyReads(t *testing.T) {
 func TestClassifySkipsReadsWhenNoTableRecordsThem(t *testing.T) {
 	off := Tables{PK: gated2.PK}
 	cases := []struct {
-		sql    string
-		kind   Kind
-		cursor *Cursor
+		sql     string
+		kind    Kind
+		cursors []Cursor
 	}{
 		{"select * from contacts", Pass, nil},
 		{"select c.name from contacts c join deals d on d.contact_id = c.id", Pass, nil},
 		{"copy contacts to stdout", Pass, nil},
 		{"insert into log select * from contacts", Pass, nil},
 		{"select 1; select * from deals", Pass, nil},
-		{"declare c cursor for select * from contacts", Pass, &Cursor{CursorDeclare, "c", false}},
-		{"fetch 10 from c", Pass, &Cursor{CursorFetch, "c", false}},
-		{"close c", Pass, &Cursor{CursorClose, "c", false}},
+		{"declare c cursor for select * from contacts", Pass, []Cursor{{CursorDeclare, "c", false}}},
+		{"fetch 10 from c", Pass, []Cursor{{CursorFetch, "c", false}}},
+		{"close c", Pass, []Cursor{{CursorClose, "c", false}}},
 		{"delete from contacts where id = 1", Gated, nil},
 		{"update contacts set status = 'x' where company_id = 3", Measured, nil},
 	}
@@ -220,8 +219,8 @@ func TestClassifySkipsReadsWhenNoTableRecordsThem(t *testing.T) {
 			if r.Kind != tc.kind || r.Reads != nil {
 				t.Errorf("got %v reads %v, want %v and no reads", r.Kind, r.Reads, tc.kind)
 			}
-			if !reflect.DeepEqual(r.Cursor, tc.cursor) {
-				t.Errorf("Cursor = %s, want %s", cursorString(r.Cursor), cursorString(tc.cursor))
+			if !reflect.DeepEqual(r.Cursors, tc.cursors) {
+				t.Errorf("Cursors = %+v, want %+v", r.Cursors, tc.cursors)
 			}
 		})
 	}
@@ -229,32 +228,33 @@ func TestClassifySkipsReadsWhenNoTableRecordsThem(t *testing.T) {
 
 func TestClassifyCursors(t *testing.T) {
 	cases := []struct {
-		sql    string
-		kind   Kind
-		reads  []string
-		cursor *Cursor
+		sql     string
+		kind    Kind
+		reads   []string
+		cursors []Cursor
 	}{
-		{"declare c cursor for select * from contacts", Read, []string{"contacts"}, &Cursor{CursorDeclare, "c", false}},
-		{`declare "My C" cursor with hold for select * from contacts`, Read, []string{"contacts"}, &Cursor{CursorDeclare, "My C", true}},
-		{"declare c cursor for select 1", Pass, nil, &Cursor{CursorDeclare, "c", false}},
+		{"declare c cursor for select * from contacts", Read, []string{"contacts"}, []Cursor{{CursorDeclare, "c", false}}},
+		{`declare "My C" cursor with hold for select * from contacts`, Read, []string{"contacts"}, []Cursor{{CursorDeclare, "My C", true}}},
+		{"declare c cursor for select 1", Pass, nil, []Cursor{{CursorDeclare, "c", false}}},
 		// Options other than WITH HOLD set neighbouring bits.
-		{"declare c binary insensitive scroll cursor without hold for select * from deals", Read, []string{"deals"}, &Cursor{CursorDeclare, "c", false}},
-		{"fetch 100 from c", Pass, nil, &Cursor{CursorFetch, "c", false}},
-		{"FETCH FORWARD 5 FROM C", Pass, nil, &Cursor{CursorFetch, "c", false}},
+		{"declare c binary insensitive scroll cursor without hold for select * from deals", Read, []string{"deals"}, []Cursor{{CursorDeclare, "c", false}}},
+		{"fetch 100 from c", Pass, nil, []Cursor{{CursorFetch, "c", false}}},
+		{"FETCH FORWARD 5 FROM C", Pass, nil, []Cursor{{CursorFetch, "c", false}}},
 		{"move 10 in c", Pass, nil, nil},
-		{"close c", Pass, nil, &Cursor{CursorClose, "c", false}},
-		{`close "My C"`, Pass, nil, &Cursor{CursorClose, "My C", false}},
-		{"close all", Pass, nil, &Cursor{CursorCloseAll, "", false}},
+		{"close c", Pass, nil, []Cursor{{CursorClose, "c", false}}},
+		{`close "My C"`, Pass, nil, []Cursor{{CursorClose, "My C", false}}},
+		{"close all", Pass, nil, []Cursor{{CursorCloseAll, "", false}}},
 		// DISCARD ALL closes every cursor, held ones included (poolers send
 		// it when a connection is handed back). Its other forms keep them.
-		{"discard all", Pass, nil, &Cursor{CursorCloseAll, "", false}},
-		{"DISCARD ALL", Pass, nil, &Cursor{CursorCloseAll, "", false}},
+		{"discard all", Pass, nil, []Cursor{{CursorCloseAll, "", false}}},
+		{"DISCARD ALL", Pass, nil, []Cursor{{CursorCloseAll, "", false}}},
 		{"discard plans", Pass, nil, nil},
 		{"discard sequences", Pass, nil, nil},
 		{"discard temp", Pass, nil, nil},
 		{"discard temporary", Pass, nil, nil},
-		{"fetch 1 from c; fetch 1 from d", Pass, nil, nil},
-		{"declare c cursor for select * from contacts; fetch 1 from c", Read, []string{"contacts"}, nil},
+		{"fetch 1 from c; fetch 1 from d", Pass, nil, []Cursor{{CursorFetch, "c", false}, {CursorFetch, "d", false}}},
+		{"declare c cursor for select * from contacts; fetch 1 from c", Read, []string{"contacts"},
+			[]Cursor{{CursorDeclare, "c", false}, {CursorFetch, "c", false}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.sql, func(t *testing.T) {
@@ -265,18 +265,47 @@ func TestClassifyCursors(t *testing.T) {
 			if r.Kind != tc.kind || r.Reason != "" || !reflect.DeepEqual(r.Reads, tc.reads) {
 				t.Errorf("got %v/%q reads %v, want %v reads %v", r.Kind, r.Reason, r.Reads, tc.kind, tc.reads)
 			}
-			if !reflect.DeepEqual(r.Cursor, tc.cursor) {
-				t.Errorf("Cursor = %s, want %s", cursorString(r.Cursor), cursorString(tc.cursor))
+			if !reflect.DeepEqual(r.Cursors, tc.cursors) {
+				t.Errorf("Cursors = %+v, want %+v", r.Cursors, tc.cursors)
 			}
 		})
 	}
 }
 
-func cursorString(c *Cursor) string {
-	if c == nil {
-		return "nil"
+// Every cursor statement of a message is listed in order, also among other
+// statements, and also in a message that writes a gated table.
+func TestClassifyCursorsAmongSeveralStatements(t *testing.T) {
+	cases := []struct {
+		sql        string
+		kind       Kind
+		statements int
+		cursors    []Cursor
+	}{
+		{"begin; declare c cursor for select * from contacts", Read, 2, []Cursor{{CursorDeclare, "c", false}}},
+		{"fetch 7 from c; select 1", Pass, 2, []Cursor{{CursorFetch, "c", false}}},
+		{"close c; declare c cursor with hold for select * from deals; fetch 2 from c", Read, 3,
+			[]Cursor{{CursorClose, "c", false}, {CursorDeclare, "c", true}, {CursorFetch, "c", false}}},
+		{"discard all; select 1", Pass, 2, []Cursor{{CursorCloseAll, "", false}}},
+		{"move 1 in c; close all", Pass, 2, []Cursor{{CursorCloseAll, "", false}}},
+		{"fetch 10 from c; delete from contacts where id = 1", Unsupported, 2, []Cursor{{CursorFetch, "c", false}}},
+		{"select 1; select 2", Pass, 2, nil},
+		{"select * from contacts", Read, 1, nil},
+		{"", Pass, 0, nil},
 	}
-	return fmt.Sprintf("%+v", *c)
+	for _, tc := range cases {
+		t.Run(tc.sql, func(t *testing.T) {
+			r, err := Classify(tc.sql, gated2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r.Kind != tc.kind || r.Statements != tc.statements {
+				t.Errorf("got %v with %d statements, want %v with %d", r.Kind, r.Statements, tc.kind, tc.statements)
+			}
+			if !reflect.DeepEqual(r.Cursors, tc.cursors) {
+				t.Errorf("Cursors = %+v, want %+v", r.Cursors, tc.cursors)
+			}
+		})
+	}
 }
 
 func TestClassifyMeasured(t *testing.T) {

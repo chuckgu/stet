@@ -13,33 +13,32 @@ import (
 // DECLARE ... WITH HOLD sets in DeclareCursorStmt.Options.
 const cursorOptHold = 0x0020
 
-// cursor reports what n, the only statement of a message, does to a SQL
-// cursor, or nil.
-func cursor(n *pg.Node) *Cursor {
+// cursor reports what n, a top-level statement, does to a SQL cursor.
+func cursor(n *pg.Node) (Cursor, bool) {
 	switch {
 	case n.GetDeclareCursorStmt() != nil:
 		s := n.GetDeclareCursorStmt()
-		return &Cursor{Op: CursorDeclare, Name: s.Portalname, Hold: s.Options&cursorOptHold != 0}
+		return Cursor{Op: CursorDeclare, Name: s.Portalname, Hold: s.Options&cursorOptHold != 0}, true
 	case n.GetFetchStmt() != nil:
 		s := n.GetFetchStmt()
 		if s.Ismove {
-			return nil
+			return Cursor{}, false
 		}
-		return &Cursor{Op: CursorFetch, Name: s.Portalname}
+		return Cursor{Op: CursorFetch, Name: s.Portalname}, true
 	case n.GetClosePortalStmt() != nil:
 		// CLOSE ALL carries no name; a cursor cannot be named "".
 		if name := n.GetClosePortalStmt().Portalname; name != "" {
-			return &Cursor{Op: CursorClose, Name: name}
+			return Cursor{Op: CursorClose, Name: name}, true
 		}
-		return &Cursor{Op: CursorCloseAll}
+		return Cursor{Op: CursorCloseAll}, true
 	case n.GetDiscardStmt() != nil:
 		// DISCARD ALL runs CLOSE ALL among its steps, so held cursors go too.
 		// Poolers send it when they hand a connection back.
 		if n.GetDiscardStmt().Target == pg.DiscardMode_DISCARD_ALL {
-			return &Cursor{Op: CursorCloseAll}
+			return Cursor{Op: CursorCloseAll}, true
 		}
 	}
-	return nil
+	return Cursor{}, false
 }
 
 // readTables returns the config keys of the gated tables that stmts read,

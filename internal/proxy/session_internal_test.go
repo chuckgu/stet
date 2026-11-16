@@ -266,7 +266,8 @@ func TestObservedPortalKeepsNoBindValues(t *testing.T) {
 }
 
 // cursorGate marks cursor statements as the real gate does, observes the
-// DECLAREs over t, and records each read with its statement.
+// statements that read t (a DECLARE over t included), and records each read
+// with its statement. The statements of a message are separated by "; ".
 type cursorGate struct {
 	*fakeGate
 	reads []observedRead
@@ -275,18 +276,24 @@ type cursorGate struct {
 
 func (g *cursorGate) Inspect(sql string) Statement {
 	st := Statement{SQL: sql}
-	f := strings.Fields(sql)
-	switch f[0] {
-	case "declare":
-		st.Cursor = &Cursor{Op: CursorDeclare, Name: f[1], Hold: strings.Contains(sql, " with hold ")}
-		st.Observe = strings.HasSuffix(sql, " from t")
-	case "fetch":
-		st.Cursor = &Cursor{Op: CursorFetch, Name: f[len(f)-1]}
-	case "close":
-		if f[1] == "all" {
-			st.Cursor = &Cursor{Op: CursorCloseAll}
-		} else {
-			st.Cursor = &Cursor{Op: CursorClose, Name: f[1]}
+	parts := strings.Split(sql, "; ")
+	st.Several = len(parts) > 1
+	for _, p := range parts {
+		f := strings.Fields(p)
+		switch f[0] {
+		case "declare":
+			st.Cursors = append(st.Cursors, Cursor{Op: CursorDeclare, Name: f[1], Hold: strings.Contains(p, " with hold ")})
+		case "fetch":
+			st.Cursors = append(st.Cursors, Cursor{Op: CursorFetch, Name: f[len(f)-1]})
+		case "close":
+			if f[1] == "all" {
+				st.Cursors = append(st.Cursors, Cursor{Op: CursorCloseAll})
+			} else {
+				st.Cursors = append(st.Cursors, Cursor{Op: CursorClose, Name: f[1]})
+			}
+		}
+		if strings.HasSuffix(p, " from t") {
+			st.Observe = true
 		}
 	}
 	return st
@@ -366,4 +373,95 @@ func TestSettledCursorsAreNotRevisited(t *testing.T) {
 	if _, ok := s.cursors["c"]; !ok || len(s.cursors) != 1 || len(s.unsettled) != 0 {
 		t.Errorf("after COMMIT: cursors %v, unsettled %v; want only c, settled", s.cursors, s.unsettled)
 	}
+}
+
+// wantReads checks the reads g was told of: each one's statement and rows.
+func (g *cursorGate) wantReads(t *testing.T, want ...any) {
+	t.Helper()
+	if len(g.reads) != len(want)/2 {
+		t.Fatalf("%d reads observed, want %d: %+v", len(g.reads), len(want)/2, g.reads)
+	}
+	for i := range g.reads {
+		if sql, sent := want[2*i].(string), int64(want[2*i+1].(int)); g.reads[i].st.SQL != sql || g.sent[i] != sent {
+			t.Errorf("read %d: %q with %d rows, want %q with %d", i+1, g.reads[i].st.SQL, g.sent[i], sql, sent)
+		}
+	}
+}
+
+// The cursor statements of a Query of several statements apply in order,
+// under its one unit. A DECLARE is remembered with the whole message as its
+// statement when the message is observed. The message is reported once at
+// most: as its own read when it is observed, which a message holding a
+// DECLARE is only when it sent rows, or else as a read of the first
+// remembered cursor it fetches from.
+func TestCursorsOfAQueryOfSeveralStatements(t *testing.T) {
+	g := &cursorGate{fakeGate: newFakeGate()}
+	s := readySession(g)
+	flush := func() error { return nil }
+	query := func(sql string) { s.fromClient('Q', body(&pgproto3.Query{String: sql}), flush) }
+	rows := &pgproto3.RowDescription{}
+
+	declare := "begin; declare c cursor for select * from t"
+	query(declare)
+	serve(s, tag("BEGIN"), tag("DECLARE CURSOR"), readyWith('T'))
+	query("fetch 2 from c")
+	serve(s, rows, row, row, tag("FETCH 2"), readyWith('T'))
+	// Closed and declared again over an unobserved query, in one message.
+	query("close c; declare c cursor for select 1")
+	serve(s, tag("CLOSE CURSOR"), tag("DECLARE CURSOR"), readyWith('T'))
+	query("fetch 1 from c")
+	serve(s, rows, row, tag("FETCH 1"), readyWith('T'))
+	// Declared and fetched in one message: one read, of the message.
+	both := "declare d cursor for select * from t; fetch 3 from d"
+	query(both)
+	serve(s, tag("DECLARE CURSOR"), rows, row, row, row, tag("FETCH 3"), readyWith('T'))
+	// A FETCH among other statements: a read of the DECLARE, with every row
+	// of the message.
+	query("fetch 1 from d; select 1")
+	serve(s, rows, row, tag("FETCH 1"), rows, row, tag("SELECT 1"), readyWith('T'))
+	query("commit")
+	serve(s, tag("COMMIT"), readyWith('I'))
+	// A DECLARE's message cut off before it answered sent no rows.
+	query("begin; declare e cursor for select * from t")
+	s.abandon()
+
+	g.wantReads(t, declare, 2, both, 3, both, 2)
+}
+
+// When a Query of several statements fails, Stet cannot tell which of them
+// ran or whether one committed. Its CLOSEs and unobserved DECLAREs are
+// undone, so the older meaning comes back, and its observed DECLAREs are
+// kept. A Query of one statement that failed is undone as before.
+func TestFailedQueryOfSeveralStatementsRemembers(t *testing.T) {
+	g := &cursorGate{fakeGate: newFakeGate()}
+	s := readySession(g)
+	flush := func() error { return nil }
+	query := func(sql string) { s.fromClient('Q', body(&pgproto3.Query{String: sql}), flush) }
+	rows := &pgproto3.RowDescription{}
+	divide := &pgproto3.ErrorResponse{Code: "22012", Message: "division by zero"}
+
+	held := "declare c cursor with hold for select * from t"
+	query(held)
+	serve(s, tag("DECLARE CURSOR"), readyWith('I'))
+	query("close c; select 1/0")
+	serve(s, tag("CLOSE CURSOR"), divide, readyWith('I'))
+	query("begin; declare c cursor for select 1; select 1/0")
+	serve(s, tag("BEGIN"), tag("DECLARE CURSOR"), divide, readyWith('E'))
+	query("rollback")
+	serve(s, tag("ROLLBACK"), readyWith('I'))
+	query("fetch 1 from c")
+	serve(s, rows, row, tag("FETCH 1"), readyWith('I'))
+
+	committed := "begin; declare d cursor with hold for select * from t; commit; select 1/0"
+	query(committed)
+	serve(s, tag("BEGIN"), tag("DECLARE CURSOR"), tag("COMMIT"), divide, readyWith('I'))
+	query("fetch 1 from d")
+	serve(s, rows, row, tag("FETCH 1"), readyWith('I'))
+
+	query("declare e cursor with hold for select * from t")
+	serve(s, &pgproto3.ErrorResponse{Code: "42P01", Message: "relation does not exist"}, readyWith('I'))
+	query("fetch 1 from e")
+	serve(s, &pgproto3.ErrorResponse{Code: "34000", Message: `cursor "e" does not exist`}, readyWith('I'))
+
+	g.wantReads(t, held, 1, committed, 1)
 }

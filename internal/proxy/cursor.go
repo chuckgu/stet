@@ -12,11 +12,12 @@ const (
 
 // Cursor says what a statement does to a SQL cursor.
 //
-// A CursorDeclare statement is never reported itself: it sends no rows. When
-// its Statement.Observe is set, the statement is remembered under the name
-// and reported as the read behind each later FETCH. When it is not set, the
-// name is forgotten, so a cursor redeclared over an unobserved query stops
-// being reported.
+// A message whose only statement is a DECLARE is never reported itself: it
+// sends no rows. When its Statement.Observe is set, the statement is
+// remembered under the name and reported as the read behind each later FETCH.
+// When it is not set, the name is forgotten, so a cursor redeclared over an
+// unobserved query stops being reported. In a message of several statements
+// the same holds with the whole message as the DECLARE (see applyCursors).
 type Cursor struct {
 	Op   CursorOp
 	Name string // compared exactly; the gate normalizes it. "" for CursorCloseAll
@@ -27,7 +28,7 @@ type Cursor struct {
 // it. Those not answered yet stack, newest first, on the one in force, so a
 // failed one can be taken out and the name means what it meant before.
 type declared struct {
-	st   Statement // the DECLARE; with Observe unset (a CLOSE included) it forgets the name
+	st   Statement // the DECLARE's message; with Observe unset (a CLOSE included) it forgets the name
 	hold bool
 	// unit holds the statement until the transaction it ran in has ended. Only
 	// a held cursor outlives that, with unit nil: it is settled.
@@ -37,45 +38,78 @@ type declared struct {
 }
 
 // undone reports whether d, stacked by head, a unit that failed, is taken
-// back. Under one Sync the Executes before the failing one ran, and what
-// they did stays: a DECLARE then meets the transaction-end rule like any
-// other (a held one is kept although an implicit transaction may have rolled
-// it back), and a CLOSE that ran stays done, since a rollback does not reopen
-// a cursor. The failing Execute and the ones after it did not run. A Query
-// holds one statement, and that one failed.
+// back.
+//
+// Under one Sync the Executes before the failing one ran, and what they did
+// stays: a DECLARE then meets the transaction-end rule like any other (a held
+// one is kept although an implicit transaction may have rolled it back), and
+// a CLOSE that ran stays done, since a rollback does not reopen a cursor. The
+// failing Execute and the ones after it did not run.
+//
+// A Query of one statement failed in that statement. Of a Query of several,
+// the proxy cannot tell which statements ran, nor whether one of them
+// committed. When unsure the table remembers: what forgets a name (a CLOSE,
+// an unobserved DECLARE) is undone, so the older meaning comes back, and an
+// observed DECLARE is kept.
 func (d *declared) undone(head *unit) bool {
-	return head.query || d.idx >= head.errAt
+	switch {
+	case !head.query:
+		return d.idx >= head.errAt
+	case d.st.Several:
+		return !d.st.Observe
+	}
+	return true
 }
 
-// cursor applies a cursor statement as it arrives from the client, so that a
-// FETCH pipelined behind a DECLARE or CLOSE sees it. A FETCH of a remembered
-// cursor joins u as a read of the DECLARE; idx is as for observe.
+// applyCursors applies the cursor statements of st as the message arrives
+// from the client, so that a FETCH pipelined behind a DECLARE or CLOSE sees
+// them. idx is as for observe. The statements apply in order, all under u.
+//
+// A DECLARE is remembered when st is observed; any other DECLARE or CLOSE of
+// a remembered name stacks an entry that forgets it once it ran. A message
+// that FETCHes from a remembered observed cursor joins u as a read of that
+// cursor's DECLARE (the first such cursor, for a message of several). A
+// message of several statements that is observed itself is reported as its
+// own read instead, once, and when it holds a DECLARE only if it sent rows:
+// "begin; declare ..." sends none, and its reads are the FETCHes that follow.
 //
 // When the cursor table must guess, it errs toward remembering: a cursor
 // remembered after the server dropped it costs a failed FETCH reported with
 // no rows, while one forgotten that the server still holds hides reads. So a
 // CLOSE forgets the name only once it ran, like an unobserved DECLARE.
-func (s *session) cursor(u *unit, idx int, st Statement) {
-	c := st.Cursor
+func (s *session) applyCursors(u *unit, idx int, st Statement) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	switch c.Op {
-	case CursorDeclare:
-		if st.Observe || s.cursors[c.Name] != nil {
-			s.stack(c.Name, &declared{st: st, hold: c.Hold, unit: u, idx: idx})
+	var fetched *declared
+	declares := false
+	for _, c := range st.Cursors {
+		switch c.Op {
+		case CursorDeclare:
+			declares = true
+			if st.Observe || s.cursors[c.Name] != nil {
+				s.stack(c.Name, &declared{st: st, hold: c.Hold, unit: u, idx: idx})
+			}
+		case CursorFetch:
+			if d := s.cursors[c.Name]; fetched == nil && d != nil && d.st.Observe {
+				fetched = d
+			}
+		case CursorClose:
+			if s.cursors[c.Name] != nil {
+				s.stack(c.Name, &declared{unit: u, idx: idx})
+			}
+		case CursorCloseAll:
+			for name := range s.cursors {
+				s.stack(name, &declared{unit: u, idx: idx})
+			}
 		}
-	case CursorFetch:
-		if d := s.cursors[c.Name]; d != nil && d.st.Observe {
-			u.reads = append(u.reads, s.arriving(d.st, idx))
-		}
-	case CursorClose:
-		if s.cursors[c.Name] != nil {
-			s.stack(c.Name, &declared{unit: u, idx: idx})
-		}
-	case CursorCloseAll:
-		for name := range s.cursors {
-			s.stack(name, &declared{unit: u, idx: idx})
-		}
+	}
+	switch {
+	case st.Several && st.Observe && !st.Watch:
+		r := s.arriving(st, idx)
+		r.ifRows = declares
+		u.reads = append(u.reads, r)
+	case fetched != nil:
+		u.reads = append(u.reads, s.arriving(fetched.st, idx))
 	}
 }
 

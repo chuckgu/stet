@@ -122,11 +122,12 @@ func (g *Gate) Inspect(sql string) proxy.Statement {
 	if r.Kind == sqlparse.Read {
 		st.Observe = g.recordsAny(r.Reads)
 	}
-	if c := r.Cursor; c != nil {
+	for _, c := range r.Cursors {
 		if op, ok := cursorOps[c.Op]; ok {
-			st.Cursor = &proxy.Cursor{Op: op, Name: c.Name, Hold: c.Hold}
+			st.Cursors = append(st.Cursors, proxy.Cursor{Op: op, Name: c.Name, Hold: c.Hold})
 		}
 	}
+	st.Several = r.Statements > 1
 	st.Data = r
 	return st
 }
