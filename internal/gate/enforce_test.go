@@ -1467,6 +1467,30 @@ func TestClosedPointsAreLoggedOncePerSessionAndReason(t *testing.T) {
 	}
 }
 
+// An agent's COPY FROM STDIN through the extended protocol is refused in its
+// Parse with an ordinary ST002, and the session goes on; through the simple
+// protocol, into a table that is not gated, it runs.
+func TestEnforceRefusesAnExtendedCopyFromStdin(t *testing.T) {
+	e := setupEnforce(t, calm())
+	ctx := context.Background()
+	conn := e.agent(t, "copier")
+	mustExec(t, conn, "create temp table copied (i int)")
+
+	_, err := conn.PgConn().Prepare(ctx, "", "copy copied from stdin", nil)
+	if pgErr := wantRefused(t, err, "ST002", ""); pgErr.Message != decide.Blocked(proxy.BlockCopyExtended).Message {
+		t.Errorf("message %q, want %q", pgErr.Message, decide.Blocked(proxy.BlockCopyExtended).Message)
+	}
+	tag, err := conn.PgConn().CopyFrom(ctx, strings.NewReader("1\n2\n"), "copy copied from stdin")
+	if err != nil || tag.RowsAffected() != 2 {
+		t.Errorf("simple-protocol COPY: %v, %v; want 2 rows", tag, err)
+	}
+	var n int
+	if err := conn.QueryRow(ctx, "select count(*) from copied").Scan(&n); err != nil || n != 2 {
+		t.Errorf("%d rows copied (%v), want 2", n, err)
+	}
+	e.wantNoDecisions(t)
+}
+
 // A SQL PREPARE of a gated write would let each EXECUTE of it, and each
 // protocol Bind of its name, run what no Begin sees, with no record at all
 // (ruling 30). Enforce refuses it whatever the table's unsupported setting,

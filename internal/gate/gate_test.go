@@ -867,6 +867,27 @@ func TestInspectMarksWhatDefinesCode(t *testing.T) {
 	}
 }
 
+// COPY ... FROM STDIN is marked, whatever the table, for the proxy to refuse
+// in a Parse on enforced sessions (copy_extended); a COPY into a gated table
+// is still a watched write, unsupported, for the simple protocol.
+func TestInspectMarksCopyFromStdin(t *testing.T) {
+	e := setup(t, calm())
+	for sql, want := range map[string]bool{
+		"copy " + e.table + " from stdin":    true,
+		"copy other_table from stdin":        true,
+		"copy " + e.table + " to stdout":     false,
+		"copy other_table from '/tmp/x'":     false,
+		"insert into other_table values (1)": false,
+	} {
+		if got := e.gate.Inspect(sql).CopyIn; got != want {
+			t.Errorf("Inspect(%q).CopyIn = %v, want %v", sql, got, want)
+		}
+	}
+	if st := e.gate.Inspect("copy " + e.table + " from stdin"); !st.Watch {
+		t.Errorf("a COPY into the gated table is not watched: %+v", st)
+	}
+}
+
 // A session the proxy ends gets decide.Blocked's error too, and its warning
 // says the session was ended; a refused message's says it was refused.
 func TestBlockedSaysWhatItEnded(t *testing.T) {
@@ -877,7 +898,7 @@ func TestBlockedSaysWhatItEnded(t *testing.T) {
 	reasons := map[string]string{
 		proxy.BlockDo:             "message refused without a decision",
 		proxy.BlockSessionSetting: "message refused without a decision",
-		proxy.BlockCopyExtended:   "session ended without a decision",
+		proxy.BlockCopyStarted:    "session ended without a decision",
 		proxy.BlockProtocolOrder:  "session ended without a decision",
 		proxy.BlockSettingChanged: "session ended without a decision",
 	}

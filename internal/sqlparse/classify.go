@@ -150,8 +150,11 @@ type Result struct {
 	// trigger, or a view whose query reads a gated table (see definesCode):
 	// writes through it would reach a gated table unseen.
 	DefinesCode bool
-	Executes    []string // prepared statements run by SQL EXECUTE, wherever it sits (EXPLAIN EXECUTE, CREATE TABLE AS EXECUTE), in order
-	Portals     []string // portals read by FETCH or MOVE, in order
+	// CopyIn: some statement is COPY ... FROM STDIN, whose data the server
+	// reads from the client.
+	CopyIn   bool
+	Executes []string // prepared statements run by SQL EXECUTE, wherever it sits (EXPLAIN EXECUTE, CREATE TABLE AS EXECUTE), in order
+	Portals  []string // portals read by FETCH or MOVE, in order
 }
 
 const onBehalfOfSetting = "stet.on_behalf_of"
@@ -192,6 +195,7 @@ func Classify(sql string, tables Tables) (Result, error) {
 		do       bool
 		defines  bool
 		prepares bool // a SQL PREPARE of a gated write
+		copyIn   bool
 	)
 	for _, raw := range tree.Stmts {
 		if w, ok := firstGatedWrite(raw.Stmt, m); ok {
@@ -214,6 +218,9 @@ func Classify(sql string, tables Tables) (Result, error) {
 		clean = clean && leavesClean(raw.Stmt)
 		do = do || raw.Stmt.GetDoStmt() != nil
 		defines = defines || definesCode(raw.Stmt, m)
+		if c := raw.Stmt.GetCopyStmt(); c != nil && c.IsFrom && !c.IsProgram && c.Filename == "" {
+			copyIn = true // FROM STDIN: a COPY cannot sit inside another statement
+		}
 	}
 
 	var r Result
@@ -242,7 +249,7 @@ func Classify(sql string, tables Tables) (Result, error) {
 	r.Table, r.Op = target.table, target.op // empty when nothing gated is written
 	r.OnBehalfOf, r.Cursors, r.Statements = obo, cursors, len(tree.Stmts)
 	r.Clean, r.Do, r.Executes, r.Portals = clean, do, executes, portals
-	r.DefinesCode = defines
+	r.DefinesCode, r.CopyIn = defines, copyIn
 	return r, nil
 }
 

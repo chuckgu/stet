@@ -79,7 +79,9 @@ func (s *session) admit(t byte) error {
 // copyIn follows a CopyInResponse or CopyBothResponse from the server of an
 // enforced session, answering head (see admit). The server ignores a Sync
 // during an extended-protocol copy, so that ends the session at once
-// (copy_extended), as does a Query copy that will read a message the client
+// (copy_started): the backstop for a COPY FROM STDIN the classifier did not
+// see, since one it sees is refused in its Parse (copy_extended). So does a
+// Query copy that will read a message the client
 // already sent other than copy messages (protocol_order). A copy the client
 // has not ended yet is in progress. It runs on the server side with s.mu
 // held.
@@ -90,7 +92,7 @@ func (s *session) copyIn(head *unit) error {
 	head.copies++
 	switch {
 	case !head.query:
-		return s.endWith(BlockCopyExtended)
+		return s.endWith(BlockCopyStarted)
 	case head.stray && head.copies > head.strayAt:
 		return s.endWith(BlockProtocolOrder)
 	case head.copies > head.copyEnds:

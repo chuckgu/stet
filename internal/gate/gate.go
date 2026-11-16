@@ -145,7 +145,8 @@ func (g *Gate) Close() {
 // be seen, and SQL that defines a function, procedure, rule or trigger, or a
 // view over a gated table, through which later writes could not be seen
 // (ruling 29), are marked with Block whatever the mode: the proxy refuses
-// them on enforced sessions only. The names SQL runs (EXECUTE, FETCH, MOVE)
+// them on enforced sessions only. So is COPY ... FROM STDIN (CopyIn), which
+// the proxy refuses in a Parse only. The names SQL runs (EXECUTE, FETCH, MOVE)
 // are passed on for the proxy to look up in the session's tables.
 func (g *Gate) Inspect(sql string) proxy.Statement {
 	r, err := sqlparse.Classify(sql, g.gated)
@@ -170,6 +171,7 @@ func (g *Gate) Inspect(sql string) proxy.Statement {
 		}
 	}
 	st.Several = r.Statements > 1
+	st.CopyIn = r.CopyIn
 	st.Executes, st.Portals = r.Executes, r.Portals
 	st.Data = r
 	return st

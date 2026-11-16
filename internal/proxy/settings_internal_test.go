@@ -279,7 +279,7 @@ func TestCopyRuleHoldsOnlyDuringTheCopy(t *testing.T) {
 		{"a Sync after the copy failed on the server", msgs(queryMsg("copy")),
 			msgs2(copyIn, serverErr("22P02"), ready), syncMsg, ""},
 		{"an extended-protocol copy", msgs(parseMsg("", "copy"), bindMsg("", ""), execMsg(""), syncMsg),
-			msgs2(parseOK, bindOK, copyIn), nil, BlockCopyExtended},
+			msgs2(parseOK, bindOK, copyIn), nil, BlockCopyStarted},
 		// A Query of two copies: the client's first CopyDone ends the first.
 		{"a Sync during a second copy", msgs(queryMsg("copy; copy")),
 			msgs2(copyIn), nil, BlockProtocolOrder},

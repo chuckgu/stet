@@ -39,7 +39,7 @@ type Gate interface {
 	// WouldBlock logs that a session that does not enforce sent a message an
 	// enforced session would refuse for reason: one of the closed points the
 	// proxy knows at no extra cost (unparsed, too_large, do_block,
-	// defines_code, function_call). The proxy calls it once per session and
+	// defines_code, function_call, copy_extended). The proxy calls it once per session and
 	// reason. Nothing is refused, and it must not block (ruling 31).
 	WouldBlock(s SessionInfo, reason string)
 }
@@ -57,7 +57,13 @@ const (
 	BlockPreparedWrite = "prepared_write" // SQL EXECUTE, FETCH or MOVE of a name the session prepared or bound as a watched statement
 	BlockUnsettledName = "unsettled_name" // the name may mean a watched statement, and the server has not said which meaning holds
 	BlockProtocolOrder = "protocol_order" // the session is ended: answers can no longer be matched to messages
-	BlockCopyExtended  = "copy_extended"  // the session is ended: COPY FROM STDIN through the extended protocol
+	// BlockCopyExtended: a Parse of COPY ... FROM STDIN (Statement.CopyIn),
+	// whose Sync the server would ignore during the copy.
+	BlockCopyExtended = "copy_extended"
+	// BlockCopyStarted: the session is ended: the server started a COPY FROM
+	// STDIN through the extended protocol, which the classifier did not see
+	// (the backstop of BlockCopyExtended; see copyIn).
+	BlockCopyStarted = "copy_started"
 	// BlockSessionSetting: the session's client_encoding or
 	// standard_conforming_strings makes the server read statements otherwise
 	// than the classifier (see readable).
@@ -76,7 +82,7 @@ const (
 // rather than refusing one message.
 func EndsSession(reason string) bool {
 	switch reason {
-	case BlockProtocolOrder, BlockCopyExtended, BlockSettingChanged:
+	case BlockProtocolOrder, BlockCopyStarted, BlockSettingChanged:
 		return true
 	}
 	return false
@@ -104,6 +110,11 @@ type Statement struct {
 	Clean bool
 	// Block says why the message cannot be inspected (BlockUnparsed, BlockDo); "" when it can.
 	Block string
+	// CopyIn marks SQL holding COPY ... FROM STDIN. The server ignores the
+	// Sync after such a copy sent through the extended protocol, so an
+	// enforced session refuses it in a Parse (BlockCopyExtended); a Query
+	// may hold it.
+	CopyIn bool
 	// Executes and Portals name what the SQL runs by name, as the server
 	// compares names: prepared statements it runs with EXECUTE, and portals
 	// it reads with FETCH or MOVE. The classifier sees no table behind them.
@@ -572,13 +583,15 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 				s.wouldBlock(unreadable(body))
 			case p.st.Block != "":
 				s.wouldBlock(p.st.Block)
+			case p.st.CopyIn:
+				s.wouldBlock(BlockCopyExtended)
 			}
 		}
 		s.mu.Lock()
 		u, pos := s.count()
 		misread := read && s.enforce && s.misread(m.Query)
 		foreign := read && s.enforce && (s.foreign(m.Name) || s.foreignNames(p.st))
-		if s.enforce && (!read || misread || p.st.Block != "" || foreign) {
+		if s.enforce && (!read || misread || p.st.Block != "" || p.st.CopyIn || foreign) {
 			s.mu.Unlock()
 			// The table is left as it was. The server keeps a named
 			// statement it holds when the replacement fails, as for any
@@ -603,6 +616,11 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 				return s.block(u, pos, 'P', name, BlockSessionSetting), nil
 			case p.st.Block != "":
 				return s.block(u, pos, 'P', name, p.st.Block), nil
+			case p.st.CopyIn:
+				// The server would ignore the Sync during the copy, and its
+				// answers would no longer match the units (spec correction
+				// B6 ②); refused here it is an ordinary error.
+				return s.block(u, pos, 'P', name, BlockCopyExtended), nil
 			}
 			return s.block(u, pos, 'P', name, BlockNameEncoding), nil
 		}

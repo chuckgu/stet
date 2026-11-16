@@ -807,6 +807,31 @@ func TestClassifyDefinesCode(t *testing.T) {
 	}
 }
 
+// COPY ... FROM STDIN makes the server read copy data from the client; sent
+// through the extended protocol, it ignores the Sync after it. Any table, any
+// statement of several. COPY TO, and COPY FROM a file or a program, read
+// nothing from the client.
+func TestClassifyCopyFromStdin(t *testing.T) {
+	for sql, want := range map[string]bool{
+		"copy contacts from stdin":                     true,
+		"copy deals (id) from stdin with (format csv)": true,
+		"select 1; copy deals from stdin":              true,
+		"copy contacts to stdout":                      false,
+		"copy (select 1) to stdout":                    false,
+		"copy deals from '/tmp/x'":                     false,
+		"copy deals from program 'cat /tmp/x'":         false,
+		"select 1":                                     false,
+	} {
+		r, err := Classify(sql, gated)
+		if err != nil {
+			t.Fatalf("%q: %v", sql, err)
+		}
+		if r.CopyIn != want {
+			t.Errorf("%q: CopyIn = %v, want %v", sql, r.CopyIn, want)
+		}
+	}
+}
+
 // Postgres reads t.f as column f of t or, when t has none, as the call f(t).
 // The count runs the WHERE clause, so it lists such names for the gate to
 // look up; no other method runs it.

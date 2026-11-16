@@ -39,6 +39,10 @@ type recordingGate struct {
 	// block, when set, says why Inspect marks a statement as one that cannot
 	// be inspected (Statement.Block); "" for one that can.
 	block func(sql string) string
+	// copyIn, when set, says which statements Inspect marks as COPY ... FROM
+	// STDIN (Statement.CopyIn); when nil, none is: the classifier did not see
+	// it.
+	copyIn func(sql string) bool
 
 	mu       sync.Mutex
 	inspects int // Inspect calls
@@ -96,6 +100,9 @@ func (g *recordingGate) Inspect(sql string) proxy.Statement {
 	}
 	if g.block != nil {
 		st.Block = g.block(sql)
+	}
+	if g.copyIn != nil {
+		st.CopyIn = g.copyIn(sql)
 	}
 	for _, m := range executeRE.FindAllStringSubmatch(sql, -1) {
 		st.Executes = append(st.Executes, strings.ToLower(m[1]))
@@ -2855,6 +2862,69 @@ func TestSettingChangedAheadOfAStatementEndsTheSession(t *testing.T) {
 	}
 }
 
+// COPY FROM STDIN sent through the extended protocol makes the server ignore
+// the Sync after its Execute, so the session could not be followed. Where the
+// classifier sees it, an enforced session refuses the Parse as a closed point
+// (copy_extended), every time, with an ordinary error, and the session goes
+// on: a simple-protocol COPY on it works. What the classifier cannot see
+// ends the session when the copy starts (the test below). The shadow proxy
+// relays it, and tells the gate once that enforce would refuse it.
+func TestExtendedCopyFromStdinIsRefused(t *testing.T) {
+	copyRE := regexp.MustCompile(`(?i)^\s*copy\b.*\bfrom\s+stdin`)
+	for _, mode := range closedPointModes {
+		t.Run(mode.name, func(t *testing.T) {
+			g := closedPointGate(isWrite)
+			g.copyIn = copyRE.MatchString
+			addr, _ := startProxyWith(t, upstream(t), g, mode.policy)
+			fe, _ := rawSessionWith(t, addr, "stet_trust", nil)
+			data := &pgproto3.CopyData{Data: []byte("1\n")}
+			sendAll(t, fe, &pgproto3.Query{String: "create temp table copied (i int)"})
+			wantReplies(t, fe, "C Z")
+
+			for range 2 {
+				sendAll(t, fe, &pgproto3.Parse{Query: "copy copied from stdin"}, &pgproto3.Bind{}, &pgproto3.Execute{}, &pgproto3.Sync{})
+				if mode.policy.Enforce {
+					wantReplies(t, fe, "E:ST002 Z", "blocked copy_extended")
+					continue
+				}
+				if got := nextReplies(t, fe, 3); got != "1 2 G" {
+					t.Fatalf("shadow: replies %q, want %q", got, "1 2 G")
+				}
+				sendAll(t, fe, data, &pgproto3.CopyDone{}, &pgproto3.Sync{})
+				wantReplies(t, fe, "C Z")
+			}
+			sendAll(t, fe, &pgproto3.Query{String: "copy copied from stdin"})
+			if got := nextReplies(t, fe, 1); got != "G" {
+				t.Fatalf("simple-protocol COPY: replies %q, want G", got)
+			}
+			sendAll(t, fe, data, &pgproto3.CopyDone{})
+			wantReplies(t, fe, "C Z")
+			sendAll(t, fe, &pgproto3.Query{String: "select count(*) from copied"})
+			wantReplies(t, fe, "T D C Z")
+
+			g.mu.Lock()
+			blocked, would := g.blocked, g.would
+			g.mu.Unlock()
+			var reasons, wouldReasons []string
+			var firsts []bool
+			for _, b := range blocked {
+				reasons, firsts = append(reasons, b.reason), append(firsts, b.first)
+			}
+			for _, w := range would {
+				wouldReasons = append(wouldReasons, w.reason)
+			}
+			if mode.policy.Enforce {
+				if !slices.Equal(reasons, []string{proxy.BlockCopyExtended, proxy.BlockCopyExtended}) ||
+					!slices.Equal(firsts, []bool{true, false}) || len(would) != 0 {
+					t.Errorf("Blocked for %q (first %v), WouldBlock for %q; want copy_extended twice, logged once", reasons, firsts, wouldReasons)
+				}
+			} else if len(blocked) != 0 || !slices.Equal(wouldReasons, []string{proxy.BlockCopyExtended}) {
+				t.Errorf("shadow: Blocked for %q, WouldBlock for %q; want WouldBlock once for copy_extended", reasons, wouldReasons)
+			}
+		})
+	}
+}
+
 // COPY FROM STDIN through the extended protocol makes the server ignore the
 // Sync after the Execute (spec correction B6 ②), so its answers no longer
 // match the units the proxy follows. An enforced session is ended with a
@@ -2871,9 +2941,9 @@ func TestCopyFromStdinThroughTheExtendedProtocolEndsTheSession(t *testing.T) {
 			wantReplies(t, fe, "C Z")
 			sendAll(t, fe, &pgproto3.Parse{Query: "copy copied from stdin"}, &pgproto3.Bind{}, &pgproto3.Execute{}, &pgproto3.Sync{})
 			if mode.policy.Enforce {
-				wantEnded(t, fe, "1 2", proxy.BlockCopyExtended)
+				wantEnded(t, fe, "1 2", proxy.BlockCopyStarted)
 				waitForBackendGone(t, pid)
-				g.wantBlocked(t, "stet_trust", proxy.BlockCopyExtended)
+				g.wantBlocked(t, "stet_trust", proxy.BlockCopyStarted)
 
 				conn := connect(t, addr, "stet_scram", nil)
 				mustExec(t, conn, "create temp table copied (i int)")
