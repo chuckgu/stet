@@ -2,6 +2,7 @@ package decide
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -255,5 +256,68 @@ func TestVerdictImpact(t *testing.T) {
 				t.Errorf("got %s %v, want %s %v", v, reasons, tc.verdict, tc.reasons)
 			}
 		})
+	}
+}
+
+func TestVerdictCumulative(t *testing.T) {
+	n := func(v int64) *int64 { return &v }
+	lim := &config.Impact{MaxRows: 100, MaxShare: 0.5}
+	cum := func(used, planned int64) *Cumulative {
+		return &Cumulative{Used: n(used), Planned: n(planned), Limit: 500, WindowS: 600}
+	}
+	dupQ := Question{ID: "duplicate", Type: "choice", Choices: []string{"4812", "none"}}
+	okAnswers := map[string]Answer{"duplicate": choice("none", 0.95)}
+	holdAnswers := map[string]Answer{"duplicate": choice("4812", 0.95)}
+	cases := []struct {
+		name    string
+		in      Input
+		verdict string
+		reasons []string
+	}{
+		{"single row, within", Input{Op: "insert", Cumulative: cum(480, 1)}, Commit, nil},
+		{"single row, over", Input{Op: "insert", Thresholds: th, Questions: []Question{dupQ}, Answers: okAnswers,
+			Cumulative: cum(500, 1)}, Hold, []string{"impact:cumulative"}},
+		{"over wins over a model hold", Input{Op: "insert", Thresholds: th, Questions: []Question{dupQ}, Answers: holdAnswers,
+			Cumulative: cum(500, 1)}, Hold, []string{"impact:cumulative"}},
+		{"over wins over state error", Input{Op: "insert", StateErr: errors.New("x"), OnFailure: "pass",
+			Cumulative: cum(500, 1)}, Hold, []string{"impact:cumulative"}},
+		{"exactly at the limit", Input{Op: "insert", Cumulative: cum(499, 1)}, Commit, nil},
+		{"measured, within both", Input{Op: "update", ImpactLimit: lim, Impact: &Impact{Method: "count", Rows: n(20)},
+			Cumulative: cum(480, 20)}, Commit, nil},
+		{"measured, over cumulative", Input{Op: "update", ImpactLimit: lim, Impact: &Impact{Method: "count", Rows: n(21)},
+			Cumulative: cum(480, 21)}, Hold, []string{"impact:cumulative"}},
+		{"rows limit wins", Input{Op: "update", ImpactLimit: lim,
+			Impact: &Impact{Method: "count", Rows: n(101), Capped: true}, Cumulative: cum(0, 101)}, Hold, []string{"impact:rows"}},
+		{"share limit wins", Input{Op: "delete", ImpactLimit: lim,
+			Impact:     &Impact{Method: "count", Rows: n(40), Share: func() *float64 { v := 0.8; return &v }()},
+			Cumulative: cum(480, 40)}, Hold, []string{"impact:share"}},
+		{"cumulative before uncertain", Input{Op: "update", ImpactLimit: lim, Impact: &Impact{Method: "estimate", Rows: n(50)},
+			Cumulative: cum(480, 50)}, Hold, []string{"impact:cumulative"}},
+		{"estimate within cumulative", Input{Op: "update", ImpactLimit: lim, Impact: &Impact{Method: "estimate", Rows: n(5)},
+			Cumulative: cum(0, 5)}, Escalate, []string{"impact:uncertain"}},
+		{"unknown usage is not applied", Input{Op: "insert", Cumulative: &Cumulative{Error: "no login role"}}, Commit, nil},
+		{"unsupported stays", Input{Unsupported: "multi_row", Cumulative: cum(500, 1)}, Unsupported, []string{"multi_row"}},
+		{"failed measure stays", Input{Op: "update", ShapeReason: "not_single_row", ImpactLimit: lim,
+			Impact: &Impact{Error: "x"}, Cumulative: cum(500, 1)}, Unsupported, []string{"not_single_row"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v, reasons := Verdict(tc.in)
+			if v != tc.verdict || !reflect.DeepEqual(reasons, tc.reasons) {
+				t.Errorf("got %s %v, want %s %v", v, reasons, tc.verdict, tc.reasons)
+			}
+		})
+	}
+}
+
+func TestCumulativeJSON(t *testing.T) {
+	zero, one := int64(0), int64(1)
+	b, _ := json.Marshal(Cumulative{Used: &zero, Planned: &one, Limit: 500, WindowS: 600})
+	if !strings.Contains(string(b), `"used":0`) {
+		t.Errorf("used 0 missing: %s", b)
+	}
+	b, _ = json.Marshal(Cumulative{Error: "x"})
+	if string(b) != `{"error":"x"}` {
+		t.Errorf("got %s", b)
 	}
 }

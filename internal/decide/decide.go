@@ -192,6 +192,8 @@ type Input struct {
 	ShapeReason string         // the reason a measured write had before; used when measuring failed
 	Impact      *Impact        // set for a measured write on a table with impact limits
 	ImpactLimit *config.Impact // the table's limits
+
+	Cumulative *Cumulative // the login role's usage in the window; nil when no limit applies
 }
 
 // Verdict applies spec 6: the first matching rule decides.
@@ -201,6 +203,9 @@ func Verdict(in Input) (string, []string) {
 	}
 	if in.Impact != nil {
 		return impactVerdict(in)
+	}
+	if in.Cumulative.Over() {
+		return Hold, []string{"impact:cumulative"}
 	}
 	if in.StateErr != nil || in.ModelErr != nil {
 		reason := "model_error"

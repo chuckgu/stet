@@ -43,6 +43,9 @@ func impactVerdict(in Input) (string, []string) {
 	if (in.Op == "update" || in.Op == "delete") && lim.MaxShare > 0 && im.Share != nil && *im.Share > lim.MaxShare {
 		return Hold, []string{"impact:share"}
 	}
+	if in.Cumulative.Over() {
+		return Hold, []string{"impact:cumulative"}
+	}
 	if im.Method == "estimate" {
 		return Escalate, []string{"impact:uncertain"}
 	}
