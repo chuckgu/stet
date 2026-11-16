@@ -381,6 +381,32 @@ func TestPresentButEmptyBlocks(t *testing.T) {
 	})
 }
 
+// The window is recorded as window_s in an append-only record, so it must be
+// a whole number of seconds.
+func TestCumulativeWindowIsWholeSeconds(t *testing.T) {
+	base := minimal + "model: {adapter: none}\ntables:\n  contacts:\n    pk: id\n    send_fields: [name]\n" +
+		"    impact: {max_rows: 100, cumulative: {max_rows: 500, window: %s}}\n"
+	for _, w := range []string{"500ms", "1.5s", "999ms", "1m0.5s"} {
+		_, err := Parse(fmt.Appendf(nil, base, w))
+		if err == nil || !strings.Contains(err.Error(), "impact.cumulative.window") || !strings.Contains(err.Error(), "whole number of seconds") {
+			t.Errorf("window %s: err = %v, want impact.cumulative.window to be a whole number of seconds", w, err)
+		}
+	}
+	for w, want := range map[string]time.Duration{"1s": time.Second, "90s": 90 * time.Second, "1m30s": 90 * time.Second, "1500ms": 0} {
+		c, err := Parse(fmt.Appendf(nil, base, w))
+		switch {
+		case want == 0:
+			if err == nil {
+				t.Errorf("window %s accepted, want it refused", w)
+			}
+		case err != nil:
+			t.Errorf("window %s: %v", w, err)
+		case c.Tables["contacts"].Impact.Cumulative.Window != want:
+			t.Errorf("window %s = %v, want %v", w, c.Tables["contacts"].Impact.Cumulative.Window, want)
+		}
+	}
+}
+
 func TestCumulativeAndReads(t *testing.T) {
 	base := minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables:\n  contacts:\n    pk: id\n    send_fields: [name]\n"
 	parse := func(extra string) Table {

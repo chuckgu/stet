@@ -75,7 +75,7 @@ type Impact struct {
 // Cumulative limits what one login role may touch in a table within a window.
 type Cumulative struct {
 	MaxRows int           // 1 to maxImpactRows, and at least Impact.MaxRows
-	Window  time.Duration // above 0, at most maxCumulativeWindow
+	Window  time.Duration // whole seconds, at least 1s and at most maxCumulativeWindow
 }
 
 // Reads turns on read recording for a table.
@@ -364,6 +364,9 @@ func resolveTable(name string, rt rawTable, hasReads, hasCumulative bool) (Table
 				fail("impact.cumulative.window", "%v", err)
 			} else if d <= 0 || d > maxCumulativeWindow {
 				fail("impact.cumulative.window", "%s must be above 0 and at most %s", rc.Window, maxCumulativeWindow)
+			} else if d%time.Second != 0 {
+				// Decisions record it as window_s, in an append-only record.
+				fail("impact.cumulative.window", "%s must be a whole number of seconds", rc.Window)
 			} else {
 				cum.Window = d
 			}
