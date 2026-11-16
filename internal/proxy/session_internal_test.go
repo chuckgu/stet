@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"log/slog"
 	"slices"
 	"strings"
 	"testing"
@@ -82,6 +83,101 @@ func TestAbandonReportsWhatAPanicLeftHolding(t *testing.T) {
 	}
 	if o, ok := g.ends[0]; !ok || !o.Lost {
 		t.Errorf("the pending write ended %+v (reported %v), want it lost", o, ok)
+	}
+}
+
+// parkingGate is fakeGate whose Begin leaves the session's lock held, as a
+// side that panicked under it would: the side that called Begin then parks
+// on that lock before it records the write.
+type parkingGate struct {
+	*fakeGate
+	s *session
+}
+
+func (g *parkingGate) Begin(info SessionInfo, st Statement, ps []Param) (any, *Refusal) {
+	h, r := g.fakeGate.Begin(info, st, ps)
+	g.s.mu.Lock()
+	return h, r
+}
+
+// A write Begin answered, whose side then parked on the lock a panicking
+// side left held, was never forwarded and is in no unit: abandon reports it
+// all the same, as not sent (neither run nor lost), and relay sees that side
+// stuck once Begin has returned.
+func TestAbandonReportsAWriteItsSideNeverRecorded(t *testing.T) {
+	for _, refused := range []bool{false, true} {
+		g := &parkingGate{fakeGate: newFakeGate()}
+		if refused {
+			g.refusal = &Refusal{Code: "ST001", Message: "held"}
+		}
+		s := readySession(g)
+		g.s = s
+		go s.fromClient('Q', body(queryMsg(ins)), func() error { return nil }) // parks for good
+		deadline := time.Now().Add(5 * time.Second)
+		for s.unrecorded.Load() == nil || s.gating.Load() != 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("Begin was not answered")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if !s.stuck() {
+			t.Error("stuck = false with the lock held and no Begin running")
+		}
+		s.abandon()
+		o, ok := g.ends[0]
+		switch {
+		case !ok:
+			t.Errorf("refused %v: the write Begin answered was never reported", refused)
+		case o.Executed || o.Lost || o.Refused != refused || refused && !o.Undelivered:
+			t.Errorf("refused %v: reported %+v, want not run, not lost, refused %v and undelivered", refused, o, refused)
+		}
+	}
+}
+
+// panicEndGate is fakeGate whose End panics for the first write it is told of.
+type panicEndGate struct{ *fakeGate }
+
+func (g panicEndGate) End(h any, o Outcome) {
+	if h.(int) == 0 {
+		panic("test gate: End")
+	}
+	g.fakeGate.End(h, o)
+}
+
+// A gate's End that panics for one write does not lose the others' (the
+// residual fix's item 2): the session logs the panic as an error and reports
+// the rest, when the server answers them and when the connection ends first.
+func TestAPanickingEndDoesNotLoseTheOthers(t *testing.T) {
+	for _, answered := range []bool{true, false} {
+		g := panicEndGate{newFakeGate()}
+		s := readySession(g)
+		var logs strings.Builder
+		s.log = slog.New(slog.NewTextHandler(&logs, nil))
+		for range 3 {
+			sendWrite(s, "")
+		}
+		func() {
+			defer func() {
+				if v := recover(); v != nil {
+					t.Errorf("answered %v: the panic escaped: %v", answered, v)
+				}
+			}()
+			if answered {
+				s.fromClient('S', nil, func() error { return nil })
+				serve(s, parseOK, bindOK, tag("INSERT 0 1"), parseOK, bindOK, tag("INSERT 0 1"), parseOK, bindOK, tag("INSERT 0 1"), ready)
+				return
+			}
+			s.abandon()
+		}()
+		if _, ok1 := g.ends[1]; !ok1 {
+			t.Errorf("answered %v: write 2 not reported", answered)
+		}
+		if _, ok2 := g.ends[2]; !ok2 {
+			t.Errorf("answered %v: write 3 not reported", answered)
+		}
+		if !strings.Contains(logs.String(), "level=ERROR") || !strings.Contains(logs.String(), "test gate: End") {
+			t.Errorf("answered %v: log %q, want the panic as an error", answered, logs.String())
+		}
 	}
 }
 

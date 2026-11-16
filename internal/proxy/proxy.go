@@ -176,12 +176,12 @@ func (s *Server) handle(client net.Conn) {
 	start := time.Now()
 	s.log.Debug("session started", "remote", client.RemoteAddr())
 	if ss := s.watch(pkt); ss == nil {
-		relay(client, server, nil, nil, nil, nil)
+		relay(client, server, nil, nil, nil, nil, nil)
 	} else {
 		relay(client, server, ss.clientTap(), ss.serverTap(), ss.ended, func(v any, stack []byte) {
 			s.log.Error("session ended by a panic", "session", ss.info.ID, "login_role", ss.info.User,
 				"database", ss.info.Database, "agent", ss.info.ApplicationName, "panic", fmt.Sprint(v), "stack", string(stack))
-		})
+		}, ss.stuck)
 		ss.abandon()
 	}
 	s.log.Debug("session ended", "remote", client.RemoteAddr(), "duration", time.Since(start))
@@ -200,6 +200,7 @@ func (s *Server) watch(pkt []byte) *session {
 	info.ID = newSessionID()
 	ss := newSession(s.gate, info)
 	ss.enforce = s.policy.Enforce
+	ss.log = s.log
 	return ss
 }
 
@@ -264,6 +265,10 @@ func readStartupPacket(r io.Reader) ([]byte, error) {
 	return pkt, nil
 }
 
+// stuckTick is how often relay looks, after a panic, whether the other side
+// can still stop (see relay). A variable only so tests can shorten it.
+var stuckTick = time.Second
+
 // relay copies messages both ways until either side closes. Taps may be nil.
 //
 // When a side stops because the proxy itself ends the session (a tap's see
@@ -275,10 +280,15 @@ func readStartupPacket(r io.Reader) ([]byte, error) {
 // A panic in a tap ends the session there (panicked, when set, is told of it
 // with its stack): both connections are closed at once, so the message the
 // tap was inspecting, and anything queued behind it, is never forwarded, and
-// the client gets no error from Stet. ended is not asked then, so a tap that
-// panicked holding the session's lock cannot stall relay; the caller reports
-// what was pending (abandon) once relay returns.
-func relay(client, server net.Conn, fromClient, fromServer *tap, ended func() []byte, panicked func(v any, stack []byte)) {
+// the client gets no error from Stet; ended is not asked. The other side then
+// stops at its next read or write, unless the tap panicked holding the
+// session's lock and the other side waits for that lock: it never stops.
+// stuck, when set, reports that state (see session.stuck): relay looks every
+// stuckTick, and stops waiting once it finds it at two looks in a row. That
+// side's goroutine is then left parked for the life of the process; it holds
+// no count in Server.wg, so Close does not wait for it. Either way the caller
+// reports what was pending (abandon) once relay returns.
+func relay(client, server net.Conn, fromClient, fromServer *tap, ended func() []byte, panicked func(v any, stack []byte), stuck func() bool) {
 	type stop struct {
 		err      error
 		panicked bool
@@ -300,7 +310,26 @@ func relay(client, server net.Conn, fromClient, fromServer *tap, ended func() []
 	go run(server, client, fromClient)
 	go run(client, server, fromServer)
 	first := <-done
-	if first.panicked || ended == nil || !errors.Is(first.err, errEnded) {
+	if first.panicked {
+		client.Close()
+		server.Close()
+		tick := time.NewTicker(stuckTick)
+		defer tick.Stop()
+		for looks := 0; looks < 2; {
+			select {
+			case <-done:
+				return
+			case <-tick.C:
+				if stuck != nil && stuck() {
+					looks++
+				} else {
+					looks = 0
+				}
+			}
+		}
+		return
+	}
+	if ended == nil || !errors.Is(first.err, errEnded) {
 		client.Close()
 		server.Close()
 		<-done

@@ -3339,3 +3339,98 @@ func TestPanicEndsOnlyItsSession(t *testing.T) {
 		})
 	}
 }
+
+// A panic where the proxy holds the session's lock (here a test hook on the
+// server side, mid-stream) leaves that lock held: the client side, still
+// following a pipeline, parks waiting for it and never stops. The session is
+// ended all the same within a bounded wait: both connections are closed (its
+// server backend ends), what was pending is reported (every write begun gets
+// its End once, reads still waiting are reported lost), and Server.Close
+// returns. The parked goroutine is left behind by design.
+func TestPanicHoldingTheSessionLockEndsTheSession(t *testing.T) {
+	for _, mode := range closedPointModes {
+		t.Run(mode.name, func(t *testing.T) {
+			table := watchedTable(t)
+			mustExec(t, connect(t, upstream(t), "stet_scram", nil), "grant select, insert on "+table+" to stet_trust")
+			g := newRecordingGate(watches(table))
+			g.observeMatch = readsOf(table)
+
+			var fired sync.Once
+			var completions int
+			restoreHook := proxy.SetServerHook(func(t byte) {
+				if t != 'C' {
+					return
+				}
+				if completions++; completions == 200 {
+					fired.Do(func() {
+						// Hold the lock long enough for the client side, which
+						// follows the pipeline still arriving, to wait for it.
+						time.Sleep(200 * time.Millisecond)
+						panic("test hook: panic under the session lock")
+					})
+				}
+			})
+			restoreTick := proxy.SetStuckTick(100 * time.Millisecond)
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var logs syncLog
+			srv := proxy.New(upstream(t), slog.New(slog.NewTextHandler(&logs, nil)), g, mode.policy)
+			go srv.Serve(ln)
+
+			fe, pid := rawSessionWith(t, ln.Addr().String(), "stet_trust", nil)
+			go func() {
+				for i := range 30000 {
+					if i%2 == 0 {
+						fe.Send(&pgproto3.Query{String: fmt.Sprintf("insert into %s values (%d, 'x')", table, i)})
+					} else {
+						fe.Send(&pgproto3.Query{String: "select count(*) from " + table})
+					}
+					if i%100 == 99 && fe.Flush() != nil {
+						return // the proxy closed the session
+					}
+				}
+				fe.Flush()
+			}()
+			for {
+				if _, err := fe.Receive(); err != nil {
+					break // the proxy closed the session
+				}
+			}
+			waitForBackendGone(t, pid)
+
+			closed := make(chan struct{})
+			go func() {
+				srv.Close()
+				close(closed)
+			}()
+			select {
+			case <-closed:
+				restoreTick()
+				restoreHook()
+			case <-time.After(10 * time.Second):
+				t.Fatalf("Server.Close is still waiting after 10s; log:\n%s", logs.String())
+			}
+
+			g.mu.Lock()
+			begins, ends, endCalls := len(g.begins), len(g.ends), g.endCalls
+			var lostReads int
+			for _, r := range g.reads {
+				if r.o.Lost {
+					lostReads++
+				}
+			}
+			g.mu.Unlock()
+			if begins == 0 || ends != begins || endCalls != begins {
+				t.Errorf("%d writes begun, %d of them ended, %d End calls; want each begun write ended once", begins, ends, endCalls)
+			}
+			if lostReads == 0 {
+				t.Error("no read was reported lost, want those still waiting when the session ended")
+			}
+			if log := logs.String(); !strings.Contains(log, "session ended by a panic") || !strings.Contains(log, "test hook") {
+				t.Errorf("the log does not hold the panic:\n%s", log)
+			}
+		})
+	}
+}

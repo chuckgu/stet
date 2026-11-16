@@ -3,9 +3,12 @@ package proxy
 import (
 	"bytes"
 	"fmt"
+	"log/slog"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -226,6 +229,16 @@ type session struct {
 	// under mu.
 	told []string
 
+	// log takes the errors of the gate's End and Observe (see report).
+	log *slog.Logger
+
+	// gating counts the gate's Begin calls running; unrecorded holds what the
+	// last one handed back until begin records the write in its unit. Both
+	// are for a session whose lock a panicking side left held (see stuck,
+	// abandon).
+	gating     atomic.Int32
+	unrecorded atomic.Pointer[unrecordedWrite]
+
 	// Enforced sessions only, under mu. utf8 and standard: the server last
 	// reported client_encoding UTF8 and standard_conforming_strings on (see
 	// readable); serverUTF8: it reported server_encoding UTF8 (see foreign). end: why the proxy is ending the session, "" while it is
@@ -348,8 +361,15 @@ type observedRead struct {
 	before int64
 }
 
+// unrecordedWrite is what the gate's Begin handed back for a write that is
+// not in its unit yet (see beginGate).
+type unrecordedWrite struct {
+	handle  any
+	refusal *Refusal
+}
+
 func newSession(g Gate, info SessionInfo) *session {
-	s := &session{gate: g, info: info, status: 'I'}
+	s := &session{gate: g, info: info, status: 'I', log: slog.New(slog.DiscardHandler)}
 	s.portals.freed = true // see names.freed
 	return s
 }
@@ -781,6 +801,10 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 // copy starts (session.copyIn), as one the classifier did not see does.
 func copyFromStdin(st Statement) bool { return st.CopyIn && !st.Watch }
 
+// serverHook, set only by tests (SetServerHook), runs with the type of each
+// server message a session follows, with s.mu held.
+var serverHook func(t byte)
+
 // unreadable is why a message whose body is body could not be inspected: nil
 // is a body past maxInspect, which was not read; any other could not be
 // decoded.
@@ -917,7 +941,7 @@ func (s *session) begin(u *unit, idx, pos int, t byte, st Statement, ps []Param,
 	if st.OnBehalfOf != nil {
 		info.OnBehalfOf = *st.OnBehalfOf // a SET in the write's own message counts for it
 	}
-	h, refuse := s.gate.Begin(info, st, ps)
+	h, refuse := s.beginGate(info, st, ps)
 	w := watchedWrite{handle: h, idx: idx, several: st.Several}
 	var r []byte
 	if refuse != nil {
@@ -926,8 +950,39 @@ func (s *session) begin(u *unit, idx, pos int, t byte, st Statement, ps []Param,
 	}
 	s.mu.Lock()
 	u.writes = append(u.writes, w)
+	s.unrecorded.Store(nil) // u holds it now
 	s.mu.Unlock()
 	return r
+}
+
+// beginGate calls the gate's Begin, counted in s.gating while it runs, and
+// keeps what Begin handed back in s.unrecorded until begin records the write
+// in its unit. When a side that panicked left s.mu held, begin parks on it
+// before recording the write, which was not forwarded; abandon reports it
+// from there (see relay).
+func (s *session) beginGate(info SessionInfo, st Statement, ps []Param) (any, *Refusal) {
+	s.gating.Add(1)
+	defer s.gating.Add(-1)
+	h, r := s.gate.Begin(info, st, ps)
+	s.unrecorded.Store(&unrecordedWrite{handle: h, refusal: r})
+	return h, r
+}
+
+// stuck reports whether a side of the session may wait forever: s.mu is
+// held and no side is in the gate's Begin, which ends on its own bounds. The
+// lock is never held across I/O or a gate call, so once relay has closed
+// both connections, a lock it finds held at two looks a tick apart can only
+// be one a side that panicked left held, and a side waiting for it never
+// stops (see relay).
+func (s *session) stuck() bool {
+	if s.gating.Load() > 0 {
+		return false
+	}
+	if s.mu.TryLock() {
+		s.mu.Unlock()
+		return false
+	}
+	return true
 }
 
 // observe notes a read in its unit. Nothing waits for the gate and nothing
@@ -1035,6 +1090,9 @@ func binding(m *pgproto3.Bind, p prepared, ok bool, others []prepared) bound {
 // answers a refused message's replacement.
 func (s *session) fromServer(t byte, body []byte) ([]byte, error) {
 	s.mu.Lock()
+	if serverHook != nil {
+		serverHook(t)
+	}
 	done := s.answeredUnsynced(nil)
 	var head *unit
 	if len(s.units) > 0 {
@@ -1167,10 +1225,10 @@ func (u *unit) tally() {
 func (s *session) finish(u *unit, inTx bool) {
 	for _, w := range u.writes {
 		if w.refused {
-			s.gate.End(w.handle, u.refusedWrite(w, inTx, true))
+			s.reportEnd(w.handle, u.refusedWrite(w, inTx, true))
 			continue
 		}
-		s.gate.End(w.handle, u.answered(w.idx, inTx))
+		s.reportEnd(w.handle, u.answered(w.idx, inTx))
 	}
 	for _, r := range u.reads {
 		o := u.answered(r.idx, inTx)
@@ -1178,7 +1236,30 @@ func (s *session) finish(u *unit, inTx bool) {
 		if r.ifRows && o.Sent == 0 {
 			continue
 		}
-		s.gate.Observe(r.info, r.st, o)
+		s.reportObserve(r.info, r.st, o)
+	}
+}
+
+// reportEnd tells the gate how a watched write ended. A panic in the gate's
+// End is logged and recovered, so the session's other statements are still
+// reported (each has its own decision row, reservation and held write).
+func (s *session) reportEnd(h any, o Outcome) {
+	defer s.recoverReport("End")
+	s.gate.End(h, o)
+}
+
+// reportObserve is reportEnd for an observed read.
+func (s *session) reportObserve(info SessionInfo, st Statement, o Outcome) {
+	defer s.recoverReport("Observe")
+	s.gate.Observe(info, st, o)
+}
+
+// recoverReport, deferred around a report to the gate, logs a panic in it as
+// an error and lets the caller go on to the next.
+func (s *session) recoverReport(call string) {
+	if v := recover(); v != nil {
+		s.log.Error("gate panicked reporting a statement", "call", call, "session", s.info.ID,
+			"login_role", s.info.User, "panic", fmt.Sprint(v), "stack", string(debug.Stack()))
 	}
 }
 
@@ -1249,10 +1330,13 @@ func tagRows(body []byte) (int64, bool) {
 	return n, true
 }
 
-// abandon reports the statements still waiting when the connection ended.
-// It runs once both sides have stopped, so s.mu can be held only by a side
-// whose tap panicked while it held it (see relay): nothing else touches the
-// session any more, and the statements are reported all the same.
+// abandon reports the statements still waiting when the connection ended,
+// and a write Begin answered that never joined its unit (see beginGate). It
+// runs once relay returned: both sides have stopped, or one panicked while it
+// held s.mu and the other waits for that lock for good (see relay). Either
+// way s.mu can be held only by the side that panicked, and nothing else
+// touches the session any more, so the statements are reported all the same,
+// without the lock.
 func (s *session) abandon() {
 	locked := s.mu.TryLock()
 	units := s.units
@@ -1265,7 +1349,13 @@ func (s *session) abandon() {
 	for _, u := range units {
 		// The rows of the statement that was still answering belong to the
 		// first unit not answered in full: an unsynced unit that completed
-		// settled its own.
+		// settled its own. When the lock was left held, the server side may
+		// be the one waiting for it, having counted rows after it last let go
+		// of the lock (s.sent is counted without it): those are left out
+		// rather than read with nothing ordering them.
+		if !locked {
+			break
+		}
 		if !u.unsynced || u.err != "" || u.acks < u.msgs {
 			s.settle(u)
 			break
@@ -1279,10 +1369,10 @@ func (s *session) abandon() {
 		inTx := status != 'I' || u.executes > 1 || u.joined || u.unsynced
 		for _, w := range u.writes {
 			if w.refused {
-				s.gate.End(w.handle, u.refusedWrite(w, inTx, false))
+				s.reportEnd(w.handle, u.refusedWrite(w, inTx, false))
 				continue
 			}
-			s.gate.End(w.handle, u.unansweredWrite(w, inTx))
+			s.reportEnd(w.handle, u.unansweredWrite(w, inTx))
 		}
 		for _, r := range u.reads {
 			o := u.unanswered(r.idx, inTx)
@@ -1290,8 +1380,19 @@ func (s *session) abandon() {
 			if r.ifRows && o.Sent == 0 {
 				continue
 			}
-			s.gate.Observe(r.info, r.st, o)
+			s.reportObserve(r.info, r.st, o)
 		}
+	}
+	if w := s.unrecorded.Swap(nil); w != nil {
+		// Begin answered, but the write never joined its unit: its side
+		// parked on the lock a panicking side left held, inside the message
+		// it was inspecting, so the write was not forwarded.
+		o := Outcome{InTransaction: status != 'I', Error: "not sent: the session ended before the statement was forwarded"}
+		if w.refusal != nil {
+			o = Outcome{InTransaction: status != 'I', Refused: true, Undelivered: true,
+				Error: "SQLSTATE " + w.refusal.Code + ": " + w.refusal.Message}
+		}
+		s.reportEnd(w.handle, o)
 	}
 }
 
