@@ -178,9 +178,12 @@ type session struct {
 	// Enforced sessions only, under mu. utf8 and standard: the server last
 	// reported client_encoding UTF8 and standard_conforming_strings on (see
 	// readable). end: why the proxy is ending the session, "" while it is
-	// not (see endWith).
-	utf8, standard bool
-	end            string
+	// not (see endWith). lastQuery: the newest Query unit, until the client
+	// sends anything but a Flush after it; copying: the Query unit whose COPY
+	// FROM STDIN the client has not ended yet (see admit, copyIn).
+	utf8, standard     bool
+	end                string
+	lastQuery, copying *unit
 }
 
 type prepared struct {
@@ -231,17 +234,21 @@ type unit struct {
 	// late: a Parse, Bind, Describe, Close or Execute came after an Execute
 	// of the unit, so the server may read it after that Execute changed a
 	// setting (see sentAfter).
-	late        bool
-	query       bool
-	dirty       bool // it holds a statement that is not clean (see Statement.Clean)
-	executes    int  // Execute messages so far
-	completions int  // CommandComplete, EmptyQueryResponse, PortalSuspended
-	err         string
-	errAt       int // the Execute the error belongs to (1-based)
-	writes      []watchedWrite
-	reads       []observedRead
-	rows        map[int]int64 // row counts by completion (1-based); kept only once a watched write or observed read joined
-	sent        map[int]int64 // row messages sent by Execute (1-based), or 0 for a Query; kept only once an observed read joined
+	late bool
+	// Of a Query unit on an enforced session (see admit): stray, a message
+	// other than a Flush came after it before a CopyDone or CopyFail;
+	// copyEnded, a CopyDone or CopyFail came after it first.
+	stray, copyEnded bool
+	query            bool
+	dirty            bool // it holds a statement that is not clean (see Statement.Clean)
+	executes         int  // Execute messages so far
+	completions      int  // CommandComplete, EmptyQueryResponse, PortalSuspended
+	err              string
+	errAt            int // the Execute the error belongs to (1-based)
+	writes           []watchedWrite
+	reads            []observedRead
+	rows             map[int]int64 // row counts by completion (1-based); kept only once a watched write or observed read joined
+	sent             map[int]int64 // row messages sent by Execute (1-based), or 0 for a Query; kept only once an observed read joined
 
 	// The server answers each Parse, Bind, Describe, Close and Execute it
 	// completes with one message: ParseComplete, BindComplete, RowDescription
@@ -291,16 +298,24 @@ func newSession(g Gate, info SessionInfo) *session {
 }
 
 func (s *session) clientTap() *tap {
-	return &tap{
-		want: func(t byte) bool {
+	want := func(t byte) bool {
+		switch t {
+		case 'Q', 'P', 'B', 'E', 'C', 'D', 'H', 'S', 'F':
+			return true
+		}
+		return false
+	}
+	if s.enforce {
+		// Also CopyDone and CopyFail (see admit). CopyData is still not shown.
+		want = func(t byte) bool {
 			switch t {
-			case 'Q', 'P', 'B', 'E', 'C', 'D', 'H', 'S', 'F':
+			case 'Q', 'P', 'B', 'E', 'C', 'D', 'H', 'S', 'F', 'c', 'f':
 				return true
 			}
 			return false
-		},
-		see: s.fromClient,
+		}
 	}
+	return &tap{want: want, see: s.fromClient}
 }
 
 func (s *session) serverTap() *tap {
@@ -312,10 +327,11 @@ func (s *session) serverTap() *tap {
 		return false
 	}
 	if s.enforce {
-		// Also ParameterStatus (see parameter). Rows are still not shown.
+		// Also ParameterStatus (see parameter), CopyInResponse and
+		// CopyBothResponse (see copyIn). Rows are still not shown.
 		want = func(t byte) bool {
 			switch t {
-			case 'C', 'I', 's', 'E', 'Z', 'S':
+			case 'C', 'I', 's', 'E', 'Z', 'S', 'G', 'W':
 				return true
 			}
 			return false
@@ -386,6 +402,12 @@ func (s *session) answeredUnsynced(done []answer) []answer {
 // runs with s.mu held.
 func (s *session) leave(u *unit, after byte) {
 	s.units = s.units[1:]
+	if s.copying == u {
+		s.copying = nil // the copy ended on the server, by an error at least
+	}
+	if s.lastQuery == u {
+		s.lastQuery = nil
+	}
 	s.stmts.answered(u, u.acks)
 	s.portals.answered(u, u.acks)
 	if after != 'I' {
@@ -451,7 +473,7 @@ func (s *session) acked(head *unit) {
 // once the proxy is ending the session (see end.go).
 func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, error) {
 	if s.enforce {
-		if err := s.admit(); err != nil {
+		if err := s.admit(t); err != nil {
 			return nil, err
 		}
 	}
@@ -932,6 +954,9 @@ func (s *session) push(u *unit) *unit {
 		u.joined = last.executes > 0
 	}
 	s.units = append(s.units, u)
+	if s.enforce && u.query {
+		s.lastQuery = u // see admit
+	}
 	return u
 }
 
@@ -1033,6 +1058,8 @@ func (s *session) fromServer(t byte, body []byte) ([]byte, error) {
 		done = s.readyForQuery(head, body, done)
 	case 'S': // enforced sessions only
 		err = s.parameter(head, body)
+	case 'G', 'W': // enforced sessions only
+		err = s.copyIn(head)
 	}
 	s.mu.Unlock()
 	s.finishAll(done)

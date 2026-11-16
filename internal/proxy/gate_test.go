@@ -2844,3 +2844,124 @@ func TestSettingChangedAheadOfAStatementEndsTheSession(t *testing.T) {
 		})
 	}
 }
+
+// COPY FROM STDIN through the extended protocol makes the server ignore the
+// Sync after the Execute (spec correction B6 ②), so its answers no longer
+// match the units the proxy follows. An enforced session is ended with a
+// FATAL when the server starts such a copy, and so is its server session; a
+// simple-protocol COPY on the same proxy works. The shadow proxy relays it.
+func TestCopyFromStdinThroughTheExtendedProtocolEndsTheSession(t *testing.T) {
+	for _, mode := range closedPointModes {
+		t.Run(mode.name, func(t *testing.T) {
+			g := closedPointGate(isWrite)
+			addr, _ := startProxyWith(t, upstream(t), g, mode.policy)
+			fe, pid := rawSessionWith(t, addr, "stet_trust", nil)
+
+			sendAll(t, fe, &pgproto3.Query{String: "create temp table copied (i int)"})
+			wantReplies(t, fe, "C Z")
+			sendAll(t, fe, &pgproto3.Parse{Query: "copy copied from stdin"}, &pgproto3.Bind{}, &pgproto3.Execute{}, &pgproto3.Sync{})
+			if mode.policy.Enforce {
+				wantEnded(t, fe, "1 2", proxy.BlockCopyExtended)
+				waitForBackendGone(t, pid)
+				g.wantBlocked(t, "stet_trust", proxy.BlockCopyExtended)
+
+				conn := connect(t, addr, "stet_scram", nil)
+				mustExec(t, conn, "create temp table copied (i int)")
+				n, err := conn.CopyFrom(testCtx(t), pgx.Identifier{"copied"}, []string{"i"}, pgx.CopyFromRows([][]any{{1}, {2}}))
+				if err != nil || n != 2 {
+					t.Errorf("simple-protocol COPY: %d rows, %v; want 2 rows", n, err)
+				}
+				return
+			}
+			if got := nextReplies(t, fe, 3); got != "1 2 G" {
+				t.Fatalf("replies %q, want %q", got, "1 2 G")
+			}
+			sendAll(t, fe, &pgproto3.CopyData{Data: []byte("1\n")}, &pgproto3.CopyDone{}, &pgproto3.Sync{})
+			wantReplies(t, fe, "C Z")
+			sendAll(t, fe, &pgproto3.Query{String: "select count(*) from copied"})
+			wantReplies(t, fe, "T D C Z")
+		})
+	}
+}
+
+// The server ignores a Sync during a simple-protocol COPY FROM STDIN (spec
+// correction B6 ③), so its answers no longer match the units the proxy
+// follows. On an enforced session a message the proxy follows, other than
+// Flush, that the server reads between CopyInResponse and the client's
+// CopyDone or CopyFail ends the session with a FATAL: sent after the
+// CopyInResponse, or with the COPY in one write. A client that sends CopyDone
+// and its next Query in one write keeps its session (ruling P10).
+func TestSyncDuringCopyEndsTheSession(t *testing.T) {
+	copyQuery := &pgproto3.Query{String: "copy copied from stdin"}
+	open := func(t *testing.T, policy proxy.Policy) (*pgproto3.Frontend, uint32, *recordingGate) {
+		t.Helper()
+		g := closedPointGate(isWrite)
+		addr, _ := startProxyWith(t, upstream(t), g, policy)
+		fe, pid := rawSessionWith(t, addr, "stet_trust", nil)
+		sendAll(t, fe, &pgproto3.Query{String: "create temp table copied (i int)"})
+		wantReplies(t, fe, "C Z")
+		return fe, pid, g
+	}
+	enforce := proxy.Policy{Enforce: true}
+
+	t.Run("a Sync after CopyInResponse", func(t *testing.T) {
+		fe, pid, g := open(t, enforce)
+		sendAll(t, fe, copyQuery)
+		if got := nextReplies(t, fe, 1); got != "G" {
+			t.Fatalf("replies %q, want G", got)
+		}
+		sendAll(t, fe, &pgproto3.Sync{})
+		wantEnded(t, fe, "", proxy.BlockProtocolOrder)
+		waitForBackendGone(t, pid)
+		g.wantBlocked(t, "stet_trust", proxy.BlockProtocolOrder)
+	})
+
+	t.Run("a Sync in one write with the COPY", func(t *testing.T) {
+		fe, pid, g := open(t, enforce)
+		sendAll(t, fe, copyQuery, &pgproto3.Sync{})
+		wantEnded(t, fe, "", proxy.BlockProtocolOrder)
+		waitForBackendGone(t, pid)
+		g.wantBlocked(t, "stet_trust", proxy.BlockProtocolOrder)
+	})
+
+	t.Run("a Flush during the copy", func(t *testing.T) {
+		fe, _, g := open(t, enforce)
+		sendAll(t, fe, copyQuery)
+		if got := nextReplies(t, fe, 1); got != "G" {
+			t.Fatalf("replies %q, want G", got)
+		}
+		sendAll(t, fe, &pgproto3.Flush{}, &pgproto3.CopyData{Data: []byte("1\n")}, &pgproto3.CopyDone{})
+		wantReplies(t, fe, "C Z")
+		sendAll(t, fe, &pgproto3.Query{String: "select count(*) from copied"})
+		wantReplies(t, fe, "T D C Z")
+		g.wantBlocked(t, "stet_trust")
+	})
+
+	for _, mode := range closedPointModes {
+		t.Run("CopyDone and the next Query in one write, "+mode.name, func(t *testing.T) {
+			fe, _, g := open(t, mode.policy)
+			sendAll(t, fe, copyQuery)
+			if got := nextReplies(t, fe, 1); got != "G" {
+				t.Fatalf("replies %q, want G", got)
+			}
+			sendAll(t, fe, &pgproto3.CopyData{Data: []byte("1\n")}, &pgproto3.CopyDone{},
+				&pgproto3.Query{String: "select count(*) from copied"})
+			wantReplies(t, fe, "C Z")
+			wantReplies(t, fe, "T D C Z")
+			sendAll(t, fe, &pgproto3.Query{String: "select 1"})
+			wantReplies(t, fe, "T D C Z")
+			g.wantBlocked(t, "stet_trust")
+		})
+	}
+
+	// The shadow proxy relays a Sync during the copy; the server ignores it.
+	t.Run("a Sync after CopyInResponse, shadow", func(t *testing.T) {
+		fe, _, _ := open(t, proxy.Policy{})
+		sendAll(t, fe, copyQuery)
+		if got := nextReplies(t, fe, 1); got != "G" {
+			t.Fatalf("replies %q, want G", got)
+		}
+		sendAll(t, fe, &pgproto3.Sync{}, &pgproto3.CopyData{Data: []byte("1\n")}, &pgproto3.CopyDone{})
+		wantReplies(t, fe, "C Z")
+	})
+}

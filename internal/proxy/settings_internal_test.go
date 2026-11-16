@@ -248,3 +248,59 @@ func TestEnforcedTapsShowNoRows(t *testing.T) {
 		t.Errorf("rows counted %d, want 1001", s.sent-before)
 	}
 }
+
+// The copy rule ends an enforced session only for a message the server reads
+// during a simple COPY FROM STDIN: between its CopyInResponse (or
+// CopyBothResponse) and the client's CopyDone or CopyFail, or the copy's own
+// end on the server, by an error say. A Flush in that stretch is let through.
+// An extended-protocol copy ends the session as it starts.
+func TestCopyRuleHoldsOnlyDuringTheCopy(t *testing.T) {
+	copyIn, copyBoth := &pgproto3.CopyInResponse{}, &pgproto3.CopyBothResponse{}
+	copyDone, copyFail := &pgproto3.CopyDone{}, &pgproto3.CopyFail{Message: "no"}
+	for _, c := range []struct {
+		name   string
+		client []pgproto3.FrontendMessage // before the server's reply
+		server []pgproto3.BackendMessage
+		then   pgproto3.FrontendMessage // after it
+		ends   string
+	}{
+		{"a Sync during the copy", msgs(queryMsg("copy")), msgs2(copyIn), syncMsg, BlockProtocolOrder},
+		{"a Query during a copy both ways", msgs(queryMsg("copy")), msgs2(copyBoth), queryMsg("select 1"), BlockProtocolOrder},
+		{"a Sync before CopyInResponse", msgs(queryMsg("copy"), syncMsg), msgs2(copyIn), nil, BlockProtocolOrder},
+		{"a Flush during the copy", msgs(queryMsg("copy")), msgs2(copyIn), &pgproto3.Flush{}, ""},
+		{"a Sync after CopyDone", msgs(queryMsg("copy")), msgs2(copyIn), nil, ""},
+		{"CopyDone before CopyInResponse", msgs(queryMsg("copy"), copyDone, syncMsg), msgs2(copyIn), nil, ""},
+		{"CopyFail before CopyInResponse", msgs(queryMsg("copy"), copyFail, queryMsg("select 1")), msgs2(copyIn), nil, ""},
+		{"a Sync after the copy failed on the server", msgs(queryMsg("copy")),
+			msgs2(copyIn, serverErr("22P02"), ready), syncMsg, ""},
+		{"an extended-protocol copy", msgs(parseMsg("", "copy"), bindMsg("", ""), execMsg(""), syncMsg),
+			msgs2(parseOK, bindOK, copyIn), nil, BlockCopyExtended},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := enforcedSession(newFakeGate())
+			send(s, c.client...)
+			var err error
+			tp := s.serverTap()
+			for _, m := range c.server {
+				b, _ := m.Encode(nil)
+				tp.each(b[0])
+				if tp.want(b[0]) {
+					if _, err = tp.see(b[0], b[5:], nil); err != nil {
+						break
+					}
+				}
+			}
+			if err == nil && c.then != nil {
+				b, _ := c.then.Encode(nil)
+				_, err = s.fromClient(b[0], b[5:], func() error { return nil })
+			}
+			if err == nil && c.name == "a Sync after CopyDone" {
+				send(s, copyDone)
+				_, err = s.fromClient('S', nil, func() error { return nil })
+			}
+			if c.ends == "" && err != nil || c.ends != "" && !errors.Is(err, errEnded) || s.end != c.ends {
+				t.Errorf("%v, ending for %q; want ending for %q", err, s.end, c.ends)
+			}
+		})
+	}
+}
