@@ -993,10 +993,13 @@ func TestWritesBehaveTheSameWithImpactOn(t *testing.T) {
 				}
 			}
 			// Every statement was measured, so the comparison covers measuring.
+			// An impact is also recorded when measuring failed or was skipped;
+			// that has an error and no method.
 			for i, r := range e.impacts(t, len(twinStatements)) {
-				if r.Impact == nil {
-					t.Errorf("statement %d was not measured", i)
+				if _, ok := r.Impact["method"]; !ok {
+					t.Errorf("statement %d was not measured: impact %v", i, r.Impact)
 				}
+				wantNoKeys(t, r.Impact, "error")
 			}
 		})
 	}
