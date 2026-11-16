@@ -507,11 +507,21 @@ func TestCheckRefusesDBUserNamespaceInEnforce(t *testing.T) {
 	admin := connect(t, pg, "stet_scram", "scram-pw")
 	table := freshTable(t, admin, 1)
 
+	// The real reader first, so a misspelled setting (read as NULL) shows.
+	var version int
+	if err := admin.QueryRow(context.Background(), "select current_setting('server_version_num')::int").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	got, err := userNamespace(context.Background(), pool)
+	if version < 170000 && (err != nil || got != "off") {
+		t.Fatalf("db_user_namespace read as %q (err %v) on server %d, want off", got, err, version)
+	}
+
 	real := userNamespace
 	t.Cleanup(func() { userNamespace = real })
 	userNamespace = func(context.Context, *pgxpool.Pool) (string, error) { return "on", nil }
 
-	_, err := check(context.Background(), pool, enforceConfig("stet_md5", table))
+	_, err = check(context.Background(), pool, enforceConfig("stet_md5", table))
 	if err == nil || !strings.Contains(err.Error(), "db_user_namespace") {
 		t.Errorf("enforce: check = %v, want an error naming db_user_namespace", err)
 	}
@@ -520,6 +530,156 @@ func TestCheckRefusesDBUserNamespaceInEnforce(t *testing.T) {
 	if warnings, err := check(context.Background(), pool, shadow); err != nil || len(warnings) != 0 {
 		t.Errorf("shadow: warnings %q, err %v; want none", warnings, err)
 	}
+}
+
+// Ruling 26: under enforce, a check whose finding stops the start also
+// stops it when it cannot be made; shadow warns and starts.
+func TestCheckStopsEnforceWhenItCannotRead(t *testing.T) {
+	pg := testPG(t)
+	pool := stetPool(t, pg)
+	admin := connect(t, pg, "stet_scram", "scram-pw")
+	cfg := enforceConfig("stet_md5", freshTable(t, admin, 1))
+	broken, cancel := context.WithCancel(context.Background())
+	cancel() // every read fails, as when the check's time is up
+
+	_, err := check(broken, pool, cfg)
+	if err == nil {
+		t.Fatal("enforce: check = nil with nothing read, want an error")
+	}
+	for _, want := range []string{"db_user_namespace could not be checked", "agents.roles: whether"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("enforce: check = %v, want it to say %q", err, want)
+		}
+	}
+
+	cfg.Mode = config.ModeShadow
+	warnings, err := check(broken, pool, cfg)
+	if err != nil {
+		t.Errorf("shadow: check = %v, want nil", err)
+	}
+	if !strings.Contains(strings.Join(warnings, "\n"), "could not be checked") {
+		t.Errorf("shadow: warnings %q, want them to say what could not be checked", warnings)
+	}
+}
+
+// The same through run, where Migrate succeeds and only the checks run out
+// of time: enforce does not serve, shadow does.
+func TestRunStopsEnforceButStartsShadowWhenChecksCannotRead(t *testing.T) {
+	pg := testPG(t)
+	admin := connect(t, pg, "stet_scram", "scram-pw")
+	table := freshTable(t, admin, 1)
+	was := checkTimeout
+	t.Cleanup(func() { checkTimeout = was })
+	checkTimeout = time.Nanosecond
+
+	const format = `mode: %[3]s
+agents: {roles: [stet_md5]}
+listen: 127.0.0.1:0
+upstream: postgres://stet_scram:scram-pw@%[1]s/stet_test?sslmode=disable
+model: {adapter: none, on_failure: pass}
+tables:
+  %[2]s: {pk: id, send_fields: [name]}
+`
+	enforce := start(t, parseConfig(t, format, pg, table, "enforce"))
+	select {
+	case <-enforce.done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("enforce: run is serving with nothing checked")
+	}
+	if enforce.err == nil || !strings.Contains(enforce.err.Error(), "db_user_namespace could not be checked") {
+		t.Errorf("enforce: run = %v, want it to refuse because db_user_namespace could not be checked", enforce.err)
+	}
+
+	shadow := start(t, parseConfig(t, format, pg, table, "shadow"))
+	conn := connect(t, shadow.addr, "stet_scram", "scram-pw")
+	if _, err := conn.Exec(context.Background(), "select 1"); err != nil {
+		t.Fatalf("shadow: %v; log:\n%s", err, shadow.log)
+	}
+	if err := shadow.stop(t); err != nil {
+		t.Fatalf("shadow: run = %v, want nil", err)
+	}
+	if !strings.Contains(shadow.log.String(), "could not be checked") {
+		t.Errorf("shadow: the log does not say what could not be checked:\n%s", shadow.log)
+	}
+}
+
+// createRole creates a role named for the test with attrs, and drops it and
+// what it owns or was granted in this database when the test ends, also
+// when it fails.
+func createRole(t *testing.T, su *pgx.Conn, kind, attrs string) string {
+	t.Helper()
+	name := fmt.Sprintf("stet_chk_%s_%d", kind, time.Now().UnixNano())
+	mustExec(t, su, "create role "+name+" "+attrs)
+	t.Cleanup(func() {
+		ctx := context.Background()
+		su.Exec(ctx, "drop owned by "+name)
+		su.Exec(ctx, "drop role "+name)
+	})
+	return name
+}
+
+// warningWith returns the first warning holding every one of parts.
+func warningWith(warnings []string, parts ...string) (string, bool) {
+	for _, w := range warnings {
+		all := true
+		for _, p := range parts {
+			all = all && strings.Contains(w, p)
+		}
+		if all {
+			return w, true
+		}
+	}
+	return "", false
+}
+
+// Rights and superuser reached through role membership count, also through
+// a NOINHERIT membership, which SET ROLE still reaches; the fix names the
+// membership the agent was granted.
+func TestCheckFollowsRoleMembership(t *testing.T) {
+	pg := testPG(t)
+	ctx := context.Background()
+	pool := stetPool(t, pg)
+	su := superuser(t, pg)
+	admin := connect(t, pg, "stet_scram", "scram-pw")
+	table := freshTable(t, admin, 1)
+
+	t.Run("member of a superuser", func(t *testing.T) {
+		super := createRole(t, su, "super", "superuser nologin")
+		agent := createRole(t, su, "agent", "login")
+		mustExec(t, su, "grant "+super+" to "+agent)
+		warnings, err := check(ctx, pool, enforceConfig(agent, table))
+		if err != nil {
+			t.Fatal(err)
+		}
+		fix := fmt.Sprintf(`REVOKE "%s" FROM "%s"`, super, agent)
+		if _, ok := warningWith(warnings, agent, "superuser", fix); !ok {
+			t.Errorf("warnings %q, want one that %s can become superuser %s, with %s", warnings, agent, super, fix)
+		}
+	})
+
+	t.Run("rights through a NOINHERIT chain", func(t *testing.T) {
+		agent := createRole(t, su, "agent", "login noinherit")
+		mid := createRole(t, su, "mid", "nologin")
+		owner := createRole(t, su, "owner", "nologin")
+		mustExec(t, su, "grant "+mid+" to "+agent)
+		mustExec(t, su, "grant "+owner+" to "+mid)
+		mustExec(t, su, "grant usage on schema stet to "+owner)
+		owned := freshTable(t, su, 1)
+		mustExec(t, su, "alter table "+owned+" owner to "+owner)
+
+		warnings, err := check(ctx, pool, enforceConfig(agent, owned))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("warnings: %q", warnings)
+		fix := fmt.Sprintf(`REVOKE "%s" FROM "%s"`, mid, agent)
+		if _, ok := warningWith(warnings, agent, "schema stet", "USAGE", owner, fix); !ok {
+			t.Errorf("warnings %q, want one that %s has USAGE on schema stet through %s, with %s", warnings, agent, owner, fix)
+		}
+		if _, ok := warningWith(warnings, agent, "owns", owned, owner, fix); !ok {
+			t.Errorf("warnings %q, want one that %s owns %s through %s, with %s", warnings, agent, owned, owner, fix)
+		}
+	})
 }
 
 func TestNewerThanParser(t *testing.T) {

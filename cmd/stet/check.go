@@ -15,17 +15,19 @@ import (
 	"github.com/stetdb/stet/internal/sqlparse"
 )
 
-// checkTimeout bounds all of check's queries together.
-const checkTimeout = 10 * time.Second
+// checkTimeout bounds all of check's queries together. A variable so a test
+// can run the checks out of time.
+var checkTimeout = 10 * time.Second
 
 // check looks at the database before serving (spec 7, 8). Warnings go to
 // the log; an error stops the start.
 //
 // It runs as Stet's own account, on Stet's pool, in read-only transactions,
 // and passes every name from the config as a parameter. A check that cannot
-// be made is a warning that says so, never a pass. In shadow mode it only
-// reads the server's version and Stet's own account, and a failure to read
-// them only warns.
+// be made is never a pass: under enforce, one whose finding would stop the
+// start stops it (ruling 26); any other is a warning that says so. In shadow
+// mode it only reads the server's version and Stet's own account, and a
+// failure to read them only warns.
 func check(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config) (warnings []string, err error) {
 	ctx, cancel := context.WithTimeout(ctx, checkTimeout)
 	defer cancel()
@@ -103,7 +105,8 @@ func (c *checker) serverVersion() {
 
 // ownAccount refuses agents.roles that list the account Stet is connected
 // as (spec 8): config validation sees it only when the upstream URL names a
-// user. It returns the listed roles that are Stet's own.
+// user. Under enforce, not being able to tell refuses too (ruling 26). It
+// returns the listed roles that are Stet's own.
 func (c *checker) ownAccount() map[string]bool {
 	if len(c.cfg.AgentRoles) == 0 {
 		return nil
@@ -112,7 +115,13 @@ func (c *checker) ownAccount() map[string]bool {
 	err := c.read(func(tx pgx.Tx) error {
 		return tx.QueryRow(c.ctx, "select session_user, current_user").Scan(&session, &current)
 	})
-	if err != nil {
+	switch {
+	case err != nil && c.cfg.Mode == config.ModeEnforce:
+		// Ruling 26: what would stop the start stops it when it cannot be seen.
+		c.errs = append(c.errs, fmt.Errorf("agents.roles: whether it lists the account Stet connects as could not "+
+			"be checked: %w; enforce mode does not start without knowing it does not", err))
+		return nil
+	case err != nil:
 		c.warn("whether agents.roles lists the account Stet connects as could not be checked: %v", err)
 		return nil
 	}
@@ -127,16 +136,18 @@ func (c *checker) ownAccount() map[string]bool {
 	return own
 }
 
-// userNamespace refuses to start under db_user_namespace (ruling 18): the
-// server then authenticates another role than the startup packet names
-// (agent@ as agent, agent as agent@<database>), so the proxy's reading of
-// the login role no longer matches and an agent session can go unwatched.
+// userNamespace refuses to start under db_user_namespace (ruling 18), or
+// when it cannot be read (ruling 26): the server then authenticates another
+// role than the startup packet names (agent@ as agent, agent as
+// agent@<database>), so the proxy's reading of the login role no longer
+// matches and an agent session can go unwatched.
 func (c *checker) userNamespace() {
 	v, err := userNamespace(c.ctx, c.pool)
 	switch {
 	case err != nil:
-		c.warn("db_user_namespace could not be checked: %v; enforce mode does not support it on, "+
-			"since the server then authenticates other role names than Stet reads", err)
+		// Ruling 26: unknown stops the start as on does.
+		c.errs = append(c.errs, fmt.Errorf("db_user_namespace could not be checked: %w; enforce mode does not "+
+			"start without knowing it is off", err))
 	case v == "on":
 		c.errs = append(c.errs, errors.New("db_user_namespace is on: the server authenticates other role names "+
 			"than the startup packet names (agent@ as agent, agent as agent@<database>), so Stet cannot tell "+
@@ -227,26 +238,44 @@ func (c *checker) gatedTables() []ownedTable {
 	return out
 }
 
+// viaRole is SQL for the role through which the role agent reaches the
+// role target: the one the agent was granted directly that is target or a
+// member of it, so that revoking it from the agent cuts that path. NULL when
+// the agent is target. MEMBER counts every membership, NOINHERIT ones too,
+// since SET ROLE reaches through them. agent and target are SQL expressions
+// written in this file, never values from the config.
+func viaRole(agent, target string) string {
+	return `(select m.rolname from pg_auth_members am join pg_roles m on m.oid = am.roleid
+		where am.member = ` + agent + ` and pg_has_role(am.roleid, ` + target + `, 'MEMBER')
+		order by am.roleid = ` + target + ` desc, m.rolname limit 1)`
+}
+
+// revokeVia is the fix that cuts the agent's path through via, a role
+// viaRole returned (nil only if the catalog changed between reads).
+func revokeVia(via *string, agentID, target string) string {
+	if via == nil {
+		return fmt.Sprintf("revoke the membership of %s that leads to %q", agentID, target)
+	}
+	return fmt.Sprintf("REVOKE %s FROM %s", pgx.Identifier{*via}.Sanitize(), agentID)
+}
+
 func (c *checker) agentRole(role string, tables []ownedTable, stetPath, database string, pathErr error) {
 	id := pgx.Identifier{role}.Sanitize()
 	var (
-		oid                       uint32
-		super                     bool
-		usage, create, member     *bool
-		schemaOwner               *string
-		publicUsage, publicCreate *bool
+		oid       uint32
+		super     bool
+		superRole *string // a superuser role the agent can SET ROLE to
+		superVia  *string
 	)
 	err := c.read(func(tx pgx.Tx) error {
 		return tx.QueryRow(c.ctx, `
-			select r.oid, r.rolsuper,
-			       has_schema_privilege(r.oid, n.oid, 'USAGE'),
-			       has_schema_privilege(r.oid, n.oid, 'CREATE'),
-			       pg_has_role(r.oid, n.nspowner, 'MEMBER'),
-			       pg_get_userbyid(n.nspowner),
-			       (select bool_or(a.privilege_type = 'USAGE') from aclexplode(n.nspacl) a where a.grantee = 0),
-			       (select bool_or(a.privilege_type = 'CREATE') from aclexplode(n.nspacl) a where a.grantee = 0)
-			from pg_roles r left join pg_namespace n on n.nspname = 'stet'
-			where r.rolname = $1`, role).Scan(&oid, &super, &usage, &create, &member, &schemaOwner, &publicUsage, &publicCreate)
+			select r.oid, r.rolsuper, s.rolname, `+viaRole("r.oid", "s.oid")+`
+			from pg_roles r
+			left join lateral (
+				select s.oid, s.rolname from pg_roles s
+				where s.rolsuper and s.oid <> r.oid and pg_has_role(r.oid, s.oid, 'MEMBER')
+				order by s.rolname limit 1) s on true
+			where r.rolname = $1`, role).Scan(&oid, &super, &superRole, &superVia)
 	})
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
@@ -257,62 +286,135 @@ func (c *checker) agentRole(role string, tables []ownedTable, stetPath, database
 	case err != nil:
 		c.warn("agent role %q could not be checked: %v", role, err)
 		return
+	// A superuser passes every right below; one line says enough.
 	case super:
-		// A superuser passes every right below; one line says enough.
 		c.warn("agent role %q is a superuser: it can change the gated tables, the stet schema and the server's "+
 			"settings around everything Stet judges; fix: ALTER ROLE %s NOSUPERUSER", role, id)
 		return
+	case superRole != nil:
+		// Superuser is not inherited, but SET ROLE reaches it.
+		c.warn("agent role %q can become superuser %q with SET ROLE, as a member of it: it can then change the "+
+			"gated tables, the stet schema and the server's settings around everything Stet judges; fix: %s",
+			role, *superRole, revokeVia(superVia, id, *superRole))
+		return
 	}
 
-	switch {
-	case usage == nil:
-		c.warn("agent role %q could not be checked for rights on schema stet: the schema was not found", role)
-	case *usage || *create || *member:
-		var rights, fixes []string
-		if *usage {
-			rights = append(rights, "USAGE")
-		}
-		if *create {
-			rights = append(rights, "CREATE")
-		}
-		if len(rights) > 0 {
-			fixes = append(fixes, fmt.Sprintf("REVOKE %s ON SCHEMA stet FROM %s", strings.Join(rights, ", "), id))
-			if (publicUsage != nil && *publicUsage) || (publicCreate != nil && *publicCreate) {
-				fixes = append(fixes, "REVOKE ALL ON SCHEMA stet FROM PUBLIC")
-			}
-		}
-		if *member {
-			rights = append(rights, fmt.Sprintf("membership in its owner %q", *schemaOwner))
-			if *schemaOwner == role {
-				fixes = append(fixes, "ALTER SCHEMA stet OWNER TO <Stet's account>")
-			} else {
-				fixes = append(fixes, fmt.Sprintf("REVOKE %s FROM %s", pgx.Identifier{*schemaOwner}.Sanitize(), id))
-			}
-		}
-		c.warn("agent role %q has %s on schema stet: it can read and change Stet's decisions and held writes; fix: %s",
-			role, strings.Join(rights, ", "), strings.Join(fixes, "; "))
-	}
+	c.schemaRights(role, id, oid)
 
 	for _, t := range tables {
 		var owns bool
+		var via *string
 		err := c.read(func(tx pgx.Tx) error {
-			return tx.QueryRow(c.ctx, "select pg_has_role($1::oid, $2::oid, 'MEMBER')", oid, t.ownerOID).Scan(&owns)
+			return tx.QueryRow(c.ctx, "select pg_has_role($1::oid, $2::oid, 'MEMBER'), "+viaRole("$1::oid", "$2::oid"),
+				oid, t.ownerOID).Scan(&owns, &via)
 		})
+		const why = "an owner can alter it, add triggers and grant itself any right outside what Stet judges"
 		switch {
 		case err != nil:
 			c.warn("whether agent role %q owns table %s could not be checked: %v", role, t.key, err)
 		case owns && t.ownerOID == oid:
-			c.warn("agent role %q owns table %s: an owner can alter it, add triggers and grant itself any right "+
-				"outside what Stet judges; fix: ALTER TABLE %s OWNER TO <a role the agent is not a member of>",
-				role, t.key, ident(t.key))
+			c.warn("agent role %q owns table %s: "+why+"; fix: ALTER TABLE %s OWNER TO <a role the agent is not "+
+				"a member of>", role, t.key, ident(t.key))
+		case owns && via != nil && *via != t.owner:
+			c.warn("agent role %q owns table %s through membership in its owner %q, reached through role %q: "+why+
+				"; fix: %s", role, t.key, t.owner, *via, revokeVia(via, id, t.owner))
 		case owns:
-			c.warn("agent role %q owns table %s through membership in its owner %q: an owner can alter it, add "+
-				"triggers and grant itself any right outside what Stet judges; fix: REVOKE %s FROM %s",
-				role, t.key, t.owner, pgx.Identifier{t.owner}.Sanitize(), id)
+			c.warn("agent role %q owns table %s through membership in its owner %q: "+why+"; fix: %s",
+				role, t.key, t.owner, revokeVia(via, id, t.owner))
 		}
 	}
 
 	c.searchPath(role, oid, stetPath, database, pathErr)
+}
+
+// schemaRights warns when the agent has a right on the stet schema: granted
+// to it, to PUBLIC, or to a role it can SET ROLE to, or through owning the
+// schema. Each right is named with the role it is held through, and the fix
+// with what removes it.
+func (c *checker) schemaRights(role, id string, oid uint32) {
+	var (
+		found            bool
+		owner            string
+		isOwner, member  bool
+		ownerVia         *string
+		rights, fixes    []string
+		direct, toPublic []string
+	)
+	err := c.read(func(tx pgx.Tx) error {
+		err := tx.QueryRow(c.ctx, `
+			select pg_get_userbyid(n.nspowner), n.nspowner = $1::oid, pg_has_role($1::oid, n.nspowner, 'MEMBER'),
+			       `+viaRole("$1::oid", "n.nspowner")+`
+			from pg_namespace n where n.nspname = 'stet'`, oid).Scan(&owner, &isOwner, &member, &ownerVia)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		found = true
+		// The owner's own entries are its ownership, reported above.
+		rows, err := tx.Query(c.ctx, `
+			select a.grantee = 0, a.grantee = $1::oid, coalesce(g.rolname, ''), a.privilege_type,
+			       case when a.grantee <> 0 then `+viaRole("$1::oid", "a.grantee")+` end
+			from pg_namespace n
+			cross join lateral aclexplode(n.nspacl) a
+			left join pg_roles g on g.oid = a.grantee
+			where n.nspname = 'stet' and a.privilege_type in ('USAGE', 'CREATE') and a.grantee <> n.nspowner
+			  and (a.grantee = 0 or pg_has_role($1::oid, a.grantee, 'MEMBER'))
+			order by 1 desc, 2 desc, 3, 4`, oid)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var public, mine bool
+			var grantee, privilege string
+			var via *string
+			if err := rows.Scan(&public, &mine, &grantee, &privilege, &via); err != nil {
+				return err
+			}
+			switch {
+			case public:
+				toPublic = append(toPublic, privilege)
+				rights = append(rights, privilege+" through PUBLIC")
+			case mine:
+				direct = append(direct, privilege)
+				rights = append(rights, privilege)
+			default:
+				rights = append(rights, fmt.Sprintf("%s through role %q", privilege, grantee))
+				fixes = append(fixes, revokeVia(via, id, grantee))
+			}
+		}
+		return rows.Err()
+	})
+	switch {
+	case err != nil:
+		c.warn("agent role %q could not be checked for rights on schema stet: %v", role, err)
+		return
+	case !found:
+		c.warn("agent role %q could not be checked for rights on schema stet: the schema was not found", role)
+		return
+	}
+	if len(direct) > 0 {
+		fixes = append(fixes, fmt.Sprintf("REVOKE %s ON SCHEMA stet FROM %s", strings.Join(direct, ", "), id))
+	}
+	if len(toPublic) > 0 {
+		fixes = append(fixes, fmt.Sprintf("REVOKE %s ON SCHEMA stet FROM PUBLIC", strings.Join(toPublic, ", ")))
+	}
+	switch {
+	case isOwner:
+		rights = append(rights, "ownership")
+		fixes = append(fixes, "ALTER SCHEMA stet OWNER TO <Stet's account>")
+	case member:
+		rights = append(rights, fmt.Sprintf("its owner's rights through role %q", owner))
+		fixes = append(fixes, revokeVia(ownerVia, id, owner))
+	}
+	if len(rights) == 0 {
+		return
+	}
+	slices.Sort(fixes)
+	c.warn("agent role %q has rights on schema stet: %s; it can read and change Stet's decisions and held writes; "+
+		"fix: %s", role, strings.Join(rights, ", "), strings.Join(slices.Compact(fixes), "; "))
 }
 
 // searchPath warns when the role has a role-level search_path, for this
