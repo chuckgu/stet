@@ -58,7 +58,14 @@ type Table struct {
 	Questions    []string
 	PolicyRules  []string // one rule each; every rule is asked as its own yes/no question
 	Thresholds   Thresholds
-	Unsupported  string // pass | reject
+	Unsupported  string  // pass | reject
+	Impact       *Impact // nil: multi-row writes stay unsupported, as before
+}
+
+// Impact limits how much one multi-row write may touch.
+type Impact struct {
+	MaxRows  int     // required, at least 1
+	MaxShare float64 // optional; 0 means unset. Applies to update and delete only
 }
 
 type Thresholds struct {
@@ -110,6 +117,12 @@ type rawTable struct {
 		EscalateBelow  *float64 `yaml:"escalate_below"`
 	} `yaml:"thresholds"`
 	Unsupported string `yaml:"unsupported"`
+	// Pointers: presence of the block, and an explicit max_share: 0, must be
+	// told apart from absence.
+	Impact *struct {
+		MaxRows  *int     `yaml:"max_rows"`
+		MaxShare *float64 `yaml:"max_share"`
+	} `yaml:"impact"`
 }
 
 var (
@@ -255,6 +268,25 @@ func resolveTable(name string, rt rawTable) (Table, []error) {
 	case "pass", "reject":
 	default:
 		fail("unsupported", "%q must be pass or reject", rt.Unsupported)
+	}
+
+	if ri := rt.Impact; ri != nil {
+		imp := Impact{}
+		switch {
+		case ri.MaxRows == nil:
+			fail("impact.max_rows", "required")
+		case *ri.MaxRows < 1:
+			fail("impact.max_rows", "%d must be at least 1", *ri.MaxRows)
+		default:
+			imp.MaxRows = *ri.MaxRows
+		}
+		if ri.MaxShare != nil {
+			if *ri.MaxShare <= 0 || *ri.MaxShare > 1 {
+				fail("impact.max_share", "%v must be above 0 and at most 1", *ri.MaxShare)
+			}
+			imp.MaxShare = *ri.MaxShare
+		}
+		t.Impact = &imp
 	}
 
 	th := rt.Thresholds

@@ -88,20 +88,25 @@ func TestInvalidConfigs(t *testing.T) {
 		yaml string
 		want string
 	}{
-		"unknown field":     {minimal + "mdoe: shadow\n", "mdoe"},
-		"bad mode":          {minimal + "mode: block\n", "mode"},
-		"no listen":         {"upstream: postgres://a@b/c\n", "listen"},
-		"no upstream":       {"listen: :6432\n", "upstream"},
-		"upstream not pg":   {"listen: :6432\nupstream: mysql://a@b/c\n", "upstream"},
-		"tables need model": {minimal + "tables: {contacts: {pk: id}}\n", "model"},
-		"table needs pk":    {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {}}\n", "pk"},
-		"bad on_failure":    {minimal + "model: {adapter: jev, version: jev-1.13.0, on_failure: retry}\n", "on_failure"},
-		"bad unsupported":   {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, unsupported: allow}}\n", "unsupported"},
-		"bad question":      {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, questions: [vibes]}}\n", "questions"},
-		"threshold > 1":     {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, thresholds: {duplicate: 1.5}}}\n", "thresholds"},
-		"policy score > 5":  {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, thresholds: {policy: 6}}}\n", "thresholds"},
-		"bad recent_window": {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, recent_window: soon}}\n", "recent_window"},
-		"bad retention":     {minimal + "retention: forever\n", "retention"},
+		"unknown field":            {minimal + "mdoe: shadow\n", "mdoe"},
+		"bad mode":                 {minimal + "mode: block\n", "mode"},
+		"no listen":                {"upstream: postgres://a@b/c\n", "listen"},
+		"no upstream":              {"listen: :6432\n", "upstream"},
+		"upstream not pg":          {"listen: :6432\nupstream: mysql://a@b/c\n", "upstream"},
+		"tables need model":        {minimal + "tables: {contacts: {pk: id}}\n", "model"},
+		"table needs pk":           {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {}}\n", "pk"},
+		"bad on_failure":           {minimal + "model: {adapter: jev, version: jev-1.13.0, on_failure: retry}\n", "on_failure"},
+		"bad unsupported":          {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, unsupported: allow}}\n", "unsupported"},
+		"bad question":             {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, questions: [vibes]}}\n", "questions"},
+		"threshold > 1":            {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, thresholds: {duplicate: 1.5}}}\n", "thresholds"},
+		"policy score > 5":         {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, thresholds: {policy: 6}}}\n", "thresholds"},
+		"bad recent_window":        {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, recent_window: soon}}\n", "recent_window"},
+		"bad retention":            {minimal + "retention: forever\n", "retention"},
+		"impact needs max_rows":    {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_share: 0.1}}}\n", "impact.max_rows"},
+		"impact max_rows below 1":  {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 0}}}\n", "impact.max_rows"},
+		"impact max_share zero":    {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 1, max_share: 0}}}\n", "impact.max_share"},
+		"impact max_share above 1": {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 1, max_share: 1.5}}}\n", "impact.max_share"},
+		"impact unknown key":       {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 1, window: 5m}}}\n", "window"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -263,5 +268,35 @@ func TestLabConfigIsValid(t *testing.T) {
 	}
 	if c.Tables["contacts"].ContextSQL == "" || c.Tables["contacts"].RecentWindow != 6*time.Hour {
 		t.Error("lab config lost its context query or recent window")
+	}
+}
+
+func TestImpactLimits(t *testing.T) {
+	base := minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables:\n  contacts:\n    pk: id\n    send_fields: [name]\n"
+	parse := func(extra string) *Impact {
+		c, err := Parse([]byte(base + extra))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c.Tables["contacts"].Impact
+	}
+	if got := parse(""); got != nil {
+		t.Errorf("no impact block: %+v, want nil", got)
+	}
+	if got := parse("    impact: {max_rows: 100, max_share: 0.1}\n"); got == nil || *got != (Impact{MaxRows: 100, MaxShare: 0.1}) {
+		t.Errorf("got %+v", got)
+	}
+	if got := parse("    impact: {max_rows: 5}\n"); got == nil || *got != (Impact{MaxRows: 5}) {
+		t.Errorf("max_rows only: %+v", got)
+	}
+}
+
+func TestExampleConfigShowsImpact(t *testing.T) {
+	c, err := Load("../../stet.example.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Tables["contacts"].Impact; got == nil || *got != (Impact{MaxRows: 100, MaxShare: 0.1}) {
+		t.Errorf("example impact = %+v", got)
 	}
 }
