@@ -377,12 +377,12 @@ CREATE TABLE IF NOT EXISTS stet.read_log (
 - [x] `reads`가 꺼진 테이블을 읽는 문장은 게이트에 알려지지 않는다. (`TestReadsWithoutTheBlockAreNotSeen`)
 - [x] 종료할 때 아직 쓰지 않은 집계가 쓰인다. (`TestCloseWritesWhatIsStillInMemory`)
 - [x] 읽기가 클라이언트에게 돌려주는 결과는 직접 연결했을 때와 같다. 기존 프로토콜 테스트(큰 결과 집합, `COPY`, 파이프라인 포함)가 그대로 통과한다. (`TestObservedPassthrough`, `TestReadsAreAggregatedPerRoleAndTable`)
-- [x] 인증이 끝나기 전에 보낸 쓰기와 읽기는 접속 계정 없이 게이트에 알려진다. 인증한 뒤에는 계정이 넘어간다. (`TestLoginRoleIsPassedOnlyOnceAuthenticated`)
+- [x] 인증이 끝나기 전에 보낸 쓰기와 읽기는 접속 계정 없이 게이트에 알려진다. 인증한 뒤에는 계정이 넘어간다. (`TestLoginRoleIsPassedOnlyOnceAuthenticated`, `TestImpactIsNotMeasuredBeforeAuthentication`)
 - [x] 값 없이 쓴 `reads:`는 읽기를 기록하고, 값 없이 쓴 `cumulative:`와 초 단위로 떨어지지 않는 `window`는 설정 검증에서 거부한다. (`TestPresentButEmptyBlocks`, `TestCumulativeWindowIsWholeSeconds`)
 - [x] `reads`가 켜진 테이블이 없으면 분류기는 읽기를 찾지 않는다. 커서 문장은 그래도 알아본다. (`TestClassifySkipsReadsWhenNoTableRecordsThem`, `TestInspectSkipsReadsWhenNoTableRecordsThem`, `BenchmarkClassify`)
 - [x] 한 Sync 아래의 단위가 실패하면 실패 앞에서 실행된 커서 문장은 그대로 둔다: 커밋한 `WITH HOLD` 커서는 기억하고, 실행된 `CLOSE`는 커서를 지운다. (`TestFailedUnitKeepsWhatRanBeforeTheError`)
-- [x] 문장이 여럿인 메시지 안의 커서 문장을 따라간다. 메시지는 많아야 한 번 세고, 실패하면 기억하는 쪽으로 정한다. (`TestCursorStatementsAmongSeveral`, `TestCursorsOfAQueryOfSeveralStatements`, `TestFailedQueryOfSeveralStatementsRemembers`)
-- [x] 한 커서의 `FETCH`들과 한 포털의 Execute들은 `max_rows`와 `log_above`에서 한 읽기다. 큰 읽기 기록은 합계가 처음 기준을 넘을 때 한 번 남는다. (`TestReadInPartsIsLoggedOnce`, `TestReadsInPartsCarryTheRowsBefore`, `TestDeclaringMessageCountsTowardItsCursor`, `TestCursorReadsAreCounted`)
+- [x] 문장이 여럿인 메시지 안의 커서 문장을 따라간다. 메시지는 많아야 한 번 세고, 실패하면 기억하는 쪽으로 정한다. (`TestCursorStatementsAmongSeveral`, `TestCursorsOfAQueryOfSeveralStatements`, `TestFailedQueryOfSeveralStatementsRemembers`, `TestFailedRedeclareAmongSeveralKeepsTheOldCursor`)
+- [x] 한 커서의 `FETCH`들과 한 포털의 Execute들은 `max_rows`와 `log_above`에서 한 읽기다. 큰 읽기 기록은 합계가 처음 기준을 넘을 때 한 번 남는다. (`TestReadInPartsIsLoggedOnce`, `TestReadInPartsOfTwoTablesIsLoggedOnce`, `TestReadsInPartsCarryTheRowsBefore`, `TestDeclaringMessageCountsTowardItsCursor`, `TestCursorReadsAreCounted`)
 - [x] `STET_TEST_PG`를 설정한 `go test -race ./...`와 2ms 지연 예산을 통과한다. `reads`가 켜진 테이블의 읽기도 같은 예산 안이다. (`TestPassthroughLatencyBudget`, `TestObservedReadLatencyBudget`; 전체는 `STET_TEST_PG=127.0.0.1:55432 go test -race -count=1 ./...`가 통과한다)
 
 ## 11. 정한 것과 남긴 것
