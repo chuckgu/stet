@@ -122,3 +122,60 @@ func TestA1CodesThePolicies(t *testing.T) {
 		}
 	}
 }
+
+// A2 is A1 fixed once (decisions.md D28): a rule is judged only when the
+// write touches a field the rule is about, and titles that differ in case,
+// punctuation, or spacing are one title. Abbreviations and typos stay
+// different values: code cannot tell them from a real change.
+func TestA2JudgesTheWriteNotTheRow(t *testing.T) {
+	recentTitle := []gate.RecentChange{{ByAgent: "crm-sync", Op: "update", Fields: map[string]any{"title": "VP Sales"}}}
+	openDeal := map[string]any{"open_deals_at_account": num("1")}
+	title := func(to string) Record {
+		return rec("import-job", "update", gate.State{Proposed: map[string]any{"title": to}, Current: map[string]any{"title": "VP Sales"}, RecentChanges: recentTitle})
+	}
+	for _, c := range []struct {
+		name   string
+		r      Record
+		a1, a2 []string // reasons; nil means commit
+	}{
+		{"note on a contact already churned at an account with an open deal",
+			rec("import-job", "update", gate.State{Proposed: map[string]any{"notes": "Prefers calls."}, Current: map[string]any{"status": "churned"}, Context: openDeal}),
+			[]string{"policy:1"}, nil},
+		{"churn while the account has an open deal",
+			rec("import-job", "update", gate.State{Proposed: map[string]any{"status": "churned"}, Current: map[string]any{"status": "active"}, Context: openDeal}),
+			[]string{"policy:1"}, []string{"policy:1"}},
+		{"churned contact brought back",
+			rec("import-job", "update", gate.State{Proposed: map[string]any{"status": "active"}, Current: map[string]any{"status": "churned"}, Context: openDeal}),
+			nil, nil},
+		{"note on a contact that has consent without a source",
+			rec("import-job", "update", gate.State{Proposed: map[string]any{"notes": "Prefers calls."}, Current: map[string]any{"marketing_consent": true, "consent_source": nil}}),
+			[]string{"policy:3"}, nil},
+		{"source cleared where consent is on",
+			rec("import-job", "update", gate.State{Proposed: map[string]any{"consent_source": nil}, Current: map[string]any{"marketing_consent": true, "consent_source": "webinar signup"}}),
+			[]string{"policy:3"}, []string{"policy:3"}},
+		{"source added where consent had none",
+			rec("import-job", "update", gate.State{Proposed: map[string]any{"consent_source": "webinar signup"}, Current: map[string]any{"marketing_consent": true, "consent_source": nil}}),
+			nil, nil},
+		{"consent turned on without a source",
+			rec("import-job", "update", gate.State{Proposed: map[string]any{"marketing_consent": "true"}, Current: map[string]any{"marketing_consent": false, "consent_source": nil}}),
+			[]string{"policy:3"}, []string{"policy:3"}},
+		{"another agent's title in other letter case", title("vp sales"), []string{"policy:2"}, nil},
+		{"another agent's title with a comma", title("VP, Sales"), []string{"policy:2"}, nil},
+		{"another agent's title spelled out", title("Vice President of Sales"), []string{"policy:2"}, []string{"policy:2"}},
+		{"another agent's title replaced", title("Sales Director"), []string{"policy:2"}, []string{"policy:2"}},
+	} {
+		for _, arm := range []struct {
+			a    RuleArm
+			want []string
+		}{{A1, c.a1}, {A2, c.a2}} {
+			v, reasons := arm.a.Judge(c.r)
+			want := "commit"
+			if arm.want != nil {
+				want = "hold"
+			}
+			if v != want || !reflect.DeepEqual(reasons, arm.want) {
+				t.Errorf("%s, %s: %s %v, want %s %v", c.name, arm.a.Name, v, reasons, want, arm.want)
+			}
+		}
+	}
+}

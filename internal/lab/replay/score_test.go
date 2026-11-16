@@ -227,3 +227,90 @@ func TestCascade(t *testing.T) {
 		t.Error("a write without a second-stage answer has a judgment")
 	}
 }
+
+// Hard negatives (D28) are scored apart from the ordinary writes: the false
+// hold on ordinary writes keeps the meaning it had before they existed.
+func TestSummarizeKeepsHardNegativesApart(t *testing.T) {
+	truths := map[string]Truth{
+		"ok":      {Source: labels.SourceInjector, Code: "normal", Expected: labels.Pass},
+		"h2-a":    {Source: labels.SourceInjector, Code: "H2", Expected: labels.Pass, Kind: "abbrev"},
+		"h2-b":    {Source: labels.SourceInjector, Code: "H2", Expected: labels.Pass, Kind: "abbrev"},
+		"h2-typo": {Source: labels.SourceInjector, Code: "H2", Expected: labels.Pass, Kind: "typo"},
+		"h3":      {Source: labels.SourceInjector, Code: "H3", Expected: labels.Pass, Kind: "inactive"},
+		"f2":      {Source: labels.SourceInjector, Code: "F2", Expected: labels.Catch},
+	}
+	recs := []Record{{ID: "ok"}, {ID: "h2-a"}, {ID: "h2-b"}, {ID: "h2-typo"}, {ID: "h3"}, {ID: "f2"}}
+	verdicts := map[string]Judged{
+		"ok": {Verdict: decide.Commit}, "h2-a": {Verdict: decide.Hold}, "h2-b": {Verdict: decide.Commit},
+		"h2-typo": {Verdict: decide.Escalate}, "h3": {Verdict: decide.Commit}, "f2": {Verdict: decide.Hold},
+	}
+	s := Summarize("X", truths, recs, verdicts)
+	check := func(name string, got Cell, n, caught, escalated int) {
+		t.Helper()
+		if got.N != n || got.Caught != caught || got.Escalated != escalated {
+			t.Errorf("%s = %+v, want n %d caught %d escalated %d", name, got, n, caught, escalated)
+		}
+	}
+	check("ordinary", s.Ordinary(""), 1, 0, 0)
+	check("H2", s.Hard("H2", ""), 3, 2, 1)
+	check("H2 abbrev", s.Hard("H2", "abbrev"), 2, 1, 0)
+	check("H3", s.Hard("H3", ""), 1, 0, 0)
+	check("all hard negatives", s.Hard("", ""), 4, 2, 1)
+	check("faults", s.Fault("", ""), 1, 1, 0)
+	if got, want := s.HardKinds(), [][2]string{{"H2", "abbrev"}, {"H2", "typo"}, {"H3", "inactive"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("kinds = %v, want %v", got, want)
+	}
+
+	var b strings.Builder
+	Report(&b, []Summary{s}, nil)
+	for _, want := range []string{"hard negative", "| H2 abbrev | 2 | 1 (50%) |", "50% (2/4"} {
+		if !strings.Contains(b.String(), want) {
+			t.Errorf("report lacks %q:\n%s", want, b.String())
+		}
+	}
+
+	// A recording without hard negatives reports as it did before.
+	delete(truths, "h2-a")
+	delete(truths, "h2-b")
+	delete(truths, "h2-typo")
+	delete(truths, "h3")
+	b.Reset()
+	Report(&b, []Summary{Summarize("X", truths, recs, verdicts)}, nil)
+	if strings.Contains(b.String(), "hard negative") {
+		t.Errorf("report has a hard-negative table with none scored:\n%s", b.String())
+	}
+}
+
+func TestReadHardNegatives(t *testing.T) {
+	sum := func(arm string, hardCaught, faultCaught, ordinaryCaught int) Summary {
+		s := Summary{Arm: arm, faults: map[[2]string]Cell{}, ordinary: map[string]Cell{}, hard: map[[2]string]Cell{}}
+		s.hard[[2]string{"H1", "same_family"}] = Cell{N: 400, Caught: hardCaught}
+		s.faults[[2]string{"F1", GroupInjected}] = Cell{N: 400, Caught: faultCaught}
+		s.ordinary[GroupInjected] = Cell{N: 100, Caught: ordinaryCaught}
+		return s
+	}
+	a2 := sum("A2", 160, 380, 4)
+	for _, c := range []struct {
+		name string
+		c    Summary
+		want string
+	}{
+		{"fewer false holds, same recall", sum("C", 80, 384, 2), HardBetter},
+		{"about as many false holds", sum("C", 150, 396, 0), HardNotBetter},
+		{"more false holds", sum("C", 200, 400, 0), HardNotBetter},
+		{"somewhat fewer false holds", sum("C", 120, 392, 0), HardMixed},
+		{"fewer false holds bought with recall", sum("C", 60, 340, 0), HardMixed},
+		{"fewer false holds, more on ordinary writes", sum("C", 60, 392, 12), HardMixed},
+	} {
+		if got := ReadHard(c.c, a2); got.Reading != c.want {
+			t.Errorf("%s: %s (%+v), want %s", c.name, got.Reading, got, c.want)
+		}
+	}
+	r := ReadHard(sum("C", 80, 384, 2), a2)
+	if r.HardPP != -20 || r.RecallPP != 1 || r.OrdinaryPP != -2 || r.OverLimit {
+		t.Errorf("%+v, want C − A2 of −20, +1, −2 points and no limit note at 20%%", r)
+	}
+	if !ReadHard(sum("C", 84, 384, 2), a2).OverLimit {
+		t.Error("a false hold above 20% on hard negatives is noted even when it beats A2")
+	}
+}

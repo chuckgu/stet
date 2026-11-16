@@ -1,6 +1,7 @@
 package replay
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -14,10 +15,15 @@ import (
 // constraints, so A0 adds what a careful team would add without a judgment
 // model: a unique index on normalized email and a pg_trgm duplicate check.
 // A1 also codes the lab's three policy rules by hand. It is reported for
-// reference; the go/kill comparison uses A0 (D24).
+// reference; the go/kill comparison uses A0 (D24). A2 is A1 fixed once, the
+// way a team would after seeing it stop ordinary writes (D28).
 type RuleArm struct {
 	Name   string
-	Policy bool // code the policy rules (A1)
+	Policy bool // code the policy rules (A1, A2)
+	// Hardened (A2) judges a rule only when the write touches a field the
+	// rule is about, and reads titles that differ in case, punctuation, or
+	// spacing as one title.
+	Hardened bool
 	// NameSimilarity marks an insert as a duplicate of a same-account
 	// contact. Fixed before the first run at pg_trgm's default
 	// similarity_threshold.
@@ -27,6 +33,7 @@ type RuleArm struct {
 var (
 	A0 = RuleArm{Name: "A0", NameSimilarity: 0.3}
 	A1 = RuleArm{Name: "A1", Policy: true, NameSimilarity: 0.3}
+	A2 = RuleArm{Name: "A2", Policy: true, Hardened: true, NameSimilarity: 0.3}
 )
 
 // Judge returns a verdict and reasons, as the gate would record them.
@@ -40,13 +47,18 @@ func (a RuleArm) Judge(r Record) (string, []string) {
 		reasons = append(reasons, a.duplicate(s)...)
 	}
 	if a.Policy && r.Table == "contacts" {
-		if after(s, "status") == "churned" && count(s.Context["open_deals_at_account"]) > 0 {
+		// A1 checks the row as it is after the write, as a CHECK constraint
+		// would, so it also stops edits to rows that already break a rule.
+		touches := func(fields ...string) bool {
+			return !a.Hardened || slices.ContainsFunc(fields, func(f string) bool { _, ok := s.Proposed[f]; return ok })
+		}
+		if touches("status") && after(s, "status") == "churned" && count(s.Context["open_deals_at_account"]) > 0 {
 			reasons = append(reasons, "policy:1")
 		}
-		if overwritesOthersTitle(r) {
+		if a.overwritesOthersTitle(r) {
 			reasons = append(reasons, "policy:2")
 		}
-		if consentWithoutSource(s) {
+		if touches("marketing_consent", "consent_source") && consentWithoutSource(s) {
 			reasons = append(reasons, "policy:3")
 		}
 	}
@@ -77,10 +89,13 @@ func (a RuleArm) duplicate(s gate.State) []string {
 // overwritesOthersTitle: rule 2 ("do not overwrite a title with an older
 // value from a stale source"). Code cannot tell a stale source, so it
 // refuses to change a title another writer set within the recent window.
-func overwritesOthersTitle(r Record) bool {
+func (a RuleArm) overwritesOthersTitle(r Record) bool {
 	s := r.State
 	v, ok := s.Proposed["title"]
 	if r.Op != "update" || !ok || text(v) == text(s.Current["title"]) {
+		return false
+	}
+	if a.Hardened && plain(text(v)) == plain(text(s.Current["title"])) {
 		return false
 	}
 	for _, c := range s.RecentChanges {
@@ -96,6 +111,16 @@ func overwritesOthersTitle(r Record) bool {
 // task input.
 func consentWithoutSource(s gate.State) bool {
 	return truthy(afterValue(s, "marketing_consent")) && strings.TrimSpace(after(s, "consent_source")) == ""
+}
+
+// plain keeps a title's letters and digits, lowercased.
+func plain(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return unicode.ToLower(r)
+		}
+		return -1
+	}, s)
 }
 
 func afterValue(s gate.State, field string) any {

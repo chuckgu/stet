@@ -1,8 +1,10 @@
 package replay
 
 import (
+	"cmp"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"slices"
 	"strconv"
@@ -142,6 +144,10 @@ type Summary struct {
 	Arm      string
 	faults   map[[2]string]Cell // code, group
 	ordinary map[string]Cell    // group
+	// hard holds the hard negatives (D28) by code and kind. A correct gate
+	// lets them through, but they are kept out of ordinary so that false
+	// hold means what it did before they existed.
+	hard map[[2]string]Cell
 	// F1 by how the names are written: Hangul against roman letters, or
 	// both in the same script. Jev is weaker outside English.
 	CrossScript, SameScript Cell
@@ -161,7 +167,27 @@ func (s Summary) Fault(code, group string) Cell {
 	return c
 }
 
-// Ordinary counts the writes a correct gate lets through.
+// Hard counts the hard negatives of a code ("" for H1-H4 together) and kind
+// ("" for every kind). Caught ones are false holds.
+func (s Summary) Hard(code, kind string) Cell {
+	var c Cell
+	for k, v := range s.hard {
+		if (code == "" || k[0] == code) && (kind == "" || k[1] == kind) {
+			c.sum(v)
+		}
+	}
+	return c
+}
+
+// HardKinds lists the code and kind of the hard negatives scored, in order.
+func (s Summary) HardKinds() [][2]string {
+	kinds := slices.Collect(maps.Keys(s.hard))
+	slices.SortFunc(kinds, func(a, b [2]string) int { return cmp.Or(cmp.Compare(a[0], b[0]), cmp.Compare(a[1], b[1])) })
+	return kinds
+}
+
+// Ordinary counts the writes a correct gate lets through, hard negatives
+// aside.
 func (s Summary) Ordinary(group string) Cell {
 	var c Cell
 	for g, v := range s.ordinary {
@@ -175,7 +201,7 @@ func (s Summary) Ordinary(group string) Cell {
 // Summarize scores one arm's verdicts against the truths. Writes without a
 // truth or a verdict are left out.
 func Summarize(arm string, truths map[string]Truth, recs []Record, verdicts map[string]Judged) Summary {
-	s := Summary{Arm: arm, faults: map[[2]string]Cell{}, ordinary: map[string]Cell{}, Verdicts: map[string]int{}}
+	s := Summary{Arm: arm, faults: map[[2]string]Cell{}, ordinary: map[string]Cell{}, hard: map[[2]string]Cell{}, Verdicts: map[string]int{}}
 	for _, r := range recs {
 		t, labeled := truths[r.ID]
 		j, judged := verdicts[r.ID]
@@ -192,6 +218,11 @@ func Summarize(arm string, truths map[string]Truth, recs []Record, verdicts map[
 			group = GroupInjected
 		}
 		switch {
+		case t.Expected == labels.Pass && strings.HasPrefix(t.Code, "H"):
+			k := [2]string{t.Code, t.Kind}
+			c := s.hard[k]
+			c.add(j.Verdict)
+			s.hard[k] = c
 		case t.Expected == labels.Pass:
 			c := s.ordinary[group]
 			c.add(j.Verdict)
@@ -301,6 +332,45 @@ func Compare(a, b Summary, pa, pb Perf) Comparison {
 	}
 }
 
+// Readings of the hard negatives (decisions.md D28).
+const (
+	HardBetter    = "better"     // the model arm beats the rule arm near the rules' edges
+	HardNotBetter = "not better" // the rules are better kept in code
+	HardMixed     = "mixed"      // it depends on the kind
+)
+
+// HardReading is a model arm against a rule arm on hard negatives, read by
+// the criteria fixed before the results (D28).
+type HardReading struct {
+	// model − rules in percentage points: false hold on hard negatives,
+	// recall on F1~F4, false hold on ordinary writes.
+	HardPP, RecallPP, OrdinaryPP float64
+	OverLimit                    bool // the model stops more than 20% of the hard negatives
+	Reading                      string
+}
+
+// ReadHard applies D28. Better: at least 15 points fewer false holds on
+// hard negatives, with recall no more than 5 points lower and false hold on
+// ordinary writes no more than 5 points higher. Not better: no more than 5
+// points fewer false holds on hard negatives. Anything else is mixed.
+func ReadHard(model, rules Summary) HardReading {
+	rate := func(c Cell) float64 { return 100 * float64(c.Caught) / float64(max(c.N, 1)) }
+	r := HardReading{
+		HardPP:     rate(model.Hard("", "")) - rate(rules.Hard("", "")),
+		RecallPP:   rate(model.Fault("", "")) - rate(rules.Fault("", "")),
+		OrdinaryPP: rate(model.Ordinary("")) - rate(rules.Ordinary("")),
+		OverLimit:  rate(model.Hard("", "")) > 20,
+		Reading:    HardMixed,
+	}
+	switch {
+	case r.HardPP > -5:
+		r.Reading = HardNotBetter
+	case r.HardPP <= -15 && r.RecallPP >= -5 && r.OrdinaryPP <= 5:
+		r.Reading = HardBetter
+	}
+	return r
+}
+
 // NotWorseBy reports whether A trails B by no more than pp percentage points
 // on recall and on false hold. Doing better by more than pp still counts.
 func (c Comparison) NotWorseBy(pp float64) bool { return c.RecallPP >= -pp && c.FalseHoldPP <= pp }
@@ -348,6 +418,43 @@ func Report(w io.Writer, sums []Summary, perf map[string]Perf) {
 		all, ag, inj := s.Ordinary(""), s.Ordinary(GroupAgents), s.Ordinary(GroupInjected)
 		fmt.Fprintf(w, "| %s | %s | %d | %s | %s |\n", s.Arm, pct(all.Caught, all.N), all.Escalated,
 			pct(ag.Caught, ag.N), pct(inj.Caught, inj.N))
+	}
+
+	var kinds [][2]string
+	if len(sums) > 0 {
+		kinds = sums[0].HardKinds()
+	}
+	if len(kinds) > 0 {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "### hard negative를 막은 비율 (정상 쓰기라서 낮을수록 좋다)")
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "| arm | H1 | H2 | H3 | H4 | H1~H4 | 그중 escalate |")
+		fmt.Fprintln(w, "|---|---|---|---|---|---|---|")
+		for _, s := range sums {
+			row := []string{s.Arm}
+			for _, code := range []string{"H1", "H2", "H3", "H4", ""} {
+				c := s.Hard(code, "")
+				row = append(row, pct(c.Caught, c.N))
+			}
+			fmt.Fprintf(w, "| %s | %d |\n", strings.Join(row, " | "), s.Hard("", "").Escalated)
+		}
+
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "### hard negative 유형별 막은 건수")
+		fmt.Fprintln(w)
+		head, rule := []string{"유형", "건수"}, "|---|---|"
+		for _, s := range sums {
+			head, rule = append(head, s.Arm), rule+"---|"
+		}
+		fmt.Fprintf(w, "| %s |\n%s\n", strings.Join(head, " | "), rule)
+		for _, k := range kinds {
+			row := []string{k[0] + " " + k[1], fmt.Sprint(sums[0].Hard(k[0], k[1]).N)}
+			for _, s := range sums {
+				c := s.Hard(k[0], k[1])
+				row = append(row, fmt.Sprintf("%d (%.0f%%)", c.Caught, 100*float64(c.Caught)/float64(max(c.N, 1))))
+			}
+			fmt.Fprintf(w, "| %s |\n", strings.Join(row, " | "))
+		}
 	}
 
 	fmt.Fprintln(w)

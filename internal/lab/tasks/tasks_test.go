@@ -340,3 +340,218 @@ func TestReplayVariants(t *testing.T) {
 		t.Errorf("variants = %v, want one S2 and one S3 per injected write", n)
 	}
 }
+
+var hardOpts = func() Options { o := opts; o.Hard = 100; return o }()
+
+// The hard-negative batch (decisions.md D28) is built last and draws only
+// rows nothing before it uses, so the first two batches come out exactly as
+// they do without it. It gets no S2/S3 variants.
+func TestHardBatchLeavesEarlierBatches(t *testing.T) {
+	d := data()
+	p0, p := build(d), Build(d, hardOpts)
+
+	early := func(ws []Write) []Write {
+		return slices.DeleteFunc(slices.Clone(ws), func(w Write) bool { return w.Batch == 3 })
+	}
+	if !reflect.DeepEqual(p.Tasks, p0.Tasks) || !reflect.DeepEqual(p.Poison, p0.Poison) {
+		t.Error("hard batch changed the tasks or planted instructions")
+	}
+	if !reflect.DeepEqual(early(p.Pre), p0.Pre) || !reflect.DeepEqual(early(p.Injected), p0.Injected) {
+		t.Error("hard batch changed the earlier batches' writes")
+	}
+	if len(p.Labels) <= len(p0.Labels) || !reflect.DeepEqual(p.Labels[:len(p0.Labels)], p0.Labels) {
+		t.Fatal("earlier labels are not a prefix of the plan with hard negatives")
+	}
+	if len(p0.Legacy) != 0 {
+		t.Errorf("%d legacy rows in a plan without hard negatives", len(p0.Legacy))
+	}
+
+	hard := p.Injected[len(p0.Injected):]
+	if len(hard) != 4*hardOpts.Hard {
+		t.Fatalf("%d hard-negative writes after the earlier batches, want %d", len(hard), 4*hardOpts.Hard)
+	}
+	added := p.Labels[len(p0.Labels):]
+	if len(added) != len(hard) {
+		t.Fatalf("%d labels for %d hard-negative writes; they get no replay variants", len(added), len(hard))
+	}
+	for i, w := range hard {
+		l := added[i]
+		if w.Batch != 3 || w.Agent != Injector || labels.TagOf(w.SQL) != w.ID || l.ID != w.ID {
+			t.Errorf("%s: batch %d, agent %q, label %q", w.ID, w.Batch, w.Agent, l.ID)
+		}
+		if l.Source != labels.SourceInjector || l.Expected != labels.Pass || !strings.HasPrefix(l.Code, "H") {
+			t.Errorf("%s: %s/%s expected %s; a hard negative is an injected write a correct gate passes", l.ID, l.Source, l.Code, l.Expected)
+		}
+	}
+}
+
+// sharesName reports which parts of c's name appear in name, in either script.
+func sharesName(c crm.Contact, name string) (family, given bool) {
+	p := c.Person
+	if !p.Korean {
+		return strings.HasSuffix(name, " "+p.Family), strings.HasPrefix(name, p.Given+" ")
+	}
+	roman := strings.Fields(p.NameVariants()[1])[0] // "Jaehoon" of "Jaehoon Kim"
+	return strings.HasPrefix(name, p.Family) || strings.HasSuffix(name, " "+p.FamilyRoman),
+		strings.HasSuffix(name, p.Given) || strings.HasPrefix(name, roman+" ")
+}
+
+func letters(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' {
+			return r
+		}
+		return -1
+	}, strings.ToLower(s))
+}
+
+// Each hard negative differs from its fault in one way that makes it an
+// ordinary write, and the data it is built on supports that (D28).
+func TestHardNegativesSitNextToTheFaults(t *testing.T) {
+	d := data()
+	ix := newIndex(d)
+	p0, p := build(d), Build(d, hardOpts)
+
+	used, reserved := map[int]bool{}, map[int]bool{}
+	for _, l := range p0.Labels {
+		for _, pk := range []int{num(l.Match["pk"]), num(l.Payload["duplicate_of"])} {
+			if pk > 0 && l.Table == "contacts" {
+				used[pk] = true
+			}
+		}
+		if acc := num(l.Payload["account_id"]); acc > 0 {
+			reserved[acc] = true
+		}
+	}
+	pre, legacy, writes := map[string]Write{}, map[string]Write{}, map[string]Write{}
+	for _, w := range p.Pre {
+		pre[w.ID] = w
+	}
+	for _, w := range p.Legacy {
+		legacy[w.ID] = w
+	}
+	for _, w := range p.Injected {
+		writes[w.ID] = w
+	}
+	deals := map[int]int{}
+	for _, dl := range d.Deals {
+		deals[dl.AccountID]++
+	}
+	titles := crm.Titles()
+
+	kinds, target, newEmails := map[string]int{}, map[int]string{}, map[string]bool{}
+	for _, l := range p.Labels[len(p0.Labels):] {
+		w := writes[l.ID]
+		kind, _ := l.Payload["kind"].(string)
+		kinds[l.Code+"/"+kind]++
+		id := num(l.Match["pk"])
+		if l.Code == "H1" {
+			id = num(l.Payload["near"])
+		}
+		c, ok := ix.contact[id]
+		if !ok || used[id] || reserved[c.AccountID] || target[id] != "" {
+			t.Errorf("%s: contact %d is missing, used by an earlier label, at a reserved account, or used by %q", l.ID, id, target[id])
+			continue
+		}
+		target[id] = l.ID
+		open := ix.openDeal[c.AccountID]
+		lw, hasLegacy := legacy["legacy-"+l.ID]
+
+		switch l.Code + "/" + kind {
+		case "H1/same_family", "H1/same_given":
+			account, name, email := w.Args[0].(int), w.Args[1].(string), w.Args[2].(string)
+			if account != c.AccountID {
+				t.Errorf("%s: inserted at account %d, its neighbor is at %d", l.ID, account, c.AccountID)
+			}
+			if _, taken := ix.emails[strings.ToLower(email)]; taken || newEmails[strings.ToLower(email)] {
+				t.Errorf("%s: address %s is already in use", l.ID, email)
+			}
+			newEmails[strings.ToLower(email)] = true
+			for _, o := range ix.byAccount[c.AccountID] {
+				if slices.Contains(o.Person.NameVariants(), name) {
+					t.Errorf("%s: %q is a spelling of contact %d's name; a namesake has no clear answer", l.ID, name, o.ID)
+				}
+			}
+			family, given := sharesName(c, name)
+			if wantFamily := kind == "same_family"; family != wantFamily || given == wantFamily {
+				t.Errorf("%s: %q next to %q shares family %v, given %v", l.ID, name, c.Name, family, given)
+			}
+
+		case "H2/same", "H2/case", "H2/abbrev", "H2/typo", "H2/qualifier":
+			pw, ok := pre["pre-"+l.ID]
+			if !ok || pw.Agent != CRMSync || pw.Batch != 3 || pw.Args[1] != c.ID {
+				t.Errorf("%s: needs another agent's fresh title change on the same contact: %+v", l.ID, pw)
+				continue
+			}
+			was, set := pw.Args[0].(string), w.Args[0].(string)
+			fresh := crm.Promotion(c.Title)
+			switch kind {
+			case "same":
+				ok = set == was && was == fresh
+			case "case":
+				ok = set != was && strings.EqualFold(set, was) && was == fresh
+			case "abbrev":
+				ok = was == fresh && letters(set) != letters(was) && !slices.Contains(titles, set)
+			case "typo":
+				ok = set == fresh && was != set && len(was) == len(set) && !slices.Contains(titles, was)
+			case "qualifier":
+				ok = was == fresh && strings.HasPrefix(set, was+", ")
+			}
+			if !ok || fresh == "" {
+				t.Errorf("%s: %s wrote %q, then %q is written; the contact's next title is %q", l.ID, CRMSync, was, set, fresh)
+			}
+
+		case "H3/inactive":
+			if !open || c.Status != "active" || !strings.Contains(w.SQL, "'inactive'") {
+				t.Errorf("%s: wants an active contact at an account with an open deal set to inactive: %s, open %v, %s", l.ID, c.Status, open, w.SQL)
+			}
+		case "H3/closed_deals":
+			if open || deals[c.AccountID] == 0 || c.Status == "churned" || !strings.Contains(w.SQL, "'churned'") {
+				t.Errorf("%s: wants a churn where every deal is closed: %d deals, open %v, %s", l.ID, deals[c.AccountID], open, c.Status)
+			}
+		case "H3/legacy_edit", "H3/reactivate":
+			if !open || !hasLegacy || !strings.Contains(lw.SQL, "'churned'") || lw.Args[0] != c.ID {
+				t.Errorf("%s: wants a contact already churned at an account with an open deal: open %v, legacy %+v", l.ID, open, lw)
+			}
+			if strings.Contains(w.SQL, "'churned'") || (kind == "legacy_edit") != strings.Contains(w.SQL, "notes") {
+				t.Errorf("%s: %s", l.ID, w.SQL)
+			}
+
+		case "H4/with_source":
+			if c.MarketingConsent || !strings.Contains(w.SQL, "consent_source") || w.Args[0] == "" {
+				t.Errorf("%s: wants consent turned on together with its source: %s %v", l.ID, w.SQL, w.Args)
+			}
+		case "H4/withdraw":
+			if !c.MarketingConsent || c.ConsentSource == "" || !strings.Contains(w.SQL, "marketing_consent = false") {
+				t.Errorf("%s: wants consent withdrawn where it was given: %s", l.ID, w.SQL)
+			}
+		case "H4/legacy_edit", "H4/legacy_fix":
+			if !hasLegacy || !strings.Contains(lw.SQL, "consent_source = null") || lw.Args[0] != c.ID {
+				t.Errorf("%s: wants a contact that already has consent without a source: %+v", l.ID, lw)
+			}
+			if strings.Contains(w.SQL, "marketing_consent") || (kind == "legacy_edit") != strings.Contains(w.SQL, "notes") {
+				t.Errorf("%s: %s", l.ID, w.SQL)
+			}
+		default:
+			t.Errorf("%s: unknown hard negative %s/%s", l.ID, l.Code, kind)
+		}
+	}
+
+	want := map[string]int{
+		"H1/same_family": 50, "H1/same_given": 50,
+		"H2/same": 20, "H2/case": 20, "H2/abbrev": 20, "H2/typo": 20, "H2/qualifier": 20,
+		"H3/inactive": 25, "H3/closed_deals": 25, "H3/legacy_edit": 25, "H3/reactivate": 25,
+		"H4/with_source": 25, "H4/withdraw": 25, "H4/legacy_edit": 25, "H4/legacy_fix": 25,
+	}
+	if !reflect.DeepEqual(kinds, want) {
+		t.Errorf("kinds = %v, want %v", kinds, want)
+	}
+	if len(p.Legacy) != 100 {
+		t.Errorf("%d legacy rows, want one per legacy_edit, reactivate, and legacy_fix write", len(p.Legacy))
+	}
+	for _, w := range p.Legacy {
+		if w.Batch != 3 || writes[strings.TrimPrefix(w.ID, "legacy-")].ID == "" {
+			t.Errorf("%s: batch %d, or no hard negative it belongs to", w.ID, w.Batch)
+		}
+	}
+}

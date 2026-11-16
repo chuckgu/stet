@@ -18,6 +18,8 @@ type Truth struct {
 	Expected string // labels.Pass or labels.Catch
 	// DuplicateOf is the existing contact an F1 write duplicates.
 	DuplicateOf string
+	// Kind is a hard negative's kind (decisions.md D28).
+	Kind string
 }
 
 // Truths links recorded writes to their labels (docs/lab.md "라벨을 쓰기와
@@ -64,7 +66,8 @@ func Truths(items []labels.Item, manual map[string]labels.Manual, recs []Record)
 			unlabeled = append(unlabeled, r)
 			continue
 		}
-		t := Truth{Item: it.ID, Source: it.Source, Code: it.Code, Expected: it.Expected, DuplicateOf: text(it.Payload["duplicate_of"])}
+		t := Truth{Item: it.ID, Source: it.Source, Code: it.Code, Expected: it.Expected,
+			DuplicateOf: text(it.Payload["duplicate_of"]), Kind: text(it.Payload["kind"])}
 		if it.Source == labels.SourceTask && it.Code == "F4" && !consentWithoutSource(r.State) {
 			t.Expected = labels.Pass
 		}

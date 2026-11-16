@@ -74,3 +74,15 @@ func TestTruthLinksWritesToLabels(t *testing.T) {
 		t.Errorf("unlabeled = %v, want r-upd-other and r-merge", ids)
 	}
 }
+
+// A hard negative's truth carries its kind, so results can be split by it.
+func TestTruthKeepsTheHardNegativeKind(t *testing.T) {
+	items := []labels.Item{{ID: "hard-0001", Source: labels.SourceInjector, Agent: "import-job", Code: "H2", Expected: labels.Pass,
+		Payload: map[string]any{"kind": "abbrev"}}}
+	recs := []Record{{ID: "r1", Agent: "import-job", Op: "update", Table: "contacts", Statement: "/* lab:hard-0001 */ update contacts set title = $1 where id = $2"}}
+	got, _ := Truths(items, nil, recs)
+	want := Truth{Item: "hard-0001", Source: labels.SourceInjector, Code: "H2", Expected: labels.Pass, Kind: "abbrev"}
+	if got["r1"] != want {
+		t.Errorf("%+v, want %+v", got["r1"], want)
+	}
+}

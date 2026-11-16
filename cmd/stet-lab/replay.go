@@ -34,7 +34,7 @@ func runReplay(args []string) error {
 		return errors.New("replay: -db or STET_LAB_DB is required")
 	}
 	switch *arm {
-	case replay.A0.Name, replay.A1.Name, "D", "D'":
+	case replay.A0.Name, replay.A1.Name, replay.A2.Name, "D", "D'":
 		return fmt.Errorf("replay: stet-lab score computes arm %s from rules or stored answers", *arm)
 	}
 	ctx := context.Background()
@@ -90,10 +90,10 @@ func runScore(args []string) error {
 	fs := flag.NewFlagSet("score", flag.ExitOnError)
 	db := fs.String("db", os.Getenv("STET_LAB_DB"), "database URL as the CRM owner (default $STET_LAB_DB)")
 	cfgPath := fs.String("config", "lab/stet-lab.yaml", "Stet config of the recording: thresholds and on_failure for model arms")
-	arms := fs.String("arms", "A0,A1,C", "comma-separated arms; A0 and A1 are computed, D and D' cascade C into B and B', others read from lab.replays")
+	arms := fs.String("arms", "A0,A1,C", "comma-separated arms; A0, A1, and A2 are computed, D and D' cascade C into B and B', others read from lab.replays")
 	budget := fs.Int("budget-ms", 800, "model timeout a live gate would use, for the latency table")
 	mistakes := fs.String("mistakes", "", "also list this arm's missed faults and false holds")
-	similarity := fs.Float64("a-similarity", replay.A0.NameSimilarity, "A0/A1 name similarity; anything but the default is a sensitivity check, not the registered arm")
+	similarity := fs.Float64("a-similarity", replay.A0.NameSimilarity, "A0/A1/A2 name similarity; anything but the default is a sensitivity check, not the registered arm")
 	thresholds := fs.String("model-thresholds", "", "thresholds for every model arm, such as duplicate=0.7,conflict=0.7; a sensitivity check, not the registered arms")
 	fs.Parse(args)
 	if *db == "" {
@@ -133,14 +133,17 @@ func runScore(args []string) error {
 		return err
 	}
 	truths, unlabeled := replay.Truths(items, manual, recs)
-	pass := 0
+	pass, hard := 0, 0
 	for _, t := range truths {
-		if t.Expected == labels.Pass {
+		switch {
+		case t.Expected == labels.Pass && strings.HasPrefix(t.Code, "H"):
+			hard++
+		case t.Expected == labels.Pass:
 			pass++
 		}
 	}
-	fmt.Printf("%d writes recorded; %d scored (%d faults or attacks, %d ordinary), %d without a label\n",
-		len(recs), len(truths), len(truths)-pass, pass, len(unlabeled))
+	fmt.Printf("%d writes recorded; %d scored (%d faults or attacks, %d ordinary, %d hard negatives), %d without a label\n",
+		len(recs), len(truths), len(truths)-pass-hard, pass, hard, len(unlabeled))
 	for _, r := range unlabeled {
 		fmt.Printf("  unlabeled %s %s %s %s pk=%s: %.120s\n", r.ID, r.Agent, r.Op, r.Table, r.PK, strings.Join(strings.Fields(r.Statement), " "))
 	}
@@ -153,11 +156,8 @@ func runScore(args []string) error {
 		var verdicts map[string]replay.Judged
 		name := arm
 		switch arm {
-		case replay.A0.Name, replay.A1.Name:
-			a := replay.A0
-			if arm == replay.A1.Name {
-				a = replay.A1
-			}
+		case replay.A0.Name, replay.A1.Name, replay.A2.Name:
+			a := map[string]replay.RuleArm{replay.A0.Name: replay.A0, replay.A1.Name: replay.A1, replay.A2.Name: replay.A2}[arm]
 			if *similarity != a.NameSimilarity {
 				a.NameSimilarity = *similarity
 				name = fmt.Sprintf("%s (유사도 %.2f)", arm, *similarity)
@@ -228,6 +228,21 @@ func runScore(args []string) error {
 		goes := x.NotWorseBy(5) && x.CostX <= 0.1 && perf["C"].P95 <= *budget
 		fmt.Printf("판정 참고 (go 기준): C − B recall %+.1f%%p, false hold %+.1f%%p (5%%p보다 나쁘지 않은가), C 비용은 B의 1/%.0f (10배 이상 싼가), C p95 %dms (%dms 이내인가) → %s\n",
 			x.RecallPP, x.FalseHoldPP, 1/x.CostX, perf["C"].P95, *budget, answer[goes])
+	}
+	// Hard negatives against the hardened rules (decisions.md D28).
+	if a2, ok := byArm[replay.A2.Name]; ok && c.Hard("", "").N > 0 && !pending(c, "D28") {
+		r := replay.ReadHard(c, a2)
+		reading := map[string]string{
+			replay.HardBetter:    "규칙 경계 근처에서도 판단 모델이 손본 규칙 코드보다 낫다",
+			replay.HardNotBetter: "정책 규칙은 코드로 옮기는 편이 낫고, 판단 모델의 근거는 중복 탐지에 한정된다",
+			replay.HardMixed:     "유형에 따라 다르다",
+		}[r.Reading]
+		limit := ""
+		if r.OverLimit {
+			limit = " 한계: C가 hard negative의 20% 넘게 막는다."
+		}
+		fmt.Printf("판정 참고 (D28): C − A2 hard negative false hold %+.1f%%p (15%%p 이상 낮은가), F1~F4 recall %+.1f%%p (5%%p 넘게 낮지 않은가), 정상 쓰기 false hold %+.1f%%p (5%%p 넘게 높지 않은가) → %s.%s\n",
+			r.HardPP, r.RecallPP, r.OrdinaryPP, reading, limit)
 	}
 	if d, ok := byArm["D"]; ok && haveB && !pending(d, "중간 기준") && !pending(b, "중간 기준") {
 		x, y := replay.Compare(d, c, perf["D"], perf["C"]), replay.Compare(d, b, perf["D"], perf["B"])

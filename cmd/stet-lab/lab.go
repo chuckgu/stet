@@ -40,6 +40,7 @@ type planOptions struct {
 	Churns     int     `json:"churns"`
 	Injections int     `json:"injections"`
 	TopUp      int     `json:"top_up"`
+	Hard       int     `json:"hard"`
 }
 
 func planFlags(fs *flag.FlagSet) *planOptions {
@@ -56,6 +57,7 @@ func planFlags(fs *flag.FlagSet) *planOptions {
 	fs.IntVar(&o.Churns, "churns", 60, "churn tasks")
 	fs.IntVar(&o.Injections, "injections", 300, "scripted writes")
 	fs.IntVar(&o.TopUp, "top-up", 100, "second batch: scripted faults that bring each of F1-F4 to this many injected writes (0 = none)")
+	fs.IntVar(&o.Hard, "hard", 0, "third batch: this many hard negatives for each of F1-F4, ordinary writes one step from a fault (decisions.md D28; 0 = none)")
 	return o
 }
 
@@ -73,11 +75,12 @@ func (o planOptions) plan() (tasks.Plan, error) {
 		return tasks.Plan{}, err
 	}
 	return tasks.Build(d, tasks.Options{Seed: o.TaskSeed, Leads: o.Leads, Updates: o.Updates,
-		Meetings: o.Meetings, Churns: o.Churns, Injections: o.Injections, TopUp: o.TopUp, Now: now}), nil
+		Meetings: o.Meetings, Churns: o.Churns, Injections: o.Injections, TopUp: o.TopUp, Hard: o.Hard, Now: now}), nil
 }
 
-// runPrepare stores labels, plants the S1 instructions, and grants the
-// agent role its tables. It needs a freshly seeded CRM, except with -append.
+// runPrepare stores labels, plants the S1 instructions and the hard
+// negatives' legacy rows, and grants the agent role its tables. It needs a
+// freshly seeded CRM, except with -append.
 func runPrepare(args []string) error {
 	fs := flag.NewFlagSet("prepare", flag.ExitOnError)
 	db := fs.String("db", os.Getenv("STET_LAB_DB"), "database URL as the CRM owner (default $STET_LAB_DB)")
@@ -136,7 +139,7 @@ func runPrepare(args []string) error {
 		if err := store.Insert(ctx, c, p.Labels); err != nil {
 			return err
 		}
-		for _, w := range p.Poison {
+		for _, w := range slices.Concat(p.Poison, p.Legacy) {
 			if _, err := c.Exec(ctx, w.SQL, w.Args...); err != nil {
 				return fmt.Errorf("plant %s: %w", w.ID, err)
 			}
@@ -156,7 +159,8 @@ func runPrepare(args []string) error {
 			}
 		}
 
-		fmt.Printf("prepared %d labels, %d planted instructions; agent role %s granted: %v\n", len(p.Labels), len(p.Poison), *agentRole, exists)
+		fmt.Printf("prepared %d labels, %d planted instructions, %d legacy rows; agent role %s granted: %v\n",
+			len(p.Labels), len(p.Poison), len(p.Legacy), *agentRole, exists)
 		printCounts(p.Labels)
 		return nil
 	})
@@ -253,7 +257,7 @@ func runRun(args []string) error {
 	user := fs.String("agent-user", "stet_agent", "role the agents connect as")
 	password := fs.String("agent-password", "agent-pw", "password of the agent role (test value)")
 	phases := fs.String("phases", "pre,inject,agents", "comma-separated phases to run")
-	batch := fs.Int("batch", 0, "send only this batch's fresh changes and scripted writes: 1, or 2 for the top-up (0 = all)")
+	batch := fs.Int("batch", 0, "send only this batch's fresh changes and scripted writes: 1, 2 for the top-up, 3 for the hard negatives (0 = all)")
 	limit := fs.Int("limit", 0, "tasks per agent (0 = all)")
 	injectLimit := fs.Int("inject-limit", 0, "scripted writes (0 = all)")
 	model := fs.String("model", "claude-opus-5-5", "agent model")
