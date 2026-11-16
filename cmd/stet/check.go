@@ -252,8 +252,14 @@ func viaRole(agent, target string) string {
 }
 
 // revokeVia is the fix that cuts the agent's path through via, a role
-// viaRole returned (nil only if the catalog changed between reads).
+// viaRole returned (nil only if the catalog changed between reads, or for
+// pg_database_owner, whose members are the database's owner with no grant to
+// revoke).
 func revokeVia(via *string, agentID, target string) string {
+	if via == nil && target == "pg_database_owner" {
+		return fmt.Sprintf("%s owns the database, which makes it a member of pg_database_owner: "+
+			"ALTER DATABASE <this database> OWNER TO <a role the agent is not a member of>", agentID)
+	}
 	if via == nil {
 		return fmt.Sprintf("revoke the membership of %s that leads to %q", agentID, target)
 	}

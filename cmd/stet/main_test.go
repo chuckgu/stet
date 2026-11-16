@@ -805,6 +805,24 @@ func TestCheckWarnsAboutRightsToCreateObjects(t *testing.T) {
 			t.Errorf("after the REVOKEs: warnings %q, want none", w)
 		}
 	})
+
+	// The owner of a database is a member of pg_database_owner (PostgreSQL
+	// 14 and later) with no row in pg_auth_members to revoke; on 15 and
+	// later schema public is that role's. The fix is the database's owner.
+	t.Run("through ownership of the database", func(t *testing.T) {
+		agent := createRole(t, su, "agent", "login") // before the database it owns
+		db := fmt.Sprintf("stet_chk_db_%d", time.Now().UnixNano())
+		mustExec(t, su, "create database "+db+" template template0 owner "+agent)
+		t.Cleanup(func() { su.Exec(ctx, "drop database if exists "+db+" with (force)") })
+		in := connectTo(t, pg, db, "postgres", "postgres-pw")
+		mustExec(t, in, "grant create on database "+db+" to stet_scram") // for the stet schema
+		mustExec(t, in, "create schema dbo authorization pg_database_owner")
+		w := run(t, stetPoolIn(t, pg, db), agent, freshTable(t, connectTo(t, pg, db, "stet_scram", "scram-pw"), 1))
+		want(t, w, agent, `ownership of schema "dbo" through role "pg_database_owner"`, "ALTER DATABASE <this database> OWNER TO")
+		if line, ok := warningWith(w, "revoke the membership"); ok {
+			t.Errorf("warning %q gives a fix that cannot be carried out", line)
+		}
+	})
 }
 
 func TestNewerThanParser(t *testing.T) {
