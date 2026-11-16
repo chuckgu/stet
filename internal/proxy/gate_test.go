@@ -3119,3 +3119,21 @@ func TestTwoCopiesInOneQueryKeepTheSession(t *testing.T) {
 	}
 	g.wantBlocked(t, "stet_trust")
 }
+
+// PostgreSQL keeps the spelling UNICODE of client_encoding, for old JDBC
+// drivers, and reports it so; it is UTF8. A session started with it works on
+// an enforced session: its writes are judged.
+func TestClientEncodingUnicodeIsUTF8(t *testing.T) {
+	table := watchedTable(t)
+	mustExec(t, connect(t, upstream(t), "stet_scram", nil), "grant insert on "+table+" to stet_trust")
+	g := closedPointGate(watches(table))
+	addr, _ := startProxyWith(t, upstream(t), g, proxy.Policy{Enforce: true})
+	fe, _ := rawSessionWith(t, addr, "stet_trust", map[string]string{"client_encoding": "UNICODE"})
+
+	sendAll(t, fe, &pgproto3.Query{String: "insert into " + table + " values (1, 'x')"})
+	wantReplies(t, fe, "C Z")
+	if n := g.beginCount(); n != 1 {
+		t.Errorf("%d writes begun, want the insert judged", n)
+	}
+	g.wantBlocked(t, "stet_trust")
+}

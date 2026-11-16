@@ -127,6 +127,11 @@ func TestSettingsTheClassifierCannotReadAreRefused(t *testing.T) {
 
 	serve(s, setting("client_encoding", "UTF8"), ready)
 	refused(t, false, queryMsg("select 1"))
+	serve(s, setting("client_encoding", "UNICODE"), ready) // UTF8, as old JDBC drivers spell it
+	refused(t, false, queryMsg("select 1"))
+	serve(s, setting("client_encoding", "unicode"), ready) // never reported so; not a name the server keeps
+	refused(t, true, queryMsg("select 1"))
+	serve(s, setting("client_encoding", "UTF8"), ready)
 	serve(s, setting("standard_conforming_strings", "off"), ready)
 	refused(t, true, queryMsg("select 1"))
 	serve(s, setting("standard_conforming_strings", "on"), ready)

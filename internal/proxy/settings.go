@@ -25,7 +25,7 @@ import (
 // before, and may record such a statement wrongly.
 
 // readable reports whether the server reads this session's statements as the
-// classifier does: it last reported client_encoding UTF8 and
+// classifier does: it last reported client_encoding UTF8 (or UNICODE) and
 // standard_conforming_strings on. Until it reported both, during startup,
 // neither is known. It runs with s.mu held.
 func (s *session) readable() bool { return s.utf8 && s.standard }
@@ -56,7 +56,9 @@ func (s *session) parameter(head *unit, body []byte) error {
 	was := s.readable()
 	switch string(name) {
 	case "client_encoding":
-		s.utf8 = string(value) == "UTF8"
+		// The server reports UTF8 by its canonical name, except the spelling
+		// UNICODE, which it keeps for old JDBC drivers.
+		s.utf8 = string(value) == "UTF8" || string(value) == "UNICODE"
 	case "standard_conforming_strings":
 		s.standard = string(value) == "on"
 	default:
