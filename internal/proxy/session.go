@@ -39,8 +39,9 @@ type Gate interface {
 	// WouldBlock logs that a session that does not enforce sent a message an
 	// enforced session would refuse for reason: one of the closed points the
 	// proxy knows at no extra cost (unparsed, too_large, do_block,
-	// defines_code, function_call, copy_extended). The proxy calls it once per session and
-	// reason. Nothing is refused, and it must not block (ruling 31).
+	// defines_code, function_call, copy_extended). The proxy calls it once
+	// per session and reason. Nothing is refused, and it must not block
+	// (ruling 31).
 	WouldBlock(s SessionInfo, reason string)
 }
 
@@ -108,7 +109,8 @@ type Statement struct {
 	Several bool
 	// Clean marks a message whose statements are all BEGIN, START TRANSACTION, SET or SHOW.
 	Clean bool
-	// Block says why the message cannot be inspected (BlockUnparsed, BlockDo); "" when it can.
+	// Block says why the message cannot be inspected (BlockUnparsed, BlockDo,
+	// BlockDefinesCode); "" when it can.
 	Block string
 	// CopyIn marks SQL holding COPY ... FROM STDIN. The server ignores the
 	// Sync after such a copy sent through the extended protocol, so an
