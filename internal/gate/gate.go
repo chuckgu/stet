@@ -179,22 +179,30 @@ func (g *Gate) Inspect(sql string) proxy.Statement {
 // asking the gate to judge it, and logs it. That is a message it refuses: a
 // closed point of spec 7 (SQL the classifier cannot read, a DO block, SQL
 // that defines code or a view over a gated table, a message too large to
-// read, a FunctionCall), a statement that runs a
-// watched write by name or a name whose meaning is not settled, a
-// statement the server may read otherwise than the classifier under the
-// session's settings, or a name it may compare otherwise under its
-// server_encoding. Or it is a session the proxy ends (proxy.EndsSession),
+// read, a FunctionCall), a statement that runs a watched write by name or a
+// name whose meaning is not settled, a statement the server may read
+// otherwise than the classifier under the session's settings, or a name it
+// may compare otherwise under its server_encoding. Or it is a session the proxy ends (proxy.EndsSession),
 // whose client gets the answer as a FATAL: a COPY or a change of setting
 // after which the server's answers no longer match what the proxy follows.
 // No decision records either, so the log line names the session and the
 // reason, never the statement, which may hold data.
+//
+// A session ended for setting_changed is logged as an error: it is the one
+// bypass enforce mode accepts (ruling 22), a message sent behind the change
+// was inspected under the old setting, and the server may have run it.
 func (g *Gate) Blocked(s proxy.SessionInfo, reason string) proxy.Refusal {
 	a := decide.Blocked(reason)
-	msg := "message refused without a decision"
-	if proxy.EndsSession(reason) {
+	level, msg := slog.LevelWarn, "message refused without a decision"
+	switch {
+	case reason == proxy.BlockSettingChanged:
+		level, msg = slog.LevelError, "session ended: client_encoding or standard_conforming_strings changed to a "+
+			"value stet cannot read, and a message sent before the server reported the change may have run "+
+			"unjudged against a watched table"
+	case proxy.EndsSession(reason):
 		msg = "session ended without a decision"
 	}
-	g.log.Warn(msg, "reason", reason,
+	g.log.Log(context.Background(), level, msg, "reason", reason,
 		"session", s.ID, "login_role", s.User, "database", s.Database, "agent", s.ApplicationName)
 	return proxy.Refusal{Code: a.Code, Message: a.Message, Hint: a.Hint("")}
 }

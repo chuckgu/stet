@@ -898,6 +898,41 @@ func TestBlockedSaysWhatItEnded(t *testing.T) {
 	}
 }
 
+// A session ended for a changed setting is the one accepted bypass (ruling
+// 22): a message sent behind the change was read under the old setting and
+// may have run unjudged. That is logged as an error, not as the warning of
+// a benign end, with who the session was.
+func TestBlockedLogsAChangedSettingAsAnError(t *testing.T) {
+	e := setup(t, calm())
+	var logs lockedBuffer
+	gate.SetLogger(e.gate, slog.New(slog.NewJSONHandler(&logs, nil)))
+	info := proxy.SessionInfo{ID: "f00d", User: "agent_a", Database: "stet_test", ApplicationName: "bot"}
+
+	if got := e.gate.Blocked(info, proxy.BlockSettingChanged); got.Message != decide.Blocked(proxy.BlockSettingChanged).Message {
+		t.Errorf("Blocked = %+v, want decide.Blocked's error", got)
+	}
+	var recs []map[string]any
+	for line := range strings.Lines(logs.String()) {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatal(err)
+		}
+		recs = append(recs, rec)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("%d log lines, want 1:\n%s", len(recs), logs.String())
+	}
+	r := recs[0]
+	msg, _ := r["msg"].(string)
+	if r["level"] != "ERROR" || !strings.Contains(msg, "may have run unjudged against a watched table") {
+		t.Errorf("logged %v %q, want an ERROR saying a message may have run unjudged against a watched table", r["level"], msg)
+	}
+	if r["reason"] != "setting_changed" || r["session"] != "f00d" || r["login_role"] != "agent_a" ||
+		r["database"] != "stet_test" || r["agent"] != "bot" {
+		t.Errorf("logged %v, want the reason, session, login role, database and application name", r)
+	}
+}
+
 // Inspect passes on what SQL runs by name, as the server compares names, so
 // the proxy can look the names up in the session's tables (spec correction
 // B5).
