@@ -112,7 +112,16 @@ func TestInvalidConfigs(t *testing.T) {
 		"impact max_share infinite":      {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 1, max_share: .inf}}}\n", "impact.max_share"},
 		"impact max_rows over a billion": {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 1000000001}}}\n", "impact.max_rows"},
 		// max_rows + 1 is the count's LIMIT; at the largest int it overflows.
-		"impact max_rows largest int": {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 9223372036854775807}}}\n", "impact.max_rows"},
+		"impact max_rows largest int":          {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 9223372036854775807}}}\n", "impact.max_rows"},
+		"cumulative needs max_rows":            {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 100, cumulative: {window: 10m}}}}\n", "cumulative.max_rows"},
+		"cumulative needs window":              {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 100, cumulative: {max_rows: 500}}}}\n", "cumulative.window"},
+		"cumulative below the statement limit": {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 100, cumulative: {max_rows: 50, window: 10m}}}}\n", "cumulative.max_rows"},
+		"cumulative above a billion":           {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 100, cumulative: {max_rows: 1000000001, window: 10m}}}}\n", "cumulative.max_rows"},
+		"window zero":                          {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 100, cumulative: {max_rows: 500, window: 0s}}}}\n", "cumulative.window"},
+		"window above a day":                   {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 100, cumulative: {max_rows: 500, window: 25h}}}}\n", "cumulative.window"},
+		"cumulative without impact max_rows":   {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {cumulative: {max_rows: 5, window: 1m}}}}\n", "impact.max_rows"},
+		"log_above zero":                       {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], reads: {log_above: 0}}}\n", "reads.log_above"},
+		"reads unknown key":                    {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], reads: {sample: 1}}}\n", "sample"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -305,7 +314,41 @@ func TestExampleConfigShowsImpact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := c.Tables["contacts"].Impact; got == nil || *got != (Impact{MaxRows: 100, MaxShare: 0.1}) {
+	if got := c.Tables["contacts"].Impact; got == nil || got.MaxRows != 100 || got.MaxShare != 0.1 {
 		t.Errorf("example impact = %+v", got)
+	}
+	if got := c.Tables["contacts"].Impact.Cumulative; got == nil || *got != (Cumulative{500, 10 * time.Minute}) {
+		t.Errorf("example cumulative = %+v", got)
+	}
+	if got := c.Tables["contacts"].Reads; got == nil || *got != (Reads{LogAbove: 1000}) {
+		t.Errorf("example reads = %+v", got)
+	}
+}
+
+func TestCumulativeAndReads(t *testing.T) {
+	base := minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables:\n  contacts:\n    pk: id\n    send_fields: [name]\n"
+	parse := func(extra string) Table {
+		c, err := Parse([]byte(base + extra))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c.Tables["contacts"]
+	}
+	if got := parse("    impact: {max_rows: 100}\n"); got.Impact.Cumulative != nil || got.Reads != nil {
+		t.Errorf("no blocks: cumulative %+v, reads %+v, want both nil", got.Impact.Cumulative, got.Reads)
+	}
+	got := parse("    impact: {max_rows: 100, cumulative: {max_rows: 500, window: 10m}}\n")
+	if got.Impact.Cumulative == nil || *got.Impact.Cumulative != (Cumulative{500, 10 * time.Minute}) {
+		t.Errorf("cumulative = %+v", got.Impact.Cumulative)
+	}
+	got = parse("    impact: {max_rows: 100, cumulative: {max_rows: 100, window: 24h}}\n")
+	if got.Impact.Cumulative == nil || *got.Impact.Cumulative != (Cumulative{100, 24 * time.Hour}) {
+		t.Errorf("cumulative at the bounds = %+v", got.Impact.Cumulative)
+	}
+	if got := parse("    reads: {}\n"); got.Reads == nil || *got.Reads != (Reads{}) {
+		t.Errorf("empty reads = %+v", got.Reads)
+	}
+	if got := parse("    reads: {log_above: 1000}\n"); got.Reads == nil || *got.Reads != (Reads{LogAbove: 1000}) {
+		t.Errorf("reads = %+v", got.Reads)
 	}
 }

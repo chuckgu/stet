@@ -60,13 +60,31 @@ type Table struct {
 	Thresholds   Thresholds
 	Unsupported  string  // pass | reject
 	Impact       *Impact // nil: multi-row writes stay unsupported, as before
+	Reads        *Reads  // nil: reads of the table are not recorded
 }
 
 // Impact limits how much one multi-row write may touch.
 type Impact struct {
 	MaxRows  int     // required, 1 to maxImpactRows
 	MaxShare float64 // optional; 0 means unset. Applies to update and delete only
+	// Cumulative limits what one login role may touch in this table within a
+	// window. nil: no cumulative limit.
+	Cumulative *Cumulative
 }
+
+// Cumulative limits what one login role may touch in a table within a window.
+type Cumulative struct {
+	MaxRows int           // 1 to maxImpactRows, and at least Impact.MaxRows
+	Window  time.Duration // above 0, at most maxCumulativeWindow
+}
+
+// Reads turns on read recording for a table.
+type Reads struct {
+	LogAbove int // 0: aggregate only; otherwise a read sending more rows is logged by itself
+}
+
+// maxCumulativeWindow is the longest cumulative window.
+const maxCumulativeWindow = 24 * time.Hour
 
 // maxImpactRows is the largest max_rows. The count stops at max_rows + 1,
 // which must not overflow, and no write is held over a larger number.
@@ -124,9 +142,16 @@ type rawTable struct {
 	// Pointers: presence of the block, and an explicit max_share: 0, must be
 	// told apart from absence.
 	Impact *struct {
-		MaxRows  *int     `yaml:"max_rows"`
-		MaxShare *float64 `yaml:"max_share"`
+		MaxRows    *int     `yaml:"max_rows"`
+		MaxShare   *float64 `yaml:"max_share"`
+		Cumulative *struct {
+			MaxRows *int   `yaml:"max_rows"`
+			Window  string `yaml:"window"`
+		} `yaml:"cumulative"`
 	} `yaml:"impact"`
+	Reads *struct {
+		LogAbove *int `yaml:"log_above"`
+	} `yaml:"reads"`
 }
 
 var (
@@ -294,7 +319,43 @@ func resolveTable(name string, rt rawTable) (Table, []error) {
 			}
 			imp.MaxShare = *ri.MaxShare
 		}
+		if rc := ri.Cumulative; rc != nil {
+			cum := Cumulative{}
+			switch {
+			case rc.MaxRows == nil:
+				fail("impact.cumulative.max_rows", "required")
+			case *rc.MaxRows < 1:
+				fail("impact.cumulative.max_rows", "%d must be at least 1", *rc.MaxRows)
+			case *rc.MaxRows > maxImpactRows:
+				fail("impact.cumulative.max_rows", "%d must be at most %d", *rc.MaxRows, maxImpactRows)
+			case ri.MaxRows != nil && *rc.MaxRows < *ri.MaxRows:
+				fail("impact.cumulative.max_rows", "%d must be at least impact.max_rows (%d)", *rc.MaxRows, *ri.MaxRows)
+			default:
+				cum.MaxRows = *rc.MaxRows
+			}
+			if rc.Window == "" {
+				fail("impact.cumulative.window", "required")
+			} else if d, err := parseDuration(rc.Window); err != nil {
+				fail("impact.cumulative.window", "%v", err)
+			} else if d <= 0 || d > maxCumulativeWindow {
+				fail("impact.cumulative.window", "%s must be above 0 and at most %s", rc.Window, maxCumulativeWindow)
+			} else {
+				cum.Window = d
+			}
+			imp.Cumulative = &cum
+		}
 		t.Impact = &imp
+	}
+
+	if rr := rt.Reads; rr != nil {
+		reads := Reads{}
+		if rr.LogAbove != nil {
+			if *rr.LogAbove < 1 {
+				fail("reads.log_above", "%d must be at least 1", *rr.LogAbove)
+			}
+			reads.LogAbove = *rr.LogAbove
+		}
+		t.Reads = &reads
 	}
 
 	th := rt.Thresholds
