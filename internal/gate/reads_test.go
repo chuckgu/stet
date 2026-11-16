@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/stetdb/stet/internal/gate"
@@ -392,10 +393,110 @@ func TestCursorReadsAreCounted(t *testing.T) {
 	}
 
 	e.gate.FlushReads()
-	wantCounts(t, e.reads(t), map[string]count{"stet_scram": {Statements: 2, Rows: 7, MaxRows: 5}})
+	// max_rows is the cursor's total; the line is written when it first
+	// passes log_above (spec 5).
+	wantCounts(t, e.reads(t), map[string]count{"stet_scram": {Statements: 2, Rows: 7, MaxRows: 7}})
 	logs := e.readLog(t)
 	if len(logs) != 1 || logs[0].Statement != declare || logs[0].Rows != 5 || !reflect.DeepEqual(logs[0].Tables, []string{e.table}) {
 		t.Errorf("read_log = %+v, want one 5-row line holding %q", logs, declare)
+	}
+}
+
+// A read taken in parts, FETCH by FETCH from one cursor or Execute by Execute
+// from one row-limited portal, is one read for log_above and max_rows. One
+// line is logged when the rows read so far first pass log_above, holding the
+// rows read up to then, and max_rows is the total. A new DECLARE of the name,
+// or a new Bind, starts over.
+func TestReadInPartsIsLoggedOnce(t *testing.T) {
+	check := func(t *testing.T, e *env, statement string) {
+		t.Helper()
+		e.gate.FlushReads()
+		// Two reads of the 7 rows, 2 at a time: 4 parts each.
+		wantCounts(t, e.reads(t), map[string]count{"stet_scram": {Statements: 8, Rows: 14, MaxRows: 7}})
+		logs := e.readLog(t)
+		if len(logs) != 2 {
+			t.Fatalf("read_log = %+v, want one line per read", logs)
+		}
+		for i, l := range logs {
+			if l.Statement != statement || l.Rows != 4 {
+				t.Errorf("line %d: %q with %d rows, want %q with the 4 rows read when log_above 3 was passed", i+1, l.Statement, l.Rows, statement)
+			}
+		}
+	}
+	t.Run("cursor", func(t *testing.T) {
+		e := setupReads(t, readsYAML)
+		e.seedMany(t)
+		conn := e.connect(t, "exporter")
+		declare := "declare c cursor for select * from " + e.table
+		for range 2 {
+			mustExec(t, conn, "begin")
+			mustExec(t, conn, declare)
+			for _, want := range []int{2, 2, 2, 1} {
+				if got := collect(t, conn, "fetch 2 from c"); len(got) != want {
+					t.Fatalf("fetched %d rows, want %d", len(got), want)
+				}
+			}
+			mustExec(t, conn, "commit")
+		}
+		check(t, e, declare)
+	})
+	t.Run("portal", func(t *testing.T) {
+		e := setupReads(t, readsYAML)
+		e.seedMany(t)
+		conn := e.connect(t, "exporter")
+		all := "select * from " + e.table
+		for range 2 {
+			mustExec(t, conn, "begin")
+			if got := executeInParts(t, conn, all, 2); !reflect.DeepEqual(got, []int{2, 2, 2, 1}) {
+				t.Fatalf("executes sent %v rows, want [2 2 2 1]", got)
+			}
+			mustExec(t, conn, "commit")
+		}
+		check(t, e, all)
+	})
+}
+
+// executeInParts binds sql to portal p, as JDBC does with a fetch size, and
+// executes it n rows at a time, one Sync each, until it completes. It returns
+// the rows each Execute sent. Run it inside a transaction, so p outlives Sync.
+func executeInParts(t *testing.T, conn *pgx.Conn, sql string, n uint32) []int {
+	t.Helper()
+	fe := conn.PgConn().Frontend()
+	// exchange sends what was queued with a Sync and reads to ReadyForQuery.
+	exchange := func() (rows int, done bool) {
+		t.Helper()
+		fe.Send(&pgproto3.Sync{})
+		if err := fe.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			msg, err := fe.Receive()
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch m := msg.(type) {
+			case *pgproto3.DataRow:
+				rows++
+			case *pgproto3.CommandComplete:
+				done = true
+			case *pgproto3.ErrorResponse:
+				t.Fatalf("SQLSTATE %s: %s", m.Code, m.Message)
+			case *pgproto3.ReadyForQuery:
+				return rows, done
+			}
+		}
+	}
+	fe.Send(&pgproto3.Parse{Query: sql})
+	fe.Send(&pgproto3.Bind{DestinationPortal: "p"})
+	exchange()
+	var sent []int
+	for {
+		fe.Send(&pgproto3.Execute{Portal: "p", MaxRows: n})
+		rows, done := exchange()
+		sent = append(sent, rows)
+		if done {
+			return sent
+		}
 	}
 }
 

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -270,8 +271,9 @@ func TestObservedPortalKeepsNoBindValues(t *testing.T) {
 // with its statement. The statements of a message are separated by "; ".
 type cursorGate struct {
 	*fakeGate
-	reads []observedRead
-	sent  []int64
+	reads  []observedRead
+	sent   []int64
+	before []int64
 }
 
 func (g *cursorGate) Inspect(sql string) Statement {
@@ -302,6 +304,7 @@ func (g *cursorGate) Inspect(sql string) Statement {
 func (g *cursorGate) Observe(info SessionInfo, st Statement, o Outcome) {
 	g.reads = append(g.reads, observedRead{info: info, st: st})
 	g.sent = append(g.sent, o.Sent)
+	g.before = append(g.before, o.Before)
 }
 
 func readyWith(b byte) *pgproto3.ReadyForQuery { return &pgproto3.ReadyForQuery{TxStatus: b} }
@@ -464,4 +467,31 @@ func TestFailedQueryOfSeveralStatementsRemembers(t *testing.T) {
 	serve(s, &pgproto3.ErrorResponse{Code: "34000", Message: `cursor "e" does not exist`}, readyWith('I'))
 
 	g.wantReads(t, held, 1, committed, 1)
+}
+
+// A message of several statements that declares a cursor and fetches from it
+// is reported as its own read, and its rows are the first the cursor's later
+// FETCHes count before theirs. A read cut off by the connection's end counts
+// toward its cursor too.
+func TestDeclaringMessageCountsTowardItsCursor(t *testing.T) {
+	g := &cursorGate{fakeGate: newFakeGate()}
+	s := readySession(g)
+	flush := func() error { return nil }
+	query := func(sql string) { s.fromClient('Q', body(&pgproto3.Query{String: sql}), flush) }
+	rows := &pgproto3.RowDescription{}
+
+	both := "declare c cursor with hold for select * from t; fetch 2 from c"
+	query(both)
+	serve(s, tag("DECLARE CURSOR"), rows, row, row, tag("FETCH 2"), readyWith('I'))
+	query("fetch 3 from c")
+	serve(s, rows, row, row, row, tag("FETCH 3"), readyWith('I'))
+	query("fetch 3 from c")
+	query("fetch 3 from c")
+	serve(s, rows, row)
+	s.abandon()
+
+	g.wantReads(t, both, 2, both, 3, both, 1, both, 0)
+	if want := []int64{0, 2, 5, 6}; !slices.Equal(g.before, want) {
+		t.Errorf("rows before = %v, want %v", g.before, want)
+	}
 }

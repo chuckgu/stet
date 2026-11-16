@@ -642,6 +642,67 @@ func TestGateObservesPortalFetchedInParts(t *testing.T) {
 	}
 }
 
+// Each report of a read taken in parts says how many rows the earlier reports
+// of the same cursor or portal counted, in the order the server answered. A
+// read in one go, a new DECLARE of the name, and a new Bind start at 0.
+func TestReadsInPartsCarryTheRowsBefore(t *testing.T) {
+	table := readTable(t)
+	admin := connect(t, upstream(t), "stet_scram", nil)
+	mustExec(t, admin, "grant select on "+table+" to stet_trust") // dropped with the table
+	g := newObservingGate(readsOf(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	declare := "declare c cursor for select * from " + table
+	mustExec(t, conn, "begin")
+	mustExec(t, conn, declare)
+	mustExec(t, conn, "fetch 300 from c")
+	b := &pgconn.Batch{} // two FETCHes under one Sync
+	b.ExecParams("fetch 300 from c", nil, nil, nil, nil)
+	b.ExecParams("fetch 300 from c", nil, nil, nil, nil)
+	if _, err := conn.PgConn().ExecBatch(testCtx(t), b).ReadAll(); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, "close c")
+	mustExec(t, conn, declare)
+	mustExec(t, conn, "fetch 300 from c")
+	mustExec(t, conn, "commit")
+	mustExec(t, conn, "select * from "+table+" where id <= 10")
+
+	fe := rawSession(t, addr, "stet_trust")
+	fe.Send(&pgproto3.Parse{Query: "select * from " + table + " order by id"})
+	fe.Send(&pgproto3.Bind{})
+	for range 3 {
+		fe.Send(&pgproto3.Execute{MaxRows: 100})
+	}
+	fe.Send(&pgproto3.Bind{})
+	fe.Send(&pgproto3.Execute{MaxRows: 100})
+	fe.Send(&pgproto3.Sync{})
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if rows, _ := untilReady(t, fe); rows != 400 {
+		t.Fatalf("client got %d rows, want 400", rows)
+	}
+
+	obs := g.observed(t, 9)
+	want := []struct{ sent, before int64 }{
+		{300, 0}, {300, 300}, {300, 600}, // the cursor
+		{300, 0},                         // declared again
+		{10, 0},                          // in one go
+		{100, 0}, {100, 100}, {100, 200}, // the portal
+		{100, 0}, // bound again
+	}
+	if len(obs) != len(want) {
+		t.Fatalf("%d reads observed, want %d", len(obs), len(want))
+	}
+	for i, w := range want {
+		if o := obs[i].o; o.Sent != w.sent || o.Before != w.before {
+			t.Errorf("read %d (%s): %d rows with %d before, want %d with %d before", i+1, obs[i].st.SQL, o.Sent, o.Before, w.sent, w.before)
+		}
+	}
+}
+
 func TestGateObservesReadsInAMultiStatementQuery(t *testing.T) {
 	table := readTable(t)
 	g := newObservingGate(readsOf(table))

@@ -71,7 +71,7 @@ type readEvent struct {
 	sql     string
 	tables  []string
 	at      time.Time
-	sent    int64
+	sent    int64 // rows read up to this read, earlier parts included
 	err     string
 }
 
@@ -111,6 +111,11 @@ func (g *Gate) recordsAny(keys []string) bool {
 // sent more than any of those tables' log_above is also logged, once, naming
 // every gated table it read. The proxy calls it before forwarding the read's
 // ReadyForQuery, so it does no I/O and never waits for the store.
+//
+// A read taken in parts (the FETCHes of one cursor, the Executes of one
+// row-limited portal) is one read for max_rows and log_above: o.Before is
+// what its earlier parts sent. Its line is logged by the part that first
+// takes the total past log_above, with the total up to then.
 func (g *Gate) Observe(s proxy.SessionInfo, st proxy.Statement, o proxy.Outcome) {
 	r, ok := st.Data.(sqlparse.Result)
 	a := g.reads
@@ -133,6 +138,7 @@ func (g *Gate) Observe(s proxy.SessionInfo, st proxy.Statement, o proxy.Outcome)
 		return
 	}
 	large := false
+	total := o.Before + o.Sent
 	for _, t := range r.Reads {
 		logAbove, ok := a.logAbove[t]
 		if !ok {
@@ -146,8 +152,8 @@ func (g *Gate) Observe(s proxy.SessionInfo, st proxy.Statement, o proxy.Outcome)
 		}
 		c.statements++
 		c.rows += o.Sent
-		c.maxRows = max(c.maxRows, o.Sent)
-		if logAbove > 0 && o.Sent > int64(logAbove) {
+		c.maxRows = max(c.maxRows, total)
+		if logAbove > 0 && o.Before <= int64(logAbove) && total > int64(logAbove) {
 			large = true
 		}
 	}
@@ -155,7 +161,7 @@ func (g *Gate) Observe(s proxy.SessionInfo, st proxy.Statement, o proxy.Outcome)
 		return
 	}
 	select {
-	case a.logs <- readEvent{session: s, sql: st.SQL, tables: r.Reads, at: at, sent: o.Sent, err: o.Error}:
+	case a.logs <- readEvent{session: s, sql: st.SQL, tables: r.Reads, at: at, sent: total, err: o.Error}:
 	default:
 		a.dropped.Add(1)
 	}

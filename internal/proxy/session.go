@@ -92,6 +92,10 @@ type Outcome struct {
 	// the server, so when the connection drops Sent can include rows not yet
 	// written to the client, at most a buffer's worth.
 	Sent int64
+	// Before is how many rows earlier reports already counted for the same
+	// cursor or portal: the FETCHes of one DECLARE, or the Executes of one
+	// bound portal. 0 for a statement read in one go. Set only for Observe.
+	Before int64
 	// Arrived is when the proxy read the statement from the client. Set only
 	// for Observe.
 	Arrived time.Time
@@ -130,6 +134,9 @@ type prepared struct {
 type bound struct {
 	st     Statement
 	params []Param
+	// rows read through the portal so far, for an observed one; a new Bind
+	// starts over. Updated on the server side as its Executes are answered.
+	rows *int64
 }
 
 // unit is the stretch of client messages answered by one ReadyForQuery: a
@@ -160,6 +167,11 @@ type observedRead struct {
 	// ifRows: reported only if it sent rows (a message of several statements
 	// that declares a cursor; its rows are read through the FETCHes).
 	ifRows bool
+	// total is the running count of rows read through the same cursor or
+	// portal, nil for a read in one go. before is what it held when this
+	// read was answered: tally sets it, in the order of the answers.
+	total  *int64
+	before int64
 }
 
 func newSession(g Gate, info SessionInfo) *session {
@@ -239,7 +251,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 		case len(st.Cursors) > 0:
 			s.applyCursors(u, 0, st)
 		case st.Observe:
-			s.observe(u, 0, st)
+			s.observe(u, 0, st, nil)
 		}
 
 	case 'P':
@@ -262,8 +274,11 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 			return
 		}
 		b := bound{st: p.st}
-		if p.st.Watch { // only Begin is handed bind values
+		switch {
+		case p.st.Watch: // only Begin is handed bind values
 			b.params = params(&m, p.oids)
+		case p.st.Observe:
+			b.rows = new(int64)
 		}
 		s.portals[m.DestinationPortal] = b
 
@@ -291,7 +306,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 		case len(b.st.Cursors) > 0:
 			s.applyCursors(u, idx, b.st)
 		case b.st.Observe:
-			s.observe(u, idx, b.st)
+			s.observe(u, idx, b.st, b.rows)
 		}
 
 	case 'C':
@@ -344,17 +359,19 @@ func (s *session) begin(u *unit, idx int, st Statement, ps []Param, flush func()
 
 // observe notes a read in its unit. Nothing waits for the gate and nothing
 // queued is flushed first: the gate hears of the read once it was answered.
-func (s *session) observe(u *unit, idx int, st Statement) {
+// rows is the running count of the portal it reads, or nil for a Query.
+func (s *session) observe(u *unit, idx int, st Statement, rows *int64) {
 	s.mu.Lock()
-	u.reads = append(u.reads, s.arriving(st, idx))
+	u.reads = append(u.reads, s.arriving(st, idx, rows))
 	s.mu.Unlock()
 }
 
 // arriving records a read reported as st, arriving now from the client as
-// Execute idx of its unit (0 for a Query). It runs on the client side with
+// Execute idx of its unit (0 for a Query), that counts toward total (nil for
+// a read in one go). It runs on the client side with
 // s.mu held, and only for reads, so no other statement pays for the clock.
-func (s *session) arriving(st Statement, idx int) observedRead {
-	return observedRead{info: s.identity(), st: st, idx: idx, at: time.Now()}
+func (s *session) arriving(st Statement, idx int, total *int64) observedRead {
+	return observedRead{info: s.identity(), st: st, idx: idx, at: time.Now(), total: total}
 }
 
 // identity is the session as the gate is told of a statement arriving now.
@@ -439,6 +456,7 @@ func (s *session) fromServer(t byte, body []byte) {
 		if len(s.unsettled) > 0 {
 			s.cursorsAnswered(head, status)
 		}
+		head.tally()
 		s.mu.Unlock()
 		s.finish(head, before, status)
 		return
@@ -469,6 +487,19 @@ func (s *session) settle(head *unit) {
 	head.sent[k] += n
 }
 
+// tally sets the rows before each read of u that counts toward a cursor or
+// portal, and adds its rows to that count. Units are answered in the order
+// they were sent, so it runs for each unit in turn: on the server side with
+// s.mu held, or from abandon.
+func (u *unit) tally() {
+	for i := range u.reads {
+		if r := &u.reads[i]; r.total != nil {
+			r.before = *r.total
+			*r.total += u.sent[r.idx]
+		}
+	}
+}
+
 // finish reports the statements of an answered unit. before and after are
 // the transaction status around it.
 func (s *session) finish(u *unit, before, after byte) {
@@ -478,7 +509,7 @@ func (s *session) finish(u *unit, before, after byte) {
 	}
 	for _, r := range u.reads {
 		o := u.answered(r.idx, inTx)
-		o.Sent, o.Arrived = u.sent[r.idx], r.at
+		o.Sent, o.Before, o.Arrived = u.sent[r.idx], r.before, r.at
 		if r.ifRows && o.Sent == 0 {
 			continue
 		}
@@ -561,13 +592,14 @@ func (s *session) abandon() {
 		s.settle(units[0]) // rows of the statement that was still answering
 	}
 	for _, u := range units {
+		u.tally()
 		inTx := status != 'I' || u.executes > 1
 		for _, w := range u.writes {
 			s.gate.End(w.handle, u.unanswered(w.idx, inTx))
 		}
 		for _, r := range u.reads {
 			o := u.unanswered(r.idx, inTx)
-			o.Sent, o.Arrived = u.sent[r.idx], r.at
+			o.Sent, o.Before, o.Arrived = u.sent[r.idx], r.before, r.at
 			if r.ifRows && o.Sent == 0 {
 				continue
 			}

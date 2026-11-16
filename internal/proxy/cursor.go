@@ -35,6 +35,9 @@ type declared struct {
 	unit *unit
 	idx  int       // which Execute of unit stacked it; 0 for a Query
 	prev *declared // what the name meant before, until this statement has run
+	// rows read through the cursor so far; a new DECLARE of the name starts
+	// over. Updated on the server side as its reads are answered (tally).
+	rows int64
 }
 
 // undone reports whether d, stacked by head, a unit that failed, is taken
@@ -80,14 +83,16 @@ func (d *declared) undone(head *unit) bool {
 func (s *session) applyCursors(u *unit, idx int, st Statement) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var fetched *declared
+	var fetched, declaredHere *declared
 	declares := false
 	for _, c := range st.Cursors {
 		switch c.Op {
 		case CursorDeclare:
 			declares = true
 			if st.Observe || s.cursors[c.Name] != nil {
-				s.stack(c.Name, &declared{st: st, hold: c.Hold, unit: u, idx: idx})
+				d := &declared{st: st, hold: c.Hold, unit: u, idx: idx}
+				s.stack(c.Name, d)
+				declaredHere = d
 			}
 		case CursorFetch:
 			if d := s.cursors[c.Name]; fetched == nil && d != nil && d.st.Observe {
@@ -105,11 +110,17 @@ func (s *session) applyCursors(u *unit, idx int, st Statement) {
 	}
 	switch {
 	case st.Several && st.Observe && !st.Watch:
-		r := s.arriving(st, idx)
+		// Its rows, if it fetched from the cursor it declared, are that
+		// cursor's first.
+		var total *int64
+		if declaredHere != nil {
+			total = &declaredHere.rows
+		}
+		r := s.arriving(st, idx, total)
 		r.ifRows = declares
 		u.reads = append(u.reads, r)
 	case fetched != nil:
-		u.reads = append(u.reads, s.arriving(fetched.st, idx))
+		u.reads = append(u.reads, s.arriving(fetched.st, idx, &fetched.rows))
 	}
 }
 
