@@ -479,8 +479,13 @@ func TestInflightLimitTurnsIntoAStateError(t *testing.T) {
 	mustExec(t, conn, "update "+e.table+" set title = 'crowded' where id = 1")
 	release()
 	mustExec(t, conn, "update "+e.table+" set title = 'later' where id = 2")
+	// The only slot came back when the second write's Begin ended.
+	mustExec(t, conn, "update "+e.table+" set title = 'again' where id = 2")
 
-	rs := e.decisions(t, 2)
+	rs := e.decisions(t, 3)
+	if r := rs[2]; r.Verdict != "commit" || len(r.Reasons) != 0 {
+		t.Errorf("third write: verdict %s %v, want commit []: the slot must come back", r.Verdict, r.Reasons)
+	}
 	if r := rs[0]; r.Verdict != "commit" || !reflect.DeepEqual(r.Reasons, []string{"state_error"}) || !r.Executed {
 		t.Errorf("crowded write: verdict %s %v executed=%v, want commit [state_error] executed", r.Verdict, r.Reasons, r.Executed)
 	}
@@ -490,11 +495,55 @@ func TestInflightLimitTurnsIntoAStateError(t *testing.T) {
 	if r := rs[1]; r.Verdict != "commit" || len(r.Reasons) != 0 {
 		t.Errorf("write after release: verdict %s %v, want commit []", r.Verdict, r.Reasons)
 	}
-	if n := d.callCount(); n != 1 {
-		t.Errorf("model called %d times, want once: not for the write with no state", n)
+	if n := d.callCount(); n != 2 {
+		t.Errorf("model called %d times, want twice: not for the write with no state", n)
 	}
-	if n := e.rowsWhere(t, "title in ('crowded', 'later')"); n != 2 {
-		t.Errorf("%d rows written, want 2: shadow mode must let both writes through", n)
+	if n := e.rowsWhere(t, "title in ('crowded', 'again')"); n != 2 {
+		t.Errorf("%d rows written, want 2: shadow mode must let the writes through", n)
+	}
+}
+
+// A measured write with no slot is a state error too, and follows on_failure;
+// it is not a measurement that failed, which unsupported would decide (spec 7).
+func TestInflightLimitTurnsAMeasuredWriteIntoAStateError(t *testing.T) {
+	d := calm()
+	e := setup(t, d, impactYAML+"limits: {max_inflight: 1}\n")
+	e.seedMany(t)
+	release := gate.HoldInflight(e.gate)
+	mustExec(t, e.connect(t, "crowded"), "update "+e.table+" set status = 'x' where company_id = 9")
+	release()
+
+	r := e.impacts(t, 1)[0]
+	wantVerdict(t, r, "commit", "state_error")
+	if r.Impact != nil {
+		t.Errorf("impact = %v, want NULL: the write was not measured", r.Impact)
+	}
+	if !r.Executed {
+		t.Error("executed = false: shadow mode must let the write through")
+	}
+	wantNoModel(t, d)
+}
+
+// In shadow mode a write's slot is let go when its Begin ends: the model is
+// asked after the write, outside the limit, so a slow answer holds no slot.
+func TestInflightSlotIsNotHeldAcrossTheShadowModelCall(t *testing.T) {
+	d := calm()
+	d.delay = time.Second
+	e := setup(t, d, tableYAML+"limits: {max_inflight: 1}\n")
+	e.seed(t)
+	conn := e.connect(t, "a")
+	mustExec(t, conn, "update "+e.table+" set title = 'first' where id = 1")
+	mustExec(t, conn, "update "+e.table+" set title = 'second' where id = 2")
+	if n := d.callCount(); n != 0 {
+		t.Fatalf("%d model calls ended before the second write returned; the first must still be pending", n)
+	}
+
+	rs := e.decisions(t, 2)
+	if r := rs[1]; r.Verdict != "commit" || len(r.Reasons) != 0 {
+		t.Errorf("second write: verdict %s %v, want commit []: it must find the slot free", r.Verdict, r.Reasons)
+	}
+	if l := rs[1].LatencyMS; l == nil || *l >= 450 {
+		t.Errorf("second write: latency_ms = %v, want well under 450: it must not wait for a slot", deref(l))
 	}
 }
 

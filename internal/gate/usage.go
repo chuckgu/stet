@@ -2,6 +2,7 @@ package gate
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"sync"
 	"time"
@@ -32,14 +33,23 @@ const usageSweepEvery = time.Minute
 // write since then was reserved here, so loading it too would count it twice.
 // That also makes a load that runs after a failed one, or after writes
 // reserved while it was pending, add nothing this gate already holds.
+//
+// A load runs in the background on its own time bound, so a write whose own
+// time runs out while it waits does not cut the load short and make the
+// pair's next writes wait out usageRetry for a failure the store never had.
 type usage struct {
 	load  func(ctx context.Context, role, table string, since, before time.Time) ([]store.UsageSecond, error)
-	start time.Time // truncated to the microsecond, as stet.decisions stores times
+	start time.Time       // truncated to the microsecond, as stet.decisions stores times
+	wg    *sync.WaitGroup // tracks loads in flight; Gate.Close waits on it
 
-	mu    sync.Mutex
-	pairs map[usageKey]*usagePair
-	swept time.Time // when reserve last dropped idle pairs
+	mu     sync.Mutex
+	pairs  map[usageKey]*usagePair
+	swept  time.Time // when reserve last dropped idle pairs
+	closed bool      // no load starts once set
 }
+
+// errUsageClosed is what a write gets that needs a load after the gate closed.
+var errUsageClosed = errors.New("gate closed")
 
 type usageKey struct{ role, table string }
 
@@ -77,12 +87,21 @@ type usageLoad struct {
 	err  error // set before done is closed
 }
 
-func newUsage(load func(ctx context.Context, role, table string, since, before time.Time) ([]store.UsageSecond, error)) *usage {
+func newUsage(load func(ctx context.Context, role, table string, since, before time.Time) ([]store.UsageSecond, error), wg *sync.WaitGroup) *usage {
 	return &usage{
 		load:  load,
 		start: time.Now().Truncate(time.Microsecond),
+		wg:    wg,
 		pairs: map[usageKey]*usagePair{},
 	}
+}
+
+// close stops new loads from starting. The caller then waits on wg for those
+// in flight, which their own bound ends.
+func (u *usage) close() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.closed = true
 }
 
 // reserve records that write id, which began at at, is about to touch
@@ -140,11 +159,13 @@ func (u *usage) settle(role, table, id string, rows *int64, executed, lost bool)
 }
 
 // fill loads a pair's window the first time the pair is seen: the seconds
-// from the one the window starts in up to the gate's start. One load runs at
-// a time per pair; writes that arrive meanwhile share its result. After a
-// failed load the pair is not loaded again for usageRetry, and the writes in
-// between get the failure. A load is not started on a context already done,
-// and that is not a failure.
+// from the one the window starts in up to the gate's start. A window that
+// starts at or after the gate's start holds only writes reserved here, so
+// there is nothing to load. One load runs at a time per pair; every write
+// that needs it, the one that started it included, waits for it or for its
+// own context. After a failed load the pair is not loaded again for
+// usageRetry, and the writes in between get the failure. A load is not
+// started on a context already done, nor once the gate has closed.
 func (u *usage) fill(ctx context.Context, key usageKey, at time.Time, window time.Duration) error {
 	u.mu.Lock()
 	p := u.pair(key, window)
@@ -152,46 +173,67 @@ func (u *usage) fill(ctx context.Context, key usageKey, at time.Time, window tim
 		u.mu.Unlock()
 		return nil
 	}
-	if l := p.loading; l != nil {
-		u.mu.Unlock()
+	l := p.loading
+	if l == nil {
+		// The whole second the window starts in, as the seconds held here count.
+		since := at.Add(-window).Truncate(time.Second)
+		var err error
+		switch {
+		case !since.Before(u.start):
+			p.loaded, p.err = true, nil
+		case p.err != nil && at.Sub(p.failed) < usageRetry:
+			err = p.err
+		case u.closed:
+			err = errUsageClosed
+		case ctx.Err() != nil:
+			err = ctx.Err()
+		default:
+			l = u.startLoad(p, key, since, at)
+		}
+		if l == nil {
+			u.mu.Unlock()
+			return err
+		}
+	}
+	u.mu.Unlock()
+	select {
+	case <-l.done:
+		return l.err
+	case <-ctx.Done():
 		select {
-		case <-l.done:
+		case <-l.done: // done as well: its answer is the better one
 			return l.err
-		case <-ctx.Done():
+		default:
 			return ctx.Err()
 		}
 	}
-	if p.err != nil && at.Sub(p.failed) < usageRetry {
-		err := p.err
-		u.mu.Unlock()
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		u.mu.Unlock()
-		return err
-	}
+}
+
+// startLoad starts p's load in the background, bound by stateTimeout alone,
+// and returns it. It merges what it loads, or records its failure, and then
+// closes done. The sweep keeps p while the load runs. Call with u.mu held.
+func (u *usage) startLoad(p *usagePair, key usageKey, since, at time.Time) *usageLoad {
 	l := &usageLoad{done: make(chan struct{})}
 	p.loading = l
-	u.mu.Unlock()
+	u.wg.Add(1)
+	go func() {
+		defer u.wg.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), stateTimeout)
+		defer cancel()
+		secs, err := u.load(ctx, key.role, key.table, since, u.start)
 
-	// The whole second the window starts in, as the seconds held here count.
-	secs, err := u.load(ctx, key.role, key.table, at.Add(-window).Truncate(time.Second), u.start)
-
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	p.loading, l.err = nil, err
-	close(l.done)
-	if err != nil {
-		p.failed, p.err = at, err
-		return err
-	}
-	for _, s := range secs {
-		if sec := s.Second.Unix(); sec >= p.floor {
-			p.add(sec, s.Rows)
+		u.mu.Lock()
+		defer u.mu.Unlock()
+		p.loading, l.err = nil, err
+		if err != nil {
+			p.failed, p.err = at, err
+		} else {
+			p.merge(secs)
+			p.loaded, p.err = true, nil
 		}
-	}
-	p.loaded, p.err = true, nil
-	return nil
+		close(l.done)
+	}()
+	return l
 }
 
 // pair returns key's entry, creating it. Call with u.mu held.
@@ -244,11 +286,38 @@ func (p *usagePair) prune(cutoff time.Time) {
 	p.secs = p.secs[n:]
 }
 
+// merge adds loaded seconds, oldest first as UsageBySecond returns them, to
+// p's own, in one pass over both: it runs under the lock every pair shares,
+// and p may hold every second reserved through a run of failed loads. A
+// loaded second that p also holds ends up once, with both counts.
+func (p *usagePair) merge(loaded []store.UsageSecond) {
+	merged, i := make([]usageSecond, 0, len(loaded)+len(p.secs)), 0
+	for _, s := range loaded {
+		sec := s.Second.Unix()
+		if sec < p.floor {
+			continue
+		}
+		p.total += s.Rows
+		for i < len(p.secs) && p.secs[i].sec < sec {
+			merged = append(merged, p.secs[i])
+			i++
+		}
+		if i < len(p.secs) && p.secs[i].sec == sec {
+			// Counted here, and copied over with the rest when a later
+			// second or the end passes it.
+			p.secs[i].rows += s.Rows
+			continue
+		}
+		merged = append(merged, usageSecond{sec: sec, rows: s.Rows})
+	}
+	p.secs = append(merged, p.secs[i:]...)
+}
+
 // add counts rows, which may be negative, in second sec, at or after floor.
 func (p *usagePair) add(sec, rows int64) {
 	p.total += rows
 	// Writes reserve in nearly the order they began, so the second is found
-	// at the end; loaded seconds are older than any reserved here.
+	// at the end.
 	i := len(p.secs)
 	for i > 0 && p.secs[i-1].sec > sec {
 		i--

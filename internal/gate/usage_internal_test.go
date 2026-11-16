@@ -3,10 +3,15 @@ package gate
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"reflect"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/stetdb/stet/internal/config"
 	"github.com/stetdb/stet/internal/store"
 )
 
@@ -19,24 +24,72 @@ func at(offset time.Duration) time.Time { return usageBase.Add(offset) }
 type loadCall struct{ since, before time.Time }
 
 // fakeLoad answers loads with secs, or with err while err is set, and keeps
-// every call.
+// every call. While block is set, a load first waits for it to be closed or
+// for its context to end.
 type fakeLoad struct {
+	mu    sync.Mutex
 	secs  []store.UsageSecond
 	err   error
 	calls []loadCall
+	block chan struct{}
 }
 
-func (f *fakeLoad) load(_ context.Context, _, _ string, since, before time.Time) ([]store.UsageSecond, error) {
+func (f *fakeLoad) load(ctx context.Context, _, _ string, since, before time.Time) ([]store.UsageSecond, error) {
+	f.mu.Lock()
 	f.calls = append(f.calls, loadCall{since, before})
+	block := f.block
+	f.mu.Unlock()
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.err != nil {
 		return nil, f.err
 	}
 	return f.secs, nil
 }
 
-// testUsage is a usage over f that started at start.
-func testUsage(f *fakeLoad, start time.Time) *usage {
-	u := newUsage(f.load)
+// answer makes later loads return secs and err.
+func (f *fakeLoad) answer(secs []store.UsageSecond, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.secs, f.err = secs, err
+}
+
+func (f *fakeLoad) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
+}
+
+// waitLoaded waits until the pair of role agent in table t has loaded.
+func (u *usage) waitLoaded(t *testing.T) {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		u.mu.Lock()
+		p := u.pairs[usageKey{"agent", "t"}]
+		loaded := p != nil && p.loaded
+		u.mu.Unlock()
+		if loaded {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the pair never loaded")
+		}
+	}
+}
+
+// testUsage is a usage over f that started at start. Its loads are waited
+// for when the test ends.
+func testUsage(t *testing.T, f *fakeLoad, start time.Time) *usage {
+	var wg sync.WaitGroup
+	t.Cleanup(wg.Wait)
+	u := newUsage(f.load, &wg)
 	u.start = start
 	return u
 }
@@ -65,7 +118,7 @@ func (u *usage) seconds(role, table string) map[time.Duration]int64 {
 }
 
 func TestUsageCountsPerSecond(t *testing.T) {
-	u := testUsage(&fakeLoad{}, usageBase)
+	u := testUsage(t, &fakeLoad{}, usageBase)
 	const window = time.Hour
 	n := func(v int64) *int64 { return &v }
 
@@ -109,7 +162,7 @@ func TestUsageCountsPerSecond(t *testing.T) {
 }
 
 func TestUsageKeepsASecondUntilItLeftTheWindow(t *testing.T) {
-	u := testUsage(&fakeLoad{}, usageBase)
+	u := testUsage(t, &fakeLoad{}, usageBase)
 	const window = 2 * time.Second
 	mustReserve(t, u, "early", at(900*time.Millisecond), 10, window)
 
@@ -143,7 +196,7 @@ func TestUsageLoadsOnlyWhatCameBeforeItStarted(t *testing.T) {
 		{Second: at(-10 * time.Second), Rows: 2},
 	}}
 	start := at(500 * time.Millisecond)
-	u := testUsage(f, start)
+	u := testUsage(t, f, start)
 	const window = time.Minute
 
 	// The window of a write at 1.5s starts at -58.5s, in second -59.
@@ -167,7 +220,7 @@ func TestUsageRetriesAfterAnInterval(t *testing.T) {
 	defer func(d time.Duration) { usageRetry = d }(usageRetry)
 	usageRetry = 5 * time.Second
 	f := &fakeLoad{err: errors.New("down")}
-	u := testUsage(f, usageBase)
+	u := testUsage(t, f, usageBase)
 	const window = time.Hour
 	reserve := func(id string, when time.Time) (int64, error) {
 		return u.reserve(context.Background(), "agent", "t", id, when, 1, window)
@@ -205,7 +258,7 @@ func TestUsageRetriesAfterAnInterval(t *testing.T) {
 // its want of one is not a failure that makes others wait.
 func TestUsageDoesNotLoadOnADoneContext(t *testing.T) {
 	f := &fakeLoad{secs: []store.UsageSecond{{Second: at(-10 * time.Second), Rows: 3}}}
-	u := testUsage(f, usageBase)
+	u := testUsage(t, f, usageBase)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := u.reserve(ctx, "agent", "t", "a", at(time.Second), 1, time.Hour); !errors.Is(err, context.Canceled) {
@@ -220,7 +273,7 @@ func TestUsageDoesNotLoadOnADoneContext(t *testing.T) {
 }
 
 func TestUsageDropsIdlePairs(t *testing.T) {
-	u := testUsage(&fakeLoad{}, usageBase)
+	u := testUsage(t, &fakeLoad{}, usageBase)
 	const window = 10 * time.Second
 	reserve := func(role, id string, when time.Time) {
 		t.Helper()
@@ -258,5 +311,197 @@ func TestUsageDropsIdlePairs(t *testing.T) {
 	reserve("other", "f", at(122*time.Second))
 	if has("busy") || has("recent") {
 		t.Errorf("busy %v recent %v, want both dropped once idle", has("busy"), has("recent"))
+	}
+}
+
+// Seconds reserved while the pair could not load pile up; the load that
+// finally succeeds merges its seconds with them, where they interleave and
+// where they fall in the same second, and skips what already left the window.
+func TestUsageMergesLoadedAndReservedSeconds(t *testing.T) {
+	defer func(d time.Duration) { usageRetry = d }(usageRetry)
+	usageRetry = time.Hour
+	f := &fakeLoad{err: errors.New("down")}
+	u := testUsage(t, f, usageBase)
+	const window = time.Hour
+	for _, s := range []int{2, 5, 9} {
+		u.reserve(context.Background(), "agent", "t", fmt.Sprint(s), at(time.Duration(s)*time.Second), 1, window)
+	}
+	f.answer([]store.UsageSecond{
+		{Second: at(-4000 * time.Second), Rows: 1000}, // before every window seen: skipped
+		{Second: at(1 * time.Second), Rows: 10},
+		{Second: at(2 * time.Second), Rows: 20},
+		{Second: at(6 * time.Second), Rows: 30},
+		{Second: at(9 * time.Second), Rows: 40},
+		{Second: at(12 * time.Second), Rows: 50},
+	}, nil)
+	usageRetry = 0
+	if used := mustReserve(t, u, "last", at(13*time.Second), 1, window); used != 153 {
+		t.Errorf("used %d, want 153: 150 loaded rows and 3 reserved", used)
+	}
+	want := map[time.Duration]int64{
+		1 * time.Second: 10, 2 * time.Second: 21, 5 * time.Second: 1, 6 * time.Second: 30,
+		9 * time.Second: 41, 12 * time.Second: 50, 13 * time.Second: 1,
+	}
+	if got := u.seconds("agent", "t"); !reflect.DeepEqual(got, want) {
+		t.Errorf("seconds = %v, want %v", got, want)
+	}
+	u.mu.Lock()
+	secs := u.pairs[usageKey{"agent", "t"}].secs
+	u.mu.Unlock()
+	for i := 1; i < len(secs); i++ {
+		if secs[i-1].sec >= secs[i].sec {
+			t.Fatalf("seconds out of order at %d: %v", i, secs)
+		}
+	}
+}
+
+// The merge runs under the lock every pair shares, so it must be one pass:
+// a full day of loaded seconds against an hour of reserved ones, reserved
+// through a run of failed loads. One pass takes under a millisecond (about
+// 5ms with -race); one insert per loaded second took over 100ms. The fastest
+// of three trials is timed, so a busy machine does not fail the test.
+func TestUsageMergesALoadInOnePass(t *testing.T) {
+	defer func(d time.Duration) { usageRetry = d }(usageRetry)
+	const window = 24 * time.Hour
+	const reserved = 3600
+	last := at(reserved * time.Second)
+	var secs []store.UsageSecond
+	for s := last.Add(-window); s.Before(usageBase); s = s.Add(time.Second) {
+		secs = append(secs, store.UsageSecond{Second: s, Rows: 1})
+	}
+
+	fastest := time.Hour
+	for range 3 {
+		usageRetry = 24 * time.Hour
+		f := &fakeLoad{err: errors.New("down")}
+		u := testUsage(t, f, usageBase)
+		for i := range reserved {
+			u.reserve(context.Background(), "agent", "t", fmt.Sprint(i), at(time.Duration(i)*time.Second), 1, window)
+		}
+		f.answer(secs, nil)
+		usageRetry = 0
+
+		start := time.Now()
+		used := mustReserve(t, u, "last", last, 1, window)
+		fastest = min(fastest, time.Since(start))
+		if want := int64(len(secs) + reserved); used != want {
+			t.Errorf("used %d, want %d", used, want)
+		}
+	}
+	t.Logf("merged %d loaded seconds into %d reserved in %v", len(secs), reserved, fastest)
+	if fastest > 10*time.Millisecond {
+		t.Errorf("merging %d loaded seconds into %d reserved took %v, want well under 10ms", len(secs), reserved, fastest)
+	}
+}
+
+// A load runs on its own time bound, not on the time left to the write that
+// started it: a write cut off while waiting is not a failure of the store,
+// and the next write finds the pair loaded.
+func TestUsageLoadOutlivesTheWriteThatStartedIt(t *testing.T) {
+	release := make(chan struct{})
+	f := &fakeLoad{secs: []store.UsageSecond{{Second: at(-10 * time.Second), Rows: 3}}, block: release}
+	u := testUsage(t, f, usageBase)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := u.reserve(ctx, "agent", "t", "a", at(time.Second), 1, time.Hour); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first write: err %v, want its own deadline", err)
+	}
+	close(release)
+	u.waitLoaded(t)
+	// Within usageRetry of the first write.
+	if used := mustReserve(t, u, "b", at(2*time.Second), 1, time.Hour); used != 4 {
+		t.Errorf("next write: used %d, want 4: three loaded rows and the first write", used)
+	}
+	if n := f.callCount(); n != 1 {
+		t.Errorf("%d loads, want 1", n)
+	}
+}
+
+// A store that does not answer is cut off by the load's own bound, and that
+// is a failure: the pair waits usageRetry before loading again.
+func TestUsageLoadThatHangsFailsOnItsOwnBound(t *testing.T) {
+	f := &fakeLoad{block: make(chan struct{})} // never closed
+	u := testUsage(t, f, usageBase)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err := u.reserve(ctx, "agent", "t", "a", at(time.Second), 1, time.Hour)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err %v, want the load's deadline", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("the load ran %v; it is bound by stateTimeout, not by the write", elapsed)
+	}
+	if _, err := u.reserve(context.Background(), "agent", "t", "b", at(2*time.Second), 1, time.Hour); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("next write: err %v, want the failed load's", err)
+	}
+	if n := f.callCount(); n != 1 {
+		t.Errorf("%d loads, want 1: the pair waits before loading again", n)
+	}
+}
+
+// Close waits for a load in flight, which its own bound ends, and no load
+// starts after it.
+func TestGateCloseWaitsForALoadAndStartsNoMore(t *testing.T) {
+	g, err := New(&config.Config{MaxInflight: 1}, nil, store.New(nil), nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &fakeLoad{block: make(chan struct{})} // the store hangs
+	var running atomic.Int32
+	g.usage.load = func(ctx context.Context, role, table string, since, before time.Time) ([]store.UsageSecond, error) {
+		running.Add(1)
+		defer running.Add(-1)
+		return f.load(ctx, role, table, since, before)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	g.usage.reserve(ctx, "agent", "t", "a", time.Now(), 1, time.Hour)
+
+	closed := make(chan struct{})
+	go func() {
+		g.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close hangs while a load is in flight")
+	}
+	if n := running.Load(); n != 0 {
+		t.Errorf("Close returned with %d loads still running", n)
+	}
+	after, cancelAfter := context.WithTimeout(context.Background(), time.Second)
+	defer cancelAfter()
+	if _, err := g.usage.reserve(after, "agent", "other", "b", time.Now(), 1, time.Hour); err == nil {
+		t.Error("a write after Close found its usage known, want an error")
+	}
+	if n := f.callCount(); n != 1 {
+		t.Errorf("%d loads, want 1: none starts after Close", n)
+	}
+}
+
+// When the window starts at or after the gate's start, everything in it was
+// reserved here: there is nothing to load, and no load can fail.
+func TestUsageDoesNotLoadAWindowThatStartsAfterTheGate(t *testing.T) {
+	f := &fakeLoad{err: errors.New("down")}
+	u := testUsage(t, f, usageBase)
+	const window = 10 * time.Second
+	// The window of a write at 10.5s starts at 0.5s, in second 0: the gate's.
+	if used := mustReserve(t, u, "a", at(10500*time.Millisecond), 1, window); used != 0 {
+		t.Errorf("first write: used %d, want 0", used)
+	}
+	if used := mustReserve(t, u, "b", at(11*time.Second), 1, window); used != 1 {
+		t.Errorf("second write: used %d, want 1", used)
+	}
+	if n := f.callCount(); n != 0 {
+		t.Errorf("%d loads, want none: nothing from before the gate started is in the window", n)
+	}
+	// A window that starts a moment earlier reaches before the gate: it loads.
+	if _, err := u.reserve(context.Background(), "early", "t", "c", at(9900*time.Millisecond), 1, window); err == nil {
+		t.Error("a window reaching before the gate's start did not load")
+	}
+	if n := f.callCount(); n != 1 {
+		t.Errorf("%d loads, want 1", n)
 	}
 }

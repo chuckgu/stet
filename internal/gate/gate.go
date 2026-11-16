@@ -83,10 +83,10 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, d decide.Decid
 		decider:  d,
 		log:      log,
 		recent:   &recentLog{byRow: map[string][]store.Change{}},
-		usage:    newUsage(st.UsageBySecond),
 		sem:      make(chan struct{}, maxModelCalls),
 		inflight: make(chan struct{}, cfg.MaxInflight),
 	}
+	g.usage = newUsage(st.UsageBySecond, &g.wg)
 	readsOn := map[string]int{}
 	for key, t := range cfg.Tables {
 		g.tables[key] = t.PK
@@ -110,10 +110,13 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, d decide.Decid
 }
 
 // Close writes the reads still held in memory and waits for decisions still
-// being judged. Close the proxy first, and wait for it, so that no session is
-// still reporting: a read reported after Close is only counted in a log line.
+// being judged and for loads of cumulative usage still running; no load
+// starts after it. Close the proxy first, and wait for it, so that no session
+// is still reporting: a read reported after Close is only counted in a log
+// line.
 func (g *Gate) Close() {
 	g.closeReads()
+	g.usage.close()
 	g.wg.Wait()
 }
 
