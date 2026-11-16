@@ -158,6 +158,9 @@ func TestClassifyReads(t *testing.T) {
 		{"explain (analyze off) insert into log select * from contacts", Pass, "", nil},
 		{"explain (analyze 'OFF') insert into log select * from contacts", Pass, "", nil},
 		{"explain (analyze 0) insert into log select * from contacts", Pass, "", nil},
+		// Postgres reads repeated options in order; the last one wins.
+		{"explain (analyze false, analyze) insert into log select * from contacts", Read, "", []string{"contacts"}},
+		{"explain (analyze, analyze false) insert into log select * from contacts", Pass, "", nil},
 		{"create view v as select * from contacts", Pass, "", nil},
 		{"create or replace view v as select * from deals", Pass, "", nil},
 		{"explain select * from deals; select * from contacts", Read, "", []string{"contacts"}},
