@@ -42,8 +42,10 @@ func cursor(n *pg.Node) *Cursor {
 // anywhere in the tree: the FROM of a SELECT (joins and subqueries in it
 // included), the FROM of an UPDATE, the USING of a DELETE, the source of a
 // MERGE, and the table of COPY ... TO. DDL and maintenance statements name
-// tables outside these positions. A statement that holds a query, such as
-// CREATE VIEW, EXPLAIN, or PREPARE, reads what its query reads.
+// tables outside these positions. EXPLAIN [ANALYZE] and CREATE VIEW read
+// nothing. Any other statement that holds a query, such as CREATE TABLE AS,
+// CREATE MATERIALIZED VIEW, or PREPARE, reads what its query reads; the rows
+// a later SQL EXECUTE sends are not counted.
 func readTables(stmts []*pg.RawStmt, m matchFunc) []string {
 	r := reader{m: m}
 	for _, raw := range stmts {
@@ -73,6 +75,10 @@ func (r *reader) visit(msg proto.Message, ctes []string, reading bool) {
 		if reading {
 			r.read(s, ctes)
 		}
+		return
+	case *pg.ExplainStmt, *pg.ViewStmt:
+		// Neither sends the query's rows: EXPLAIN sends plan lines, and
+		// CREATE VIEW only defines the query.
 		return
 	case *pg.SelectStmt:
 		with, from = s.WithClause, "from_clause"

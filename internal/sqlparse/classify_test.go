@@ -137,9 +137,17 @@ func TestClassifyReads(t *testing.T) {
 		{"select * from contacts where exists (with contacts as (select 1) select * from contacts)", Read, "", []string{"contacts"}},
 		{"with contacts as (select 1) update log set n = 1 from contacts", Pass, "", nil},
 
-		// A statement that holds a query reads what the query reads, as a
-		// write held by EXPLAIN ANALYZE or PREPARE counts as a write.
+		// EXPLAIN and CREATE VIEW send none of the table's rows. Statements
+		// that copy the rows elsewhere, or prepare the query, read the table.
+		{"explain select * from contacts", Pass, "", nil},
+		{"explain analyze select * from contacts c join deals d on d.contact_id = c.id", Pass, "", nil},
+		{"explain analyze delete from contacts where id = 1", Unsupported, "nested_write", nil},
+		{"create view v as select * from contacts", Pass, "", nil},
+		{"create or replace view v as select * from deals", Pass, "", nil},
+		{"explain select * from deals; select * from contacts", Read, "", []string{"contacts"}},
 		{"create table t as select * from contacts", Read, "", []string{"contacts"}},
+		{"select * into t from contacts", Read, "", []string{"contacts"}},
+		{"create materialized view mv as select * from deals", Read, "", []string{"deals"}},
 		{"prepare p as select * from deals", Read, "", []string{"deals"}},
 
 		// A statement that writes a gated table keeps its write kind.
