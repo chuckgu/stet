@@ -1,12 +1,25 @@
 package gate_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math"
+	"net/url"
+	"os"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/stetdb/stet/internal/gate"
 )
 
 // impactYAML is tableYAML plus impact limits: at most 3 rows, half the table.
@@ -353,4 +366,488 @@ func TestWithoutImpactLimitsNothingChanges(t *testing.T) {
 		t.Errorf("impact = %v, want NULL for a table without impact limits", r.Impact)
 	}
 	wantNoModel(t, d)
+}
+
+// connectAs opens a client connection through the proxy as another role.
+func (e *env) connectAs(t *testing.T, user, password, agent string) *pgx.Conn {
+	t.Helper()
+	u := url.URL{
+		Scheme: "postgres", Host: e.addr, Path: "/stet_test", User: url.User(user),
+		RawQuery: url.Values{"sslmode": {"disable"}, "application_name": {agent}}.Encode(),
+	}
+	if password != "" {
+		u.User = url.UserPassword(user, password)
+	}
+	conn, err := pgx.Connect(context.Background(), u.String())
+	if err != nil {
+		t.Fatalf("connect as %s: %v", user, err)
+	}
+	t.Cleanup(func() { conn.Close(context.Background()) })
+	return conn
+}
+
+// superuser connects straight to the test database as postgres
+// (password postgres-pw, set by scripts/testdb.sh).
+func superuser(t *testing.T) *pgx.Conn {
+	t.Helper()
+	conn, err := pgx.Connect(context.Background(),
+		"postgres://postgres:postgres-pw@"+os.Getenv("STET_TEST_PG")+"/stet_test?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close(context.Background()) })
+	return conn
+}
+
+// sqlstate is err's SQLSTATE: "" for no error, the error's text for one that
+// did not come from Postgres.
+func sqlstate(err error) string {
+	var pgErr *pgconn.PgError
+	switch {
+	case err == nil:
+		return ""
+	case errors.As(err, &pgErr):
+		return pgErr.Code
+	}
+	return err.Error()
+}
+
+// wantCleanPool checks every connection in the env's pool: none may be left
+// in a transaction or as the client's role by a measurement.
+func (e *env) wantCleanPool(t *testing.T) {
+	t.Helper()
+	e.gate.Close() // judgments hold pooled connections while they record
+	ctx := context.Background()
+	conns := e.pool.AcquireAllIdle(ctx)
+	defer func() {
+		for _, c := range conns {
+			c.Release()
+		}
+	}()
+	if total := e.pool.Stat().TotalConns(); len(conns) == 0 || int32(len(conns)) != total {
+		t.Fatalf("%d of %d pooled connections are idle, want all of at least one", len(conns), total)
+	}
+	for i, c := range conns {
+		if s := c.Conn().PgConn().TxStatus(); s != 'I' {
+			t.Errorf("connection %d: transaction status %q, want idle", i, s)
+		}
+		var user, timeout string
+		if err := c.QueryRow(ctx, "select current_user, current_setting('statement_timeout')").Scan(&user, &timeout); err != nil {
+			t.Fatal(err)
+		}
+		if user != "stet_scram" || timeout != "0" {
+			t.Errorf("connection %d: current_user %s, statement_timeout %s; want stet_scram, 0", i, user, timeout)
+		}
+	}
+}
+
+// lockedBuffer collects log output written from several goroutines.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestImpactCountsWhatTheClientsRoleCanSee(t *testing.T) {
+	d := calm()
+	e := setup(t, d, impactYAML)
+	mustExec(t, superuser(t), "grant stet_md5 to stet_scram") // so Stet can SET ROLE stet_md5
+	e.seedMany(t)
+	mustExec(t, e.admin, "grant all on "+e.table+" to stet_md5")
+	mustExec(t, e.admin, "alter table "+e.table+" enable row level security")
+	mustExec(t, e.admin, "create policy p on "+e.table+" for all to stet_md5 using (company_id = 9)")
+	// All seven rows are active. Counted as the table's owner, the write
+	// would be capped at 4 and held; stet_md5 sees only company 9's two.
+	mustExec(t, e.connectAs(t, "stet_md5", "md5-pw", "tenant-9"),
+		"update "+e.table+" set status = 'x' where status = 'active'")
+
+	r := e.impacts(t, 1)[0]
+	wantVerdict(t, r, "commit")
+	wantImpact(t, r.Impact, map[string]any{"method": "count", "rows": 2.0, "actual_rows": 2.0})
+	wantNoKeys(t, r.Impact, "capped", "error")
+	wantNoModel(t, d)
+	e.wantCleanPool(t)
+}
+
+func TestImpactFailsWhenTheRoleCannotBeAssumed(t *testing.T) {
+	d := calm()
+	e := setup(t, d, impactYAML)
+	var member bool
+	if err := e.admin.QueryRow(context.Background(),
+		"select pg_has_role('stet_scram', 'stet_trust', 'member')").Scan(&member); err != nil || member {
+		t.Fatalf("stet_scram is a member of stet_trust (%v); this test needs it not to be", err)
+	}
+	e.seedMany(t)
+	mustExec(t, e.admin, "grant all on "+e.table+" to stet_trust")
+	mustExec(t, e.connectAs(t, "stet_trust", "", "outsider"),
+		"update "+e.table+" set status = 'x' where company_id = 9")
+
+	r := e.impacts(t, 1)[0]
+	wantVerdict(t, r, "unsupported", "not_single_row")
+	if msg, _ := r.Impact["error"].(string); !strings.Contains(msg, "set role") {
+		t.Errorf("impact.error = %q, want the SET ROLE failure (impact %v)", msg, r.Impact)
+	}
+	wantNoKeys(t, r.Impact, "method")
+	if n := e.rowsWhere(t, "status = 'x'"); n != 2 || !r.Executed {
+		t.Errorf("%d rows changed, executed=%v: the write must go through", n, r.Executed)
+	}
+	wantNoModel(t, d)
+	e.wantCleanPool(t)
+}
+
+func TestImpactWarnsOncePerRoleItCannotAssume(t *testing.T) {
+	e := setup(t, calm(), impactYAML)
+	var logs lockedBuffer
+	gate.SetLogger(e.gate, slog.New(slog.NewJSONHandler(&logs, nil)))
+	e.seedMany(t)
+	mustExec(t, e.admin, "grant all on "+e.table+" to stet_trust")
+	for _, agent := range []string{"first", "second"} {
+		mustExec(t, e.connectAs(t, "stet_trust", "", agent),
+			"update "+e.table+" set status = 'x' where company_id = 9")
+	}
+	e.impacts(t, 2)
+
+	var warnings []map[string]any
+	for line := range strings.Lines(logs.String()) {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatal(err)
+		}
+		if rec["level"] == "WARN" && rec["role"] == "stet_trust" {
+			warnings = append(warnings, rec)
+		}
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("%d warnings for stet_trust, want 1:\n%s", len(warnings), logs.String())
+	}
+	if fix := warnings[0]["fix"]; fix != `GRANT "stet_trust" TO "stet_scram"` {
+		t.Errorf("fix = %v, want the GRANT that lets Stet assume the role", fix)
+	}
+}
+
+func TestImpactNeverCountsThroughAnUnlistedFunction(t *testing.T) {
+	d := calm()
+	e := setup(t, d, looseYAML)
+	e.seedMany(t)
+	mustExec(t, e.admin, "analyze "+e.table)
+	mustExec(t, e.connect(t, "sneaky"), "update "+e.table+
+		" set status = 'x' where set_config('stet.marker', 'ran', false) is not null and company_id = 9")
+
+	r := e.impacts(t, 1)[0]
+	wantVerdict(t, r, "escalate", "impact:uncertain")
+	wantImpact(t, r.Impact, map[string]any{"method": "estimate", "actual_rows": 2.0})
+	wantNoKeys(t, r.Impact, "cap", "capped", "error") // no cap: counting was never tried
+	wantNoModel(t, d)
+}
+
+// A session-level advisory lock outlives the measurement's rollback, so it
+// shows where the predicate ran: on the client's connection, never on Stet's.
+func TestImpactNeverRunsAnUnlistedFunctionOnStetsConnection(t *testing.T) {
+	d := calm()
+	e := setup(t, d, looseYAML)
+	e.seedMany(t)
+	ctx := context.Background()
+	key := time.Now().UnixNano() % math.MaxInt32
+	conn := e.connect(t, "sneaky")
+	var client int32
+	if err := conn.QueryRow(ctx, "select pg_backend_pid()").Scan(&client); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, fmt.Sprintf("update %s set status = 'x' where pg_try_advisory_lock(%d) and company_id = 9", e.table, key))
+
+	r := e.impacts(t, 1)[0]
+	wantImpact(t, r.Impact, map[string]any{"method": "estimate", "actual_rows": 2.0})
+	var holders []int32
+	rows, err := e.admin.Query(ctx,
+		"select pid from pg_locks where locktype = 'advisory' and classid = 0 and objid::bigint = $1 and objsubid = 1", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if holders, err = pgx.CollectRows(rows, pgx.RowTo[int32]); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(holders, []int32{client}) {
+		t.Errorf("advisory lock held by %v, want only the client's backend %d", holders, client)
+	}
+	wantNoModel(t, d)
+}
+
+func TestImpactFallsBackToTheEstimateWhenCountingIsSlow(t *testing.T) {
+	d := calm()
+	e := setup(t, d, looseYAML)
+	defer gate.SetCountTimeout(time.Millisecond)()
+	mustExec(t, e.admin, "insert into "+e.table+" (id, company_id) select g, 1 from generate_series(100, 200100) g")
+	mustExec(t, e.admin, "analyze "+e.table)
+	// No row matches and company_id has no index: counting scans every row.
+	mustExec(t, e.connect(t, "bulk"), "update "+e.table+" set status = 'x' where company_id = 424242")
+
+	r := e.impacts(t, 1)[0]
+	wantVerdict(t, r, "escalate", "impact:uncertain")
+	wantImpact(t, r.Impact, map[string]any{"method": "estimate", "cap": 101.0, "actual_rows": 0.0}) // a cap: counting was tried
+	wantNoKeys(t, r.Impact, "capped", "error")
+	wantNoModel(t, d)
+	e.wantCleanPool(t)
+}
+
+// Stet's connection cannot plan a statement that reads the client's
+// temporary table. The write runs; the measurement fails.
+func TestImpactFailureKeepsTheOldReason(t *testing.T) {
+	d := calm()
+	e := setup(t, d, impactYAML)
+	e.seedMany(t)
+	conn := e.connect(t, "temp-user")
+	mustExec(t, conn, "create temp table tmp_ids (id int)")
+	mustExec(t, conn, "insert into tmp_ids values (9)")
+	mustExec(t, conn, "update "+e.table+" set status = 'x' where company_id in (select id from tmp_ids)")
+
+	r := e.impacts(t, 1)[0]
+	wantVerdict(t, r, "unsupported", "subquery")
+	if msg, _ := r.Impact["error"].(string); !strings.Contains(msg, "tmp_ids") {
+		t.Errorf("impact.error = %q, want the failed estimate (impact %v)", msg, r.Impact)
+	}
+	wantNoKeys(t, r.Impact, "method")
+	wantImpact(t, r.Impact, map[string]any{"actual_rows": 2.0})
+	if !r.Executed {
+		t.Error("executed = false: the write must go through")
+	}
+	wantNoModel(t, d)
+}
+
+// Binary bind values are turned into text on Stet's connection, which
+// cannot see the client's temporary table either. The write is then not
+// measured, and the record says why.
+func TestImpactRecordsWhyBindValuesWereNotRead(t *testing.T) {
+	d := calm()
+	e := setup(t, d, impactYAML)
+	e.seedMany(t)
+	conn := e.connect(t, "temp-user")
+	mustExec(t, conn, "create temp table tmp_ids (id int)")
+	mustExec(t, conn, "insert into tmp_ids values (9)")
+	mustExec(t, conn, "update "+e.table+" set status = 'x' where company_id in (select id from tmp_ids where id = $1)",
+		9) // pgx sends an int as a binary value
+
+	r := e.impacts(t, 1)[0]
+	wantVerdict(t, r, "unsupported", "subquery")
+	if msg, _ := r.Impact["error"].(string); !strings.HasPrefix(msg, "bind values: ") {
+		t.Errorf("impact.error = %q, want why the bind values were not read (impact %v)", msg, r.Impact)
+	}
+	wantNoKeys(t, r.Impact, "method")
+	wantImpact(t, r.Impact, map[string]any{"actual_rows": 2.0})
+	wantNoModel(t, d)
+}
+
+func TestImpactIsRecordedWhenTheWriteFails(t *testing.T) {
+	d := calm()
+	e := setup(t, d, impactYAML)
+	e.seed(t)
+	_, err := e.connect(t, "bulk").Exec(context.Background(),
+		"insert into "+e.table+" (id, name) values (1, 'dup'), (50, 'new')")
+	if code := sqlstate(err); code != "23505" {
+		t.Fatalf("client got %v, want the unique violation 23505", err)
+	}
+
+	r := e.impacts(t, 1)[0]
+	wantVerdict(t, r, "commit")
+	wantImpact(t, r.Impact, map[string]any{"method": "syntax", "rows": 2.0})
+	wantNoKeys(t, r.Impact, "actual_rows")
+	if r.Executed || r.ExecError == nil || !strings.Contains(*r.ExecError, "23505") {
+		t.Errorf("executed=%v exec_error=%v, want the unique violation", r.Executed, r.ExecError)
+	}
+	wantNoModel(t, d)
+}
+
+func TestImpactMeasuresConcurrentWrites(t *testing.T) {
+	d := calm()
+	e := setup(t, d, impactYAML)
+	e.seedMany(t)
+	const n = 8
+	conns := make([]*pgx.Conn, n)
+	for i := range conns {
+		conns[i] = e.connect(t, fmt.Sprintf("worker-%d", i))
+	}
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i, c := range conns {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, errs[i] = c.Exec(context.Background(), "update "+e.table+" set title = $1 where company_id = 9", fmt.Sprint("title-", i))
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("worker %d: %v", i, err)
+		}
+	}
+
+	rs := e.impacts(t, n)
+	if len(rs) != n {
+		t.Fatalf("%d decisions, want %d", len(rs), n)
+	}
+	for _, r := range rs {
+		wantVerdict(t, r, "commit")
+		wantImpact(t, r.Impact, map[string]any{"method": "count", "rows": 2.0, "actual_rows": 2.0})
+	}
+	wantNoModel(t, d)
+}
+
+func TestImpactCountsThroughAliasOnlyAndSchema(t *testing.T) {
+	d := calm()
+	e := setup(t, d, impactYAML)
+	e.seedMany(t)
+	// $1 goes unused in the count; pgx sends $2 as binary and $3 as text.
+	if _, err := e.connect(t, "bulk").Exec(context.Background(),
+		"update only public."+e.table+" as c set title = $1 where c.company_id = $2 and c.status = $3",
+		"CTO", 9, "active"); err != nil {
+		t.Fatal(err)
+	}
+
+	r := e.impacts(t, 1)[0]
+	wantVerdict(t, r, "commit")
+	wantImpact(t, r.Impact, map[string]any{"method": "count", "rows": 2.0, "actual_rows": 2.0})
+	wantNoModel(t, d)
+}
+
+// The estimate covers shapes counting cannot. A write to another table
+// inside WITH is planned as an InitPlan and not added to the rows.
+func TestImpactEstimatesWhatItCannotCount(t *testing.T) {
+	d := calm()
+	e := setup(t, d, looseYAML)
+	e.seedMany(t)
+	other := e.table + "_other"
+	mustExec(t, e.admin, "create table "+other+" (id int)")
+	t.Cleanup(func() { e.admin.Exec(context.Background(), "drop table "+other) })
+	mustExec(t, e.admin, "insert into "+other+" select g from generate_series(1, 1000) g")
+	mustExec(t, e.admin, "analyze "+e.table)
+	mustExec(t, e.admin, "analyze "+other)
+	conn := e.connect(t, "bulk")
+	for _, sql := range []string{
+		"update %[1]s set title = 'x' from (values (9)) v(id) where %[1]s.company_id = v.id",
+		"with d as (delete from %[2]s returning id) update %[1]s set status = 'x' where company_id = 9",
+		"insert into %[1]s (id, name) select id + 100, name from %[1]s where company_id = 9",
+	} {
+		mustExec(t, conn, fmt.Sprintf(sql, e.table, other))
+	}
+
+	rs := e.impacts(t, 3)
+	for _, r := range rs {
+		wantVerdict(t, r, "escalate", "impact:uncertain")
+		wantImpact(t, r.Impact, map[string]any{"method": "estimate", "actual_rows": 2.0})
+	}
+	// Analyzed, company 9 is two of seven rows; the CTE's 1000 are not added.
+	wantImpact(t, rs[1].Impact, map[string]any{"rows": 2.0})
+	wantNoModel(t, d)
+}
+
+// A function marked immutable runs while the statement is planned, so the
+// estimate can run it on Stet's connection (spec 4). The read-only
+// transaction stops what it writes.
+func TestImpactMeasuresInAReadOnlyTransaction(t *testing.T) {
+	d := calm()
+	e := setup(t, d, looseYAML)
+	e.seedMany(t)
+	sink, write, folded := e.table+"_sink", e.table+"_write", e.table+"_folded"
+	mustExec(t, e.admin, "create table "+sink+" (n int)")
+	mustExec(t, e.admin, "create function "+write+"() returns int language plpgsql as $$ begin insert into "+sink+" values (1); return 1; end $$")
+	mustExec(t, e.admin, "create function "+folded+"() returns int language plpgsql immutable as $$ begin return "+write+"(); end $$")
+	t.Cleanup(func() {
+		e.admin.Exec(context.Background(), "drop function "+folded+"(); drop function "+write+"(); drop table "+sink)
+	})
+	mustExec(t, e.connect(t, "sneaky"), "update "+e.table+" set status = 'x' where company_id = 9 and "+folded+"() = 1")
+
+	r := e.impacts(t, 1)[0]
+	wantVerdict(t, r, "unsupported", "not_single_row")
+	if msg, _ := r.Impact["error"].(string); !strings.Contains(msg, "read-only transaction") {
+		t.Errorf("impact.error = %q, want the write refused as read-only (impact %v)", msg, r.Impact)
+	}
+	wantImpact(t, r.Impact, map[string]any{"actual_rows": 2.0})
+	if n := e.rowsWhere(t, "status = 'x'"); n != 2 || !r.Executed {
+		t.Errorf("%d rows changed, executed=%v: the write must go through", n, r.Executed)
+	}
+	var logged int
+	if err := e.admin.QueryRow(context.Background(), "select count(*) from "+sink).Scan(&logged); err != nil || logged != 1 {
+		t.Errorf("%d rows logged (%v), want 1: the client's own planning", logged, err)
+	}
+	wantNoModel(t, d)
+}
+
+// twinStatements are sent to the gated table through the proxy and to its
+// twin directly. %[1]s is the table.
+var twinStatements = []string{
+	"update %[1]s set status = 'x' where company_id = 3",
+	"delete from %[1]s where company_id = 424242",
+	"insert into %[1]s (id, name) values (1, 'dup'), (60, 'new')",
+	"update %[1]s set title = 'y' where company_id in (select 9)",
+	"insert into %[1]s (id, name) select id + 100, name from %[1]s where company_id = 9",
+	"delete from %[1]s",
+}
+
+// Shadow mode must not change a write (rule 6): each statement gets the same
+// command tag or error, and leaves the same rows, through Stet as without it.
+func TestWritesBehaveTheSameWithImpactOn(t *testing.T) {
+	protocols := map[string]func(context.Context, *pgx.Conn, string) (pgconn.CommandTag, error){
+		"simple": func(ctx context.Context, c *pgx.Conn, sql string) (pgconn.CommandTag, error) {
+			return c.Exec(ctx, sql) // no arguments: pgx sends a Simple Query
+		},
+		"extended": func(ctx context.Context, c *pgx.Conn, sql string) (pgconn.CommandTag, error) {
+			r := c.PgConn().ExecParams(ctx, sql, nil, nil, nil, nil).Read()
+			return r.CommandTag, r.Err
+		},
+	}
+	for name, run := range protocols {
+		t.Run(name, func(t *testing.T) {
+			e := setup(t, calm(), impactYAML)
+			e.seedMany(t)
+			twin := e.table + "_twin"
+			mustExec(t, e.admin, "create table "+twin+" (like "+e.table+" including all)")
+			t.Cleanup(func() { e.admin.Exec(context.Background(), "drop table "+twin) })
+			mustExec(t, e.admin, "insert into "+twin+" select * from "+e.table)
+			client := e.connect(t, "twin")
+			ctx := context.Background()
+
+			for i, s := range twinStatements {
+				tag, err := run(ctx, client, fmt.Sprintf(s, e.table))
+				wantTag, wantErr := run(ctx, e.admin, fmt.Sprintf(s, twin))
+				if tag.String() != wantTag.String() || sqlstate(err) != sqlstate(wantErr) {
+					t.Errorf("statement %d: %q %q through Stet, %q %q directly",
+						i, tag, sqlstate(err), wantTag, sqlstate(wantErr))
+				}
+				if got, want := e.contents(t, e.table), e.contents(t, twin); !reflect.DeepEqual(got, want) {
+					t.Errorf("statement %d: rows differ\nthrough Stet %v\ndirectly     %v", i, got, want)
+				}
+			}
+			// Every statement was measured, so the comparison covers measuring.
+			for i, r := range e.impacts(t, len(twinStatements)) {
+				if r.Impact == nil {
+					t.Errorf("statement %d was not measured", i)
+				}
+			}
+		})
+	}
+}
+
+// contents is every row of table, by id.
+func (e *env) contents(t *testing.T, table string) [][]any {
+	t.Helper()
+	rows, err := e.admin.Query(context.Background(), "select * from "+table+" order by id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) ([]any, error) { return r.Values() })
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
 }

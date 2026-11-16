@@ -17,9 +17,14 @@ import (
 	"github.com/stetdb/stet/internal/sqlparse"
 )
 
-// countTimeout is the statement_timeout of a measurement's queries. A count
-// that runs past it falls back to the planner's estimate (spec 4).
-var countTimeout = 200 * time.Millisecond // a var so tests can shorten it (Task 7)
+// queryTimeout is the statement_timeout of a measurement's queries other
+// than the count: the prepare, the catalog reads and EXPLAIN.
+const queryTimeout = 200 * time.Millisecond
+
+// countTimeout is the statement_timeout of the count. A count that runs past
+// it falls back to the planner's estimate (spec 4). A var so tests can
+// shorten it; while it equals queryTimeout, no extra SET is sent.
+var countTimeout = queryTimeout
 
 // rollbackTimeout bounds the rollback that ends every measurement. It has its
 // own context because the measurement's may already have expired.
@@ -79,8 +84,12 @@ func (g *Gate) queryImpact(ctx context.Context, p *pending, m *sqlparse.Measure,
 	}()
 
 	begin := fmt.Sprintf("begin read only; set local role %s; set local statement_timeout = '%dms'",
-		pgx.Identifier{p.session.User}.Sanitize(), max(countTimeout.Milliseconds(), 1))
+		pgx.Identifier{p.session.User}.Sanitize(), queryTimeout.Milliseconds())
 	if err := pg.Exec(ctx, begin).Close(); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "42501" { // not a member of the role
+			g.warnRole(p.session.User)
+		}
 		// Never retried without the role.
 		return fmt.Errorf("set role: %w", err)
 	}
@@ -141,6 +150,11 @@ func (g *Gate) queryImpact(ctx context.Context, p *pending, m *sqlparse.Measure,
 		im.Method, im.Rows = string(sqlparse.MethodEstimate), &est
 		return nil
 	}
+	if ct := countTimeout; ct != queryTimeout {
+		if err := pg.Exec(ctx, fmt.Sprintf("set local statement_timeout = '%dms'", max(ct.Milliseconds(), 1))).Close(); err != nil {
+			return fmt.Errorf("count timeout: %w", err)
+		}
+	}
 	limit := lim.MaxRows + 1
 	im.Cap = limit
 	rows, err = rowsOf(ctx, pg, fmt.Sprintf("select count(*) from (%s limit %d) s", m.CountSQL, limit), values, oids)
@@ -163,6 +177,17 @@ func (g *Gate) queryImpact(ctx context.Context, p *pending, m *sqlparse.Measure,
 	}
 	im.Method, im.Rows = string(sqlparse.MethodCount), &n
 	return nil
+}
+
+// warnRole logs, once per role, that Stet's account cannot assume a client's
+// role, so that role's multi-row writes are recorded as not measured.
+func (g *Gate) warnRole(role string) {
+	if _, seen := g.warnedRoles.LoadOrStore(role, true); seen {
+		return
+	}
+	g.log.Warn("impact not measured: Stet's account is not a member of the client's role",
+		"role", role,
+		"fix", "GRANT "+pgx.Identifier{role}.Sanitize()+" TO "+pgx.Identifier{g.pool.Config().ConnConfig.User}.Sanitize())
 }
 
 // estimate returns the planner's row estimate for the statement, from

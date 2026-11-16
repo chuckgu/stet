@@ -53,6 +53,8 @@ type Gate struct {
 	recent  *recentLog
 	sem     chan struct{}
 	wg      sync.WaitGroup
+
+	warnedRoles sync.Map // client roles Stet could not assume, logged once each
 }
 
 type named struct {
@@ -205,8 +207,13 @@ func (g *Gate) judge(p *pending, o proxy.Outcome) {
 	case o.InTransaction:
 		in.Unsupported = "in_transaction"
 	case p.res.Kind == sqlparse.Measured:
-		if p.impact == nil { // skipped in Begin but the write turned out not to be in a transaction
+		if p.impact == nil {
+			// Skipped in Begin: the bind values could not be read, or the
+			// write looked to be in a transaction and turned out not to be.
 			p.impact = &decide.Impact{Error: "not measured"}
+			if p.stateErr != nil {
+				p.impact.Error = p.stateErr.Error()
+			}
 		}
 		in.Op, in.ShapeReason, in.Impact, in.ImpactLimit = p.res.Op, p.res.Reason, p.impact, t.Impact
 	case p.stateErr != nil:
