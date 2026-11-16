@@ -17,9 +17,11 @@ import (
 type Gate interface {
 	// Inspect classifies the SQL of a Query or Parse message.
 	Inspect(sql string) Statement
-	// Begin runs just before a watched statement goes upstream: the last
-	// moment its pre-write state is visible. The client waits for it.
-	Begin(s SessionInfo, st Statement, params []Param) any
+	// Begin runs just before a watched statement goes upstream, and the client
+	// waits for it. When refuse is not nil the statement is not sent: the proxy
+	// sends a message of the same kind that the server rejects, and gives the
+	// client refuse in place of the server's error. End is still called.
+	Begin(s SessionInfo, st Statement, params []Param) (handle any, refuse *Refusal)
 	// End reports how upstream answered. It must not block.
 	End(handle any, o Outcome)
 	// Observe reports a read after its response ended, or when the connection
@@ -79,7 +81,8 @@ type Outcome struct {
 	Executed bool
 	// Error holds the SQLSTATE and message when the statement failed or was
 	// skipped because an earlier one in the same Sync failed, or, when Lost,
-	// says the connection closed first.
+	// says the connection closed first. A refused statement's is the
+	// refusal's.
 	Error string
 	// InTransaction means the statement ran inside an explicit transaction,
 	// or next to other statements under one Sync (an implicit transaction).
@@ -90,7 +93,8 @@ type Outcome struct {
 	// Lost means the connection ended before the server's ReadyForQuery for
 	// the statement. It may have run and committed. A watched write whose
 	// completion the server had already sent is Executed, with its Rows;
-	// otherwise Executed is false because nothing said it ran.
+	// otherwise Executed is false because nothing said it ran. A refused
+	// statement is never Lost: it was not sent.
 	Lost bool
 	// Sent is how many row messages (DataRow, CopyData) went to the client in
 	// answer to the statement, also when it failed or was cancelled. Set only
@@ -105,6 +109,12 @@ type Outcome struct {
 	// Arrived is when the proxy read the statement from the client. Set only
 	// for Observe.
 	Arrived time.Time
+	// Refused means the statement was not sent: the gate's Begin refused it.
+	Refused bool
+	// Undelivered, set only with Refused, means the client was not given the
+	// refusal: an earlier message under the same Sync failed first, or the
+	// connection ended before the unit's ReadyForQuery.
+	Undelivered bool
 }
 
 // session follows one client connection closely enough to tell the gate
@@ -184,6 +194,10 @@ type unit struct {
 	msgs   int // P, B, D, C and E messages so far; a message's pos is its 1-based count
 	acks   int // how many of them the server completed so far; final at the unit's ReadyForQuery
 	errPos int // pos of the message the unit's error answers; 0 when it has none, msgs+1 when it came at the Sync (a deferred constraint, say)
+
+	// refused lists the messages of the unit that were not sent, in the order
+	// they arrived (see refuse).
+	refused []refusal
 }
 
 type watchedWrite struct {
@@ -192,6 +206,10 @@ type watchedWrite struct {
 	// several: a Query of several statements, whose completions do not say
 	// which statement ran
 	several bool
+	// refused: the gate refused it, and the message at pos of the unit (0 for
+	// a Query) was replaced (see refuse)
+	refused bool
+	pos     int
 }
 
 type observedRead struct {
@@ -235,7 +253,9 @@ func (s *session) serverTap() *tap {
 			}
 			return false
 		},
-		see: func(t byte, body []byte, _ func() error) { s.fromServer(t, body) },
+		see: func(t byte, body []byte, _ func() error) ([]byte, error) {
+			return s.fromServer(t, body), nil
+		},
 		each: func(t byte) {
 			switch t {
 			case 'D', 'd': // DataRow, CopyData
@@ -257,29 +277,18 @@ func (s *session) ack() {
 	s.mu.Unlock()
 }
 
-func (s *session) fromClient(t byte, body []byte, flush func() error) {
+// fromClient follows a message from the client before it is forwarded, and
+// returns the message to send in its place when the gate refused it.
+func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, error) {
 	switch t {
 	case 'Q':
 		u := s.push(&unit{closed: true, query: true})
 		var m pgproto3.Query
 		if body == nil || m.Decode(body) != nil {
 			s.markDirty(u) // it may hold anything
-			return
+			return nil, nil
 		}
-		st := s.gate.Inspect(m.String)
-		s.apply(st)
-		switch {
-		case st.Watch:
-			s.begin(u, 0, st, nil, flush)
-			if len(st.Cursors) > 0 { // a write among cursor statements
-				s.applyCursors(u, 0, st)
-			}
-		case len(st.Cursors) > 0:
-			s.applyCursors(u, 0, st)
-		case st.Observe:
-			s.observe(u, 0, st, nil)
-		}
-		s.dirties(u, st)
+		return s.statement(u, 0, 0, 'Q', s.gate.Inspect(m.String), nil, nil, flush), nil
 
 	case 'P':
 		var m pgproto3.Parse
@@ -327,7 +336,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 		var m pgproto3.Execute
 		read := body != nil && m.Decode(body) == nil
 		s.mu.Lock()
-		u, _ := s.count()
+		u, pos := s.count()
 		u.executes++
 		idx := u.executes
 		var b bound
@@ -339,21 +348,9 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 		if !ok || b.unread {
 			// It may run anything, or a statement Stet does not follow.
 			s.markDirty(u)
-			return
+			return nil, nil
 		}
-		s.apply(b.st)
-		switch {
-		case b.st.Watch:
-			s.begin(u, idx, b.st, b.params, flush)
-			if len(b.st.Cursors) > 0 {
-				s.applyCursors(u, idx, b.st)
-			}
-		case len(b.st.Cursors) > 0:
-			s.applyCursors(u, idx, b.st)
-		case b.st.Observe:
-			s.observe(u, idx, b.st, b.rows)
-		}
-		s.dirties(u, b.st)
+		return s.statement(u, idx, pos, 'E', b.st, b.params, b.rows, flush), nil
 
 	case 'C':
 		var m pgproto3.Close
@@ -391,6 +388,33 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 	case 'F':
 		s.push(&unit{closed: true, dirty: true}) // the function may change anything
 	}
+	return nil, nil
+}
+
+// statement follows st, arriving as a Query (idx and pos 0) or as Execute idx
+// at pos of u, with the bind values ps and the running row count rows of its
+// portal. It returns the message to send in its place when the gate refused
+// it, and nil to forward it.
+//
+// A refused statement never runs, so it leaves on_behalf_of and the cursor
+// table as they were. It still marks u: its replacement was sent and fails,
+// and the server's answer settles the rest.
+func (s *session) statement(u *unit, idx, pos int, t byte, st Statement, ps []Param, rows *int64, flush func() error) []byte {
+	if st.Watch {
+		if r := s.begin(u, idx, pos, t, st, ps, flush); r != nil {
+			s.dirties(u, st)
+			return r
+		}
+	}
+	s.apply(st)
+	switch {
+	case len(st.Cursors) > 0: // for a watched write too: a write among cursor statements
+		s.applyCursors(u, idx, st)
+	case st.Observe && !st.Watch:
+		s.observe(u, idx, st, rows)
+	}
+	s.dirties(u, st)
+	return nil
 }
 
 func (s *session) apply(st Statement) {
@@ -438,17 +462,29 @@ func (s *session) txDirty() bool {
 	return false
 }
 
-// begin hands a watched write to the gate. Messages already queued go out
-// first so they are not held back while the gate reads state.
-func (s *session) begin(u *unit, idx int, st Statement, ps []Param, flush func() error) {
+// begin hands a watched write, arriving as message t at pos of u (see
+// statement), to the gate. Messages already queued go out first so they are
+// not held back while the gate reads state. When the gate refuses the write,
+// begin returns the message to send in its place.
+func (s *session) begin(u *unit, idx, pos int, t byte, st Statement, ps []Param, flush func() error) []byte {
 	flush()
 	s.mu.Lock()
 	info := s.identity()
 	s.mu.Unlock()
-	h := s.gate.Begin(info, st, ps)
+	if st.OnBehalfOf != nil {
+		info.OnBehalfOf = *st.OnBehalfOf // a SET in the write's own message counts for it
+	}
+	h, refuse := s.gate.Begin(info, st, ps)
+	w := watchedWrite{handle: h, idx: idx, several: st.Several}
+	var r []byte
+	if refuse != nil {
+		r = s.refuse(u, pos, t, "", *refuse)
+		w.refused, w.pos = true, pos
+	}
 	s.mu.Lock()
-	u.writes = append(u.writes, watchedWrite{handle: h, idx: idx, several: st.Several})
+	u.writes = append(u.writes, w)
 	s.mu.Unlock()
+	return r
 }
 
 // observe notes a read in its unit. Nothing waits for the gate and nothing
@@ -538,7 +574,10 @@ func binding(m *pgproto3.Bind, p prepared, ok bool, others []prepared) bound {
 	return b
 }
 
-func (s *session) fromServer(t byte, body []byte) {
+// fromServer follows a message from the server before it is forwarded, and
+// returns the message to send in its place: the refusal, for the error that
+// answers a refused message's replacement.
+func (s *session) fromServer(t byte, body []byte) []byte {
 	s.mu.Lock()
 	var head *unit
 	if len(s.units) > 0 {
@@ -569,6 +608,15 @@ func (s *session) fromServer(t byte, body []byte) {
 			if !head.query {
 				head.errPos = head.acks + 1
 			}
+			if len(head.refused) > 0 {
+				if rf := head.replaced(body); rf != nil {
+					rf.given = true
+					head.err = rf.text() // what the client got, for the statements it hid
+					r := rf.r
+					s.mu.Unlock()
+					return refusalError(r)
+				}
+			}
 		}
 	case 'Z':
 		s.settle(head) // normally nothing is left; never carry rows into the next unit
@@ -586,7 +634,7 @@ func (s *session) fromServer(t byte, body []byte) {
 		if !s.ready {
 			s.ready = true
 			s.mu.Unlock()
-			return
+			return nil
 		}
 		if head != nil {
 			s.units = s.units[1:]
@@ -598,7 +646,7 @@ func (s *session) fromServer(t byte, body []byte) {
 		}
 		if head == nil {
 			s.mu.Unlock()
-			return
+			return nil
 		}
 		if status != 'I' {
 			s.carry(head)
@@ -609,9 +657,10 @@ func (s *session) fromServer(t byte, body []byte) {
 		head.tally()
 		s.mu.Unlock()
 		s.finish(head, before, status)
-		return
+		return nil
 	}
 	s.mu.Unlock()
+	return nil
 }
 
 // settle moves the row messages sent since the last completion or error to
@@ -655,6 +704,10 @@ func (u *unit) tally() {
 func (s *session) finish(u *unit, before, after byte) {
 	inTx := before != 'I' || after != 'I' || u.executes > 1
 	for _, w := range u.writes {
+		if w.refused {
+			s.gate.End(w.handle, u.refusedWrite(w, inTx, true))
+			continue
+		}
 		s.gate.End(w.handle, u.answered(w.idx, inTx))
 	}
 	for _, r := range u.reads {
@@ -745,6 +798,10 @@ func (s *session) abandon() {
 		u.tally()
 		inTx := status != 'I' || u.executes > 1
 		for _, w := range u.writes {
+			if w.refused {
+				s.gate.End(w.handle, u.refusedWrite(w, inTx, false))
+				continue
+			}
 			s.gate.End(w.handle, u.unansweredWrite(w, inTx))
 		}
 		for _, r := range u.reads {

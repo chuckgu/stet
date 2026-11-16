@@ -268,7 +268,11 @@ func relay(client, server net.Conn, fromClient, fromServer *tap) {
 // read; it runs once per result row, so it must stay trivial.
 type tap struct {
 	want func(t byte) bool
-	see  func(t byte, body []byte, flush func() error)
+	// see may return one whole message (type, length, body) to send in
+	// place of the one it was shown; nil forwards it unchanged. For a message
+	// past maxInspect a replacement makes pump read and discard the body. A
+	// non-nil err ends the pump.
+	see  func(t byte, body []byte, flush func() error) (replace []byte, err error)
 	each func(t byte)
 }
 
@@ -302,9 +306,9 @@ func pump(dst io.Writer, src io.Reader, tp *tap) error {
 			tp.each(hdr[0])
 		}
 		if tp != nil && tp.want(hdr[0]) {
-			if size > maxInspect {
-				tp.see(hdr[0], nil, bw.Flush)
-			} else {
+			read := size <= maxInspect // past it, see is shown no body
+			var shown []byte
+			if read {
 				if int64(cap(body)) < size {
 					body = make([]byte, size)
 				}
@@ -312,7 +316,24 @@ func pump(dst io.Writer, src io.Reader, tp *tap) error {
 				if _, err := io.ReadFull(br, body); err != nil {
 					return err
 				}
-				tp.see(hdr[0], body, bw.Flush)
+				shown = body
+			}
+			replace, err := tp.see(hdr[0], shown, bw.Flush)
+			if err != nil {
+				return err
+			}
+			switch {
+			case replace != nil:
+				if !read {
+					if _, err := io.CopyN(io.Discard, br, size); err != nil {
+						return err
+					}
+				}
+				if _, err := bw.Write(replace); err != nil {
+					return err
+				}
+				continue
+			case read:
 				if _, err := bw.Write(hdr[:]); err != nil {
 					return err
 				}
@@ -321,6 +342,7 @@ func pump(dst io.Writer, src io.Reader, tp *tap) error {
 				}
 				continue
 			}
+			// Past maxInspect and not replaced: streamed below.
 		}
 		if _, err := bw.Write(hdr[:]); err != nil {
 			return err

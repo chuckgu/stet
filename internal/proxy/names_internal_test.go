@@ -21,7 +21,7 @@ func (g *stmtGate) Inspect(sql string) Statement {
 	return Statement{SQL: sql, Watch: strings.Contains(sql, "insert")}
 }
 
-func (g *stmtGate) Begin(info SessionInfo, st Statement, ps []Param) any {
+func (g *stmtGate) Begin(info SessionInfo, st Statement, ps []Param) (any, *Refusal) {
 	g.begun = append(g.begun, st.SQL)
 	return g.fakeGate.Begin(info, st, ps)
 }

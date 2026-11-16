@@ -163,7 +163,7 @@ type pending struct {
 	added        time.Duration // time the client waited on Begin
 }
 
-func (g *Gate) Begin(s proxy.SessionInfo, st proxy.Statement, ps []proxy.Param) any {
+func (g *Gate) Begin(s proxy.SessionInfo, st proxy.Statement, ps []proxy.Param) (any, *proxy.Refusal) {
 	start := time.Now()
 	p := &pending{id: store.NewID(), at: start, session: s, sql: st.SQL, res: st.Data.(sqlparse.Result)}
 	for _, x := range ps {
@@ -195,7 +195,7 @@ func (g *Gate) Begin(s proxy.SessionInfo, st proxy.Statement, ps []proxy.Param) 
 		g.reserve(ctx, p, lim.Cumulative)
 	}
 	p.added = time.Since(start)
-	return p
+	return p, nil
 }
 
 // reserve counts the write toward its login role's cumulative limit before it

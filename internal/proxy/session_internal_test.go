@@ -8,18 +8,20 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
-// fakeGate watches every statement and records each End.
+// fakeGate watches every statement and records each End. While refusal is
+// set, Begin refuses every write with it.
 type fakeGate struct {
-	n    int
-	ends map[int]Outcome
+	n       int
+	ends    map[int]Outcome
+	refusal *Refusal
 }
 
 func newFakeGate() *fakeGate { return &fakeGate{ends: map[int]Outcome{}} }
 
 func (g *fakeGate) Inspect(sql string) Statement { return Statement{SQL: sql, Watch: true} }
-func (g *fakeGate) Begin(SessionInfo, Statement, []Param) any {
+func (g *fakeGate) Begin(SessionInfo, Statement, []Param) (any, *Refusal) {
 	g.n++
-	return g.n - 1
+	return g.n - 1, g.refusal
 }
 func (g *fakeGate) End(h any, o Outcome)                    { g.ends[h.(int)] = o }
 func (g *fakeGate) Observe(SessionInfo, Statement, Outcome) {}
@@ -147,7 +149,7 @@ func (g *txGate) Inspect(sql string) Statement {
 	return st
 }
 
-func (g *txGate) Begin(info SessionInfo, st Statement, ps []Param) any {
+func (g *txGate) Begin(info SessionInfo, st Statement, ps []Param) (any, *Refusal) {
 	g.infos = append(g.infos, info)
 	return g.fakeGate.Begin(info, st, ps)
 }

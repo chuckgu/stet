@@ -3,6 +3,7 @@ package proxy_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -30,11 +31,15 @@ type recordingGate struct {
 	onBegin func(st proxy.Statement) // runs inside Begin, before the write is forwarded
 	// observeMatch chooses the statements observed as reads; nil observes none.
 	observeMatch func(sql string) bool
+	// refuse, when set, is asked inside Begin whether to refuse the write; nil
+	// from it sends the write as before.
+	refuse func(st proxy.Statement) *proxy.Refusal
 
 	mu       sync.Mutex
 	inspects int // Inspect calls
 	begins   []began
 	ends     map[int]proxy.Outcome
+	endCalls int // End calls, to tell a second End for one write from the first
 	reads    []observation
 }
 
@@ -104,20 +109,25 @@ func cursorOf(sql string) (*proxy.Cursor, string) {
 	return nil, ""
 }
 
-func (g *recordingGate) Begin(info proxy.SessionInfo, st proxy.Statement, params []proxy.Param) any {
+func (g *recordingGate) Begin(info proxy.SessionInfo, st proxy.Statement, params []proxy.Param) (any, *proxy.Refusal) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.onBegin != nil {
 		g.onBegin(st)
 	}
 	g.begins = append(g.begins, began{info, st, params})
-	return len(g.begins) - 1
+	var r *proxy.Refusal
+	if g.refuse != nil {
+		r = g.refuse(st)
+	}
+	return len(g.begins) - 1, r
 }
 
 func (g *recordingGate) End(h any, o proxy.Outcome) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.ends[h.(int)] = o
+	g.endCalls++
 }
 
 func (g *recordingGate) Observe(info proxy.SessionInfo, st proxy.Statement, o proxy.Outcome) {
@@ -1574,4 +1584,413 @@ func TestGateJudgesTheStatementTheServerHolds(t *testing.T) {
 	if n := rows(); n != 2 {
 		t.Errorf("%d rows after the skipped Close, want 2", n)
 	}
+}
+
+// held is the refusal the test gates give: an ST001 with every field set.
+var held = proxy.Refusal{Code: "ST001", Message: "held", Detail: "d", Hint: "h"}
+
+// refuseAll refuses every watched write.
+func refuseAll(proxy.Statement) *proxy.Refusal {
+	r := held
+	return &r
+}
+
+// refuseMarked refuses the watched writes whose SQL holds the value 'held'.
+func refuseMarked(st proxy.Statement) *proxy.Refusal {
+	if strings.Contains(st.SQL, "'held'") {
+		return refuseAll(st)
+	}
+	return nil
+}
+
+// wantHeld fails the test unless err is the refusal held as the client got
+// it: severity ERROR and held's fields, nothing of the server's own error.
+func wantHeld(t *testing.T, err error) {
+	t.Helper()
+	var e *pgconn.PgError
+	if !errors.As(err, &e) {
+		t.Fatalf("error %v, want the gate's refusal", err)
+	}
+	want := pgconn.PgError{Severity: "ERROR", SeverityUnlocalized: "ERROR", Code: "ST001", Message: "held", Detail: "d", Hint: "h"}
+	if *e != want {
+		t.Errorf("client got %+v, want %+v", *e, want)
+	}
+}
+
+// rowCount counts the rows of table on a direct connection.
+func rowCount(t *testing.T, table string) int {
+	t.Helper()
+	admin := connect(t, upstream(t), "stet_scram", nil)
+	var n int
+	if err := admin.QueryRow(testCtx(t), "select count(*) from "+table).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// wantRefused fails the test unless o is the outcome of a write the gate
+// refused, delivered to the client or not as undelivered says.
+func wantRefused(t *testing.T, o proxy.Outcome, undelivered bool) {
+	t.Helper()
+	if !o.Refused || o.Undelivered != undelivered || o.Executed || o.Lost || o.Rows != nil {
+		t.Errorf("outcome %+v, want refused, undelivered %v, not executed", o, undelivered)
+	}
+}
+
+// rawAgent opens a raw session through addr as stet_trust, after granting it
+// insert on table (dropped with the table).
+func rawAgent(t *testing.T, addr, table string) *pgproto3.Frontend {
+	t.Helper()
+	admin := connect(t, upstream(t), "stet_scram", nil)
+	mustExec(t, admin, "grant insert on "+table+" to stet_trust")
+	return rawSession(t, addr, "stet_trust", pgproto3.ProtocolVersionNumber)
+}
+
+// unnamed is a Parse, Bind and Execute of sql on the unnamed statement and
+// portal.
+func unnamed(sql string, params ...string) []pgproto3.FrontendMessage {
+	var ps [][]byte
+	for _, p := range params {
+		ps = append(ps, []byte(p))
+	}
+	return []pgproto3.FrontendMessage{&pgproto3.Parse{Query: sql}, &pgproto3.Bind{Parameters: ps}, &pgproto3.Execute{}}
+}
+
+// sendAll sends msgs in one write.
+func sendAll(t *testing.T, fe *pgproto3.Frontend, msgs ...pgproto3.FrontendMessage) {
+	t.Helper()
+	for _, m := range msgs {
+		fe.Send(m)
+	}
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRefusedQueryGetsTheGatesError(t *testing.T) {
+	table := watchedTable(t)
+	g := newRecordingGate(watches(table))
+	g.refuse = refuseAll
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+	ctx := testCtx(t)
+
+	_, err := conn.PgConn().Exec(ctx, "insert into "+table+" values (1, 'x')").ReadAll()
+	wantHeld(t, err)
+	mustExec(t, conn, "select 1")
+	if n := rowCount(t, table); n != 0 {
+		t.Errorf("%d rows, want the table as it was", n)
+	}
+	_, os := g.outcomes(t, 1)
+	wantRefused(t, os[0], false)
+	if os[0].InTransaction {
+		t.Errorf("outcome %+v, want outside a transaction", os[0])
+	}
+}
+
+// Queries sent in one write are answered one by one, the refused one with
+// the gate's error in the server's place (spec 16).
+func TestRefusedQueryAmongPipelinedQueries(t *testing.T) {
+	table := watchedTable(t)
+	g := newRecordingGate(watches(table))
+	g.refuse = refuseMarked
+	addr, _ := startProxy(t, upstream(t), g)
+	fe := rawAgent(t, addr, table)
+
+	sendAll(t, fe,
+		&pgproto3.Query{String: "insert into " + table + " values (1, 'x')"},
+		&pgproto3.Query{String: "insert into " + table + " values (2, 'held')"},
+		&pgproto3.Query{String: "select 1"})
+	for _, want := range []string{"C Z", "E:ST001 Z", "T D C Z"} {
+		if got := replies(t, fe); got != want {
+			t.Errorf("replies %q, want %q", got, want)
+		}
+	}
+	if n := rowCount(t, table); n != 1 {
+		t.Errorf("%d rows, want the one insert that passed", n)
+	}
+	_, os := g.outcomes(t, 2)
+	if !os[0].Executed || os[0].Refused {
+		t.Errorf("passing insert: %+v, want executed", os[0])
+	}
+	wantRefused(t, os[1], false)
+}
+
+func TestRefusedExecuteGetsTheGatesError(t *testing.T) {
+	table := watchedTable(t)
+	g := newRecordingGate(watches(table))
+	g.refuse = refuseAll
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+	ctx := testCtx(t)
+	ins := "insert into " + table + " values ($1, $2)"
+
+	_, err := conn.Exec(ctx, ins, 1, "secret")
+	wantHeld(t, err)
+	mustExec(t, conn, "select 1")
+	if n := rowCount(t, table); n != 0 {
+		t.Errorf("%d rows, want the table as it was", n)
+	}
+	bs, os := g.outcomes(t, 1)
+	wantRefused(t, os[0], false)
+	if bs[0].st.SQL != ins {
+		t.Errorf("Begin got %q, want %q", bs[0].st.SQL, ins)
+	}
+	if p := bs[0].params; len(p) != 2 || string(p[1].Value) != "secret" {
+		t.Errorf("Begin got params %+v, want 2 with the second = secret", p)
+	}
+}
+
+func TestRefusalFailsTheOpenTransaction(t *testing.T) {
+	table := watchedTable(t)
+	g := newRecordingGate(watches(table))
+	g.refuse = refuseAll
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+	ctx := testCtx(t)
+
+	mustExec(t, conn, "begin")
+	_, err := conn.Exec(ctx, "insert into "+table+" values (1, 'x')")
+	wantHeld(t, err)
+	mustFail(t, conn, "select 1", "25P02")
+	mustExec(t, conn, "rollback")
+	mustExec(t, conn, "select 1")
+
+	_, os := g.outcomes(t, 1)
+	wantRefused(t, os[0], false)
+	if !os[0].InTransaction {
+		t.Errorf("outcome %+v, want inside a transaction", os[0])
+	}
+}
+
+// The server sees an error where the refused write stood, so the implicit
+// transaction of its Sync rolls back what ran before it.
+func TestRefusalRollsBackTheRestOfItsSync(t *testing.T) {
+	table := watchedTable(t)
+	other := watchedTable(t) // not watched by this gate
+	g := newRecordingGate(watches(table))
+	g.refuse = refuseAll
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	b := &pgconn.Batch{}
+	b.ExecParams("insert into "+other+" values (1, 'unwatched')", nil, nil, nil, nil)
+	b.ExecParams("insert into "+table+" values (1, 'x')", nil, nil, nil, nil)
+	// pgconn reads up to the first error and returns it from ReadAll; the
+	// results are the statements completed before it.
+	results, err := conn.PgConn().ExecBatch(testCtx(t), b).ReadAll()
+	wantHeld(t, err)
+	if len(results) != 1 || results[0].Err != nil {
+		t.Errorf("results %+v, want the unwatched insert's alone, completed", results)
+	}
+	if n := rowCount(t, other); n != 0 {
+		t.Errorf("%d rows in the unwatched table, want its insert rolled back", n)
+	}
+	_, os := g.outcomes(t, 1)
+	wantRefused(t, os[0], false)
+}
+
+// A refused Execute is answered as the same Execute failing on the server
+// would be: the same kinds of message, as many, in the same order.
+func TestRefusedPipelineAnswersLikeAServerError(t *testing.T) {
+	table := watchedTable(t)
+	g := newRecordingGate(watches(table))
+	g.refuse = refuseMarked
+	addr, _ := startProxy(t, upstream(t), g)
+	fe := rawAgent(t, addr, table)
+	direct := rawSession(t, upstream(t), "stet_trust", pgproto3.ProtocolVersionNumber)
+	pipeline := func(fe *pgproto3.Frontend, second string) string {
+		t.Helper()
+		var msgs []pgproto3.FrontendMessage
+		msgs = append(msgs, unnamed("insert into "+table+" values (1, 'x')")...)
+		msgs = append(msgs, unnamed(second)...)
+		msgs = append(msgs, unnamed("select 1")...)
+		sendAll(t, fe, append(msgs, &pgproto3.Sync{})...)
+		return replies(t, fe)
+	}
+
+	proxied := pipeline(fe, "insert into "+table+" values (2, 'held')")
+	if proxied != "1 2 C 1 2 E:ST001 Z" {
+		t.Errorf("through the proxy: replies %q, want %q", proxied, "1 2 C 1 2 E:ST001 Z")
+	}
+	if n := rowCount(t, table); n != 0 {
+		t.Errorf("%d rows, want the insert before the refusal rolled back", n)
+	}
+	failing := pipeline(direct, "insert into "+table+" values (1, 'duplicate')")
+	if strings.Replace(failing, "E:23505", "E:ST001", 1) != proxied {
+		t.Errorf("a server error at the same place gives %q, the refusal %q", failing, proxied)
+	}
+	_, os := g.outcomes(t, 2)
+	wantRefused(t, os[1], false)
+}
+
+// An error before the refused write under the same Sync is what the client
+// gets; the refusal never reaches it.
+func TestEarlierFailureHidesTheRefusal(t *testing.T) {
+	table := watchedTable(t)
+	g := newRecordingGate(watches(table))
+	g.refuse = refuseAll
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	b := &pgconn.Batch{}
+	b.ExecParams("select 1/0", nil, nil, nil, nil)
+	b.ExecParams("insert into "+table+" values (1, 'x')", nil, nil, nil, nil)
+	if _, err := conn.PgConn().ExecBatch(testCtx(t), b).ReadAll(); pgCode(err) != "22012" {
+		t.Fatalf("error %v, want the server's 22012", err)
+	}
+	mustExec(t, conn, "select 1")
+	_, os := g.outcomes(t, 1)
+	wantRefused(t, os[0], true)
+}
+
+// The Bind before a refused Execute fails first: the client gets the Bind's
+// own error, not the refusal.
+func TestBindFailureBeforeARefusedExecuteIsLeftAlone(t *testing.T) {
+	table := watchedTable(t)
+	g := newRecordingGate(watches(table))
+	g.refuse = refuseAll
+	addr, _ := startProxy(t, upstream(t), g)
+	fe := rawAgent(t, addr, table)
+
+	sendAll(t, fe, append(unnamed("insert into "+table+" values ($1, 'x')", "abc"), &pgproto3.Sync{})...)
+	if got := replies(t, fe); got != "1 E:22P02 Z" {
+		t.Errorf("replies %q, want %q", got, "1 E:22P02 Z")
+	}
+	_, os := g.outcomes(t, 1)
+	wantRefused(t, os[0], true)
+}
+
+// Of two refused writes under one Sync the server fails the first; the
+// second never runs and its refusal is not delivered. Each is ended once.
+func TestSecondRefusalUnderOneSyncIsUndelivered(t *testing.T) {
+	table := watchedTable(t)
+	g := newRecordingGate(watches(table))
+	g.refuse = refuseAll
+	addr, srv := startProxy(t, upstream(t), g)
+	fe := rawAgent(t, addr, table)
+
+	var msgs []pgproto3.FrontendMessage
+	msgs = append(msgs, unnamed("insert into "+table+" values (1, 'x')")...)
+	msgs = append(msgs, unnamed("insert into "+table+" values (2, 'x')")...)
+	sendAll(t, fe, append(msgs, &pgproto3.Sync{})...)
+	if got := replies(t, fe); got != "1 2 E:ST001 Z" {
+		t.Errorf("replies %q, want %q", got, "1 2 E:ST001 Z")
+	}
+	_, os := g.outcomes(t, 2)
+	wantRefused(t, os[0], false)
+	wantRefused(t, os[1], true)
+
+	srv.Close() // the sessions end: nothing is ended twice
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.endCalls != 2 {
+		t.Errorf("End called %d times, want once per write", g.endCalls)
+	}
+}
+
+// A prepared write refused twice stays prepared on the server: the third
+// Execute of it runs.
+func TestRefusedExecuteLeavesThePreparedStatementUsable(t *testing.T) {
+	table := watchedTable(t)
+	g := newRecordingGate(watches(table))
+	refusals := 0
+	g.refuse = func(st proxy.Statement) *proxy.Refusal {
+		if refusals++; refusals <= 2 {
+			return refuseAll(st)
+		}
+		return nil
+	}
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+	ctx := testCtx(t)
+
+	if _, err := conn.Prepare(ctx, "ins", "insert into "+table+" values ($1, $2)"); err != nil {
+		t.Fatal(err)
+	}
+	for id := range 2 {
+		_, err := conn.Exec(ctx, "ins", id, "x")
+		wantHeld(t, err)
+	}
+	if _, err := conn.Exec(ctx, "ins", 3, "x"); err != nil {
+		t.Fatalf("third Execute: %v", err)
+	}
+	if n := rowCount(t, table); n != 1 {
+		t.Errorf("%d rows, want the third insert's", n)
+	}
+	_, os := g.outcomes(t, 3)
+	wantRefused(t, os[0], false)
+	wantRefused(t, os[1], false)
+	if !os[2].Executed || os[2].Refused {
+		t.Errorf("third write: %+v, want executed", os[2])
+	}
+}
+
+// pgx streams the rows of a COPY FROM STDIN without waiting for the server's
+// CopyInResponse. A refused COPY is answered with an error instead, and the
+// server ignores the copy data that follows.
+func TestRefusedCopyFromStdinDoesNotHang(t *testing.T) {
+	table := watchedTable(t)
+	g := newRecordingGate(func(sql string) bool {
+		return strings.HasPrefix(strings.ToLower(sql), "copy") && strings.Contains(sql, table)
+	})
+	g.refuse = refuseAll
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rows := [][]any{{1, "a"}, {2, "b"}}
+	_, err := conn.CopyFrom(ctx, pgx.Identifier{table}, []string{"id", "v"}, pgx.CopyFromRows(rows))
+	if ctx.Err() != nil {
+		t.Fatalf("COPY still waiting after 5s: %v", err)
+	}
+	wantHeld(t, err)
+	mustExec(t, conn, "select 1")
+	if n := rowCount(t, table); n != 0 {
+		t.Errorf("%d rows, want none copied", n)
+	}
+	bs, os := g.outcomes(t, 1)
+	wantRefused(t, os[0], false)
+	if !strings.HasPrefix(bs[0].st.SQL, "copy") {
+		t.Errorf("Begin got %q, want the COPY", bs[0].st.SQL)
+	}
+}
+
+// A deferred constraint that fails at the Sync raises an error that belongs
+// to no message: it is the server's, also on a session whose gate refuses
+// writes. Only a refused message's own error is rewritten.
+func TestErrorAtTheSyncIsNotARefusal(t *testing.T) {
+	table := fmt.Sprintf("deferred_%d", time.Now().UnixNano())
+	admin := connect(t, upstream(t), "stet_scram", nil)
+	mustExec(t, admin, "create table "+table+" (id int primary key, v text unique deferrable initially deferred)")
+	t.Cleanup(func() { admin.Exec(context.Background(), "drop table "+table) })
+	g := newRecordingGate(watches(table))
+	g.refuse = refuseMarked
+	addr, _ := startProxy(t, upstream(t), g)
+	fe := rawAgent(t, addr, table)
+	unit := func(want string, sqls ...string) {
+		t.Helper()
+		var msgs []pgproto3.FrontendMessage
+		for _, sql := range sqls {
+			msgs = append(msgs, unnamed(sql)...)
+		}
+		sendAll(t, fe, append(msgs, &pgproto3.Sync{})...)
+		if got := replies(t, fe); got != want {
+			t.Errorf("replies %q, want %q", got, want)
+		}
+	}
+
+	unit("1 2 C 1 2 C E:23505 Z", "insert into "+table+" values (1, 'same')", "insert into "+table+" values (2, 'same')")
+	unit("1 2 C 1 2 E:ST001 Z", "insert into "+table+" values (3, 'x')", "insert into "+table+" values (4, 'held')")
+	if n := rowCount(t, table); n != 0 {
+		t.Errorf("%d rows, want both units rolled back", n)
+	}
+	_, os := g.outcomes(t, 4)
+	for i, o := range os[:3] {
+		if o.Refused {
+			t.Errorf("write %d: %+v, want it sent", i+1, o)
+		}
+	}
+	wantRefused(t, os[3], false)
 }
