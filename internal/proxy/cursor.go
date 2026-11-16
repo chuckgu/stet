@@ -57,7 +57,9 @@ type declared struct {
 // when it did: the server refuses a DECLARE of a name it holds (42P03), and
 // keeping the new entry would drop the cursor the server still has. If the
 // server took it (the older one was gone), its FETCHes count as reads of the
-// older DECLARE.
+// older DECLARE while that entry stays. If the older one is not held and the
+// failing message ended its transaction, it is dropped too and the name is
+// forgotten: a known gap, listed in the spec's section 9.
 func (d *declared) undone(head *unit) bool {
 	switch {
 	case !head.query:

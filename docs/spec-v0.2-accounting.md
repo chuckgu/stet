@@ -331,7 +331,7 @@ CREATE TABLE IF NOT EXISTS stet.read_log (
 - 문장이 여럿인 메시지 안의 `DECLARE`는 메시지 전체를 선언한 문장으로 기억한다. 그래서 큰 읽기 기록의 `statement`는 메시지 전체다. 그 메시지가 `reads`가 켜진 테이블을 읽으면 그 안의 `DECLARE`는 모두 그 메시지가 읽는 테이블을 읽는 것으로 기억된다(`declare a cursor for select 1; select * from contacts`의 `a`).
 - 한 메시지가 기억한 커서 여럿에서 `FETCH`하면 첫 커서의 읽기로 한 번만 센다. 다른 커서가 읽는 테이블에는 세지 않는다.
 - `DECLARE`를 담은 메시지가 행을 내보내지 않으면 그 메시지는 읽기로 세지 않는다. 그 메시지 안에 행 0의 다른 읽기가 있어도 그렇다(`declare c ...; select * from contacts where false`).
-- 문장이 여럿인 메시지가 실패하면서 이미 기억하던 이름을 다시 선언했고 서버가 그 선언을 받아들였다면(앞선 커서가 서버에 없었다면), 프록시는 앞선 선언을 되살린다. 뒤의 `FETCH`는 앞선 선언의 문장과 테이블로 세어진다.
+- 문장이 여럿인 메시지가 실패하면서 이미 기억하던 이름을 다시 선언했고 서버가 그 선언을 받아들였다면(앞선 커서가 서버에 없었다면), 프록시는 앞선 선언을 되살린다. 앞선 선언이 남아 있으면 뒤의 `FETCH`는 앞선 선언의 문장과 테이블로 세어지고, 누적 행 수도 앞선 커서의 것에 이어진다. 앞선 커서가 `WITH HOLD`가 아니고 그 트랜잭션을 실패한 메시지가 끝냈다면 앞선 선언도 지워지므로, 그 이름의 뒤 `FETCH`는 세지 않는다(아래 "enforce 전에 닫을 것").
 - 게이트 대상 테이블에 쓰는 메시지 안의 `DECLARE`는 적어 두지 않는다. 그 메시지는 읽기가 아니기 때문이다. 그래서 그 커서의 뒤 `FETCH`는 세지 않는다.
 - 문장이 여럿인 메시지가 그 메시지 자체의 읽기로 알려지면, 그 안의 `FETCH`가 앞서 적어 둔 커서를 읽었어도 그 행은 그 커서의 누적 행 수에 더해지지 않는다. 그래서 그 커서의 뒤 `FETCH`가 `log_above`를 넘으면 줄이 하나 더 남을 수 있다. 그 메시지가 스스로 선언한 커서는 예외다(5장 "나눠 가져간 읽기").
 - SQL `PREPARE` / `EXECUTE`로 읽은 행은 세지 않는다. `EXECUTE`에는 테이블 이름이 없다.
@@ -339,7 +339,7 @@ CREATE TABLE IF NOT EXISTS stet.read_log (
 - 아직 서버가 답하지 않은 `BEGIN` 바로 뒤에 보낸 읽기의 `TxOpen`은 false다. 쓰기도 같다.
 - 설정 키 둘이 스키마만 다르고 관계 이름이 같으면(`a.contacts`, `b.contacts`), 스키마 없이 쓴 이름이 둘 중 어느 것으로 잡히는지는 정해져 있지 않다. 쓰기에 이미 있던 한계이고, 이제 읽기에도 해당한다. 읽기는 다른 키의 집계로 들어갈 수 있다.
 - `EXPLAIN ANALYZE SELECT`는 서버에서 질의를 실제로 실행한다. 그 안의 함수도 실행된다. 행이 클라이언트에게 나가지 않으므로 Stet은 읽기로 세지 않는다.
-- 클라이언트가 서버의 첫 ReadyForQuery 전에 보낸 문장은 모두 접속 계정 없이 기록된다. 인증 방식과 상관없다. 클라이언트는 시작 패킷이나 인증 응답 바로 뒤에 문장을 이어 보낼 수 있고, 서버는 인증한 뒤에 그 문장을 실행한다. 그런 문장은 누적 한도를 적용받지 않고 계정 `''`로 집계된다.
+- 클라이언트가 서버의 첫 ReadyForQuery 전에 보낸 문장은 모두 접속 계정 없이 기록된다. 인증 방식과 상관없다. 클라이언트는 시작 패킷이나 인증 응답 바로 뒤에 문장을 이어 보낼 수 있고, 인증이 성공하면 서버는 그 문장을 실행한다. 그런 문장은 누적 한도를 적용받지 않고 계정 `''`로 집계된다.
 
 ### enforce 전에 닫을 것
 
@@ -350,6 +350,7 @@ CREATE TABLE IF NOT EXISTS stet.read_log (
 - CommandComplete는 왔지만 ReadyForQuery 전에 연결이 끊긴 쓰기는 실행되지 않은 것으로 기록된다(`internal/proxy/session.go`의 `unanswered`). 누적 값에는 남지만, 판단 기록의 `executed`가 실제와 다를 수 있어 기록으로 다시 채점할 때 틀린다.
 - 시작 패킷의 프로토콜 부 버전이 3.0, 3.2가 아니면 접속 계정을 읽지 못한다. Postgres는 3.1을 받아 주므로, 클라이언트가 누적 한도와 계정별 읽기 집계를 피할 수 있다. enforce에서는 한도를 피하는 길이 된다. 이 브랜치의 테스트가 "접속 계정을 모르는 세션"을 만드는 데 이 동작을 쓰고 있어, 고칠 때 테스트의 방법도 바꿔야 한다.
 - 응답을 받지 못한, 관찰 대상이 아닌 재선언(re-DECLARE) 뒤에 파이프라인으로 온 `FETCH`는, 그 재선언이 실패해도 기록되지 않는다. 서버는 앞선 커서를 그대로 읽는다. 읽기를 가리는 길이 하나 남는다.
+- 문장이 여럿인 메시지가 `WITH HOLD`가 아닌 커서의 트랜잭션을 끝내고, 같은 이름을 `WITH HOLD`로 다시 선언해 커밋한 뒤 실패하면(`commit; declare c cursor with hold ...; commit; select 1/0`), 프록시는 그 이름을 잊는다. 서버는 새 커서를 가지고 있으므로 뒤의 `FETCH`가 기록되지 않는다. 읽기를 가리는 길이 하나 더 남는다. 방향: 실패한 메시지에서 취소한 가장 새 선언을 기억해 두고, 이름에 남은 것이 없으면 그 선언을 남긴다.
 - `stet.read_log`에 `created_at`, `login_role` 인덱스가 없다. 읽기 기록으로 계정을 막거나 조사하려면 기록이 쌓인 뒤 질의가 느려진다.
 - 프로세스 종료 순서(세션이 끝난 뒤 게이트를 닫는다)를 확인하는 자동 테스트가 없다. 손으로만 확인했다. 순서가 깨지면 종료할 때 끊긴 쓰기와 읽기가 기록되지 않는다.
 - 게이트가 닫힌 뒤 도착한 읽기를 알리는 로그 줄은 100ms 타이머에서 나가므로, 그 전에 프로세스가 끝나면 남지 않는다. 기록되지 않은 읽기가 있었다는 흔적도 사라진다.
@@ -372,7 +373,7 @@ CREATE TABLE IF NOT EXISTS stet.read_log (
 - [x] `reads`가 켜진 테이블을 읽는 문장이 분류된다: 단순 `SELECT`, 조인, 서브쿼리, `WITH`, `COPY ... TO`, 다른 테이블에 쓰면서 읽는 문장. 게이트 대상 테이블에 쓰는 문장은 읽기로 분류되지 않는다. (`TestClassifyReads`, `TestWritesAreNotCountedAsReads`)
 - [x] 읽기의 문장 수와 나간 행 수가 접속 계정과 테이블별로 `stet.reads`에 쌓인다. Simple Query와 Extended Query 모두에서 맞다. (`TestReadsAreAggregatedPerRoleAndTable`, `TestGateObservesReads`)
 - [x] 행을 내보내다 실패하거나 취소된 읽기의 나간 행이 세어진다. 행 수 상한을 걸고 나눠 가져간 읽기의 행이 모두 세어진다. (`TestFailedReadCountsTheRowsItSent`, `TestGateObservesRowsOfACancelledRead`, `TestGateObservesPortalFetchedInParts`)
-- [x] 커서로 읽은 행이 그 커서가 읽는 테이블의 읽기로 세어진다. `FETCH`마다 나간 행이 더해지고, `CLOSE`한 뒤나 트랜잭션이 끝난 뒤의 같은 이름은 세지 않는다. `WITH HOLD` 커서는 커밋 뒤에도 센다. 선언에 실패한 커서는 적어 두지 않는다. (`TestCursorReadsAreCounted`, `TestGateObservesFetchesAsReadsOfTheCursor`, `TestCursorIsForgottenWhenClosed`, `TestCursorIsForgottenAtTransactionEnd`, `TestHeldCursorSurvivesCommit`, `TestFailedDeclareIsNotRemembered`)
+- [x] 커서로 읽은 행이 그 커서가 읽는 테이블의 읽기로 세어진다. `FETCH`마다 나간 행이 더해지고, `CLOSE`한 뒤나 트랜잭션이 끝난 뒤의 같은 이름은 세지 않는다. `WITH HOLD` 커서는 커밋 뒤에도 센다. 문장 하나로 보낸 선언이 실패하면 그 커서는 적어 두지 않는다. (`TestCursorReadsAreCounted`, `TestGateObservesFetchesAsReadsOfTheCursor`, `TestCursorIsForgottenWhenClosed`, `TestCursorIsForgottenAtTransactionEnd`, `TestHeldCursorSurvivesCommit`, `TestFailedDeclareIsNotRemembered`)
 - [x] `log_above`를 넘는 읽기만 `stet.read_log`에 남는다. 커서로 읽은 경우 `statement`는 커서를 선언한 문장이다. (`TestLargeReadsAreLogged`, `TestCursorReadsAreCounted`)
 - [x] `reads`가 꺼진 테이블을 읽는 문장은 게이트에 알려지지 않는다. (`TestReadsWithoutTheBlockAreNotSeen`)
 - [x] 종료할 때 아직 쓰지 않은 집계가 쓰인다. (`TestCloseWritesWhatIsStillInMemory`)
