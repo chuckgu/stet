@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -319,4 +320,185 @@ func TestUnreadBindLeavesItsPortalsUnknown(t *testing.T) {
 	if b, ok, _ := s.portals.get(nil, "other"); ok {
 		t.Errorf("after the transaction ended: portal other is %+v, want no portal", b)
 	}
+}
+
+// An Execute of a name that may also mean a statement that is not clean
+// leaves the transaction dirty, even when its newest meaning is clean: the
+// server may run the other one. The other meaning can be one its statement's
+// name had at the Bind, or one the portal's own name has. When every meaning
+// is clean, the transaction stays clean.
+func TestNameThatMayMeanAnUncleanStatementDirties(t *testing.T) {
+	const insert = "insert into t values (1)"
+	for _, c := range []struct {
+		name string
+		old  string // what s1 or p meant before the unanswered change
+		want bool   // TxDirty of the insert that follows
+	}{
+		{"statement, another meaning not clean", "update u set x = 1", true},
+		{"statement, every meaning clean", "show x", false},
+		{"portal, another meaning not clean", "update u set x = 1", true},
+		{"portal, every meaning clean", "show x", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			g := &txGate{fakeGate: newFakeGate()}
+			s := readySession(g)
+			if strings.HasPrefix(c.name, "statement") {
+				send(s, parseMsg("s1", c.old), syncMsg)
+				serve(s, parseOK, readyWith('I'))
+				send(s, queryMsg("begin"))
+				serve(s, tag("BEGIN"), readyWith('T'))
+				send(s, parseMsg("s1", "set x = 1"), syncMsg) // the server refuses it (42P05), but has not said so yet
+				send(s, bindMsg("", "s1"), execMsg(""), syncMsg)
+			} else {
+				send(s, queryMsg("begin"))
+				serve(s, tag("BEGIN"), readyWith('T'))
+				send(s, parseMsg("old", c.old), parseMsg("set", "set x = 1"), bindMsg("p", "old"), syncMsg)
+				serve(s, parseOK, parseOK, bindOK, readyWith('T'))
+				send(s, bindMsg("p", "set"), syncMsg) // the server refuses it (42P03), but has not said so yet
+				send(s, execMsg("p"), syncMsg)
+			}
+			send(s, queryMsg(insert))
+			if len(g.infos) != 1 || g.infos[0].TxDirty != c.want {
+				t.Errorf("writes begun with %+v, want one with TxDirty %v", g.infos, c.want)
+			}
+		})
+	}
+}
+
+// A change the proxy could not read cannot have set a named statement or
+// portal the server holds: the server refuses a Parse or Bind of it. So the
+// held meaning stays the only one. Once a Close of the name may have held,
+// the name may be free, and the unread change may have set it.
+func TestUnreadChangeLeavesAHeldNameAlone(t *testing.T) {
+	g := newStmtGate()
+	s := readySession(g)
+	flush := func() error { return nil }
+	send(s, parseMsg("s1", ins), parseMsg("s2", ins), syncMsg)
+	serve(s, parseOK, parseOK, readyWith('I'))
+	send(s, closeMsg('S', "s2"))
+	s.fromClient('P', nil, flush) // not answered yet
+	send(s, syncMsg)
+
+	if p, ok, others := s.stmts.get(nil, "s1"); !ok || p.unread || p.st.SQL != ins || len(others) != 0 {
+		t.Errorf("held s1: %+v (found %v), others %v; want the insert alone", p, ok, others)
+	}
+	if p, ok, others := s.stmts.get(nil, "s2"); !ok || !p.unread || len(others) != 1 || others[0].st.SQL != ins {
+		t.Errorf("s2 behind its Close: %+v (found %v), others %v; want unread, and the insert among others", p, ok, others)
+	}
+	if p, ok, _ := s.stmts.get(nil, ""); !ok || !p.unread {
+		t.Errorf("unnamed: %+v (found %v), want unread", p, ok)
+	}
+	send(s, bindMsg("", "s1"), execMsg(""), syncMsg)
+	if !slices.Equal(g.begun, []string{ins}) {
+		t.Errorf("writes begun %q, want the insert s1 holds", g.begun)
+	}
+}
+
+// A Close the server completed removes the name, also with no Parse after
+// it.
+func TestConfirmedCloseRemovesTheName(t *testing.T) {
+	g := newStmtGate()
+	s := readySession(g)
+	send(s, queryMsg("begin"))
+	serve(s, tag("BEGIN"), readyWith('T'))
+	send(s, parseMsg("s1", ins), bindMsg("p", "s1"), syncMsg)
+	serve(s, parseOK, bindOK, readyWith('T'))
+	send(s, closeMsg('S', "s1"), closeMsg('P', "p"), syncMsg)
+	serve(s, closeOK, closeOK, readyWith('T'))
+
+	if p, ok, _ := s.stmts.get(nil, "s1"); ok {
+		t.Errorf("statement s1 after its Close: %+v, want none", p)
+	}
+	if b, ok, _ := s.portals.get(nil, "p"); ok {
+		t.Errorf("portal p after its Close: %+v, want none", b)
+	}
+	send(s, bindMsg("", "s1"), execMsg(""), execMsg("p"), syncMsg)
+	if len(g.begun) != 0 {
+		t.Errorf("writes begun %q, want none", g.begun)
+	}
+}
+
+// waiting is how many changes wait for the server's answer.
+func (n *names[T]) waiting() int { return len(n.changes) - n.done }
+
+// A change the server completed holds from then on, whatever comes later in
+// its unit, so it is applied at once and not kept until the ReadyForQuery.
+func TestCompletedChangeHoldsAtOnce(t *testing.T) {
+	g := newStmtGate()
+	s := readySession(g)
+	send(s, parseMsg("", "select 1"), syncMsg)
+	serve(s, parseOK, readyWith('I'))
+	send(s, parseMsg("", ins), syncMsg)
+	serve(s, parseOK) // its ReadyForQuery has not arrived
+
+	if p, ok, others := s.stmts.get(nil, ""); !ok || p.st.SQL != ins || len(others) != 0 {
+		t.Errorf("unnamed: %q (found %v), others %v; want the completed insert alone", p.st.SQL, ok, others)
+	}
+	if n := s.stmts.waiting(); n != 0 {
+		t.Errorf("%d statement changes waiting, want 0", n)
+	}
+}
+
+// A batch under one Sync (one Parse, then many Binds and Executes to the
+// unnamed portal) keeps few changes: one that gives the name the meaning it
+// already has is not kept twice, a completed one is applied at once, and in a
+// unit that already failed only the newest per name is kept, for the
+// messages behind it. Once the list is empty, a large array is let go.
+func TestBatchUnderOneSyncKeepsFewChanges(t *testing.T) {
+	const rows = 1000
+	value := func(i int) [][]byte { return [][]byte{[]byte(strconv.Itoa(i))} }
+	batch := func(s *session, sql string, from int) {
+		send(s, parseMsg("", sql))
+		for i := from; i < rows; i++ {
+			send(s, &pgproto3.Bind{PreparedStatement: "", Parameters: value(i)}, execMsg(""))
+		}
+	}
+
+	t.Run("statement Stet does not follow", func(t *testing.T) {
+		s := readySession(newStmtGate())
+		batch(s, "update t set v = $1", 0)
+		if n := s.portals.waiting(); n != 1 {
+			t.Errorf("%d portal changes waiting, want 1", n)
+		}
+	})
+
+	t.Run("watched, answered", func(t *testing.T) {
+		s := readySession(newStmtGate())
+		batch(s, ins, 0)
+		send(s, syncMsg)
+		replies := []pgproto3.BackendMessage{parseOK}
+		for range rows {
+			replies = append(replies, bindOK, tag("INSERT 0 1"))
+		}
+		serve(s, replies...)
+		if n := s.portals.waiting(); n != 0 {
+			t.Errorf("once every Bind completed: %d portal changes waiting, want 0", n)
+		}
+		serve(s, readyWith('I'))
+		if c := cap(s.portals.changes); c > 64 {
+			t.Errorf("after the ReadyForQuery the list keeps room for %d changes, want its array let go", c)
+		}
+	})
+
+	t.Run("watched, failed early", func(t *testing.T) {
+		g := newStmtGate()
+		s := readySession(g)
+		batch(s, ins, rows-1) // Parse, one Bind and Execute
+		u := s.units[0]
+		serve(s, parseOK, bindOK, failed("23505"))
+		for i := 0; i < rows-1; i++ {
+			send(s, &pgproto3.Bind{PreparedStatement: "", Parameters: value(i)}, execMsg(""))
+		}
+		if n := s.portals.waiting(); n != 1 {
+			t.Errorf("%d portal changes waiting in the failed unit, want 1", n)
+		}
+		if b, _, _ := s.portals.get(u, ""); len(b.params) != 1 || string(b.params[0].Value) != strconv.Itoa(rows-2) {
+			t.Errorf("unnamed portal in the failed unit: %+v, want the newest Bind", b)
+		}
+		send(s, syncMsg)
+		serve(s, readyWith('I'))
+		if n := s.portals.waiting(); n != 0 {
+			t.Errorf("after the ReadyForQuery: %d portal changes waiting, want 0", n)
+		}
+	})
 }

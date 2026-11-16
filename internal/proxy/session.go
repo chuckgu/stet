@@ -272,9 +272,18 @@ func (s *session) serverTap() *tap {
 func (s *session) ack() {
 	s.mu.Lock()
 	if len(s.units) > 0 {
-		s.units[0].acks++
+		s.acked(s.units[0])
 	}
 	s.mu.Unlock()
+}
+
+// acked counts one more message of head, the unit being answered, as
+// completed, and applies the table changes that completion makes hold. It
+// runs with s.mu held.
+func (s *session) acked(head *unit) {
+	head.acks++
+	s.stmts.completed(head, head.acks)
+	s.portals.completed(head, head.acks)
 }
 
 // fromClient follows a message from the client before it is forwarded, and
@@ -341,8 +350,9 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		idx := u.executes
 		var b bound
 		var ok bool
+		var others []bound
 		if read {
-			b, ok, _ = s.portals.get(u, m.Portal)
+			b, ok, others = s.portals.get(u, m.Portal)
 		}
 		s.mu.Unlock()
 		if !ok || b.unread {
@@ -350,7 +360,11 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 			s.markDirty(u)
 			return nil, nil
 		}
-		return s.statement(u, idx, pos, 'E', b.st, b.params, b.rows, flush), nil
+		r := s.statement(u, idx, pos, 'E', b.st, b.params, b.rows, flush)
+		if mayRunUnclean(b, others) {
+			s.markDirty(u) // the server may run another meaning of the name
+		}
+		return r, nil
 
 	case 'C':
 		var m pgproto3.Close
@@ -428,9 +442,28 @@ func (s *session) apply(st Statement) {
 // is never clean; it marks u only here, after Begin was told whether the
 // transaction was clean when it arrived.
 func (s *session) dirties(u *unit, st Statement) {
-	if st.Watch || !st.Clean {
+	if unclean(st) {
 		s.markDirty(u)
 	}
+}
+
+// unclean reports whether st leaves the transaction it runs in dirty.
+func unclean(st Statement) bool { return st.Watch || !st.Clean }
+
+// mayRunUnclean reports whether an Execute of a portal whose newest meaning
+// is b may run, in its place, a statement that is not clean or is unknown:
+// one of others, the portal name's other meanings (see names.get), or one
+// its statement's name meant at the Bind of b or of one of others.
+func mayRunUnclean(b bound, others []bound) bool {
+	uncleanStatement := func(ps []prepared) bool {
+		return slices.ContainsFunc(ps, func(p prepared) bool { return p.unread || unclean(p.st) })
+	}
+	if uncleanStatement(b.others) {
+		return true
+	}
+	return slices.ContainsFunc(others, func(o bound) bool {
+		return o.unread || unclean(o.st) || uncleanStatement(o.others)
+	})
 }
 
 // markDirty notes that u holds a statement that is not clean.
@@ -588,7 +621,7 @@ func (s *session) fromServer(t byte, body []byte) []byte {
 		s.settle(head)
 		if head != nil {
 			head.completions++
-			head.acks++
+			s.acked(head)
 			// Watched writes and observed reads join their unit before they
 			// go upstream, so units with neither never need their tags read.
 			if t == 'C' && (len(head.writes) > 0 || len(head.reads) > 0) {

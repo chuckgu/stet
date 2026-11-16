@@ -265,7 +265,9 @@ func relay(client, server net.Conn, fromClient, fromServer *tap) {
 // gets the whole body before the message is forwarded (nil past
 // maxInspect), plus a way to flush what is already queued for the peer.
 // each, when set, gets the type of every message as soon as its header is
-// read; it runs once per result row, so it must stay trivial.
+// read. It runs for every result row, so for a row (DataRow, CopyData) it may
+// do no more than increment a counter; for the few other types it acts on
+// (the session's completions) it may take a lock.
 type tap struct {
 	want func(t byte) bool
 	// see may return one whole message (type, length, body) to send in

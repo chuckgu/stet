@@ -1,24 +1,40 @@
 package proxy
 
+import "slices"
+
 // names follows the prepared statements, or the portals, of one session as
 // the server holds them. Keys are the first 63 bytes of a name.
 //
-// A Parse, Bind or Close changes a name only once the server completed it.
-// Until the ReadyForQuery of its unit the change waits, and the name may
-// mean what the change made it or what it meant before (get). At that
-// ReadyForQuery the unit's completions say which changes held (answered).
+// A Parse, Bind or Close changes a name only once the server completed it
+// (ParseComplete, BindComplete, CloseComplete): from then on it holds,
+// whatever comes later in its unit (completed). Until then the change waits,
+// and the name may mean what the change made it or what it meant before
+// (get). At the unit's ReadyForQuery the changes the server did not complete
+// are dropped (answered).
 //
 // When the proxy cannot tell which meaning a name has, the meaning that is a
 // watched write must stay possible: get hands back every meaning the name
 // may have, and a message the proxy could not read leaves the names it may
 // have set meaning something unread.
-type names[T any] struct {
-	held    map[string]T // what the server confirmed
-	changes []change[T]  // not answered yet, oldest first
+//
+// A change is kept only while it can still decide something, so a batch
+// under one Sync does not grow the list with its rows (see put).
+type names[T meaning[T]] struct {
+	held map[string]T // what the server confirmed
+	// changes[done:] wait for the server's answer, oldest first; a unit's
+	// changes are contiguous. changes[:done] were settled and cleared.
+	changes []change[T]
+	done    int
 	// blind: a change whose name the proxy could not read held, so a name
 	// held does not list may mean unread, what that change set.
 	blind  bool
 	unread T
+}
+
+// meaning is what a name means in a names table.
+type meaning[T any] interface {
+	// same reports whether the name means the same with either value.
+	same(T) bool
 }
 
 type change[T any] struct {
@@ -34,6 +50,10 @@ type change[T any] struct {
 	v     T
 }
 
+// keepChanges is how many changes the list keeps room for once it is empty;
+// a larger array, grown by a batch, is let go.
+const keepChanges = 64
+
 // nameKey is the part of a statement or portal name the server compares.
 func nameKey(name string) string {
 	if len(name) > maxName {
@@ -43,8 +63,25 @@ func nameKey(name string) string {
 }
 
 // put notes a Parse or Bind (set) or a Close (!set) of name, sent as message pos of u.
+//
+// It is not kept when the change before it to the name in u, with no unread
+// change between them, already gives the name the same meaning: whichever of
+// the two the server reaches, the name means the same. In a unit that
+// already failed, the server skips every message still to come, so none of
+// its waiting changes will hold; only the newest per name counts, for the
+// messages behind it in u, and it takes the place of the one before.
 func (n *names[T]) put(u *unit, pos int, name string, set bool, v T) {
-	n.changes = append(n.changes, change[T]{u: u, pos: pos, name: nameKey(name), set: set, v: v})
+	c := change[T]{u: u, pos: pos, name: nameKey(name), set: set, v: v}
+	if i := n.last(u, c.name); i >= 0 {
+		switch prev := &n.changes[i]; {
+		case prev.set == set && prev.v.same(v):
+			return
+		case u.errPos != 0 && prev.pos >= u.errPos:
+			*prev = c
+			return
+		}
+	}
+	n.changes = append(n.changes, c)
 }
 
 // putUnread notes a Parse or Bind the proxy could not read, sent as message
@@ -53,56 +90,110 @@ func (n *names[T]) putUnread(u *unit, pos int, v T) {
 	n.changes = append(n.changes, change[T]{u: u, pos: pos, set: true, blind: true, v: v})
 }
 
+// last returns the index of the newest waiting change u made to the name
+// with key k, or -1 when there is none or an unread change of u came after
+// it (it may have been to k).
+func (n *names[T]) last(u *unit, k string) int {
+	for i := len(n.changes) - 1; i >= n.done && n.changes[i].u == u; i-- {
+		switch c := &n.changes[i]; {
+		case c.blind:
+			return -1
+		case c.name == k:
+			return i
+		}
+	}
+	return -1
+}
+
 // get is what name means to a message arriving now in u. A change made
 // earlier in u itself counts at once: if it fails, the server skips the rest
 // of u. A change from an earlier unit not yet answered may hold or not, so
 // the name can mean several things: v is the newest and others the rest.
-// A change the proxy could not read may or may not have been to name, so it
-// adds a meaning wherever it was sent.
+//
+// A change the proxy could not read adds a meaning to the unnamed name, and
+// to a named one the server may not hold at that point; a name the server
+// holds stays as it is, since a Parse or Bind of it fails.
 //
 // u is the unit still collecting messages, so its changes are the newest.
 // The newest of them to name decides, and the walk starts there.
 func (n *names[T]) get(u *unit, name string) (v T, ok bool, others []T) {
 	k := nameKey(name)
-	from := 0
 	v, ok = n.held[k]
+	free := !ok || k == "" // the server may not hold the name
 	if !ok && n.blind {
 		v, ok = n.unread, true
 	}
-	for i := len(n.changes) - 1; i >= 0 && n.changes[i].u == u; i-- {
-		if c := n.changes[i]; c.name == k && !c.blind {
+	from := n.done
+	for i := len(n.changes) - 1; i >= n.done && n.changes[i].u == u; i-- {
+		if c := &n.changes[i]; c.name == k && !c.blind {
 			v, ok, from = c.v, c.set, i+1
+			free = !c.set || k == ""
 			break
 		}
 	}
-	for _, c := range n.changes[from:] {
-		if c.name != k && !c.blind {
+	for i := from; i < len(n.changes); i++ {
+		c := &n.changes[i]
+		switch {
+		case c.blind && !free:
+			continue
+		case !c.blind && c.name != k:
 			continue
 		}
 		if ok {
 			others = append(others, v)
 		}
 		v, ok = c.v, c.set
+		if !c.set {
+			free = true // a Close that may hold
+		}
 	}
 	return v, ok, others
+}
+
+// completed applies the changes of u, the unit being answered, that the
+// server has completed so far (pos <= acks), and lets them go. u's changes
+// are the oldest waiting, since units are answered in the order they were
+// sent.
+func (n *names[T]) completed(u *unit, acks int) {
+	i := n.done
+	for ; i < len(n.changes) && n.changes[i].u == u && n.changes[i].pos <= acks; i++ {
+		n.apply(n.changes[i])
+	}
+	n.settle(i)
 }
 
 // answered settles u's changes at its ReadyForQuery: those at pos <= acks
 // hold, the rest are dropped. Units are answered in the order they were
 // sent, so u's changes are the oldest.
 func (n *names[T]) answered(u *unit, acks int) {
-	i := 0
+	i := n.done
 	for ; i < len(n.changes) && n.changes[i].u == u; i++ {
 		if c := n.changes[i]; c.pos <= acks {
 			n.apply(c)
 		}
 	}
-	if i == 0 {
+	n.settle(i)
+}
+
+// settle lets go of the changes before index i, which were applied or
+// dropped.
+func (n *names[T]) settle(i int) {
+	if i == n.done {
 		return
 	}
-	end := len(n.changes)
-	n.changes = append(n.changes[:0], n.changes[i:]...)
-	clear(n.changes[len(n.changes):end]) // let go of their values (bind values, say)
+	clear(n.changes[n.done:i]) // let go of their values (bind values, say)
+	n.done = i
+	switch {
+	case n.done == len(n.changes) && cap(n.changes) > keepChanges:
+		n.changes, n.done = nil, 0
+	case n.done == len(n.changes):
+		n.changes, n.done = n.changes[:0], 0
+	case n.done > len(n.changes)/2: // more settled than waiting: move the rest down
+		end := len(n.changes)
+		n.changes = n.changes[:copy(n.changes, n.changes[n.done:])]
+		clear(n.changes[len(n.changes):end])
+		n.done = 0
+	}
 }
 
 // apply makes the change c, which the server completed, hold.
@@ -127,4 +218,18 @@ func (n *names[T]) forget() {
 	clear(n.held)
 	var zero T
 	n.blind, n.unread = false, zero
+}
+
+// same reports whether p and q are the same statement: the gate classifies
+// SQL alone, so the same text and parameter types are the same statement.
+func (p prepared) same(q prepared) bool {
+	return p.unread == q.unread && p.st.SQL == q.st.SQL && slices.Equal(p.oids, q.oids)
+}
+
+// same reports whether portals a and b run the same statement and Stet keeps
+// nothing of either beyond it: no bind values, no row count, no other
+// meanings. Two portals of statements Stet does not follow are the same.
+func (a bound) same(b bound) bool {
+	return !a.unread && !b.unread && a.params == nil && b.params == nil && a.rows == nil && b.rows == nil &&
+		len(a.others) == 0 && len(b.others) == 0 && a.st.SQL == b.st.SQL
 }
