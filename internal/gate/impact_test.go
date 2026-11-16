@@ -583,6 +583,70 @@ func TestImpactNeverRunsAnUnlistedFunctionOnStetsConnection(t *testing.T) {
 	wantNoModel(t, d)
 }
 
+// advisoryHolders lists the backends holding the session advisory lock key.
+func (e *env) advisoryHolders(t *testing.T, key int64) []int32 {
+	t.Helper()
+	rows, err := e.admin.Query(context.Background(),
+		"select pid from pg_locks where locktype = 'advisory' and classid = 0 and objid::bigint = $1 and objsubid = 1 order by pid", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holders, err := pgx.CollectRows(rows, pgx.RowTo[int32])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return holders
+}
+
+// Postgres resolves (x).f to f(x), so this predicate calls an unlisted
+// function without call syntax. Counted on Stet's connection, it would leave
+// the lock held there and the client's own write would then find it taken.
+func TestImpactNeverRunsAFunctionReachedThroughFieldNotation(t *testing.T) {
+	d := calm()
+	e := setup(t, d, looseYAML)
+	e.seedMany(t)
+	mustExec(t, e.admin, "analyze "+e.table)
+	twin := e.table + "_twin"
+	mustExec(t, e.admin, "create table "+twin+" (like "+e.table+" including all)")
+	t.Cleanup(func() { e.admin.Exec(context.Background(), "drop table "+twin) })
+	mustExec(t, e.admin, "insert into "+twin+" select * from "+e.table)
+	ctx := context.Background()
+	const write = "update %s set status = 'x' where ((company_id + %d)::bigint).pg_try_advisory_lock and company_id = 9"
+
+	// Sent directly first, with other keys, and its locks released.
+	key := time.Now().UnixNano() % (math.MaxInt32 - 2000)
+	want, err := e.admin.Exec(ctx, fmt.Sprintf(write, twin, key+1000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, e.admin, "select pg_advisory_unlock_all()")
+
+	conn := e.connect(t, "sneaky")
+	var client int32
+	if err := conn.QueryRow(ctx, "select pg_backend_pid()").Scan(&client); err != nil {
+		t.Fatal(err)
+	}
+	got, err := conn.Exec(ctx, fmt.Sprintf(write, e.table, key))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := e.impacts(t, 1)[0]
+	wantVerdict(t, r, "escalate", "impact:uncertain")
+	wantImpact(t, r.Impact, map[string]any{"method": "estimate", "actual_rows": 2.0})
+	wantNoKeys(t, r.Impact, "cap", "capped", "error") // no cap: counting was never tried
+	for _, company := range []int64{3, 9} {
+		if h := e.advisoryHolders(t, key+company); len(h) > 0 && !reflect.DeepEqual(h, []int32{client}) {
+			t.Errorf("advisory lock %d held by %v, want only the client's backend %d", key+company, h, client)
+		}
+	}
+	if got.String() != want.String() || want.String() != "UPDATE 2" {
+		t.Errorf("%q through Stet, %q directly; want UPDATE 2 both ways", got, want)
+	}
+	wantNoModel(t, d)
+	e.wantCleanPool(t)
+}
+
 func TestImpactFallsBackToTheEstimateWhenCountingIsSlow(t *testing.T) {
 	d := calm()
 	e := setup(t, d, looseYAML)

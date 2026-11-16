@@ -176,11 +176,15 @@ func countSQL(rel *pg.RangeVar, where *pg.Node) (string, bool) {
 }
 
 // countable reports whether Stet may run where on its own connection: no
-// WHERE CURRENT OF, no query, every function call on countFuncs, and no
-// schema-qualified operator (OPERATOR(schema.op)).
+// WHERE CURRENT OF, no query, every function call on countFuncs, no
+// field selection, and no schema-qualified operator (OPERATOR(schema.op)).
 //
 // A query can sit outside a SubLink, where hasSubLink does not see it:
 // JSON_ARRAY(SELECT ...) holds a bare SelectStmt. Any SelectStmt refuses.
+//
+// A function can be called without call syntax: Postgres resolves (x).f to
+// f(x) for any f that takes one argument, so field selection refuses too.
+// Array subscripts (x[1], x[1:2]) are the only indirection allowed.
 func countable(where *pg.Node) bool {
 	ok := true
 	walk(where, func(msg proto.Message) bool {
@@ -191,6 +195,12 @@ func countable(where *pg.Node) bool {
 			ok = countFunc(e.Funcname)
 		case *pg.A_Expr:
 			ok = len(e.Name) < 2
+		case *pg.A_Indirection:
+			for _, i := range e.Indirection {
+				if i.GetAIndices() == nil {
+					ok = false
+				}
+			}
 		}
 		return ok
 	})
