@@ -32,12 +32,12 @@ func (s *session) readable() bool { return s.utf8 && s.standard }
 
 // misread reports whether the server of this enforced session may read sql
 // otherwise than the classifier: the session is not readable, and sql does
-// more than repair the settings (see repairsSettings).
+// more than repair the settings (see repairsSettings). It runs with s.mu
+// held, once the message holding sql has joined its unit: a report that
+// makes the session unreadable is then either seen here or sees that unit
+// (sentAfter).
 func (s *session) misread(sql string) bool {
-	s.mu.Lock()
-	ok := s.readable()
-	s.mu.Unlock()
-	return !ok && !repairsSettings(sql)
+	return !s.readable() && !repairsSettings(sql)
 }
 
 // parameter follows a ParameterStatus with body body from the server of an

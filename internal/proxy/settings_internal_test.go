@@ -327,3 +327,54 @@ func TestCopyRuleHoldsOnlyDuringTheCopy(t *testing.T) {
 		})
 	}
 }
+
+// hookGate is fakeGate that inspects nothing as watched and runs hook, once,
+// inside the next Inspect: the server side answering while the client side
+// inspects a message.
+type hookGate struct {
+	*fakeGate
+	hook func()
+}
+
+func (g *hookGate) Inspect(sql string) Statement {
+	if h := g.hook; h != nil {
+		g.hook = nil
+		h()
+	}
+	return Statement{SQL: sql}
+}
+
+// A report that makes the settings unreadable while the client side inspects
+// a Query or Parse counts for that message: it is refused, not forwarded
+// under the old reading. A Query has joined its unit before it is inspected,
+// so the report also ends the session; a Parse joins its unit only after,
+// and is refused once it has.
+func TestSettingReportedWhileAMessageIsInspected(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		m    pgproto3.FrontendMessage
+		ends bool
+	}{
+		{"Parse", parseMsg("s1", "select 1"), false},
+		{"Query", queryMsg("select 1"), true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			g := &hookGate{fakeGate: newFakeGate()}
+			s := enforcedSession(g)
+			send(s, queryMsg("set client_encoding to 'SJIS'")) // what the report answers
+			g.hook = func() { serve(s, setting("client_encoding", "SJIS")) }
+			if r := sendOne(s, c.m); r == nil {
+				t.Error("forwarded, want it refused")
+			}
+			if (s.end != "") != c.ends {
+				t.Errorf("session ending for %q, want ended %v", s.end, c.ends)
+			}
+			if len(g.blocked) == 0 || g.blocked[0] != BlockSessionSetting {
+				t.Errorf("Blocked for %q, want session_setting first", g.blocked)
+			}
+			if _, ok, _ := s.stmts.get(nil, "s1"); ok {
+				t.Error("the refused Parse was put in the statement table")
+			}
+		})
+	}
+}

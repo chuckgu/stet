@@ -493,20 +493,18 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 			}
 			return nil, nil
 		}
-		if s.enforce && s.misread(m.String) {
-			s.markDirty(u)
-			return s.block(u, 0, 'Q', "", BlockSessionSetting), nil
-		}
 		st := s.gate.Inspect(m.String)
 		if s.enforce {
+			s.mu.Lock()
 			reason := st.Block
-			if reason == "" && runsNames(st) {
-				s.mu.Lock()
-				if s.runsWatched(u, st, maxRunDepth) {
-					reason = BlockPreparedWrite
-				}
-				s.mu.Unlock()
+			switch {
+			case s.misread(m.String):
+				reason = BlockSessionSetting
+				st = Statement{} // what the classifier saw does not count
+			case reason == "" && runsNames(st) && s.runsWatched(u, st, maxRunDepth):
+				reason = BlockPreparedWrite
 			}
+			s.mu.Unlock()
 			if reason != "" {
 				s.dirties(u, st)
 				return s.block(u, 0, 'Q', "", reason), nil
@@ -517,13 +515,13 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 	case 'P':
 		var m pgproto3.Parse
 		read := body != nil && m.Decode(body) == nil
-		misread := read && s.enforce && s.misread(m.Query)
 		var p prepared
-		if read && !misread {
+		if read {
 			p = prepared{st: s.gate.Inspect(m.Query), oids: slices.Clone(m.ParameterOIDs)}
 		}
 		s.mu.Lock()
 		u, pos := s.count()
+		misread := read && s.enforce && s.misread(m.Query)
 		if s.enforce && (!read || misread || p.st.Block != "") {
 			s.mu.Unlock()
 			// The table is left as it was. The server keeps a named
