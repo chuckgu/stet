@@ -32,7 +32,19 @@ type declared struct {
 	// unit holds the statement until the transaction it ran in has ended. Only
 	// a held cursor outlives that, with unit nil: it is settled.
 	unit *unit
+	idx  int       // which Execute of unit stacked it; 0 for a Query
 	prev *declared // what the name meant before, until this statement has run
+}
+
+// undone reports whether d, stacked by head, a unit that failed, is taken
+// back. Under one Sync the Executes before the failing one ran, and what
+// they did stays: a DECLARE then meets the transaction-end rule like any
+// other (a held one is kept although an implicit transaction may have rolled
+// it back), and a CLOSE that ran stays done, since a rollback does not reopen
+// a cursor. The failing Execute and the ones after it did not run. A Query
+// holds one statement, and that one failed.
+func (d *declared) undone(head *unit) bool {
+	return head.query || d.idx >= head.errAt
 }
 
 // cursor applies a cursor statement as it arrives from the client, so that a
@@ -50,7 +62,7 @@ func (s *session) cursor(u *unit, idx int, st Statement) {
 	switch c.Op {
 	case CursorDeclare:
 		if st.Observe || s.cursors[c.Name] != nil {
-			s.stack(c.Name, &declared{st: st, hold: c.Hold, unit: u})
+			s.stack(c.Name, &declared{st: st, hold: c.Hold, unit: u, idx: idx})
 		}
 	case CursorFetch:
 		if d := s.cursors[c.Name]; d != nil && d.st.Observe {
@@ -58,11 +70,11 @@ func (s *session) cursor(u *unit, idx int, st Statement) {
 		}
 	case CursorClose:
 		if s.cursors[c.Name] != nil {
-			s.stack(c.Name, &declared{unit: u})
+			s.stack(c.Name, &declared{unit: u, idx: idx})
 		}
 	case CursorCloseAll:
 		for name := range s.cursors {
-			s.stack(name, &declared{unit: u})
+			s.stack(name, &declared{unit: u, idx: idx})
 		}
 	}
 }
@@ -80,10 +92,10 @@ func (s *session) stack(name string, d *declared) {
 
 // cursorsAnswered brings the unsettled names up to date once head was
 // answered and left s.units, after being the transaction status it reported.
-// The DECLAREs and CLOSEs of a failed unit are undone. Once a statement ran,
-// what the name meant before it is gone. When a transaction ends (after is
-// idle) the cursors declared in it are forgotten, except held ones. It runs
-// on the server side with s.mu held.
+// The DECLAREs and CLOSEs of a failed unit that did not run are undone (see
+// undone). Once a statement ran, what the name meant before it is gone. When
+// a transaction ends (after is idle) the cursors declared in it are
+// forgotten, except held ones. It runs on the server side with s.mu held.
 func (s *session) cursorsAnswered(head *unit, after byte) {
 	for name := range s.unsettled {
 		var first *declared // what stays, newest first
@@ -92,7 +104,7 @@ func (s *session) cursorsAnswered(head *unit, after byte) {
 			next := d.prev
 			keep := false
 			switch {
-			case d.unit == head && head.err != "":
+			case d.unit == head && head.err != "" && d.undone(head):
 				// It failed or did not run: the name means what it meant before.
 			case d.unit != nil && s.pending(d.unit):
 				keep = true // not answered yet

@@ -1073,6 +1073,60 @@ func TestFailedCloseKeepsTheCursor(t *testing.T) {
 	}
 }
 
+// Under one Sync the Executes before the failing one ran. A held cursor they
+// declared and committed stays open, and a CLOSE among them closed its
+// cursor for good: the rollback of the rest does not reopen it.
+func TestFailedUnitKeepsWhatRanBeforeTheError(t *testing.T) {
+	table := readTable(t)
+	held := "declare c cursor with hold for select * from " + table
+	run := func(name string, test func(t *testing.T, g *recordingGate, conn *pgx.Conn)) {
+		t.Run(name, func(t *testing.T) {
+			g := newObservingGate(readsOf(table))
+			addr, _ := startProxy(t, upstream(t), g)
+			test(t, g, connect(t, addr, "stet_scram", nil))
+		})
+	}
+	batch := func(t *testing.T, conn *pgx.Conn, sqls ...string) {
+		t.Helper()
+		b := &pgconn.Batch{}
+		for _, sql := range sqls {
+			b.ExecParams(sql, nil, nil, nil, nil)
+		}
+		if _, err := conn.PgConn().ExecBatch(testCtx(t), b).ReadAll(); pgCode(err) != "22012" {
+			t.Fatalf("batch %q: %v, want 22012", sqls, err)
+		}
+	}
+
+	run("held cursor committed before the error", func(t *testing.T, g *recordingGate, conn *pgx.Conn) {
+		batch(t, conn, "begin", held, "commit", "select 1/0")
+		mustExec(t, conn, "fetch 7 from c")
+		mustExec(t, conn, "close c")
+		obs := g.observed(t, 1)
+		if len(obs) != 1 {
+			t.Fatalf("%d reads observed, want 1", len(obs))
+		}
+		if ob := obs[0]; ob.st.SQL != held || ob.o.Sent != 7 || !ob.o.Executed {
+			t.Errorf("FETCH: %q %+v, want %q with 7 rows sent", ob.st.SQL, ob.o, held)
+		}
+	})
+	run("close before the error", func(t *testing.T, g *recordingGate, conn *pgx.Conn) {
+		mustExec(t, conn, held)
+		batch(t, conn, "close c", "select 1/0")
+		mustFail(t, conn, "fetch 1 from c", "34000")
+		if obs := g.observed(t, 0); len(obs) != 0 {
+			t.Errorf("reads = %+v, want none: the CLOSE ran", obs)
+		}
+	})
+	run("cursor declared before the error, not held", func(t *testing.T, g *recordingGate, conn *pgx.Conn) {
+		batch(t, conn, "begin", "declare d cursor for select * from "+table, "select 1/0")
+		mustExec(t, conn, "rollback")
+		mustFail(t, conn, "fetch 1 from d", "34000")
+		if obs := g.observed(t, 0); len(obs) != 0 {
+			t.Errorf("reads = %+v, want none: its transaction ended", obs)
+		}
+	})
+}
+
 func TestFailedDeclareIsNotRemembered(t *testing.T) {
 	table := readTable(t)
 	// The failing DECLARE is one the gate observes, so Stet would remember
