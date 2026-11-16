@@ -107,6 +107,12 @@ func TestInvalidConfigs(t *testing.T) {
 		"impact max_share zero":    {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 1, max_share: 0}}}\n", "impact.max_share"},
 		"impact max_share above 1": {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 1, max_share: 1.5}}}\n", "impact.max_share"},
 		"impact unknown key":       {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 1, window: 5m}}}\n", "window"},
+		// NaN is neither above 0 nor at most 1, and fails no comparison either.
+		"impact max_share NaN":           {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 1, max_share: .nan}}}\n", "impact.max_share"},
+		"impact max_share infinite":      {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 1, max_share: .inf}}}\n", "impact.max_share"},
+		"impact max_rows over a billion": {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 1000000001}}}\n", "impact.max_rows"},
+		// max_rows + 1 is the count's LIMIT; at the largest int it overflows.
+		"impact max_rows largest int": {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], impact: {max_rows: 9223372036854775807}}}\n", "impact.max_rows"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -288,6 +294,9 @@ func TestImpactLimits(t *testing.T) {
 	}
 	if got := parse("    impact: {max_rows: 5}\n"); got == nil || *got != (Impact{MaxRows: 5}) {
 		t.Errorf("max_rows only: %+v", got)
+	}
+	if got := parse("    impact: {max_rows: 1000000000, max_share: 1}\n"); got == nil || *got != (Impact{MaxRows: 1000000000, MaxShare: 1}) {
+		t.Errorf("largest limits: %+v", got)
 	}
 }
 

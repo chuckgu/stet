@@ -64,9 +64,13 @@ type Table struct {
 
 // Impact limits how much one multi-row write may touch.
 type Impact struct {
-	MaxRows  int     // required, at least 1
+	MaxRows  int     // required, 1 to maxImpactRows
 	MaxShare float64 // optional; 0 means unset. Applies to update and delete only
 }
+
+// maxImpactRows is the largest max_rows. The count stops at max_rows + 1,
+// which must not overflow, and no write is held over a larger number.
+const maxImpactRows = 1_000_000_000
 
 type Thresholds struct {
 	Duplicate float64
@@ -277,11 +281,15 @@ func resolveTable(name string, rt rawTable) (Table, []error) {
 			fail("impact.max_rows", "required")
 		case *ri.MaxRows < 1:
 			fail("impact.max_rows", "%d must be at least 1", *ri.MaxRows)
+		case *ri.MaxRows > maxImpactRows:
+			fail("impact.max_rows", "%d must be at most %d", *ri.MaxRows, maxImpactRows)
 		default:
 			imp.MaxRows = *ri.MaxRows
 		}
 		if ri.MaxShare != nil {
-			if *ri.MaxShare <= 0 || *ri.MaxShare > 1 {
+			// Written as what is allowed, so NaN, which fails every
+			// comparison, is refused.
+			if !(*ri.MaxShare > 0 && *ri.MaxShare <= 1) {
 				fail("impact.max_share", "%v must be above 0 and at most 1", *ri.MaxShare)
 			}
 			imp.MaxShare = *ri.MaxShare
