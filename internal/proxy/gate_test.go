@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/url"
 	"regexp"
@@ -3145,4 +3146,126 @@ func TestClientEncodingUnicodeIsUTF8(t *testing.T) {
 		t.Errorf("%d writes begun, want the insert judged", n)
 	}
 	g.wantBlocked(t, "stet_trust")
+}
+
+// panicGate is recordingGate that panics in Inspect for SQL holding
+// "panic_inspect", and in Begin for a write holding "panic_begin".
+type panicGate struct{ *recordingGate }
+
+func (g panicGate) Inspect(sql string) proxy.Statement {
+	if strings.Contains(sql, "panic_inspect") {
+		panic("test gate: Inspect of " + sql)
+	}
+	return g.recordingGate.Inspect(sql)
+}
+
+func (g panicGate) Begin(info proxy.SessionInfo, st proxy.Statement, ps []proxy.Param) (any, *proxy.Refusal) {
+	if strings.Contains(st.SQL, "panic_begin") {
+		panic("test gate: Begin of " + st.SQL)
+	}
+	return g.recordingGate.Begin(info, st, ps)
+}
+
+// syncLog is a log destination tests read while the proxy writes to it.
+type syncLog struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *syncLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *syncLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+// A panic in a session's taps, the gate's Inspect or Begin here, ends that
+// session alone: both its connections are closed and the message being
+// inspected is not forwarded, so the write that panicked never runs. The
+// panic is logged as an error with the session and the stack, a write the
+// session had sent before it is still reported (End once), and other
+// sessions, and the process, go on.
+func TestPanicEndsOnlyItsSession(t *testing.T) {
+	for _, mode := range closedPointModes {
+		t.Run(mode.name, func(t *testing.T) {
+			table := watchedTable(t)
+			mustExec(t, connect(t, upstream(t), "stet_scram", nil), "grant insert on "+table+" to stet_trust")
+			g := panicGate{newRecordingGate(watches(table))}
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var logs syncLog
+			srv := proxy.New(upstream(t), slog.New(slog.NewTextHandler(&logs, nil)), g, mode.policy)
+			go srv.Serve(ln)
+			t.Cleanup(func() { srv.Close() })
+			addr := ln.Addr().String()
+			ctx := testCtx(t)
+
+			other := connect(t, addr, "stet_scram", nil)
+			mustExec(t, other, "insert into "+table+" values (1, 'before')")
+
+			// Begin panics: the write is not sent.
+			victim := connect(t, addr, "stet_scram", nil)
+			if _, err := victim.Exec(ctx, "insert into "+table+" values (2, 'panic_begin')"); err == nil {
+				t.Error("the write whose Begin panicked succeeded")
+			}
+			// Inspect panics on the message after a write already sent in
+			// the same pipeline, which is reported once all the same.
+			fe := rawSession(t, addr, "stet_trust", pgproto3.ProtocolVersionNumber)
+			sendAll(t, fe, &pgproto3.Query{String: "insert into " + table + " values (3, 'sent')"},
+				&pgproto3.Query{String: "insert into " + table + " values (4, 'panic_inspect')"})
+			for {
+				if _, err := fe.Receive(); err != nil {
+					break // the proxy closed the session
+				}
+			}
+
+			mustExec(t, other, "insert into "+table+" values (5, 'after')")
+			mustExec(t, connect(t, addr, "stet_scram", nil), "insert into "+table+" values (6, 'new session')")
+
+			var ids []int
+			rows, err := other.Query(ctx, "select id from "+table+" order by id")
+			if err != nil {
+				t.Fatal(err)
+			}
+			ids, err = pgx.CollectRows(rows, pgx.RowTo[int])
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, id := range ids {
+				if id == 2 || id == 4 {
+					t.Errorf("rows %v: the write whose %s panicked ran", ids, map[int]string{2: "Begin", 4: "Inspect"}[id])
+				}
+			}
+			bs, os := g.outcomes(t, g.beginCount())
+			var sent int
+			for i, b := range bs {
+				if strings.Contains(b.st.SQL, "'sent'") {
+					sent++
+					if os[i].Executed && os[i].Lost || !os[i].Executed && !os[i].Lost {
+						t.Errorf("the write sent before the panic ended %+v, want it run or lost", os[i])
+					}
+				}
+			}
+			g.mu.Lock()
+			endCalls := g.endCalls
+			g.mu.Unlock()
+			if sent != 1 || endCalls != len(bs) {
+				t.Errorf("%d writes begun, %d of them the one sent before the panic, %d End calls; want it begun once and each write ended once",
+					len(bs), sent, endCalls)
+			}
+			log := logs.String()
+			for _, want := range []string{"level=ERROR", "session ended by a panic", "test gate: Begin of", "test gate: Inspect of", "goroutine"} {
+				if !strings.Contains(log, want) {
+					t.Errorf("the log does not hold %q:\n%s", want, log)
+				}
+			}
+		})
+	}
 }

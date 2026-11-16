@@ -19,7 +19,7 @@ func (s *session) endWith(reason string) error {
 // ended returns the error the client is given when the proxy ended the
 // session: a FATAL with the gate's text for the reason (Blocked, which also
 // logs it). It returns nil when the proxy did not end the session. It runs
-// without s.mu held, once a pump has stopped.
+// without s.mu held, once both pumps have stopped.
 func (s *session) ended() []byte {
 	s.mu.Lock()
 	reason := s.end

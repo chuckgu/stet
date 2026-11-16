@@ -14,6 +14,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -84,6 +85,13 @@ func (s *Server) Serve(ln net.Listener) error {
 		go func() {
 			defer s.wg.Done()
 			defer s.untrack(c)
+			// A panic in a session's taps ends that session in relay; this
+			// keeps one elsewhere (abandon reporting, say) to the session too.
+			defer func() {
+				if v := recover(); v != nil {
+					s.log.Error("connection ended by a panic", "remote", c.RemoteAddr(), "panic", fmt.Sprint(v), "stack", string(debug.Stack()))
+				}
+			}()
 			s.handle(c)
 		}()
 	}
@@ -168,9 +176,12 @@ func (s *Server) handle(client net.Conn) {
 	start := time.Now()
 	s.log.Debug("session started", "remote", client.RemoteAddr())
 	if ss := s.watch(pkt); ss == nil {
-		relay(client, server, nil, nil, nil)
+		relay(client, server, nil, nil, nil, nil)
 	} else {
-		relay(client, server, ss.clientTap(), ss.serverTap(), ss.ended)
+		relay(client, server, ss.clientTap(), ss.serverTap(), ss.ended, func(v any, stack []byte) {
+			s.log.Error("session ended by a panic", "session", ss.info.ID, "login_role", ss.info.User,
+				"database", ss.info.Database, "agent", ss.info.ApplicationName, "panic", fmt.Sprint(v), "stack", string(stack))
+		})
 		ss.abandon()
 	}
 	s.log.Debug("session ended", "remote", client.RemoteAddr(), "duration", time.Since(start))
@@ -255,22 +266,41 @@ func readStartupPacket(r io.Reader) ([]byte, error) {
 
 // relay copies messages both ways until either side closes. Taps may be nil.
 //
-// ended, when set, is asked once either side has stopped whether the proxy
-// itself ended the session (a tap's see returned an error), and returns the
-// error to give the client then. The server connection is closed and the
-// other side stopped before that error is written, so it is the last thing
-// the client reads. A message the server was sending when its connection
-// closed may reach the client cut short, ahead of it.
-func relay(client, server net.Conn, fromClient, fromServer *tap, ended func() []byte) {
-	done := make(chan struct{}, 2)
-	go func() { pump(server, client, fromClient); done <- struct{}{} }()
-	go func() { pump(client, server, fromServer); done <- struct{}{} }()
-	<-done
-	var fatal []byte
-	if ended != nil {
-		fatal = ended()
+// When a side stops because the proxy itself ends the session (a tap's see
+// returned errEnded), the server connection is closed and the other side
+// stopped, and then ended, when set, returns the error to give the client:
+// it is the last thing the client reads. A message the server was sending
+// when its connection closed may reach the client cut short, ahead of it.
+//
+// A panic in a tap ends the session there (panicked, when set, is told of it
+// with its stack): both connections are closed at once, so the message the
+// tap was inspecting, and anything queued behind it, is never forwarded, and
+// the client gets no error from Stet. ended is not asked then, so a tap that
+// panicked holding the session's lock cannot stall relay; the caller reports
+// what was pending (abandon) once relay returns.
+func relay(client, server net.Conn, fromClient, fromServer *tap, ended func() []byte, panicked func(v any, stack []byte)) {
+	type stop struct {
+		err      error
+		panicked bool
 	}
-	if fatal == nil {
+	done := make(chan stop, 2)
+	run := func(dst, src net.Conn, tp *tap) {
+		defer func() {
+			if v := recover(); v != nil {
+				if panicked != nil {
+					panicked(v, debug.Stack())
+				}
+				client.Close()
+				server.Close()
+				done <- stop{panicked: true}
+			}
+		}()
+		done <- stop{err: pump(dst, src, tp)}
+	}
+	go run(server, client, fromClient)
+	go run(client, server, fromServer)
+	first := <-done
+	if first.panicked || ended == nil || !errors.Is(first.err, errEnded) {
 		client.Close()
 		server.Close()
 		<-done
@@ -281,8 +311,12 @@ func relay(client, server net.Conn, fromClient, fromServer *tap, ended func() []
 	// A client that stopped reading does not hold the pump writing to it,
 	// nor the error, past the deadline.
 	client.SetWriteDeadline(time.Now().Add(fatalTimeout))
-	<-done
-	client.Write(fatal)
+	if (<-done).panicked {
+		return
+	}
+	if fatal := ended(); fatal != nil {
+		client.Write(fatal)
+	}
 	client.Close()
 }
 

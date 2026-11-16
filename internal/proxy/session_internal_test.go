@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -58,6 +59,30 @@ func sendWrite(s *session, name string) {
 
 func serverError() []byte {
 	return body(&pgproto3.ErrorResponse{Code: "23505", Message: "duplicate key"})
+}
+
+// A side whose tap panicked while it held the session's lock never lets go of
+// it (see relay). abandon, which runs once both sides have stopped, still
+// reports what was pending, without waiting for the lock.
+func TestAbandonReportsWhatAPanicLeftHolding(t *testing.T) {
+	g := newFakeGate()
+	s := readySession(g)
+	sendWrite(s, "")
+	s.fromClient('S', nil, func() error { return nil })
+	s.mu.Lock() // as a tap that panicked holding it leaves it
+	done := make(chan struct{})
+	go func() {
+		s.abandon()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("abandon is still waiting for the lock")
+	}
+	if o, ok := g.ends[0]; !ok || !o.Lost {
+		t.Errorf("the pending write ended %+v (reported %v), want it lost", o, ok)
+	}
 }
 
 func TestAbandonKeepsTheServersError(t *testing.T) {

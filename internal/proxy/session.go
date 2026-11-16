@@ -1221,14 +1221,18 @@ func tagRows(body []byte) (int64, bool) {
 }
 
 // abandon reports the statements still waiting when the connection ended.
-// It runs once both sides have stopped.
+// It runs once both sides have stopped, so s.mu can be held only by a side
+// whose tap panicked while it held it (see relay): nothing else touches the
+// session any more, and the statements are reported all the same.
 func (s *session) abandon() {
-	s.mu.Lock()
+	locked := s.mu.TryLock()
 	units := s.units
 	s.units = nil
 	s.cursors, s.unsettled = nil, nil
 	status := s.status
-	s.mu.Unlock()
+	if locked {
+		s.mu.Unlock() // the gate is never called with it held
+	}
 	for _, u := range units {
 		// The rows of the statement that was still answering belong to the
 		// first unit not answered in full: an unsynced unit that completed
