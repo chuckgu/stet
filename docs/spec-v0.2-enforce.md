@@ -11,7 +11,7 @@
 - `mode: enforce`에서 에이전트 역할의 쓰기를 판정에 따라 보내거나 보내지 않는다. 보내지 않을 때는 에이전트가 읽고 행동을 고칠 수 있는 에러를 돌려준다.
 - 판단할 수 없으면 막는다. 섀도 모드에서 일부러 열어 둔 지점을 닫는다.
 - 드라이버가 `BEGIN`을 붙여 보내는 흔한 쓰기를 처음부터 판단한다.
-- 섀도 모드의 판정이 enforce 모드의 판정과 같게 한다. 섀도 기록을 보면 enforce를 켰을 때 무엇이 막힐지 알 수 있어야 한다.
+- 섀도 모드의 판정이 enforce 모드의 판정과 같게 한다. 섀도 기록을 보면 enforce를 켰을 때 무엇이 막힐지 알 수 있어야 한다. 판단 기록이 남지 않는 닫힌 지점은 섀도에서 경고 로그로 알린다. 알리지 못하는 것도 있다(7장).
 - 보류한 쓰기를 저장해 둔다. 다음 단계(2b)의 승인·거부 함수가 그것을 쓴다.
 
 **비목표 (이 단계)**
@@ -33,7 +33,7 @@
 | 트랜잭션 안의 쓰기 | 아직 아무것도 바꾸지 않은 트랜잭션의 첫 쓰기는 자동 커밋처럼 판단한다. 이미 바꾼 뒤의 쓰기는 막는다 (논의에서 고름) | 전부 막기: psycopg 기본 설정이나 ORM으로 붙는 에이전트는 아무것도 쓰지 못한다. `COMMIT` 때 모아서 판단하기: 프록시가 트랜잭션을 붙잡아야 해서 범위가 몇 배다 |
 | 막는 방법 | 서버가 그 자리에서 에러를 내게 하고, 그 에러를 Stet의 에러로 바꿔 돌려준다 (작성자가 정함) | 프록시가 에러를 지어내 돌려주기: 서버는 에러를 본 적이 없어서, 같은 Sync 아래의 앞 문장이 커밋되고 트랜잭션 상태가 클라이언트와 어긋난다 |
 | 동시 변경 확인 | 보내기 직전에 대상 행의 버전을 다시 읽어 비교한다 (작성자가 정함) | 문장에 `AND xmin = ...`을 붙이기: 확장 프로토콜에서는 문장이 이미 Parse로 서버에 가 있어 고칠 수 없다. 낡은 쓰기 탐지(5번 단계)에서 다시 본다 |
-| 결정론적 판정 뒤의 모델 호출 | enforce에서는 부르지 않는다. 섀도에서는 누적 한도만으로 판정이 난 쓰기에 한해 지금처럼 실행 뒤에 부르고 답을 기록한다. 다른 한도로 다시 매길 수 있게 하려는 것이다 (작성자가 정함) | 항상 부르기: 이미 막기로 정해진 쓰기를 위해 에이전트가 모델 응답을 기다린다 |
+| 결정론적 판정 뒤의 모델 호출 | enforce에서는 부르지 않는다. 섀도에서는 누적 한도나 누적 값 모름만으로 판정이 난 쓰기에 한해 지금처럼 실행 뒤에 부르고 답을 기록한다. 다른 한도로 다시 매길 수 있게 하려는 것이다 (작성자가 정함) | 항상 부르기: 이미 막기로 정해진 쓰기를 위해 에이전트가 모델 응답을 기다린다 |
 | 보류 건 | `stet.held_writes`에 저장만 한다 (작성자가 정함) | 저장하지 않기: 2b가 생기기 전에 보류된 건을 승인할 수 없게 된다 |
 
 ## 3. 대상과 흐름
@@ -45,11 +45,11 @@
 **enforce에서 쓰기 하나가 지나가는 순서.** 프록시는 쓰기를 서버로 보내기 전에 게이트를 기다린다(`Begin`). 섀도에서는 이때 상태만 읽고 판단은 실행 뒤에 한다. enforce에서는 판단까지 끝낸 뒤에 보낸다.
 
 1. 프록시가 7장의 닫힌 지점을 먼저 막는다. 그런 메시지는 게이트의 판단에 오지 않는다.
-2. 형태, 트랜잭션, 접속 계정을 본다. 판단할 수 없는 형태(영향 한도가 없는 테이블의 다중 행 쓰기 포함)면 테이블 설정 `unsupported`를 따른다. 이미 바꾼 트랜잭션 안이거나(4장) 접속 계정을 모르면(7장) 막는다. 여기서 정해지는 쓰기는 동시 상한의 자리를 잡지 않고, 상태를 읽거나 재지 않으며, 모델을 부르지 않는다. 막는 쓰기는 판단하는 동안 Stet의 DB에 가지 않는다. `unsupported: pass`로 보내는 쓰기는 바인딩 값을 읽고, 누적 한도가 있으면 0행으로 예약한다.
+2. 형태, 트랜잭션, 접속 계정을 본다. 판단할 수 없는 형태(영향 한도가 없는 테이블의 다중 행 쓰기 포함)면 테이블 설정 `unsupported`를 따른다. 이미 바꾼 트랜잭션 안이거나(4장) 접속 계정을 모르거나(7장) 게이트 대상 테이블에 쓰는 SQL `PREPARE`면(7장) 막는다. 여기서 정해지는 쓰기는 동시 상한의 자리를 잡지 않고, 상태를 읽거나 재지 않으며, 모델을 부르지 않는다. 막는 쓰기는 판단하는 동안 Stet의 DB에 가지 않는다. `unsupported: pass`로 보내는 쓰기는 바인딩 값을 읽고, 누적 한도가 있으면 0행으로 예약한다.
 3. 동시 상한(`limits.max_inflight`)의 자리를 잡는다(10장).
 4. 상태를 읽거나(단일 행) 영향을 잰다(다중 행). 섀도와 같은 코드다.
 5. 누적 한도에 예약한다.
-6. 결정론적 규칙을 먼저 적용한다(규칙 5): 측정 결과(실패, 영향 한도, 추정), 누적 한도, 누적 값 모름, 상태 실패. 물을 것이 없는 쓰기도 여기서 정해진다. 여기서 판정이 나면 모델을 부르지 않는다.
+6. 결정론적 규칙을 먼저 적용한다(규칙 5): 측정 실패, 영향 한도(행 수, 비율), 누적 한도, 누적 값 모름, 추정, 상태 실패의 순서다. 물을 것이 없는 쓰기도 여기서 정해진다. 여기서 판정이 나면 모델을 부르지 않는다.
 7. 남은 것은 단일 행 쓰기의 값 판단이다. 모델을 부른다. Stet은 이때 자기 트랜잭션을 열어 두지 않는다. 3의 자리는 쥐고 있다.
 8. `commit`으로 판정된 단일 행 `UPDATE`·`DELETE`는 대상 행의 버전을 다시 읽는다. 바뀌었으면 4, 6, 7을 한 번 더 한다(5장).
 9. 판정을 적용한다(5장): 보내거나, 막고 에러를 돌려준다. `hold`와 `escalate`는 막기 전에 `stet.held_writes`에 넣는다(9장). 여기서 3의 자리를 돌려준다.
@@ -57,7 +57,7 @@
 
 클라이언트가 기다리는 시간에는 단계마다 상한이 있다. 3부터 5까지(자리를 기다리는 시간, 바이너리 바인딩 값 읽기, 상태 읽기나 측정, 누적 값의 적재를 기다리는 시간)는 합쳐 500ms다. 7은 `model.timeout_ms`다. 어댑터가 시간을 지키지 않아도 그때 기다림을 끝낸다. 8의 행 버전 다시 읽기는 한 번에 500ms다. 다시 판단하면 상태 읽기(500ms), 모델(`model.timeout_ms`), 행 버전 다시 읽기(500ms)가 많아야 한 번 더 든다. 9의 보류 건 삽입은 500ms다. 2에서 `unsupported: pass`로 보내는 쓰기의 바인딩 값 읽기와 예약은 합쳐 500ms다. 상한을 넘은 단계는 그 단계의 실패로 다룬다(7장).
 
-**섀도에서 달라지는 것.** 판정 규칙이 enforce와 같아진다. 4장의 트랜잭션 규칙, 7장의 "접속 계정 없음"과 "누적 값 모름"이 섀도의 판정에도 적용된다. 형태, 트랜잭션, 접속 계정, 측정, 상태 실패로 판정이 난 쓰기에는 섀도에서도 모델을 부르지 않는다. 누적 한도만으로 판정이 난 단일 행 쓰기에는 지금처럼 묻고 답을 기록한다. 모델이 고른 중복 후보가 Stet이 보낸 후보가 아니면 두 모드 모두 이유에 그 id를 적지 않는다(5장). 섀도는 여전히 아무것도 막지 않고, 모델은 실행 뒤에 부른다.
+**섀도에서 달라지는 것.** 판정 규칙이 enforce와 같아진다. 4장의 트랜잭션 규칙, 7장의 "접속 계정 없음"과 "누적 값 모름"이 섀도의 판정에도 적용된다. 형태, 트랜잭션, 접속 계정, 측정, 상태 실패로 판정이 난 쓰기에는 섀도에서도 모델을 부르지 않는다. 누적 한도나 누적 값 모름만으로 판정이 난 단일 행 쓰기에는 지금처럼 묻고 답을 기록한다. 모델이 고른 중복 후보가 Stet이 보낸 후보가 아니면 두 모드 모두 이유에 그 id를 적지 않는다(5장). 섀도는 여전히 아무것도 막지 않고, 모델은 실행 뒤에 부른다.
 
 ## 4. 트랜잭션 안의 쓰기
 
@@ -98,7 +98,7 @@ v0.1은 명시적 트랜잭션 안의 쓰기를 모두 판단하지 않았다(`i
 | `commit` | 서버로 보낸다. 상태를 읽은 단일 행 `UPDATE`·`DELETE`는 보내기 전에 행 버전을 다시 확인한다 | 없음 |
 | `hold` | 보내지 않는다. `stet.held_writes`에 저장한다 | `ST001` |
 | `escalate` | `hold`와 같다 | `ST001` |
-| `unsupported` | 더러운 트랜잭션 안이거나 접속 계정을 모르면 보내지 않는다. 형태의 이유가 먼저 나왔어도 같다. 그 밖에는 테이블 설정 `unsupported`를 따른다(`reject`가 기본값이고, `pass`면 판단 없이 보낸다) | `ST002` |
+| `unsupported` | 더러운 트랜잭션 안이거나 접속 계정을 모르면 보내지 않는다. 형태의 이유가 먼저 나왔어도 같다. 게이트 대상 테이블에 쓰는 SQL `PREPARE`(`prepare`)도 보내지 않는다(7장). 그 밖에는 테이블 설정 `unsupported`를 따른다(`reject`가 기본값이고, `pass`면 판단 없이 보낸다) | `ST002` |
 
 판정 `reject`는 지금의 규칙에서 나오지 않는다. 판정 함수가 돌려주는 것은 위 넷이다. `ST003`은 내지 않는다. 판정을 행동으로 옮기는 표가 모르는 판정이 오면 `ST002`로 막는다.
 
@@ -173,7 +173,7 @@ HINT:  narrow the WHERE clause, or ask a human to approve held_write ec210d65-54
 | `ST002` | 판단할 수 없음 | `unsupported`, 7장의 닫힌 지점, 세션을 끝낼 때(FATAL) |
 | `ST003` | 정책에 따른 거부 | 내지 않는다 |
 
-- 메시지는 영어다. 이유마다 한 문장과 `HINT`를 둔다. 문구의 표는 `internal/decide/act.go`에 있다. `ST002`의 `HINT`는 고칠 방법을 말한다(예: `in_transaction`의 "ROLLBACK, then send this write as its own statement or as the first statement after BEGIN").
+- 메시지는 영어다. 이유마다 한 문장과 `HINT`를 둔다. 문구의 표는 `internal/decide/act.go`에 있다. `ST002`의 `HINT`는 고칠 방법을 말한다(예: `in_transaction`의 "send this write as the first statement of its transaction, after the answer to the statement before it (ROLLBACK first if a transaction is open)"). `in_transaction`의 문장과 `HINT`는 그 이유로 막히는 세 경우에 모두 맞게 썼다. 이미 무언가를 바꾼 명시적 트랜잭션 안의 쓰기, 앞 문장의 답을 기다리지 않고 이어 보낸 쓰기, 한 Sync 아래 묶음의 두 번째 쓰기다(4장).
 - 판단 기록이 있는 거부는 `write held by stet: `나 `write refused by stet: `로 시작한다. 닫힌 지점은 막은 것의 이름으로 시작하고(`statement refused by stet: `, `message refused by stet: `, `function call refused by stet: `, `DO block refused by stet: `) `DETAIL`이 없다. 세션을 끝낼 때는 `connection closed by stet: `로 시작한다.
 - 메시지에 다른 행의 값을 넣지 않는다. 중복 후보는 키만 적는다(5장). 에이전트가 볼 권한이 없는 값이 에러로 새면 안 된다. 에러에 넣는 값은 제어 문자를 공백으로 바꾸고 UTF-8이 아닌 바이트를 바꿔 넣는다.
 - `DETAIL`은 `decision=<id> held_write=<id> reasons=<a,b>`이다. `decision`은 판단 기록의 id다. 보류하지 않았거나 저장하지 못한 쓰기에는 `held_write`가 없다.
@@ -189,12 +189,15 @@ HINT:  narrow the WHERE clause, or ask a human to approve held_write ec210d65-54
 | 64MiB가 넘는 Query·Parse·Bind·Execute | 검사하지 않고 보낸다 | 막는다 | 기록 없음, `ST002` (`too_large`) |
 | FunctionCall 메시지 | 검사하지 않고 보낸다 | 막는다 | 기록 없음, `ST002` (`function_call`) |
 | `DO` 블록 | 보낸다 | 막는다 | 기록 없음, `ST002` (`do_block`) |
+| 함수·프로시저·규칙·트리거를 만드는 문장, 게이트 대상 테이블을 읽는 뷰를 만드는 문장 | 보낸다 | 막는다 | 기록 없음, `ST002` (`defines_code`) |
+| 확장 프로토콜 Parse의 `COPY ... FROM STDIN` | 보낸다 | 막는다 | 기록 없음, `ST002` (`copy_extended`) |
 | 감시 대상 이름의 SQL `EXECUTE`·`FETCH`·`MOVE` | 보낸다. 기록도 없다 | 막는다 | 기록 없음, `ST002` (`prepared_write`) |
-| 뜻이 정해지지 않은 이름의 Execute | 가장 새 뜻으로 판단한다 | 막는다 | 기록 없음, `ST002` (`unsettled_name`) |
+| 뜻이 정해지지 않았고 그 가운데 감시 대상이나 무엇인지 모르는 뜻이 있는 이름의 Execute | 가장 새 뜻으로 판단한다 | 막는다 | 기록 없음, `ST002` (`unsettled_name`) |
 | 분류기와 다르게 읽히는 세션 설정 | 그대로 분류한다 | 막는다 | 기록 없음, `ST002` (`session_setting`) |
 | UTF8이 아닌 서버에서 ASCII가 아닌 문장·포털 이름 | 보낸다 | 막는다 | 기록 없음, `ST002` (`name_encoding`) |
 | 판단할 수 없는 형태의 쓰기 | 보낸다 | 테이블 설정 `unsupported`. 기본값은 `reject` | `unsupported`, 형태의 이유 |
 | 접속 계정을 모르는 세션의 쓰기 | 보낸다 | 막는다. `unsupported: pass`여도 막는다 | `unsupported`, `no_login_role` |
+| 게이트 대상 테이블에 쓰는 SQL `PREPARE` | 보낸다 | 막는다. `unsupported: pass`여도 막는다 | `unsupported`, `prepare` |
 | 상태를 읽지 못함·시간 초과 | 보낸다 | `on_failure` (enforce 기본 `hold`) | `on_failure`에 따라 `hold`나 `commit`, `state_error` |
 | 모델 실패·시간 초과 | 보낸다 | 위와 같다 | 위와 같다, `model_error` (모델이 없으면 `no_model`) |
 | 영향 측정 실패 | 보낸다 | 테이블 설정 `unsupported` | `unsupported`, 형태의 이유 |
@@ -202,19 +205,23 @@ HINT:  narrow the WHERE clause, or ask a human to approve held_write ec210d65-54
 | 동시에 판단 중인 쓰기가 상한을 넘음 | 보낸다 | 500ms 안에 자리가 나지 않으면 `on_failure` | `state_error` |
 | `held_writes` 저장 실패 | 해당 없음 | 그래도 막는다. 에러의 `DETAIL`에 `held_write`가 없다 | 로그 |
 
-- "기록 없음"인 줄은 판단 기록에 넣지 않는다. 경고 로그 한 줄("message refused without a decision")에 이유, 세션 id, 접속 계정, 데이터베이스, `application_name`을 남긴다. 문장은 남기지 않는다. 데이터가 들어 있을 수 있다.
+- "기록 없음"인 줄은 판단 기록에 넣지 않는다. 경고 로그 한 줄("message refused without a decision")에 이유, 세션 id, 접속 계정, 데이터베이스, `application_name`을 남긴다. 문장은 남기지 않는다. 데이터가 들어 있을 수 있다. 이 로그는 세션과 이유마다 처음 한 번만 남는다. 막는 것은 매번 막는다. 읽을 수 없는 인코딩에 머문 세션처럼 같은 것을 되풀이해 보내는 클라이언트가 로그를 채우지 않게 하려는 것이다.
+- 섀도의 에이전트 세션은 "기록 없음"인 줄 가운데 프록시가 따로 일하지 않고 아는 것을 경고 로그 한 줄("would be refused under enforce")로 알린다. 읽지 못한 메시지(`unparsed`), 큰 메시지(`too_large`), `DO` 블록(`do_block`), 코드를 만드는 문장(`defines_code`), FunctionCall(`function_call`), 확장 프로토콜 Parse의 `COPY ... FROM STDIN`(`copy_extended`)이다. 세션과 이유마다 한 번이고, 로그의 항목은 enforce의 것과 같다. 메시지는 그대로 보내고, 세션을 끝내지 않는다. 더하는 것은 그 로그 한 줄뿐이다.
+- 섀도는 나머지 닫힌 지점을 알리지 않는다. 세션 설정(`session_setting`, `setting_changed`)과 이름의 인코딩(`name_encoding`)은 섀도의 탭이 서버의 ParameterStatus를 따라가지 않아 모른다. 이름으로 실행하는 문장(`prepared_write`)과 뜻이 정해지지 않은 이름(`unsettled_name`)은 세션의 표를 더 찾아야 안다. 게이트 대상 테이블에 쓰는 SQL `PREPARE`는 섀도에서도 판단 기록(`unsupported`, `prepare`)이 남고, 그 이유는 enforce에서 언제나 막힌다.
 - 한 Query에 게이트 대상 쓰기와 `DO` 블록이 함께 있으면(`insert into <대상> ...; do $$...$$`) 감시 대상(`unsupported`, `multi_statement`)이면서 닫힌 지점이다. enforce는 닫힌 지점으로 막고 로그만 남긴다. 섀도는 `unsupported` 판단 기록을 남긴다.
 - 분류기는 PostgreSQL 17 문법을 읽는다. 서버가 더 새 버전이면 서버는 받는 문장을 분류기가 읽지 못할 수 있다. enforce에서 그런 문장은 막힌다. Stet은 시작할 때 서버 버전을 읽어 분류기보다 새면 경고한다(두 모드 모두).
 - `on_failure: pass`와 `unsupported: pass`는 enforce에서도 쓸 수 있다. 운영자가 고른 것이다. 시작할 때 경고 로그를 남긴다.
 - `DO` 블록은 안에서 무엇을 쓰는지 볼 수 없다. 에이전트 세션에서는 대상 테이블과 상관없이 막는다. 단, 게이트 대상 테이블이 하나도 없으면 게이트가 없어 이 표의 어느 것도 막지 않는다. enforce에서도 프록시는 통과만 하고, 시작할 때 그렇다고 경고한다.
 - 누적 한도가 있는 테이블에서 그 계정의 사용량을 아직 읽지 않았으면, 자리를 얻지 못한 쓰기는 `state_error`가 아니라 `hold`(`impact:cumulative_unknown`)다. 규칙의 순서에서 누적 값 모름이 상태 실패보다 앞이다. `on_failure: pass`여도 막힌다. 자리를 얻지 못한 다중 행 쓰기도 측정 실패(`unsupported`)가 아니라 `state_error`이고, 테이블 설정 `unsupported`가 아니라 `on_failure`가 정한다.
 - 보낸 그대로 저장할 수 없는 보류 건도 저장하지 않고 막는다. 바인딩 값을 읽지 못했거나, 문장이나 바인딩 값이 UTF-8이 아니거나 NUL이 있는 경우다. 바꾼 값으로 승인하면 다른 쓰기가 실행되기 때문이다. 저장하지 못한 보류 건의 `HINT`는 `this write`를 승인하라고 말하고, 에러 로그를 남긴다.
-- 함수 안의 쓰기, 트리거, 뷰와 파티션 자식, DDL은 문장만 봐서는 닫을 수 없다. DB 권한으로 닫는다(8장).
+- 함수, 프로시저, 규칙, 트리거와 게이트 대상 테이블을 읽는 뷰는 그것을 거치는 쓰기를 어느 문장에도 드러내지 않는다. 그래서 `DO` 블록과 같은 이유로, 에이전트 세션이 그것을 만드는 문장(`CREATE [OR REPLACE] FUNCTION`, `CREATE PROCEDURE`, `CREATE RULE`, `CREATE TRIGGER`, 게이트 대상 테이블을 읽는 `CREATE [OR REPLACE] [TEMP] VIEW`)은 대상 테이블과 상관없이 막는다(`defines_code`). 한 Query의 문장 가운데 하나라도 그러면 막고, `CREATE SCHEMA` 안의 뷰와 트리거도 센다. 게이트 대상 테이블을 읽지 않는 뷰는 만든다.
+- 그 밖에 문장만 봐서는 닫을 수 없는 길(실행할 수 있는 이미 있는 함수, 게이트 대상 테이블을 상속한 테이블, 파티션 자식, 그 밖의 DDL)은 DB 권한으로 닫는다(8장, 13장).
 
 **이름으로 실행하는 문장.** SQL `EXECUTE s1`은 프로토콜 Parse로 준비한 쓰기를 실행한다. 트랜잭션 안에서 SQL `FETCH`·`MOVE`는 프로토콜 Bind로 만든 `UPDATE ... RETURNING` 포털을 실행한다. 분류기에는 둘 다 테이블이 보이지 않는다.
 
 - enforce에서는 문장이 이름으로 실행하는 준비된 문장과 포털을 세션의 표(6장)에서 찾는다. 그 이름이 가질 수 있는 뜻 가운데 하나라도 감시 대상 쓰기이거나 무엇인지 모르면 막는다(`prepared_write`). `EXPLAIN ANALYZE EXECUTE`처럼 다른 문장 안에 든 것도 같다.
 - 그 뜻이 다시 이름을 실행하면 네 단계까지 따라가고, 그보다 깊으면 감시 대상으로 본다. 표에 없는 이름(SQL `PREPARE`로 만든 것)은 서버의 답에 맡긴다.
+- 게이트 대상 테이블에 쓰는 SQL `PREPARE`는 enforce에서 테이블 설정과 상관없이 막는다(`prepare`). 보내면 그 이름의 `EXECUTE`와 프로토콜 Bind·Execute가 판단도 기록도 없이 그 쓰기를 실행한다. 막은 `PREPARE`의 이름은 서버에 생기지 않으므로 뒤의 `EXECUTE`는 서버에서 실패한다(26000). 한 Query의 다른 문장과 함께 보내도 같다. 프로토콜 Parse로 준비한 쓰기는 지금처럼 Execute마다 판단한다.
 - 프로토콜 Execute도 같다. 포털이 실행할 수 있는 문장이 이름으로 감시 대상을 실행하면 막는다.
 
 **세션 설정.** 서버는 문장의 바이트를 세션의 `client_encoding`에서 바꾼 뒤 읽고, `standard_conforming_strings`에 따라 문자열 안의 역슬래시를 다르게 읽는다. 분류기는 UTF-8과 `standard_conforming_strings = on`으로 읽는다. SJIS, BIG5, GBK, UHC, GB18030, JOHAB, SHIFT_JIS_2004에서는 여러 바이트 글자의 끝 바이트가 역슬래시일 수 있고, `standard_conforming_strings`가 `off`면 `\'`가 따옴표다. 그러면 서버와 분류기가 문자열이 끝나는 곳을 다르게 보고, 분류기가 문자열로 읽은 곳에 쓰기가 숨는다. 테스트 서버에서 두 경우 모두 그 쓰기가 판단 없이 실행되는 것을 확인했다.
@@ -226,11 +233,13 @@ HINT:  narrow the WHERE clause, or ask a human to approve held_write ec210d65-54
 
 **이름의 인코딩.** 서버의 `server_encoding`이 UTF8이 아니면, 서버는 ASCII가 아닌 이름을 자기 인코딩으로 바꿔 63바이트로 자른다. 프록시와 분류기는 UTF-8로 자르므로 이름을 다르게 비교할 수 있다. 그런 서버에서 enforce의 에이전트 세션은 ASCII가 아닌 이름을 쓰는 Parse, Bind, Execute와 그런 이름을 SQL `EXECUTE`·`FETCH`·`MOVE`로 실행하는 문장을 막는다(`name_encoding`). 보통 문장은 ASCII가 아닌 글이 있어도 지나간다.
 
-**세션을 끝내는 경우.** 서버의 답이 프록시가 따라가는 단위와 어긋나는 순서가 있다. enforce의 에이전트 세션에서는 그때 세션을 끝낸다. 끝내게 한 메시지는 넘기지 않고, 서버 연결을 닫고, 클라이언트에게 `ST002`의 FATAL을 마지막으로 보낸다. 판단 기록은 없고 경고 로그 "session ended without a decision"이 남는다.
+**세션을 끝내는 경우.** 서버의 답이 프록시가 따라가는 단위와 어긋나는 순서가 있다. enforce의 에이전트 세션에서는 그때 세션을 끝낸다. 끝내게 한 메시지는 넘기지 않고, 서버 연결을 닫고, 클라이언트에게 `ST002`의 FATAL을 마지막으로 보낸다. 판단 기록은 없고 경고 로그 "session ended without a decision"이 남는다(`setting_changed`는 에러 로그다).
 
-- 확장 프로토콜의 `COPY ... FROM STDIN`(`copy_extended`). 서버는 그 복사 중의 Sync를 무시한다. 서버가 그 복사를 시작한다고 답하는(CopyInResponse) 순간 끝낸다. 단순 Query로 보낸 `COPY ... FROM STDIN`은 된다.
+- 분류기가 보지 못한 확장 프로토콜의 `COPY ... FROM STDIN`(`copy_started`). 서버는 그 복사 중의 Sync를 무시한다. 서버가 그 복사를 시작한다고 답하는(CopyInResponse) 순간 끝낸다. 분류기가 Parse에서 본 `COPY ... FROM STDIN`은 그 Parse를 닫힌 지점으로 막는다(`copy_extended`). 클라이언트는 보통 에러를 받고 세션은 남는다. 이 규칙은 그 뒤를 받치는 장치다. 단순 Query로 보낸 `COPY ... FROM STDIN`은 된다.
 - 단순 Query의 `COPY ... FROM STDIN` 중에 온 메시지(`protocol_order`). 서버의 CopyInResponse부터 클라이언트의 CopyDone이나 CopyFail까지 서버는 복사 메시지만 읽고 Sync는 무시한다. 그 사이에 Sync나 다른 메시지가 오면 끝낸다. Flush는 지나간다. COPY와 한 번에 보낸 Sync처럼 이미 보낸 메시지가 복사 중에 읽힐 때도 끝낸다. 한 Query에 복사가 여럿이어도 하나씩 센다. CopyDone과 다음 Query를 한 번에 보내는 클라이언트는 세션을 지킨다.
-- 두 설정이 읽을 수 없는 값으로 바뀌었는데 그 변경 뒤에 읽혔을 수 있는 메시지가 이미 간 경우(`setting_changed`). 서버는 변경을 그 단위의 ReadyForQuery 바로 앞에서야 알린다. 그 전에 클라이언트가 보낸 다음 메시지는 옛 값으로 검사됐다. 뒤 단위에 Query나 Parse·Bind·Describe·Close·Execute가 있거나, 같은 단위에서 Execute 뒤에 메시지가 있거나, 실행한 문장이 있는 Sync 없는 단위 뒤의 Query면 끝낸다. Sync나 Flush만 있는 뒤 단위는 세지 않는다. 이미 간 그 메시지는 서버가 실행했을 수 있다(13장).
+- 두 설정이 읽을 수 없는 값으로 바뀌었는데 그 변경 뒤에 읽혔을 수 있는 메시지가 이미 간 경우(`setting_changed`). 서버는 변경을 그 단위의 ReadyForQuery 바로 앞에서야 알린다. 그 전에 클라이언트가 보낸 다음 메시지는 옛 값으로 검사됐다. 뒤 단위에 Query나 Parse·Bind·Describe·Close·Execute가 있거나, 같은 단위에서 Execute 뒤에 Parse·Bind·Describe·Close·Execute가 있거나, 실행한 문장이 있는 Sync 없는 단위 뒤의 Query면 끝낸다. Sync나 Flush만 있는 뒤 단위는 세지 않는다. 이미 간 그 메시지는 서버가 실행했을 수 있다(13장). 그래서 이 경우의 로그는 경고가 아니라 에러다. 변경을 서버가 알리기 전에 보낸 메시지가 판단 없이 감시 대상 테이블에 대해 실행됐을 수 있다고 말하고, 세션 id, 접속 계정, 데이터베이스, `application_name`을 남긴다.
+
+**세션 안의 panic.** 세션을 따라가는 코드(그 안의 게이트 호출 포함)에서 panic이 나면 그 세션만 끝낸다. 두 모드 모두 같다. 두 연결을 닫고, 그때 검사하던 메시지와 그 뒤에 쌓인 메시지는 보내지 않는다. 클라이언트는 Stet의 에러를 받지 않고 연결이 끊긴다. 에러 로그("session ended by a panic")에 세션 id, 접속 계정, 데이터베이스, `application_name`, panic 값, 스택을 남긴다. 그때 서버의 답을 기다리던 문장은 연결이 끝난 문장으로 `End`와 `Observe`에 보고한다. panic이 세션 잠금을 쥔 채 났어도 같다. 다른 세션과 프로세스는 그대로 돈다.
 
 ## 8. 에이전트 역할
 
@@ -252,7 +261,7 @@ agents:
 **시작할 때의 확인.** 게이트 대상 테이블이 있으면, Stet은 스키마를 올린 뒤 서버를 받기 전에 자기 계정으로, 읽기 전용 트랜잭션에서 아래를 확인한다. 합쳐 10초가 상한이다. 설정의 이름은 SQL에 파라미터로만 들어간다.
 
 - 두 모드: 서버가 분류기의 문법(PostgreSQL 17)보다 새면 경고한다. Stet 자신의 계정이 `agents.roles`에 있으면 시작하지 않는다.
-- enforce에서만: `db_user_namespace`가 켜져 있으면 시작하지 않는다. `model.on_failure: pass`와 테이블의 `unsupported: pass`는 경고한다. 에이전트 계정마다 다음을 경고한다. 계정이 없을 때. superuser이거나 `SET ROLE`로 될 수 있는 superuser 역할의 구성원일 때. `stet` 스키마에 권한(USAGE, CREATE)이 있을 때. 게이트 대상 테이블의 소유자일 때. 역할 수준의 `search_path`(이 데이터베이스용이나 전체용)가 Stet 연결의 것과 다를 때. 권한과 소유는 직접 받은 것, PUBLIC에 준 것, `SET ROLE`로 될 수 있는 역할을 거친 것(NOINHERIT 구성원 포함), 스키마나 테이블의 소유자 역할의 구성원인 것을 모두 센다. 경고는 그 계정과, 거둘 역할이나 고칠 문장을 말한다.
+- enforce에서만: `db_user_namespace`가 켜져 있으면 시작하지 않는다. `model.on_failure: pass`와 테이블의 `unsupported: pass`는 경고한다. 에이전트 계정마다 다음을 경고한다. 계정이 없을 때. superuser이거나 `SET ROLE`로 될 수 있는 superuser 역할의 구성원일 때. `stet` 스키마에 권한(USAGE, CREATE)이 있을 때. 객체를 만들 수 있을 때: 데이터베이스의 `TEMPORARY`나 `CREATE`, 또는 `pg_`로 시작하는 스키마와 `information_schema`, `stet`을 뺀 스키마의 `CREATE`나 소유(데이터베이스의 것과 스키마의 것이 경고 한 줄씩이다). 게이트 대상 테이블의 소유자일 때. 역할 수준의 `search_path`(이 데이터베이스용이나 전체용)가 Stet 연결의 것과 다를 때. 권한과 소유는 직접 받은 것, PUBLIC에 준 것, `SET ROLE`로 될 수 있는 역할을 거친 것(NOINHERIT 구성원 포함), 스키마나 테이블이나 데이터베이스의 소유자 역할의 구성원인 것을 모두 센다. `search_path`는 그 계정 자신의 설정만 본다. 경고는 그 계정과, 권한마다 PUBLIC을 거친 것인지 어느 역할을 거친 것인지와, 거둘 역할이나 고칠 문장(`REVOKE ...`)을 말한다. PUBLIC에서 거두는 문장에는 모든 계정이 잃는다는 말을 붙인다.
 - 확인하지 못한 것은 통과가 아니다. enforce에서 그 결과가 시작을 멈추는 확인(`db_user_namespace`, Stet 자신의 계정)은 확인하지 못해도 시작하지 않는다. 그 밖의 확인과 섀도의 확인은 "확인하지 못했다"고 경고하고 시작한다.
 - Stet 계정이 각 에이전트 계정의 구성원인지는 시작할 때 확인하지 않는다. 게이트가 그 계정으로 측정하지 못하면 계정마다 한 번 경고한다.
 - 리스너는 스키마 이전과 확인보다 먼저 열린다. 그동안 붙는 클라이언트는 Stet이 서버를 받기 시작할 때까지 기다린다. 시작하지 않으면 리스너를 닫는다.
@@ -262,6 +271,7 @@ agents:
 - 에이전트 계정은 Stet을 거쳐서만 DB에 닿아야 한다. `pg_hba.conf`에서 그 계정의 접속을 Stet의 주소로만 허용한다. 직접 붙을 수 있으면 Stet은 아무것도 막지 못한다.
 - 에이전트 계정은 superuser도, superuser 역할의 구성원도 아니고, 게이트 대상 테이블의 소유자가 아니며, `stet` 스키마에 권한이 없다.
 - 게이트 대상 테이블에 쓰는 함수의 `EXECUTE`, `dblink`·`postgres_fdw`, `TRIGGER`·`CREATE` 권한을 에이전트 계정에 주지 않는다(v0.1 스펙 10장의 표).
+- 에이전트 계정이 객체를 만들 수 없게 한다. 데이터베이스의 `TEMPORARY`(임시 뷰와 함수), 데이터베이스의 `CREATE`(자기 스키마), 시스템 스키마가 아닌 스키마의 `CREATE`와 소유다. `TEMPORARY`는 모든 PostgreSQL 버전에서 기본으로 PUBLIC에 있고, `public` 스키마의 `CREATE`는 PostgreSQL 14까지 기본으로 PUBLIC에 있다. 그래서 손대지 않은 DB에서는 어느 계정이나 임시 뷰나 함수를 만들고 그것을 거쳐 게이트 대상 테이블에 판단 없이 쓸 수 있다. enforce는 그것을 만드는 문장을 에이전트 세션에서 막지만(7장의 `defines_code`) 모든 길을 막지는 못한다(13장). PUBLIC에서 거두면 모든 계정이 잃으므로 필요한 계정에는 다시 준다. 시작할 때의 확인이 남은 권한을 경고한다.
 - Stet의 계정은 각 에이전트 계정의 구성원이어야 한다(`GRANT agent_x TO stet`). 영향 측정이 그 계정의 권한으로 돌기 때문이다.
 - 에이전트 계정의 `search_path`는 Stet 계정의 것과 같아야 하고, 게이트 대상 테이블과 이름이 같은 테이블이 다른 스키마에 없어야 한다. Stet은 상태 읽기와 영향 측정에서 스키마 없는 이름을 자기 `search_path`로 푼다(13장). 시작할 때 에이전트 계정에 역할 수준의 `search_path` 설정이 있고 Stet의 것과 다르면 경고한다.
 - `db_user_namespace`를 끈다(PostgreSQL 16까지).
@@ -356,6 +366,12 @@ limits:
 | accounting 9장 | CommandComplete 뒤 ReadyForQuery 전에 끊긴 쓰기가 "실행 안 됨"으로 기록됨 | CommandComplete를 받은 쓰기는 `executed = true`와 그 행 수로 기록하고, 누적 한도도 그 행 수로 정산한다. 문장이 여럿인 Query는 어느 문장의 완료인지 몰라 그대로 둔다 |
 | 이 스펙의 검토 | 프록시의 문장 표가 서버와 어긋나 판단받지 않은 쓰기가 나감 | 6장. 서버가 완료한 변경만 남기고, 뜻이 둘 이상인 이름은 그 뜻을 모두 들고 있으며, Sync 전의 Query를 서버대로 따라간다. 표를 피해 가는 길(SQL `EXECUTE`·`FETCH`·`MOVE`, 뜻이 정해지지 않은 이름, 확장 프로토콜 복사, 복사 중의 Sync)은 enforce에서 막거나 세션을 끝낸다(7장). 섀도에 남은 어긋남은 13장 |
 | accounting 9장 | 종료 순서의 자동 테스트가 없음 | `stet proxy`의 실행부를 떼어 내고, 끝날 때 아직 돌던 쓰기와 읽기가 기록되는지 테스트한다 |
+| 브랜치 전체 검토 | 에이전트가 만든 임시 뷰나 함수를 거쳐 게이트 대상 테이블에 판단 없이 씀 | 7장(`defines_code`), 8장(객체를 만들 수 있는 권한의 경고) |
+| 브랜치 전체 검토 | `unsupported: pass`에서 SQL `PREPARE` 뒤의 `EXECUTE`가 기록 없이 실행됨 | 7장(`prepare`). enforce에서 언제나 막는다 |
+| 브랜치 전체 검토 | 섀도가 닫힌 지점을 알리지 않음, enforce의 닫힌 지점 로그에 한도가 없음 | 7장. 세션과 이유마다 한 번 |
+| 브랜치 전체 검토 | 받아들인 우회(`setting_changed`)가 보통 경고로만 남음 | 7장. 에러 로그 |
+| 브랜치 전체 검토 | 세션 하나의 panic이 프로세스를 끝냄 | 7장. 그 세션만 끝낸다 |
+| 브랜치 전체 검토 | 확장 프로토콜의 `COPY ... FROM STDIN`이 세션을 끝냄 | 7장. 분류기가 본 것은 Parse를 막고 세션은 남는다 |
 
 **남긴다**
 
@@ -370,6 +386,8 @@ limits:
 - 이미 무언가를 바꾼 트랜잭션 안의 쓰기는 모두 막힌다. 한 트랜잭션에서 게이트 대상 테이블에 두 번 쓰는 에이전트는 두 번째에서 막히고, 트랜잭션 전체가 롤백된다. 쓰기 앞에 `SELECT`를 둔 트랜잭션도 마찬가지다.
 - 한 Query에 문장을 여럿 담아 보내는 쓰기는 막힌다(`begin; update ...; commit` 한 줄 포함).
 - 앞 문장의 응답을 기다리지 않고 이어 보낸 쓰기는 막힌다. 프록시는 앞 문장이 끝났는지 모르기 때문이다. 흔한 드라이버는 응답을 받고 다음 문장을 보낸다. 파이프라인 모드를 켜고 Sync를 따로 붙여 보내는 클라이언트가 해당한다.
+- 한 Sync 아래 묶어 보내는 쓰기(JDBC의 `executeBatch`, pgx의 `SendBatch`, psycopg의 `executemany`)는 묶음의 두 번째 쓰기부터 막힌다. 앞 쓰기가 같은 암묵 트랜잭션을 더럽히기 때문이다(4장).
+- `SAVEPOINT`는 트랜잭션을 더럽힌다. 그래서 드라이버의 중첩 트랜잭션(저장점)을 쓰면 그 뒤의 쓰기가 막힌다.
 - 판단을 기다리는 동안 클라이언트가 취소를 보내거나 연결을 끊어도, `commit`으로 판정된 쓰기는 서버로 간다. Stet 없이 보냈을 때도 이미 보낸 문장은 실행된다. enforce는 그 사이의 시간을 늘릴 뿐이다.
 - 상태 읽기와 영향 측정은 스키마 없는 테이블 이름을 Stet 연결의 `search_path`로 푼다. 에이전트 세션의 `search_path`가 다르고 같은 이름의 테이블이 다른 스키마에 있으면, 에이전트가 쓰는 테이블과 Stet이 재는 테이블이 달라진다. 섀도에서는 틀린 기록이고, enforce에서는 영향 한도를 피하는 길이다. 운영으로 막는다(8장). 세션의 `search_path`를 따라가는 것은 남긴다.
 - 세션에서 `SET ROLE`이나 `SET SESSION AUTHORIZATION`으로 바꾼 역할은 따라가지 않는다. 판단, 영향 측정, 누적 한도는 접속 계정으로 한다. 두 문장은 트랜잭션을 더럽히지도 않는다(4장).
@@ -379,20 +397,24 @@ limits:
 - 다중 행 쓰기는 값 판단을 받지 않는다. 한 행짜리를 다중 행 모양으로 쓰면(`id BETWEEN 5 AND 5`) 값 판단을 피한다. 영향 한도와 누적 한도는 적용된다.
 - 조인, `WITH`, 서브쿼리가 있는 문장에서 키에 값 하나짜리 `IN`을 쓴 쓰기는 `= 5`처럼 `unsupported`다. 이 단계 전에는 다중 행으로 재었지만 이제 재지 않는다.
 - 에이전트는 모델 응답을 기다린다. `model.timeout_ms`만큼 쓰기가 느려질 수 있다. 행이 바뀌어 다시 판단하면 한 번 더 기다린다.
-- 시간을 지키지 않는 모델 어댑터의 호출은 `model.timeout_ms`가 지나면 기다리지 않고 버린다. 그 호출은 혼자 끝날 때까지 돌고, Stet이 끝날 때도 기다리지 않는다. Stet에 든 어댑터는 시간을 지킨다.
+- enforce에서 시간을 지키지 않는 모델 어댑터의 호출은 `model.timeout_ms`가 지나면 기다리지 않고 버린다. 그 호출은 혼자 끝날 때까지 돌고, Stet이 끝날 때도 기다리지 않는다. 섀도의 실행 뒤 호출은 끝날 때까지 기다리고, Stet이 끝날 때도 기다린다. Stet에 든 어댑터는 시간을 지킨다.
 - 섀도의 판정은 enforce와 같은 규칙이지만, 누적 한도가 있으면 갈라질 수 있다. 섀도는 enforce라면 막았을 쓰기도 실행하고 그 행을 누적 값에 센다. 그래서 그 뒤의 쓰기가 섀도에서 먼저 한도에 걸릴 수 있다.
-- 세션 설정의 경주. `client_encoding`이나 `standard_conforming_strings`를 바꾸고 서버의 답을 기다리지 않고 다음 메시지를 보내는 클라이언트는, 그 메시지를 옛 값으로 검사받는다. Stet은 그 변경을 알게 되면 세션을 끝내지만, 서버는 그 메시지를 이미 실행했을 수 있다. 일부러 그렇게 하는 클라이언트는 enforce에서도 판단받지 않은 메시지 하나를 보낼 수 있다(D30). 막으려면 프록시가 이어 보낸 메시지를 서버의 답까지 붙잡아 두어야 한다.
+- 세션 설정의 경주. `client_encoding`이나 `standard_conforming_strings`를 바꾸고 서버의 답을 기다리지 않고 다음 메시지를 보내는 클라이언트는, 그 메시지를 옛 값으로 검사받는다. Stet은 그 변경을 알게 되면 세션을 끝내지만, 서버는 그 메시지를 이미 실행했을 수 있다. 일부러 그렇게 하는 클라이언트는 enforce에서도 판단받지 않은 메시지 하나를 보낼 수 있다(D30). Stet은 그때 에러 로그를 남긴다(7장). 막으려면 프록시가 이어 보낸 메시지를 서버의 답까지 붙잡아 두어야 한다(17장).
 - 실행한 문장이 있는 확장 프로토콜 단위 뒤에 Sync 없이 이어 보낸 Query가 마지막 문장으로 두 설정을 읽을 수 없는 값으로 바꾸면, 뒤에 아무것도 보내지 않았어도 세션이 끝날 수 있다.
 - `client_encoding`이 `UTF8`이 아니거나 `standard_conforming_strings`가 `off`인 클라이언트는 enforce를 쓸 수 없다. SJIS 계열만이 아니라 UTF8이 아닌 모든 인코딩이다. 정직한 클라이언트도 그 세션의 문장이 모두 막힌다. 섀도에서는 그런 세션의 문장이 틀리게 분류되고 기록될 수 있다.
-- 확장 프로토콜로 `COPY ... FROM STDIN`을 보내는 클라이언트(tokio-postgres의 `copy_in`이 그렇다고 알려져 있다)는 enforce에서 세션이 끝난다.
-- 섀도에서는 단순 Query의 복사 중에 온 Sync나 확장 프로토콜의 `COPY ... FROM STDIN` 뒤로 그 세션의 응답이 한 단위 늦게 맞춰진다. 그 뒤의 기록과 표가 틀린다. enforce는 그런 세션을 끝낸다.
+- 확장 프로토콜로 `COPY ... FROM STDIN`을 보내는 클라이언트(tokio-postgres의 `copy_in`, libpq의 `PQexecParams`가 그렇다고 알려져 있다)는 enforce에서 그 복사를 할 수 없다. 그 Parse가 `ST002`로 막히고 세션은 남는다. 분류기가 보지 못한 것은 복사가 시작될 때 세션이 끝난다.
+- 섀도에서는 단순 Query의 복사 중에 온 Sync나 확장 프로토콜의 `COPY ... FROM STDIN` 뒤로 그 세션의 응답이 한 단위 늦게 맞춰진다. 그 뒤의 기록과 표가 틀린다. enforce는 확장 프로토콜의 것을 Parse에서 막고, 복사 중의 Sync가 온 세션은 끝낸다.
 - 섀도에서는 감시 대상 이름을 SQL `EXECUTE`·`FETCH`·`MOVE`로 실행한 쓰기가 판단도 기록도 받지 않는다.
+- 섀도는 닫힌 지점 가운데 세션 설정, 이름의 인코딩, 이름으로 실행하는 문장, 뜻이 정해지지 않은 이름은 알리지 않는다(7장). 그런 메시지를 보내는 클라이언트는 enforce를 켠 뒤에야 막히는 것을 안다.
+- 섀도는 `rejudged`와 `concurrent_change`를 기록하지 않는다. 행 버전 다시 확인은 enforce에서만 한다.
+- 프록시의 문장 표는 SQL `DEALLOCATE`를 따라가지 않는다. 서버가 버린 문장의 뜻을 표는 들고 있다. 판단이 한 번 더 붙거나 막히는 쪽으로 틀리고, 판단받지 않은 쓰기는 생기지 않는다. 그 기억은 세션이 끝날 때까지 남는다.
 - 아직 답이 오지 않은 변경 때문에 뜻이 둘 이상인 이름으로 Bind한 포털은, 그 변경에 답이 온 뒤에도 그 뜻들을 모두 들고 있다. 그 가운데 감시 대상이 있으면 enforce에서 그 포털은 끝까지 막힌다.
 - 보류 건 삽입의 틈. 시간을 넘겨 실패로 보고된 삽입도 서버에서 들어갈 수 있다. Stet은 그 id를 판단 기록을 남길 때 `undelivered`로 바꾸지만, 그때 아직 진행 중이던 삽입은 그 뒤에 `pending`으로 남을 수 있다. 클라이언트는 보류된 것이 없다고 들었다.
 - 프록시가 막은 보류 건을 실행됐다고 보고하면 그 보류 줄은 `pending`으로 남는다. 2b가 거두지 않으면 승인할 때 같은 쓰기가 두 번 실행된다.
 - 형태, 트랜잭션, 접속 계정만으로 막은 쓰기의 바이너리 바인딩 값은 기록되지 않는다(11장).
 - 서버의 `db_user_namespace`가 켜져 있으면 enforce를 쓸 수 없다. Stet이 시작하지 않는다.
-- 함수, 트리거, 뷰, 파티션 자식, DDL, 다른 연결을 통한 쓰기는 보지 못한다. DB 권한이 막아야 한다(8장).
+- 객체를 만들 수 있는 에이전트는 Stet이 보지 못하는 길로 쓸 수 있다. enforce는 함수, 프로시저, 규칙, 트리거와 게이트 대상 테이블을 읽는 뷰를 만드는 문장을 막지만(7장), 실행할 수 있는 이미 있는 함수, 게이트 대상 테이블을 상속한 테이블, 그 밖에 7장이 막지 않는 객체를 거친 쓰기는 보지 못한다. 파티션 자식, DDL, 다른 연결을 통한 쓰기도 보지 못한다. DB 권한이 막아야 한다(8장). 시작할 때 객체를 만들 수 있는 권한을 경고한다.
+- 세션 안에서 panic이 나면 그 세션은 끝난다(7장). 그 세션의 클라이언트는 연결이 끊긴 것만 안다.
 - 에이전트 계정이 Stet을 거치지 않고 DB에 붙을 수 있으면 아무것도 막지 못한다. Stet은 이것을 확인할 수 없다.
 - 에러 메시지는 에이전트에게 왜 막혔는지 알려 준다. 한도의 값과 판단의 이유가 드러난다. 실수하는 에이전트에게는 도움이고, 공격자에게는 정보다(D30).
 - Stet이 죽으면 에이전트는 DB에 붙지 못한다. 고가용성은 6번 단계다.
@@ -404,12 +426,12 @@ limits:
 | 패키지 | 바뀌는 것 |
 |---|---|
 | `internal/config` | `agents.roles`, `limits.max_inflight`, enforce의 기본값과 검증 |
-| `internal/sqlparse` | 깨끗한 트랜잭션을 가리는 문장 종류(`BEGIN`, `SET`, `SHOW`), `DO` 블록, 값 하나짜리 `IN`, 이름으로 실행하는 문장(`EXECUTE`, `FETCH`, `MOVE`), 조건식의 한정된 이름 |
-| `internal/proxy` | 세션이 에이전트의 것인지 가리기(시작 패킷을 서버처럼 읽기). 트랜잭션이 깨끗한지 세기. 문장·포털 표를 서버가 완료한 것에 맞추기와 Sync 전의 Query 따라가기. 게이트가 "보내지 마라"고 답하면 메시지를 바꿔 보내고 돌아온 그 에러 하나를 바꿔 쓰기. 닫힌 지점(읽지 못한 메시지, 큰 메시지, FunctionCall, `DO`, 이름으로 실행하는 문장, 뜻이 정해지지 않은 이름, 세션 설정, 이름의 인코딩). 세션 끝내기(복사, 설정 변경) |
-| `internal/gate` | enforce에서 `Begin`이 판단까지 끝내고 무엇을 할지 돌려준다. 행 버전 다시 확인. 보류 건 저장. 동시 상한. 누적 값의 구조와 적재. 세기 전의 열 확인. 섀도의 판정을 같은 규칙으로 |
-| `internal/decide` | `in_transaction`의 새 뜻, `no_login_role`, `impact:cumulative_unknown`, `concurrent_change`. enforce에서 판정을 행동과 에러 문구로 옮기는 표. 닫힌 지점과 세션을 끝낼 때의 문구 |
+| `internal/sqlparse` | 깨끗한 트랜잭션을 가리는 문장 종류(`BEGIN`, `SET`, `SHOW`), `DO` 블록, 코드나 게이트 대상 테이블 위의 뷰를 만드는 문장, `COPY ... FROM STDIN`, 게이트 대상 쓰기의 SQL `PREPARE`(`prepare`), 값 하나짜리 `IN`, 이름으로 실행하는 문장(`EXECUTE`, `FETCH`, `MOVE`), 조건식의 한정된 이름 |
+| `internal/proxy` | 세션이 에이전트의 것인지 가리기(시작 패킷을 서버처럼 읽기). 트랜잭션이 깨끗한지 세기. 문장·포털 표를 서버가 완료한 것에 맞추기와 Sync 전의 Query 따라가기. 게이트가 "보내지 마라"고 답하면 메시지를 바꿔 보내고 돌아온 그 에러 하나를 바꿔 쓰기. 닫힌 지점(읽지 못한 메시지, 큰 메시지, FunctionCall, `DO`, 코드를 만드는 문장, 확장 프로토콜의 `COPY ... FROM STDIN`, 이름으로 실행하는 문장, 뜻이 정해지지 않은 이름, 세션 설정, 이름의 인코딩)와 그 로그를 세션과 이유마다 한 번. 섀도에서 닫힌 지점 알리기. 세션 끝내기(복사, 설정 변경, panic) |
+| `internal/gate` | enforce에서 `Begin`이 판단까지 끝내고 무엇을 할지 돌려준다. 행 버전 다시 확인. 보류 건 저장. 동시 상한. 누적 값의 구조와 적재. 세기 전의 열 확인. 섀도의 판정을 같은 규칙으로. 닫힌 지점과 섀도의 알림 로그(`setting_changed`는 에러) |
+| `internal/decide` | `in_transaction`의 새 뜻, `no_login_role`, `impact:cumulative_unknown`, `concurrent_change`, 언제나 막는 `prepare`. enforce에서 판정을 행동과 에러 문구로 옮기는 표. 닫힌 지점과 세션을 끝낼 때의 문구 |
 | `internal/store` | `stet.held_writes`, `stet.decisions.refused`, 초 단위로 묶은 사용량 질의 |
-| `cmd/stet` | enforce를 거부하던 검사를 없앤다. 시작할 때의 확인과 경고. 실행부를 테스트할 수 있게 뗀다 |
+| `cmd/stet` | enforce를 거부하던 검사를 없앤다. 시작할 때의 확인과 경고(객체를 만들 수 있는 권한 포함). 실행부를 테스트할 수 있게 뗀다 |
 | `CLAUDE.md` | 규칙 1의 문구(구현 전에 고쳤다) |
 
 모델 인터페이스는 바뀌지 않는다(규칙 7).
@@ -420,7 +442,7 @@ limits:
 - enforce에서 판단받는 쓰기는 3장의 단계마다 그 상한까지 기다린다. 상태 읽기(500ms 이하, 자리를 기다리는 시간 포함), 모델 호출(`timeout_ms` 이하), 행 버전 다시 읽기(500ms 이하), 많아야 한 번의 다시 판단, 보류 건 삽입(500ms 이하)이다. 결정론적 규칙으로 판정이 나는 쓰기는 모델을 기다리지 않는다.
 - 게이트 대상 테이블에 쓰지 않는 문장은 enforce에서도 기다리지 않는다. 분류 비용만 든다.
 - 행 버전 다시 확인은 기본 키로 한 행을 읽는 질의 하나다.
-- 마무리 확인(2026-11-17)에서 프록시가 더한 p95는 패스스루 22.5µs, 읽기를 기록하는 세션 23.9µs, 감시하지 않는 세션 22.3µs, enforce의 에이전트 세션 21.9µs, 매번 ParameterStatus를 받는 enforce 세션 22.6µs였다.
+- 마무리 확인(2026-11-17)에서 프록시가 더한 p95는 패스스루 22.5µs, 읽기를 기록하는 세션 23.9µs, 감시하지 않는 세션 22.3µs, enforce의 에이전트 세션 21.9µs, 매번 ParameterStatus를 받는 enforce 세션 22.6µs였다. 전체 검토 뒤의 수정을 마치고 같은 날 다시 재니 차례로 22.5µs, 23.5µs, 23.2µs, 22.3µs, 22.8µs였다.
 
 ## 16. 수용 기준
 
@@ -437,18 +459,24 @@ limits:
 - [x] 막으려던 쓰기의 에러가 앞 메시지의 실패에 가려지면 클라이언트는 앞 메시지의 에러를 그대로 받고, 그 보류 줄은 `undelivered`가 된다. (`TestEarlierFailureHidesTheRefusal`, `TestEnforceMarksAHiddenHoldUndelivered`)
 - [x] 트랜잭션 안에서 막힌 뒤 `ROLLBACK`하면 세션이 정상으로 돌아온다. (`TestRefusalFailsTheOpenTransaction`, `TestEnforceRefusesAWriteInADirtyTransaction`)
 - [x] `agents.roles`에 없는 계정의 세션에서는 같은 쓰기가 그대로 실행되고 기록이 남지 않는다. (`TestSessionsOfOtherRolesAreNotSeen`, `TestEnforceLeavesOtherRolesAlone`)
-- [x] 7장의 표의 줄마다 테스트가 있다. 읽지 못한 메시지(`TestUnreadableStatementsAreRefused`, `TestEnforceClosedPointsAnswerThroughTheGate`), 큰 메시지(`TestOversizedMessagesAreRefused`), FunctionCall(`TestFunctionCallsAreRefused`), `DO` 블록(`TestClassifyDo`, `TestDoBlocksAreRefused`), 이름으로 실행하는 문장(`TestSQLExecuteOfAPreparedWriteIsRefused`, `TestFetchFromAWritePortalIsRefused`), 뜻이 정해지지 않은 이름(`TestUnsureNameIsRefused`), 세션 설정(`TestStatementsTheClassifierMisreadsAreRefused`), 이름의 인코딩(`TestNamesThatAServerEncodingMayCompareOtherwiseAreRefused`), 판단할 수 없는 형태(`TestEnforceRefusesUnsupportedShapes`), 계정 없는 세션(`TestWritesWithoutALoginRoleAreUnsupported`, `TestEnforceRefusesWithoutALoginRole`), 상태 실패와 모델 실패(`TestEnforceFailuresFollowOnFailure`, `TestEnforceRowVersionThatCannotBeReadFollowsOnFailure`), 측정 실패(`TestEnforceRefusesWhenMeasuringFails`), 누적 값 모름(`TestVerdictCumulative`, `TestCumulativeWaitsBeforeLoadingAgain`, `TestEnforceHoldsWhenTheCumulativeUsageIsUnknown`), 동시 상한(`TestInflightLimitTurnsIntoAStateError`, `TestInflightLimitTurnsAMeasuredWriteIntoAStateError`, `TestEnforceHoldsWhenTooManyWritesAreInFlight`), `held_writes` 저장 실패(`TestEnforceRefusesEvenWhenTheHeldWriteIsNotStored`, `TestHeldWriteThatCannotBeStoredAsSentIsStillRefused`, `TestEnforceMarksAnUnconfirmedHeldWriteUndelivered`), 게이트 대상 테이블이 없을 때(`TestRunWithoutTablesWarnsThatEnforceOnlyPassesThrough`, `TestEnforceWithoutAGateOnlyRelays`).
+- [x] 7장의 표의 줄마다 테스트가 있다. 읽지 못한 메시지(`TestUnreadableStatementsAreRefused`, `TestEnforceClosedPointsAnswerThroughTheGate`, `TestClosedPointsAreReplacedOnEnforcedSessions`), 큰 메시지(`TestOversizedMessagesAreRefused`, `TestClosedPointsAreReplacedOnEnforcedSessions`), FunctionCall(`TestFunctionCallsAreRefused`), `DO` 블록(`TestClassifyDo`, `TestDoBlocksAreRefused`), 코드를 만드는 문장(`TestClassifyDefinesCode`, `TestInspectMarksWhatDefinesCode`, `TestStatementsThatDefineCodeAreRefused`), 확장 프로토콜 Parse의 `COPY ... FROM STDIN`(`TestClassifyCopyFromStdin`, `TestInspectMarksCopyFromStdin`, `TestExtendedCopyFromStdinIsRefused`, `TestEnforceRefusesAnExtendedCopyFromStdin`), 이름으로 실행하는 문장(`TestSQLExecuteOfAPreparedWriteIsRefused`, `TestFetchFromAWritePortalIsRefused`), 뜻이 정해지지 않은 이름(`TestUnsureNameIsRefused`), 세션 설정(`TestStatementsTheClassifierMisreadsAreRefused`), 이름의 인코딩(`TestNamesThatAServerEncodingMayCompareOtherwiseAreRefused`, 섀도의 몫 포함), 판단할 수 없는 형태(`TestEnforceRefusesUnsupportedShapes`), 계정 없는 세션(`TestWritesWithoutALoginRoleAreUnsupported`, `TestEnforceRefusesWithoutALoginRole`), 게이트 대상 쓰기의 SQL `PREPARE`(`TestClassifyKinds`, `TestActForwards`, `TestSQLPrepareOfAWriteIsRefused`), 상태 실패와 모델 실패(`TestEnforceFailuresFollowOnFailure`, `TestEnforceRowVersionThatCannotBeReadFollowsOnFailure`), 측정 실패(`TestEnforceRefusesWhenMeasuringFails`), 누적 값 모름(`TestVerdictCumulative`, `TestCumulativeWaitsBeforeLoadingAgain`, `TestEnforceHoldsWhenTheCumulativeUsageIsUnknown`), 동시 상한(`TestInflightLimitTurnsIntoAStateError`, `TestInflightLimitTurnsAMeasuredWriteIntoAStateError`, `TestEnforceHoldsWhenTooManyWritesAreInFlight`), `held_writes` 저장 실패(`TestEnforceRefusesEvenWhenTheHeldWriteIsNotStored`, `TestHeldWriteThatCannotBeStoredAsSentIsStillRefused`, `TestEnforceMarksAnUnconfirmedHeldWriteUndelivered`), 게이트 대상 테이블이 없을 때(`TestRunWithoutTablesWarnsThatEnforceOnlyPassesThrough`, `TestEnforceWithoutAGateOnlyRelays`).
 - [x] 상태를 읽은 뒤 다른 연결이 행을 바꾸면 다시 판단하고, 또 바뀌면 `hold`(`concurrent_change`)가 된다. (`TestEnforceRejudgesWhenTheRowChanged`, `TestEnforceHoldsWhenTheRowKeepsChanging`, `TestEnforceSendsAWriteWhoseRowIsGone`, `TestEnforceRejudgesWhenTheRowAppears`)
 - [x] 결정론적 규칙으로 판정이 난 쓰기는 enforce에서 모델을 부르지 않는다. (`TestDeterministic`, `TestEnforceSkipsTheModelWhenTheRulesDecide`)
 - [x] `WHERE id IN (5)`와 `WHERE id IN ($1)`이 단일 행 쓰기로 분류되어 값 판단을 받는다. (`TestClassifySingleValueIn`, `TestEnforceJudgesASingleValueIn`)
 - [x] 섀도 모드에서 같은 쓰기 스트림을 돌리면 판정이 enforce와 같다(모델 답이 같다는 전제에서). 섀도는 아무것도 막지 않는다. (`TestShadowAndEnforceAgreeOnVerdicts`, `TestEnforceNamesOnlyACandidateAsTheDuplicate`. 누적 한도가 없는 설정에서 확인했다. 누적 한도가 있으면 갈라질 수 있다(13장))
-- [ ] 섀도 모드의 기존 테스트는 4장과 7장이 바꾼 판정(`in_transaction`, 계정 없는 세션, 누적 값 모름)을 빼고 단언을 고치지 않고 통과한다. (확인 못 함: 그 밖의 기존 단언도 셋이 바뀌었다. `TestAbandonLosesUnansweredWrites`는 CommandComplete를 받은 뒤 끊긴 쓰기를 `Executed`로 보게 바뀌었고(12장), `TestCumulativeWindowSlides`는 초 단위 칸 때문에 기다리는 시간이 늘었으며(12장), `TestClassifyMeasured`는 비교 방식만 바뀌었다(기대값은 그대로). 모두 계획이 허락한 변경이다. `BEGIN`만으로는 더러워지지 않게 되어 `select 1`을 더하거나, 이제 읽히는 3.1 시작 패킷 대신 인증 전 Query로 계정 없는 세션을 만드는 식으로 입력을 바꾼 테스트도 있다)
+- [ ] 섀도 모드의 기존 테스트는 4장과 7장이 바꾼 판정(`in_transaction`, 계정 없는 세션, 누적 값 모름)을 빼고 단언을 고치지 않고 통과한다. (확인 못 함: 그 밖의 기존 테스트도 넷이 바뀌었다. `TestAbandonLosesUnansweredWrites`는 CommandComplete를 받은 뒤 끊긴 쓰기를 `Executed`로 보게 바뀌었고(12장), `TestCumulativeWindowSlides`는 초 단위 칸 때문에 기다리는 시간이 늘었으며(12장), `TestClassifyMeasured`는 비교 방식만 바뀌었다(기대값은 그대로). `internal/store`의 `TestUsage`는 사용량 질의가 초 단위로 바뀌며 지우고 `TestUsageBySecond`로 대신했다(12장). 모두 계획이 허락한 변경이다. 전체 검토 뒤의 수정에서 바뀐 것도 있다. `TestClassifyKinds`의 SQL `PREPARE` 줄은 이유가 `nested_write`에서 `prepare`로, `TestAct`와 `TestActFallsBackToTheGenericRow`의 `in_transaction` 문구와 `TestBlocked`의 `copy_extended` 문구는 새 문구로 바뀌었고, 세션을 끝내는 복사의 이유를 단언하던 세 테스트는 그 이유의 새 이름 `copy_started`를 쓴다. `TestUsageMergesALoadInOnePass`는 합치기만 재고 상한을 30ms로 늘렸다. `TestCheckWarnsAboutAgentRoles`와 `TestCheckWarnsAboutPassSettings`는 단언은 그대로 두고, PUBLIC이 객체를 만들 수 없는 테스트 자신의 데이터베이스에서 돈다. `BEGIN`만으로는 더러워지지 않게 되어 `select 1`을 더하거나, 이제 읽히는 3.1 시작 패킷 대신 인증 전 Query로 계정 없는 세션을 만드는 식으로 입력을 바꾼 테스트도 있다)
 - [x] 2ms 지연 예산을 지킨다. 에이전트가 아닌 세션은 게이트를 부르지 않는다. (`TestPassthroughLatencyBudget`, `TestObservedReadLatencyBudget`, `TestUnwatchedSessionLatencyBudget`, `TestEnforcedSessionLatencyBudget`, `TestEnforcedSessionSettingsLatencyBudget`, `TestSessionsOfOtherRolesAreNotSeen`)
 - [x] 12장의 "이 단계에서 닫는다" 표의 줄마다 테스트가 있다. 7장의 실패 지점(위), 값 하나짜리 `IN`(`TestClassifySingleValueIn`, `TestEnforceJudgesASingleValueIn`), `테이블.함수`(`TestClassifyQualifiedNames`, `TestImpactDoesNotCountThroughATableQualifiedFunction`, `TestAllColumnsFailsClosed`), 동시 측정의 상한(`TestAgentRolesAndLimits`, `TestInflightLimitTurnsIntoAStateError`), 첫 적재(`TestUsageBySecond`, `TestUsageLoadsOnlyWhatCameBeforeItStarted`, `TestUsageRetriesAfterAnInterval`, `TestCumulativeWaitsBeforeLoadingAgain`, `TestUsageLoadOutlivesTheWriteThatStartedIt`, `TestUsageDoesNotLoadAWindowThatStartsAfterTheGate`), 사용량 정리(`TestUsageCountsPerSecond`, `TestUsageKeepsASecondUntilItLeftTheWindow`, `TestUsageDropsIdlePairs`, `TestUsageMergesALoadInOnePass`), 3.1 시작 패킷(`TestStartupUserIsReadAsTheServerReadsIt`, `TestProtocol31SessionHasItsLoginRole`, `TestProtocol31SessionsRecordTheirLoginRole`), 인증 전 문장(`TestWritesWithoutALoginRoleAreUnsupported`, `TestEnforceRefusesWithoutALoginRole`), CommandComplete 뒤 끊김(`TestAbandonKnowsACompletedWriteRan`, `TestCumulativeSettlesAWriteLostAfterItCompleted`), 문장 표(`TestGateJudgesTheStatementTheServerHolds`, `TestSkippedParseAndCloseAreUndone`, `TestNamesAreComparedByTheirFirst63Bytes`, `TestUnsureNameIsRefused`, `TestSQLExecuteOfAPreparedWriteIsRefused`, `TestFetchFromAWritePortalIsRefused`, `TestQueryBeforeSyncIsFollowed`, `TestUnitsAfterAQueryBeforeSyncFollowTheServer`, `TestRefusalsAfterAQueryBeforeSyncAreDelivered`, `TestRewriteIsBoundToTheReplacementsOwnError`, `TestCopyFromStdinThroughTheExtendedProtocolEndsTheSession`, `TestSyncDuringCopyEndsTheSession`), 종료 순서(`TestRunRecordsWhatWasInFlightAtShutdown`).
 - [x] 분류기와 다르게 읽히는 세션 설정에서는 에이전트 세션의 문장이 `ST002`로 막히고, 두 설정을 고치는 `SET`·`RESET`만 지나간다. 고친 세션은 다시 판단받는다. 설정을 읽을 수 없는 값으로 바꾸고 이미 다음 메시지를 보낸 세션은 끝난다. 섀도는 그대로 보낸다. (`TestStatementsTheClassifierMisreadsAreRefused`, `TestSettingsTheClassifierCannotReadAreRefused`, `TestRepairsSettings`, `TestUnreadableSessionRepairsItsSettings`, `TestClientEncodingUnicodeIsUTF8`, `TestSettingChangedAheadOfAStatementEndsTheSession`, `TestSettingChangedAheadOfSentStatementsEndsTheSession`, `TestSettingReportedWhileAMessageIsInspected`)
 - [x] 아직 답이 오지 않은 변경 때문에 뜻이 둘 이상인 이름은 그 뜻을 모두 들고 있고, 그 가운데 감시 대상이 있으면 enforce에서 그 실행이 막힌다. 이름은 앞 63바이트로 비교한다. 감시 대상 이름을 SQL `EXECUTE`·`FETCH`·`MOVE`로 실행하면 막힌다. (`TestUnansweredChangeLeavesSeveralMeanings`, `TestUnsureNameIsRefused`, `TestUnsettledNamesAreRefused`, `TestNamesAreComparedByTheirFirst63Bytes`, `TestSQLExecuteOfAPreparedWriteIsRefused`, `TestFetchFromAWritePortalIsRefused`, `TestWhatRunsAWatchedNameIsRefused`, `TestNameThatMayMeanAnUncleanStatementDirties`)
-- [x] enforce의 에이전트 세션에서 확장 프로토콜의 `COPY ... FROM STDIN`과 단순 복사 중의 Sync는 세션을 FATAL `ST002`로 끝낸다. CopyDone과 다음 Query를 한 번에 보낸 세션과 한 Query의 복사 여럿은 그대로 쓴다. 막은 `COPY ... FROM STDIN`은 멈추지 않고 에러를 받는다. (`TestCopyFromStdinThroughTheExtendedProtocolEndsTheSession`, `TestSyncDuringCopyEndsTheSession`, `TestSyncDuringASecondCopyEndsTheSession`, `TestSyncBeforeASecondCopyEndsTheSession`, `TestTwoCopiesInOneQueryKeepTheSession`, `TestCopyRuleHoldsOnlyDuringTheCopy`, `TestRefusedCopyFromStdinDoesNotHang`)
-- [x] 시작할 때의 확인이 8장대로다. Stet 자신의 계정이 목록에 있으면 시작하지 않는다. enforce에서 `db_user_namespace`가 켜져 있거나, 그것이나 Stet 자신의 계정을 확인하지 못하면 시작하지 않는다. 섀도는 확인하지 못해도 시작한다. 에이전트 계정의 superuser, superuser 역할의 구성원, `stet` 스키마 권한, 테이블 소유, `search_path`를 역할 구성원을 거친 것까지 경고한다. (`TestCheckRefusesStetsOwnAccount`, `TestRunRefusesToStartAsAnAgentsAccount`, `TestCheckRefusesDBUserNamespaceInEnforce`, `TestCheckStopsEnforceWhenItCannotRead`, `TestRunStopsEnforceButStartsShadowWhenChecksCannotRead`, `TestCheckWarnsAboutAgentRoles`, `TestCheckFollowsRoleMembership`, `TestCheckWarnsAboutPassSettings`, `TestNewerThanParser`. `db_user_namespace = on`은 테스트 서버에서 켤 수 없어 읽는 함수를 바꿔 끼워 확인했다)
+- [x] enforce의 에이전트 세션에서 분류기가 본 확장 프로토콜의 `COPY ... FROM STDIN`은 Parse가 `ST002`로 막히고 세션은 남는다. 분류기가 보지 못한 것과 단순 복사 중의 Sync는 세션을 FATAL `ST002`로 끝낸다. CopyDone과 다음 Query를 한 번에 보낸 세션과 한 Query의 복사 여럿은 그대로 쓴다. 막은 `COPY ... FROM STDIN`은 멈추지 않고 에러를 받는다. (`TestExtendedCopyFromStdinIsRefused`, `TestEnforceRefusesAnExtendedCopyFromStdin`, `TestCopyFromStdinThroughTheExtendedProtocolEndsTheSession`, `TestSyncDuringCopyEndsTheSession`, `TestSyncDuringASecondCopyEndsTheSession`, `TestSyncBeforeASecondCopyEndsTheSession`, `TestTwoCopiesInOneQueryKeepTheSession`, `TestCopyRuleHoldsOnlyDuringTheCopy`, `TestRefusedCopyFromStdinDoesNotHang`)
+- [x] 시작할 때의 확인이 8장대로다. Stet 자신의 계정이 목록에 있으면 시작하지 않는다. enforce에서 `db_user_namespace`가 켜져 있거나, 그것이나 Stet 자신의 계정을 확인하지 못하면 시작하지 않는다. 섀도는 확인하지 못해도 시작한다. 에이전트 계정의 superuser, superuser 역할의 구성원, `stet` 스키마 권한, 객체를 만들 수 있는 권한(데이터베이스의 `TEMPORARY`·`CREATE`, 스키마의 `CREATE`와 소유), 테이블 소유를 역할 구성원을 거친 것까지, 그리고 역할 수준의 `search_path`를 경고한다. 객체를 만들 수 있는 권한은 PUBLIC을 거친 것인지 어느 역할을 거친 것인지 말하고, 거두면 경고가 사라진다. (`TestCheckRefusesStetsOwnAccount`, `TestRunRefusesToStartAsAnAgentsAccount`, `TestCheckRefusesDBUserNamespaceInEnforce`, `TestCheckStopsEnforceWhenItCannotRead`, `TestRunStopsEnforceButStartsShadowWhenChecksCannotRead`, `TestCheckWarnsAboutAgentRoles`, `TestCheckFollowsRoleMembership`, `TestCheckWarnsAboutPassSettings`, `TestCheckWarnsAboutRightsToCreateObjects`, `TestNewerThanParser`. PUBLIC에서 거둔 상태는 공용 테스트 데이터베이스를 바꾸지 않으려고 테스트가 만든 데이터베이스에서 확인했다. `db_user_namespace = on`은 테스트 서버에서 켤 수 없어 읽는 함수를 바꿔 끼워 확인했다)
+- [x] 에이전트 세션이 함수, 프로시저, 규칙, 트리거나 게이트 대상 테이블을 읽는 뷰를 만드는 문장은 enforce에서 `ST002`로 막히고, 섀도에서는 그대로 실행된다. 게이트 대상 테이블을 읽지 않는 뷰는 만들어진다. (`TestClassifyDefinesCode`, `TestInspectMarksWhatDefinesCode`, `TestStatementsThatDefineCodeAreRefused`)
+- [x] 게이트 대상 테이블에 쓰는 SQL `PREPARE`는 `unsupported: pass`여도 enforce에서 막히고, 그 뒤의 `EXECUTE`는 서버에서 실패한다. 섀도는 `unsupported`, `prepare`로 기록한다. (`TestSQLPrepareOfAWriteIsRefused`, `TestActForwards`)
+- [x] 섀도의 에이전트 세션은 프록시가 따로 일하지 않고 아는 닫힌 지점을 세션과 이유마다 한 번 경고하고, 메시지는 그대로 보낸다. enforce의 닫힌 지점 경고도 세션과 이유마다 한 번이고, 막는 것은 매번 막는다. (`TestShadowTellsOfClosedPointsOncePerSessionAndReason`, `TestEnforcedSessionAsksToLogAReasonOnce`, `TestBlockedLogsOnlyWhenAskedTo`, `TestWouldBlockWarns`, `TestClosedPointsAreLoggedOncePerSessionAndReason`)
+- [x] 설정이 바뀌어 세션을 끝낼 때의 로그는 에러이고, 판단 없이 실행됐을 수 있는 메시지를 말한다. (`TestBlockedLogsAChangedSettingAsAnError`)
+- [x] 세션 안의 panic은 그 세션만 끝내고, 검사하던 메시지는 보내지 않으며, 기다리던 문장은 보고된다. 다른 세션과 프로세스는 그대로 돈다. (`TestPanicEndsOnlyItsSession`, `TestAbandonReportsWhatAPanicLeftHolding`)
+- [x] `in_transaction`의 문장과 `HINT`는 이어 보낸 쓰기와 한 Sync 아래 묶음의 두 번째 쓰기에도 맞다. (`TestAct`)
 - [x] `go test -race ./...`가 통과한다. (`STET_TEST_PG=127.0.0.1:55432 go test -race -count=1 ./...`가 모든 패키지에서 `ok`)
 
 ## 17. 정한 것과 남긴 것
@@ -470,7 +498,7 @@ limits:
 - 읽기에 대한 판정.
 - 문장에 행 버전 조건을 붙이는 정확한 동시성 확인(5번 단계).
 - 에이전트 세션의 `search_path`와 `SET ROLE`을 따라가는 것.
-- 응답을 기다리지 않고 이어 보낸 쓰기를 판단하는 것. 클라이언트 쪽에서 트랜잭션의 경계를 따라가야 한다.
-- 설정을 바꾼 뒤 이어 보낸 메시지를 서버의 답까지 붙잡아 두어 세션 설정의 경주를 닫는 것.
+- enforce 세션의 단위를 차례로 처리하는 것. 앞 단위의 답이 오기 전에는 다음 단위를 읽지 않는다. 그러면 세션 설정의 경주가 닫히고, 뜻이 정해지지 않은 이름과 응답을 기다리지 않고 이어 보낸 쓰기를 막지 않고 판단할 수 있다. 셋을 함께 닫는 길이다.
 - `UTF8`이 아닌 `client_encoding`과 `standard_conforming_strings = off`를 서버처럼 읽는 것.
-- 확장 프로토콜의 `COPY ... FROM STDIN`을 세션을 끝내지 않고 따라가는 것.
+- 확장 프로토콜의 `COPY ... FROM STDIN`을 막지 않고 따라가는 것.
+- 섀도에서도 세션 설정과 이름을 따라가, 지금 알리지 못하는 닫힌 지점까지 알리는 것.

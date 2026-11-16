@@ -4,8 +4,9 @@ mode: shadow                 # shadow | enforce
 # 에이전트의 접속 계정(시작 패킷의 user) 목록. 대소문자까지 같아야 한다. enforce에서는 필수이고,
 # 판정은 이 계정들의 세션에만 적용된다. 섀도에서 없으면 모든 세션을 본다. upstream의 계정(Stet 자신)은
 # 넣을 수 없다. enforce로 시작할 때 Stet은 이 계정들을 확인해 경고한다(있는지, superuser이거나 superuser
-# 역할의 구성원인지, stet 스키마에 권한이 있는지, 게이트 대상 테이블의 소유자인지, 역할 수준 search_path가
-# Stet의 것과 다른지. 권한과 소유는 SET ROLE로 될 수 있는 역할을 거친 것도 센다).
+# 역할의 구성원인지, stet 스키마에 권한이 있는지, 객체를 만들 수 있는지(데이터베이스의 TEMPORARY·CREATE,
+# 스키마의 CREATE나 소유), 게이트 대상 테이블의 소유자인지, 역할 수준 search_path가 Stet의 것과 다른지.
+# 권한과 소유는 PUBLIC에 준 것과 SET ROLE로 될 수 있는 역할을 거친 것도 센다).
 # Stet이 접속한 계정이 목록에 있으면 시작하지 않는다. enforce에서는 서버의 db_user_namespace가 켜져 있을
 # 때도, 그 설정이나 Stet이 접속한 계정을 확인하지 못했을 때도 시작하지 않는다.
 # 운영자가 DB에서 해 둘 일은 docs/spec-v0.2-enforce.md 8장에 있다.
