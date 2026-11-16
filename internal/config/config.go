@@ -154,6 +154,24 @@ type rawTable struct {
 	} `yaml:"reads"`
 }
 
+// presentKeys is the file read once more for the optional blocks whose key
+// is present with no value. yaml decodes `reads:` with nothing after it (or
+// only a commented-out line, or ~) to a nil pointer, the same as no key at
+// all; a map keeps the key.
+type presentKeys struct {
+	Tables map[string]map[string]any `yaml:"tables"`
+}
+
+// present reports whether table name writes the reads key and the impact
+// block's cumulative key, with or without a value.
+func (k presentKeys) present(name string) (reads, cumulative bool) {
+	t := k.Tables[name]
+	_, reads = t["reads"]
+	impact, _ := t["impact"].(map[string]any)
+	_, cumulative = impact["cumulative"]
+	return reads, cumulative
+}
+
 var (
 	defaultThresholds = Thresholds{Duplicate: 0.85, Conflict: 0.80, Policy: 0.80, PolicyEscalate: 0.50, EscalateBelow: 0.60}
 	allQuestions      = []string{"duplicate", "conflict", "policy"}
@@ -182,6 +200,10 @@ func Parse(b []byte) (*Config, error) {
 	if err := dec.Decode(&raw); err != nil {
 		return nil, err
 	}
+	// The strict decode above accepted the shape, so this one only adds
+	// which keys are present.
+	var keys presentKeys
+	_ = yaml.Unmarshal(b, &keys)
 
 	sum := sha256.Sum256(b)
 	c := &Config{Mode: Mode(raw.Mode), Listen: raw.Listen, Upstream: raw.Upstream, Hash: hex.EncodeToString(sum[:8])}
@@ -236,7 +258,8 @@ func Parse(b []byte) (*Config, error) {
 
 	c.Tables = make(map[string]Table, len(raw.Tables))
 	for name, rt := range raw.Tables {
-		t, tErrs := resolveTable(name, rt)
+		reads, cumulative := keys.present(name)
+		t, tErrs := resolveTable(name, rt, reads, cumulative)
 		errs = append(errs, tErrs...)
 		c.Tables[name] = t
 	}
@@ -247,7 +270,9 @@ func Parse(b []byte) (*Config, error) {
 	return c, nil
 }
 
-func resolveTable(name string, rt rawTable) (Table, []error) {
+// resolveTable checks one table. hasReads and hasCumulative say whether its
+// reads key and its impact.cumulative key are present, with a value or not.
+func resolveTable(name string, rt rawTable, hasReads, hasCumulative bool) (Table, []error) {
 	var errs []error
 	fail := func(field, format string, args ...any) {
 		errs = append(errs, fmt.Errorf("tables.%s.%s: %s", name, field, fmt.Sprintf(format, args...)))
@@ -343,13 +368,17 @@ func resolveTable(name string, rt rawTable) (Table, []error) {
 				cum.Window = d
 			}
 			imp.Cumulative = &cum
+		} else if hasCumulative {
+			// A limit without its numbers cannot mean anything.
+			fail("impact.cumulative", "present but empty: max_rows and window are required")
 		}
 		t.Impact = &imp
 	}
 
-	if rr := rt.Reads; rr != nil {
+	// A present reads block records reads, also when it is empty.
+	if rr := rt.Reads; rr != nil || hasReads {
 		reads := Reads{}
-		if rr.LogAbove != nil {
+		if rr != nil && rr.LogAbove != nil {
 			if *rr.LogAbove < 1 {
 				fail("reads.log_above", "%d must be at least 1", *rr.LogAbove)
 			}

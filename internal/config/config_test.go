@@ -325,6 +325,62 @@ func TestExampleConfigShowsImpact(t *testing.T) {
 	}
 }
 
+// A key written with no value is present: yaml decodes it as null, the same
+// as an absent key, so presence is read separately.
+func TestPresentButEmptyBlocks(t *testing.T) {
+	base := minimal + "model: {adapter: none}\ntables:\n  contacts:\n    pk: id\n    send_fields: [name]\n"
+	for name, reads := range map[string]string{
+		"no value":           "    reads:\n",
+		"tilde":              "    reads: ~\n",
+		"commented-out line": "    reads:\n      # log_above: 1000\n",
+	} {
+		t.Run("reads "+name, func(t *testing.T) {
+			c, err := Parse([]byte(base + reads))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := c.Tables["contacts"].Reads; got == nil || *got != (Reads{}) {
+				t.Errorf("reads = %+v, want recorded with no log_above", got)
+			}
+		})
+	}
+	t.Run("reads absent", func(t *testing.T) {
+		c, err := Parse([]byte(base))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := c.Tables["contacts"].Reads; got != nil {
+			t.Errorf("reads = %+v, want nil", got)
+		}
+	})
+	for name, impact := range map[string]string{
+		"flow":  "    impact: {max_rows: 100, cumulative: }\n",
+		"block": "    impact:\n      max_rows: 100\n      cumulative:\n",
+		"tilde": "    impact:\n      max_rows: 100\n      cumulative: ~\n",
+	} {
+		t.Run("cumulative "+name, func(t *testing.T) {
+			_, err := Parse([]byte(base + impact))
+			if err == nil {
+				t.Fatal("an empty cumulative block was accepted")
+			}
+			for _, want := range []string{"tables.contacts.impact.cumulative", "max_rows", "window"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("err = %v, want it to mention %q", err, want)
+				}
+			}
+		})
+	}
+	t.Run("cumulative absent", func(t *testing.T) {
+		c, err := Parse([]byte(base + "    impact: {max_rows: 100}\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := c.Tables["contacts"].Impact.Cumulative; got != nil {
+			t.Errorf("cumulative = %+v, want nil", got)
+		}
+	})
+}
+
 func TestCumulativeAndReads(t *testing.T) {
 	base := minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables:\n  contacts:\n    pk: id\n    send_fields: [name]\n"
 	parse := func(extra string) Table {
