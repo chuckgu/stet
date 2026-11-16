@@ -1,89 +1,202 @@
 # Stet
 
-> 에이전트 네이티브 데이터베이스 레이어: **클라이언트가 틀릴 수 있다고 가정하는 DB**
->
+**Runtime control for agentic queries. Stet asks the database instead of guessing from the SQL.**
+
 > *Agents propose. Stet decides what stands.*
 
-상태: v0.1 구현 3주차 (2026-10-31). 섀도 모드가 동작한다. 게이트 대상 쓰기의 상태를 조립하고 `stet.decisions`에 판단을 기록하며, 원래 쓰기는 바꾸지 않는다. 모델 어댑터는 Jev(`jev`)와 기록만 하는 `none`이 있고, 실험용으로 Claude(`claude`)가 있다. Jev 단건 지연은 p95 약 200ms다. 실험은 합성 CRM에서 쓰기 1,461건을 녹화했고, arm A0·A1·B·B'·C·D로 재생해 채점했다. 실험 전에 고정한 기준으로는 go다(docs/lab.md). enforce 모드는 아직 없다.
+AI agents now write SQL at run time and send it with nobody reading it first. Stet is a Postgres wire-protocol proxy that stands on the one path those agents use to reach your database. Before an agent's write goes through, Stet asks the database what the write would actually do, decides whether it should commit, hold, escalate or be rejected, and records why.
 
-2026-11-16: 규칙 경계 근처의 정상 쓰기(hard negative) 400건을 넣어 규칙 코드와 다시 비교했다. 막은 비율은 Jev 2.5%, 정책을 코드로 옮겨 한 번 손본 arm 31%다. 차이는 사람과 직함처럼 뜻을 봐야 하는 유형에서 나오고, 구조로 떨어지는 규칙에서는 차이가 없다(docs/lab.md "hard negative 비교").
+Integration is a connection string. Agents connect to Stet as if it were Postgres. Your services keep connecting to Postgres directly, so Stet adds nothing to their latency and cannot take them down.
 
-## 정의
+> **Status (2026-11-16): early, shadow mode only.** Stet observes, judges and records. It does not block anything yet. Details in [Status](#status).
 
-기존 DB는 클라이언트를 사람이 작성한 결정론적 코드로 가정한다. 그 코드는 스키마의 의미를 이해하고, 검증을 거친 뒤에 쓰며, 오류는 드문 버그라고 본다.
+## The problem: nobody reads an agentic query
 
-AI 에이전트는 다르다.
+Databases were built for clients that are deterministic code: written by a person, reviewed, tested, deployed. An agentic query is none of those. A model writes it at run time, from whatever the agent read a few seconds or a few hours ago, and it runs under credentials that are usually wider than the task.
 
-- 권한은 있지만 판단은 확률적이다.
-- 스키마의 업무적 의미를 모른다.
-- 낡은 상태로 행동하고, 재시도하고, 병렬로 같은 데이터를 건드린다.
-- 누군가를 대신해서 행동한다.
+Three things go wrong.
 
-Stet은 이 전제를 DB 계층에서 받아들인다. 결정론적 제약은 형식 오류만 잡는다. 형식은 맞지만 의미가 틀린 쓰기는 판단이 있어야 잡힌다.
-
-## 구조
-
-Postgres는 그대로 두고 그 앞에 얹는다. Postgres가 이미 하는 것(ACID, RLS, WAL, 복제)은 다시 만들지 않는다.
-
-| 계층 | 하는 일 | v0.1 |
-|---|---|---|
-| 에이전트 인터페이스 | 의미 카탈로그, 권한 위임, 멱등 쓰기 | 에이전트 식별·기록만 |
-| **판단 계층** | 판단형 쓰기 게이트, 판단 기록 | **핵심 범위** |
-| 상태 계층 | 버전·시점·출처, 의존성 기반 무효화·재평가 | 행 버전 확인만 |
-| 학습 루프 | 임계값 보정, 자체 판단 모델 | 판단 기록 축적만 |
-| Postgres | 저장, 트랜잭션, 권한, 복제 | 그대로 사용 |
-
-## 오픈 코어 경계
-
-| 오픈소스 (Apache 2.0) | 매니지드 (유료) |
+| Risk | What happens |
 |---|---|
-| pgwire 프록시 | 추론 최적화: 캐싱, 배치, 버전 고정, 판단 단위 과금 |
-| 판단형 쓰기 게이트 | 고객별 confidence 보정 |
-| 판단 기록 스키마 | 판단–결과 데이터로 학습한 자체 판단 모델 |
-| 섀도 모드 | 감사 대시보드, 보류 건 검토 UI, 팀 권한 |
-| 모델 어댑터 인터페이스 | 컴플라이언스 리포트 |
-| (v0.2) 무효화·재평가 | |
+| Leak | The agent reads what it should not |
+| Destruction | The agent deletes or breaks data |
+| Corruption | The agent has permission, the SQL is valid, and the data ends up wrong |
 
-오픈소스 사용자는 자기 모델 API 키를 쓴다. 라이선스는 처음 정한 대로 유지한다.
+Most guardrails for agents judge the statement text. The text does not say much:
 
-## 문서
+```sql
+DELETE FROM contacts WHERE last_seen < $1;
+```
 
-- [docs/spec-v0.1.md](docs/spec-v0.1.md): v0.1 기술 스펙
-- [docs/experiment.md](docs/experiment.md): 검증 실험 설계와 go/kill 기준
-- [docs/decisions.md](docs/decisions.md): 결정 기록과 열린 질문
-- [docs/landscape.md](docs/landscape.md): 주변 지형
+Is that three rows or three million? Does it cascade into `deals`? Did another agent change these rows after this one read them? The statement cannot tell you. The database can.
 
-## 개발
+## What Stet does
 
-필요한 것: Go 1.27 이상. 통합 테스트에는 Postgres(`initdb`, `pg_ctl`, `psql`)가 PATH에 있어야 한다.
+Stet asks the database first and a model last.
+
+| Tier | The question Stet asks | Needs a model | Today |
+|---|---|---|---|
+| 1. Measure the impact | How many rows, what share of the table, how far through foreign keys? | No | Spec drafted |
+| 2. Make it reversible | Can this exact write be undone? Small writes go through and stay reversible instead of being blocked | No | Before-values recorded for single-row writes |
+| 3. Judge the values | Is this a duplicate? Does it undo a recent change? Does it break a written policy? | Yes, a small judgment model | Working, in shadow mode |
+| 4. Catch stale writes | Has the row changed since this session read it? | No | Row versions recorded |
+
+- **Deterministic checks run first.** A write that a rule can settle never reaches a model. That keeps cost and latency low, and it keeps the model out of the security boundary.
+- **Every verdict has a reason an agent can act on.** `duplicate:4812` names the row it collides with. `policy:2` names the rule it breaks.
+- **Every decision is recorded.** `stet.decisions` is an append-only log of who wrote, on whose behalf, what the database looked like, which pinned model version judged it, and what was decided. Replays read the recorded judgment and never ask the model again.
+
+## Where it sits
+
+```
+ services (high volume) ──────────────────> Postgres
+ agents ───────────────> stet ────────────> Postgres
+                           │
+                           └──> judgment model, before the write
+```
+
+- **Agents only.** High-volume service traffic never passes through Stet. An agent step takes seconds, so a judgment that takes a quarter of a second fits.
+- **On the database side.** A control that lives on the agent's machine can be skipped by the agent. A control next to the database sees every agent at once, which is the only place conflicts between agents are visible.
+- **Identity comes from the database role, not from what the agent says about itself.** Agent roles are set up so they only work through Stet. This arrives with enforce mode. Today Stet selects what to judge by table.
+
+## What we measured
+
+We recorded 1,461 writes against a synthetic B2B CRM, then replayed the same recorded state through each gate. The scored set held 414 defective writes (near-duplicate contacts, stale titles, status changes that contradict an open deal, consent with no source) and 851 legitimate ones.
+
+| Gate | Defects caught | Legitimate writes held | p95 latency | Cost per 1,000 writes |
+|---|---|---|---|---|
+| Stet with a judgment model (TypeSafe Jev) | 97.6% | 1.1% | 249 ms | $0.048 |
+| The same questions put to Claude Opus 5.5 | 99.5% | 0% | 5.4 s | $8.31 |
+
+Database constraints plus fuzzy matching, with no judgment, caught 23.2% of the same defects.
+
+Then we looked for where a model is actually needed. We wrote 400 legitimate writes that sit right next to a rule boundary, such as a new contact who shares a family name with an existing one, or a job title rewritten as its abbreviation. We ran them through the judgment model and through the same policies ported to code and tuned once.
+
+| Gate | Legitimate near-boundary writes held |
+|---|---|
+| Policies as hand-tuned rule code | 31.2% |
+| Stet with a judgment model | 2.5% |
+
+Two results cut against us, and they shaped the design.
+
+- A frontier agent (Claude Opus 5.5) avoided most traps on its own. It produced 14 defective writes across 326 planted traps.
+- Plain rule code caught every policy violation we injected. It fell behind only on near-duplicates.
+
+So Stet does not bet on agents being careless, and it does not put a model where a rule will do. It bets on two things that stay true as models improve: what even a perfect agent cannot know (what other agents wrote after it last read), and what must exist even when the write is right (who wrote what, for whom, having read which version).
+
+Pass and fail criteria were fixed before we looked at results. The data is synthetic and most defects were injected by script. Latency was measured on one development machine at four concurrent requests. Method, raw numbers and limits are in [docs/lab.md](docs/lab.md).
+
+## Status
+
+| Capability | State |
+|---|---|
+| pgwire proxy, simple and extended query protocol | Working |
+| Shadow mode: assemble state, judge, record, never change the write | Working |
+| Value-level judgment on single-row writes (duplicate, conflict, policy) | Working, in shadow mode |
+| Append-only decision log, replay and scoring lab | Working |
+| Impact measurement for multi-row writes | Spec drafted |
+| Enforce mode: block the write and return the reason | Next |
+| Reversal, stale-write detection | Planned |
+| TLS, role-based identity, credential custody | Planned |
+| Reads: recording, limits, masking | Planned |
+
+What that means in practice today:
+
+- Stet is safe to put in the path of an agent because it changes nothing. It is not yet a control, and it is not a security boundary.
+- There is no TLS yet. Use it against a local Postgres or one in the same private network.
+- Writes inside an explicit transaction are recorded but not judged.
+
+## Roadmap
+
+1. Impact measurement, in shadow mode.
+2. Minimal enforce: block, return a structured reason, fail closed by default.
+3. A head-to-head benchmark against statement-level guardrails, including an attack set, with criteria fixed in advance.
+4. Reversal: before-values for every affected row, undo by session.
+5. Stale-write detection.
+6. TLS, role-based identity, credential custody, availability.
+7. Breadth: approvals, masking, a control plane, more protocols, then other data platforms.
+8. Quality: a cache that knows when it is stale, and hints drawn from the session record.
+
+The destination is one control layer for every agentic query, reads as well as writes, whoever sends it: an agent that made a mistake, an agent that was fed an injected instruction, or an agent run by an attacker. At the database they look the same, so Stet does not guess intent. It bounds what any session can do and keeps a record of what it did. The reasoning is in [docs/concept-v0.2.md](docs/concept-v0.2.md).
+
+## Built to sit in front of a production database
+
+- Model calls never run inside a Postgres transaction.
+- Model versions are pinned. Aliases such as `latest` are rejected when the config is validated.
+- The decision log is append-only. Only the after-the-fact label columns can be updated.
+- Replay uses the recorded judgment. It never infers again.
+- Data written by agents is untrusted input. Its origin is marked, deterministic constraints run before any judgment, and judgment never replaces them.
+- Shadow mode never changes the original behaviour.
+- You choose which columns a model may see. `send_fields` is mandatory, with no "all columns" default.
+- Statements Stet does not gate may add at most 2 ms at p95. A test holds that budget.
+- The model interface is neutral. TypeSafe Jev is the first adapter, and a Claude adapter exists for experiments.
+
+## Quick start
+
+Requirements: Go 1.27 or later. Integration tests also need Postgres binaries (`initdb`, `pg_ctl`, `psql`) on `PATH`.
 
 ```bash
 go build -o bin/stet ./cmd/stet
-bin/stet proxy -config stet.yaml   # 설정 형식은 stet.example.yaml
+cp stet.example.yaml stet.yaml        # set upstream, tables and send_fields
+bin/stet proxy -config stet.yaml
 ```
 
-통합 테스트는 일회용 Postgres를 띄워서 돌린다. `STET_TEST_PG`가 없으면 통합 테스트는 건너뛴다.
+Point the agent's connection string at Stet's `listen` address. Then read what Stet recorded:
+
+```sql
+select * from stet.decisions order by created_at desc;
+```
+
+- To judge with Jev, set `TYPESAFE_API_KEY` in the environment.
+- To record writes and state with no model, set `model: {adapter: none}`.
+- To measure Jev latency yourself, run `bin/stet bench-jev -n 60 -version jev-1.14.0`.
+
+### Tests
+
+Integration tests run against a throwaway Postgres. Without `STET_TEST_PG` they are skipped.
 
 ```bash
-scripts/testdb.sh start /tmp/stet-pg   # 포트 55432, 인증 방식별 테스트 계정 생성
+scripts/testdb.sh start /tmp/stet-pg    # port 55432, creates test accounts per auth method
 export STET_TEST_PG=127.0.0.1:55432
 go test -race ./...
 scripts/testdb.sh stop /tmp/stet-pg
 ```
 
-| 패키지 | 역할 |
+### Layout
+
+| Package | Role |
 |---|---|
 | `cmd/stet` | CLI (`stet proxy`, `stet bench-jev`) |
-| `internal/config` | `stet.yaml` 로드와 검증. 모델 버전 별칭 거부 |
-| `internal/proxy` | pgwire 프록시. 세션별로 문장·실행 결과·트랜잭션 상태를 추적하고 `Gate`에 알린다 |
-| `internal/sqlparse` | 게이트 대상 쓰기 분류 (pass / gated / unsupported), `stet.on_behalf_of` |
-| `internal/gate` | 상태 조립, 판단 호출, 기록 (섀도 모드) |
-| `internal/decide` | 모델 중립 `Decider` 인터페이스, 질문 세트, verdict 정책 |
-| `internal/decide/jev` | TypeSafe Jev 어댑터 (`TYPESAFE_API_KEY` 필요) |
-| `internal/decide/claude` | Claude 어댑터: 같은 질문을 JSON으로 묻는 LLM 게이트, 실험 arm B·B'용 (`ANTHROPIC_API_KEY` 필요, 지금은 `stet-lab`에만 등록) |
-| `internal/store` | `stet.decisions` 스키마와 기록 |
-| `cmd/stet-lab`, `internal/lab/*` | 실험 도구: 합성 CRM, 업무·주입·라벨, LLM 에이전트, 재생과 채점 (docs/lab.md) |
+| `internal/config` | Loads and validates `stet.yaml`. Rejects model version aliases |
+| `internal/proxy` | pgwire proxy. Tracks statements, results and transaction state per session and reports them to the gate |
+| `internal/sqlparse` | Classifies writes to gated tables (pass / gated / unsupported), reads `stet.on_behalf_of` |
+| `internal/gate` | Assembles state, calls the judgment, records the decision |
+| `internal/decide` | Model-neutral `Decider` interface, question set, verdict policy |
+| `internal/decide/jev` | TypeSafe Jev adapter |
+| `internal/decide/claude` | Claude adapter, used by the lab |
+| `internal/store` | `stet.decisions` schema and writes |
+| `cmd/stet-lab`, `internal/lab/*` | Experiment tooling: synthetic CRM, tasks, defect injection, labels, replay and scoring |
 
-섀도 모드로 쓰기를 기록해 보려면 `stet.example.yaml`을 복사해 `upstream`, 테이블, `send_fields`를 맞춘다. Jev로 판단하려면 `TYPESAFE_API_KEY`를 환경 변수로 주고, 모델 없이 기록만 하려면 `model: {adapter: none}`으로 둔다. 기록은 `select * from stet.decisions order by created_at desc`로 본다.
+## Open core
 
-Jev 단건 지연은 `TYPESAFE_API_KEY`를 준 상태에서 `bin/stet bench-jev -n 60 -version jev-1.14.0`으로 잰다.
+| Open source (Apache 2.0) | Managed (paid) |
+|---|---|
+| pgwire proxy | Inference optimisation: caching, batching, version pinning, billing per judgment |
+| Judgment write gate | Confidence calibration per customer |
+| Decision log schema | A judgment model trained on decision and outcome data |
+| Shadow mode | Audit dashboard, review UI for held writes, team permissions |
+| Model adapter interface | Compliance reports |
+| Invalidation and re-evaluation (planned) | |
+
+Open-source users bring their own model API key. The license stays as first chosen.
+
+## Documentation
+
+The design documents are written in Korean for now.
+
+- [docs/concept-v0.2.md](docs/concept-v0.2.md): the v0.2 concept and direction
+- [docs/spec-v0.2-impact.md](docs/spec-v0.2-impact.md): draft spec for impact measurement
+- [docs/spec-v0.1.md](docs/spec-v0.1.md): the v0.1 technical spec
+- [docs/experiment.md](docs/experiment.md): experiment design and go / kill criteria
+- [docs/lab.md](docs/lab.md): experiment runs and results
+- [docs/decisions.md](docs/decisions.md): decision record and open questions
+- [docs/landscape.md](docs/landscape.md): the surrounding landscape
