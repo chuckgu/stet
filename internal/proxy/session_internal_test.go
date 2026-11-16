@@ -378,7 +378,7 @@ func TestObservedPortalKeepsNoBindValues(t *testing.T) {
 	flush := func() error { return nil }
 	s.fromClient('P', body(&pgproto3.Parse{Name: "r", Query: "select * from t where v = $1"}), flush)
 	s.fromClient('B', body(&pgproto3.Bind{PreparedStatement: "r", DestinationPortal: "p", Parameters: [][]byte{[]byte("secret")}}), flush)
-	b, ok := s.portals["p"]
+	b, ok, _ := s.portals.get(nil, "p")
 	if !ok || !b.st.Observe {
 		t.Fatalf("portal = %+v (found %v), want the observed read remembered", b, ok)
 	}

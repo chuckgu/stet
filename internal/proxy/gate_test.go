@@ -1098,6 +1098,33 @@ func untilReady(t *testing.T, fe *pgproto3.Frontend) (rows, suspended int) {
 	}
 }
 
+// replies reads messages up to ReadyForQuery and returns their type bytes in
+// order, joined by one space, with an ErrorResponse written as E:<SQLSTATE>:
+// for example "1 2 C 1 2 E:ST001 Z".
+func replies(t *testing.T, fe *pgproto3.Frontend) string {
+	t.Helper()
+	var got []string
+	for {
+		msg, err := fe.Receive()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch m := msg.(type) {
+		case *pgproto3.ErrorResponse:
+			got = append(got, "E:"+m.Code)
+		default:
+			b, err := msg.Encode(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got = append(got, string(b[0]))
+		}
+		if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+			return strings.Join(got, " ")
+		}
+	}
+}
+
 // mustFail runs sql and fails the test unless the server refuses it with code.
 func mustFail(t *testing.T, conn *pgx.Conn, sql, code string) {
 	t.Helper()
@@ -1484,5 +1511,67 @@ func TestCursorsThroughTheExtendedProtocol(t *testing.T) {
 		if ob := obs[i]; ob.st.SQL != declare || ob.o.Sent != want || !ob.o.Executed {
 			t.Errorf("FETCH %d: %q %+v, want the DECLARE with %d rows sent", i+1, ob.st.SQL, ob.o, want)
 		}
+	}
+}
+
+// The proxy's statement table follows what the server confirmed. A Parse the
+// server refused (42P05), and a Close it skipped after an earlier error in
+// the same Sync, leave the name meaning the watched insert the server still
+// holds, so Executing it is judged as that insert.
+func TestGateJudgesTheStatementTheServerHolds(t *testing.T) {
+	table := watchedTable(t)
+	admin := connect(t, upstream(t), "stet_scram", nil)
+	mustExec(t, admin, "grant insert on "+table+" to stet_trust") // dropped with the table
+	g := newRecordingGate(watches(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	fe := rawSession(t, addr, "stet_trust", pgproto3.ProtocolVersionNumber)
+	ins := "insert into " + table + " values ($1, 'x')"
+	unit := func(want string, msgs ...pgproto3.FrontendMessage) {
+		t.Helper()
+		for _, m := range msgs {
+			fe.Send(m)
+		}
+		fe.Send(&pgproto3.Sync{})
+		if err := fe.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		if got := replies(t, fe); got != want {
+			t.Fatalf("replies %q, want %q", got, want)
+		}
+	}
+	insertRow := func(id string) []pgproto3.FrontendMessage {
+		return []pgproto3.FrontendMessage{
+			&pgproto3.Bind{PreparedStatement: "s1", Parameters: [][]byte{[]byte(id)}},
+			&pgproto3.Execute{},
+		}
+	}
+	rows := func() int {
+		t.Helper()
+		var n int
+		if err := admin.QueryRow(testCtx(t), "select count(*) from "+table).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	unit("1 Z", &pgproto3.Parse{Name: "s1", Query: ins})
+	unit("E:42P05 Z", &pgproto3.Parse{Name: "s1", Query: "select 1"})
+	unit("2 C Z", insertRow("1")...)
+	bs, os := g.outcomes(t, 1)
+	if len(bs) != 1 || bs[0].st.SQL != ins || !os[0].Executed {
+		t.Fatalf("after the refused Parse: writes begun %+v, outcomes %+v; want the insert, executed", bs, os)
+	}
+	if n := rows(); n != 1 {
+		t.Errorf("%d rows after the refused Parse, want 1", n)
+	}
+
+	unit("E:26000 Z", &pgproto3.Bind{PreparedStatement: "nosuch"}, &pgproto3.Close{ObjectType: 'S', Name: "s1"})
+	unit("2 C Z", insertRow("2")...)
+	bs, os = g.outcomes(t, 2)
+	if len(bs) != 2 || bs[1].st.SQL != ins || !os[1].Executed {
+		t.Fatalf("after the skipped Close: writes begun %+v, outcomes %+v; want the insert again, executed", bs, os)
+	}
+	if n := rows(); n != 2 {
+		t.Errorf("%d rows after the skipped Close, want 2", n)
 	}
 }

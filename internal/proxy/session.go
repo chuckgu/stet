@@ -114,10 +114,6 @@ type session struct {
 	gate Gate
 	info SessionInfo
 
-	// Touched only on the client side.
-	stmts   map[string]prepared
-	portals map[string]bound
-
 	// Touched only on the server side, and by abandon once both sides have
 	// stopped: row messages sent since the last completion or error.
 	sent int64
@@ -133,19 +129,36 @@ type session struct {
 	// unsettled holds the names in cursors whose newest entry can still change
 	// at a ReadyForQuery: all but held cursors that outlived their transaction.
 	unsettled map[string]struct{}
+
+	// The prepared statements and portals as the server holds them, under mu:
+	// changed as the client sends, settled as the server answers.
+	stmts   names[prepared]
+	portals names[bound]
 }
 
 type prepared struct {
 	st   Statement
 	oids []uint32
+	// unread: set by a Parse the proxy could not read. What it runs is
+	// unknown.
+	unread bool
 }
 
+// bound is what a portal means. A Bind of a statement Stet does not follow
+// leaves it empty.
 type bound struct {
 	st     Statement
 	params []Param
 	// rows read through the portal so far, for an observed one; a new Bind
 	// starts over. Updated on the server side as its Executes are answered.
 	rows *int64
+	// unread: set by a Bind the proxy could not read, or bound to a statement
+	// that was unread. What it runs is unknown.
+	unread bool
+	// others are the other meanings its statement's name had at the Bind
+	// (see names.get): the portal runs one of them if the newest did not
+	// hold.
+	others []prepared
 }
 
 // unit is the stretch of client messages answered by one ReadyForQuery: a
@@ -162,6 +175,15 @@ type unit struct {
 	reads       []observedRead
 	rows        map[int]int64 // row counts by completion (1-based); kept only once a watched write or observed read joined
 	sent        map[int]int64 // row messages sent by Execute (1-based), or 0 for a Query; kept only once an observed read joined
+
+	// The server answers each Parse, Bind, Describe, Close and Execute it
+	// completes with one message: ParseComplete, BindComplete, RowDescription
+	// or NoData, CloseComplete, and CommandComplete, EmptyQueryResponse or
+	// PortalSuspended. It stops at the first that fails and skips the rest
+	// until Sync, so the first acks messages are the ones that ran.
+	msgs   int // P, B, D, C and E messages so far; a message's pos is its 1-based count
+	acks   int // how many of them the server completed so far; final at the unit's ReadyForQuery
+	errPos int // pos of the message the unit's error answers; 0 when it has none, msgs+1 when it came at the Sync (a deferred constraint, say)
 }
 
 type watchedWrite struct {
@@ -188,13 +210,7 @@ type observedRead struct {
 }
 
 func newSession(g Gate, info SessionInfo) *session {
-	return &session{
-		gate:    g,
-		info:    info,
-		stmts:   map[string]prepared{},
-		portals: map[string]bound{},
-		status:  'I',
-	}
+	return &session{gate: g, info: info, status: 'I'}
 }
 
 func (s *session) clientTap() *tap {
@@ -221,11 +237,24 @@ func (s *session) serverTap() *tap {
 		},
 		see: func(t byte, body []byte, _ func() error) { s.fromServer(t, body) },
 		each: func(t byte) {
-			if t == 'D' || t == 'd' { // DataRow, CopyData
+			switch t {
+			case 'D', 'd': // DataRow, CopyData
 				s.sent++
+			case '1', '2', '3', 'T', 'n': // ParseComplete, BindComplete, CloseComplete, RowDescription, NoData
+				s.ack()
 			}
 		},
 	}
+}
+
+// ack counts a message of the unit being answered as completed. It runs on
+// the server side, once per completion, never per row.
+func (s *session) ack() {
+	s.mu.Lock()
+	if len(s.units) > 0 {
+		s.units[0].acks++
+	}
+	s.mu.Unlock()
 }
 
 func (s *session) fromClient(t byte, body []byte, flush func() error) {
@@ -253,49 +282,63 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 		s.dirties(u, st)
 
 	case 'P':
-		s.open()
 		var m pgproto3.Parse
-		if body == nil || m.Decode(body) != nil {
-			return
+		read := body != nil && m.Decode(body) == nil
+		var p prepared
+		if read {
+			p = prepared{st: s.gate.Inspect(m.Query), oids: slices.Clone(m.ParameterOIDs)}
 		}
-		s.stmts[m.Name] = prepared{st: s.gate.Inspect(m.Query), oids: slices.Clone(m.ParameterOIDs)}
+		s.mu.Lock()
+		u, pos := s.count()
+		if read {
+			s.stmts.put(u, pos, m.Name, true, p)
+		} else {
+			s.stmts.putUnread(u, pos, prepared{unread: true})
+		}
+		s.mu.Unlock()
 
 	case 'B':
-		s.open()
 		var m pgproto3.Bind
-		if body == nil || m.Decode(body) != nil {
-			return
+		read := body != nil && m.Decode(body) == nil
+		var p prepared
+		var ok bool
+		var others []prepared
+		s.mu.Lock()
+		u, pos := s.count()
+		if read {
+			p, ok, others = s.stmts.get(u, m.PreparedStatement)
 		}
-		// A portal is remembered when its Execute does something beyond
-		// leaving the transaction dirty; one not remembered dirties it.
-		p, ok := s.stmts[m.PreparedStatement]
-		if !ok || (!p.st.Watch && !p.st.Observe && !p.st.Clean && p.st.OnBehalfOf == nil && len(p.st.Cursors) == 0) {
-			delete(s.portals, m.DestinationPortal)
-			return
+		s.mu.Unlock()
+		// Bind values are copied without the lock: the server side takes it
+		// for every completion it counts.
+		b := bound{unread: true}
+		if read {
+			b = binding(&m, p, ok, others)
 		}
-		b := bound{st: p.st}
-		switch {
-		case p.st.Watch: // only Begin is handed bind values
-			b.params = params(&m, p.oids)
-		case p.st.Observe:
-			b.rows = new(int64)
+		s.mu.Lock()
+		if read {
+			s.portals.put(u, pos, m.DestinationPortal, true, b)
+		} else {
+			s.portals.putUnread(u, pos, b)
 		}
-		s.portals[m.DestinationPortal] = b
+		s.mu.Unlock()
 
 	case 'E':
-		u := s.open()
+		var m pgproto3.Execute
+		read := body != nil && m.Decode(body) == nil
 		s.mu.Lock()
+		u, _ := s.count()
 		u.executes++
 		idx := u.executes
-		s.mu.Unlock()
-		var m pgproto3.Execute
-		if body == nil || m.Decode(body) != nil {
-			s.markDirty(u) // it may run anything
-			return
+		var b bound
+		var ok bool
+		if read {
+			b, ok, _ = s.portals.get(u, m.Portal)
 		}
-		b, ok := s.portals[m.Portal]
-		if !ok {
-			s.markDirty(u) // a portal of no statement Stet follows
+		s.mu.Unlock()
+		if !ok || b.unread {
+			// It may run anything, or a statement Stet does not follow.
+			s.markDirty(u)
 			return
 		}
 		s.apply(b.st)
@@ -313,18 +356,27 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 		s.dirties(u, b.st)
 
 	case 'C':
-		s.open()
 		var m pgproto3.Close
-		if body == nil || m.Decode(body) != nil {
-			return
+		read := body != nil && m.Decode(body) == nil
+		s.mu.Lock()
+		u, pos := s.count()
+		// A Close the proxy could not read changes nothing here: a name it
+		// may have closed stays remembered.
+		switch {
+		case !read:
+		case m.ObjectType == 'S':
+			s.stmts.put(u, pos, m.Name, false, prepared{})
+		case m.ObjectType == 'P':
+			s.portals.put(u, pos, m.Name, false, bound{})
 		}
-		if m.ObjectType == 'S' {
-			delete(s.stmts, m.Name)
-		} else {
-			delete(s.portals, m.Name)
-		}
+		s.mu.Unlock()
 
-	case 'D', 'H':
+	case 'D':
+		s.mu.Lock()
+		s.count()
+		s.mu.Unlock()
+
+	case 'H':
 		s.open()
 
 	case 'S':
@@ -444,12 +496,46 @@ func (s *session) push(u *unit) *unit {
 func (s *session) open() *unit {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.openLocked()
+}
+
+// openLocked is open with s.mu held.
+func (s *session) openLocked() *unit {
 	if n := len(s.units); n > 0 && !s.units[n-1].closed {
 		return s.units[n-1]
 	}
 	u := &unit{}
 	s.units = append(s.units, u)
 	return u
+}
+
+// count adds a Parse, Bind, Describe, Close or Execute arriving now to the
+// unit still collecting messages, and returns that unit and the message's
+// pos in it. It runs with s.mu held.
+func (s *session) count() (*unit, int) {
+	u := s.openLocked()
+	u.msgs++
+	return u, u.msgs
+}
+
+// binding is what the portal of Bind m means, given what its statement's
+// name meant (see names.get). A portal is given a statement when its Execute
+// does something beyond leaving the transaction dirty; one left empty
+// dirties it. Only a watched statement keeps the bind values, for Begin.
+func binding(m *pgproto3.Bind, p prepared, ok bool, others []prepared) bound {
+	b := bound{others: others}
+	switch {
+	case !ok:
+	case p.unread:
+		b.unread = true
+	case p.st.Watch:
+		b.st, b.params = p.st, params(m, p.oids)
+	case p.st.Observe:
+		b.st, b.rows = p.st, new(int64)
+	case p.st.Clean || p.st.OnBehalfOf != nil || len(p.st.Cursors) > 0:
+		b.st = p.st
+	}
+	return b
 }
 
 func (s *session) fromServer(t byte, body []byte) {
@@ -463,6 +549,7 @@ func (s *session) fromServer(t byte, body []byte) {
 		s.settle(head)
 		if head != nil {
 			head.completions++
+			head.acks++
 			// Watched writes and observed reads join their unit before they
 			// go upstream, so units with neither never need their tags read.
 			if t == 'C' && (len(head.writes) > 0 || len(head.reads) > 0) {
@@ -479,6 +566,9 @@ func (s *session) fromServer(t byte, body []byte) {
 		if head != nil && head.err == "" {
 			head.err = errorText(body)
 			head.errAt = head.completions + 1
+			if !head.query {
+				head.errPos = head.acks + 1
+			}
 		}
 	case 'Z':
 		s.settle(head) // normally nothing is left; never carry rows into the next unit
@@ -498,11 +588,18 @@ func (s *session) fromServer(t byte, body []byte) {
 			s.mu.Unlock()
 			return
 		}
+		if head != nil {
+			s.units = s.units[1:]
+			s.stmts.answered(head, head.acks)
+			s.portals.answered(head, head.acks)
+		}
+		if status == 'I' {
+			s.portals.forget() // the server drops every portal when a transaction ends
+		}
 		if head == nil {
 			s.mu.Unlock()
 			return
 		}
-		s.units = s.units[1:]
 		if status != 'I' {
 			s.carry(head)
 		}
