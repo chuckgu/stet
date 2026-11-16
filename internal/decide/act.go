@@ -61,7 +61,8 @@ const approve = "ask a human to approve " + heldMark
 // role is not known, is always refused (spec 4, 7), whatever the table's
 // unsupported setting, and also when its shape reason came first in the
 // rule order. Its sentence is then the transaction's or the login role's:
-// changing the shape would not let it through.
+// changing the shape would not let it through. A SQL PREPARE of a gated
+// write is always refused too, with its own sentence (ruling 30).
 func Act(verdict string, reasons []string, f Facts) Action {
 	var a Action
 	switch verdict {
@@ -98,9 +99,11 @@ func Act(verdict string, reasons []string, f Facts) Action {
 }
 
 // alwaysRefused reports the reasons the table's unsupported: pass does not
-// let through (spec 5).
+// let through (spec 5): a dirty transaction, an unknown login role, and a SQL
+// PREPARE of a gated write, whose EXECUTEs would run it with no judgment and
+// no record (ruling 30).
 func alwaysRefused(reason string) bool {
-	return reason == "in_transaction" || reason == "no_login_role"
+	return reason == "in_transaction" || reason == "no_login_role" || reason == "prepare"
 }
 
 // Hint is the HINT line. heldWrite is the stet.held_writes id; "" when the
@@ -210,6 +213,8 @@ var ofTable = map[string]phrase{
 	"truncate":       {"TRUNCATE of %s cannot be judged", "delete rows by primary key"},
 	"merge":          {"MERGE into %s cannot be judged", "send separate INSERT and UPDATE statements"},
 	"nested_write":   {"a write to %s inside another statement cannot be judged", "send it as a plain INSERT, UPDATE or DELETE"},
+	"prepare": {"a write to %s prepared with SQL PREPARE cannot be judged when it is executed",
+		"send the write as a plain statement, or as a protocol-level prepared statement (Parse, Bind, Execute)"},
 }
 
 var manyRows = phrase{"it may touch more than one row of %s and its rows could not be counted",

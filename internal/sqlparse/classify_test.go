@@ -71,7 +71,13 @@ func TestClassifyKinds(t *testing.T) {
 		{"write inside cte", "with d as (delete from contacts where id = 1 returning *) select * from d", Unsupported, "nested_write"},
 		{"write into other table from cte", "with d as (update contacts set title = 'x' where id = 1 returning *) insert into log select * from d", Unsupported, "nested_write"},
 		{"explain analyze", "explain analyze delete from contacts where id = 1", Unsupported, "nested_write"},
-		{"prepare", "prepare p as insert into contacts (name) values ($1)", Unsupported, "nested_write"},
+		// SQL PREPARE of a gated write: its EXECUTEs run what no Begin sees,
+		// so it has a reason of its own, which enforce always refuses (ruling
+		// 30), among other statements too.
+		{"prepare", "prepare p as insert into contacts (name) values ($1)", Unsupported, "prepare"},
+		{"prepare among several", "select 1; prepare p as delete from contacts where id = $1", Unsupported, "prepare"},
+		{"prepare after a write", "delete from contacts where id = 1; prepare p as delete from contacts", Unsupported, "prepare"},
+		{"prepare of another table", "prepare p as insert into deals (id) values ($1)", Pass, ""},
 		{"gated write among several", "select 1; delete from contacts where id = 1", Unsupported, "multi_statement"},
 	}
 	for _, tc := range cases {

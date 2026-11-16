@@ -191,6 +191,7 @@ func Classify(sql string, tables Tables) (Result, error) {
 		clean    = true
 		do       bool
 		defines  bool
+		prepares bool // a SQL PREPARE of a gated write
 	)
 	for _, raw := range tree.Stmts {
 		if w, ok := firstGatedWrite(raw.Stmt, m); ok {
@@ -198,6 +199,7 @@ func Classify(sql string, tables Tables) (Result, error) {
 				target = w
 			}
 			touching++
+			prepares = prepares || raw.Stmt.GetPrepareStmt() != nil
 		}
 		if v, ok := onBehalfOf(raw.Stmt); ok {
 			obo = &v
@@ -225,6 +227,11 @@ func Classify(sql string, tables Tables) (Result, error) {
 				r.Kind, r.Reads = Read, reads
 			}
 		}
+	case prepares:
+		// Its EXECUTEs, and protocol Binds of its name, would run the write
+		// with no Begin (ruling 30): enforce refuses it whatever the table's
+		// unsupported setting, also among other statements.
+		r = unsupported("prepare")
 	case len(tree.Stmts) > 1:
 		// Several statements in one Query run as one implicit transaction.
 		r = unsupported("multi_statement")

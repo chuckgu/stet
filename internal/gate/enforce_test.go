@@ -1408,6 +1408,59 @@ func TestStatementsThatDefineCodeAreRefused(t *testing.T) {
 	}
 }
 
+// A SQL PREPARE of a gated write would let each EXECUTE of it, and each
+// protocol Bind of its name, run what no Begin sees, with no record at all
+// (ruling 30). Enforce refuses it whatever the table's unsupported setting,
+// so the name never exists on the server. Shadow records it as unsupported
+// with the reason enforce refuses it for, and lets it run.
+func TestSQLPrepareOfAWriteIsRefused(t *testing.T) {
+	for _, mode := range []string{"enforce", "shadow"} {
+		t.Run(mode, func(t *testing.T) {
+			format := enforcePrefix + tableYAML + "    unsupported: pass\n"
+			if mode == "shadow" {
+				format = "agents: {roles: [stet_md5]}\n" + tableYAML + "    unsupported: pass\n"
+			}
+			e := setupEnforce(t, calm(), format)
+			e.seed(t)
+			ctx := context.Background()
+			conn := e.agent(t, mode)
+
+			_, err := conn.Exec(ctx, "prepare w as update "+e.table+" set title = 'viaexec'")
+			if mode == "shadow" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				mustExec(t, conn, "execute w")
+				if n := e.rowsWhere(t, "title = 'viaexec'"); n != 2 {
+					t.Errorf("shadow: %d rows written by EXECUTE, want 2", n)
+				}
+			} else {
+				wantRefused(t, err, "ST002", "write refused by stet: a write to "+e.table+" prepared with SQL PREPARE")
+				if _, err := conn.Exec(ctx, "execute w"); sqlstate(err) != "26000" {
+					t.Errorf("execute w: %v, want the server's 26000: w does not exist", err)
+				}
+				if err := conn.PgConn().ExecPrepared(ctx, "w", nil, nil, nil).Read().Err; sqlstate(err) != "26000" {
+					t.Errorf("Bind of w: %v, want the server's 26000", err)
+				}
+				if n := e.rowsWhere(t, "title = 'viaexec'"); n != 0 {
+					t.Errorf("%d rows written, want none", n)
+				}
+			}
+
+			rs := e.enforced(t, 1)
+			if len(rs) != 1 {
+				t.Fatalf("%d decisions, want the PREPARE's alone", len(rs))
+			}
+			wantEnforced(t, 0, rs[0], "unsupported", "prepare")
+			if mode == "enforce" {
+				wantRefusedRecord(t, 0, rs[0], "ST002")
+			} else if !rs[0].Executed || rs[0].Refused != nil {
+				t.Errorf("shadow: executed=%v refused=%v, want executed and NULL", rs[0].Executed, deref(rs[0].Refused))
+			}
+		})
+	}
+}
+
 // churnDecider says a write breaks policy rule 1 when it sets status to
 // churned, and answers every other question calmly.
 type churnDecider struct{}
