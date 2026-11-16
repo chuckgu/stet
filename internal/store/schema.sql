@@ -56,6 +56,8 @@ ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS impact jsonb;
 ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS login_role text;       -- DB가 인증한 접속 계정
 ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS rows_affected bigint;  -- 쓰기가 게이트 대상 테이블에서 바꾼 행 수
 ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS cumulative jsonb;      -- 누적 한도 판단 근거
+-- enforce (docs/spec-v0.2-enforce.md 11장). Stet이 문장을 보내지 않고 돌려준 SQLSTATE. 보냈으면 NULL. 입력 전용 컬럼이다.
+ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS refused text;
 CREATE INDEX IF NOT EXISTS decisions_role_idx ON stet.decisions (login_role, target_table, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS decisions_target_idx ON stet.decisions (target_table, target_pk, created_at DESC);
@@ -111,3 +113,22 @@ CREATE TABLE IF NOT EXISTS stet.read_log (
   rows          bigint NOT NULL,               -- 클라이언트에게 나간 행 수
   exec_error    text                           -- 실패하거나 끊긴 문장이면 그 원인
 );
+
+-- 보류 건 (docs/spec-v0.2-enforce.md 9장). hold와 escalate로 막은 쓰기. 트리거를 두지 않는다: 2b가 status를 바꾼다.
+CREATE TABLE IF NOT EXISTS stet.held_writes (
+  id            uuid PRIMARY KEY,
+  decision_id   uuid NOT NULL,                 -- stet.decisions의 id
+  created_at    timestamptz NOT NULL,          -- 문장이 들어온 시각
+  status        text NOT NULL DEFAULT 'pending',  -- 이 단계에서는 pending | undelivered
+  login_role    text NOT NULL,
+  database      text NOT NULL,
+  statement     text NOT NULL,
+  params        jsonb,                         -- 바인딩 값의 텍스트 배열
+  param_types   oid[],                         -- 클라이언트가 Parse에서 준 타입
+  target_table  text NOT NULL,
+  target_pk     text,
+  row_version   text,                          -- 상태를 읽을 때의 xmin. 단일 행 UPDATE·DELETE만
+  verdict       text NOT NULL,                 -- hold | escalate
+  reasons       text[] NOT NULL
+);
+CREATE INDEX IF NOT EXISTS held_writes_pending ON stet.held_writes (created_at) WHERE status = 'pending';

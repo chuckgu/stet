@@ -80,6 +80,8 @@ type Decision struct {
 	LoginRole    *string // the role the database authenticated; nil when unknown
 	RowsAffected *int64  // rows the write changed in the gated table; nil when unknown
 	Cumulative   any     // stored as jsonb; nil is NULL
+
+	Refused *string // the SQLSTATE Stet answered with instead of sending the statement; nil when it was sent
 }
 
 func (s *Store) Insert(ctx context.Context, d *Decision) error {
@@ -111,19 +113,19 @@ func (s *Store) Insert(ctx context.Context, d *Decision) error {
 			statement, statement_fp, params, op, target_table, target_pk, proposed,
 			state, state_version, model, model_version, questions, answers, policy_version,
 			verdict, reasons, executed, exec_error, latency_ms, model_latency_ms, cost_usd, impact,
-			login_role, rows_affected, cumulative
+			login_role, rows_affected, cumulative, refused
 		) values (
 			$1, $2, $3, $4, $5, $6,
 			$7, $8, $9::jsonb, $10, $11, $12::jsonb, $13::jsonb,
 			$14::jsonb, $15::jsonb, $16, $17, $18::jsonb, $19::jsonb, $20,
 			$21, $22, $23, $24, $25, $26, $27, $28::jsonb,
-			$29, $30, $31::jsonb
+			$29, $30, $31::jsonb, $32
 		)`,
 		d.ID, d.CreatedAt, d.Mode, d.AgentID, d.OnBehalfOf, d.SessionID,
 		d.Statement, d.StatementFP, params, d.Op, d.TargetTable, pk, proposed,
 		state, stateVersion, d.Model, d.ModelVersion, jsonArg(d.Questions), jsonArg(d.Answers), d.PolicyVersion,
 		d.Verdict, reasons, d.Executed, d.ExecError, d.LatencyMS, d.ModelLatencyMS, d.CostUSD, jsonArg(d.Impact),
-		d.LoginRole, d.RowsAffected, jsonArg(d.Cumulative),
+		d.LoginRole, d.RowsAffected, jsonArg(d.Cumulative), d.Refused,
 	)
 	return err
 }
