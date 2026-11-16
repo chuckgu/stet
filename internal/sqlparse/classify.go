@@ -18,10 +18,11 @@ import (
 type Kind int
 
 const (
-	Pass        Kind = iota // writes no gated table
+	Pass        Kind = iota // neither writes nor reads a gated table
 	Gated                   // single-row write that v0.1 judges
 	Unsupported             // writes a gated table in a shape v0.1 does not judge
 	Measured                // multi-row write of a gated table whose row count can be learned
+	Read                    // reads a gated table and writes none
 )
 
 func (k Kind) String() string {
@@ -34,8 +35,26 @@ func (k Kind) String() string {
 		return "unsupported"
 	case Measured:
 		return "measured"
+	case Read:
+		return "read"
 	}
 	return "Kind(" + strconv.Itoa(int(k)) + ")"
+}
+
+type CursorOp int
+
+const (
+	CursorDeclare  CursorOp = iota + 1
+	CursorFetch             // FETCH; MOVE sends no rows and is not one
+	CursorClose             // CLOSE name
+	CursorCloseAll          // CLOSE ALL
+)
+
+// Cursor says what a statement does to a SQL cursor.
+type Cursor struct {
+	Op   CursorOp
+	Name string // as the parser normalizes it: unquoted names lowercased; "" for CLOSE ALL
+	Hold bool   // DECLARE ... WITH HOLD
 }
 
 type ValueKind int
@@ -91,10 +110,20 @@ type Result struct {
 	Write   *Write   // set when Gated
 	Measure *Measure // set exactly when Kind is Measured
 
-	// Table and Op name the first gated write found (any Kind but Pass).
-	// Op is insert, update, delete, merge, copy, or truncate.
+	// Table and Op name the first gated write found (Gated, Unsupported,
+	// or Measured). Op is insert, update, delete, merge, copy, or truncate.
 	Table string
 	Op    string
+
+	// Reads holds the config keys of the gated tables the statements read,
+	// sorted, and is set exactly when Kind is Read. A statement that writes
+	// a gated table is classified as that write; what it reads is not kept.
+	Reads []string
+
+	// Cursor is set when the SQL is a single DECLARE CURSOR, FETCH, or
+	// CLOSE that writes no gated table. A DECLARE is Read or Pass by what
+	// its query reads; FETCH and CLOSE are Pass.
+	Cursor *Cursor
 
 	// OnBehalfOf is set when the SQL sets or resets stet.on_behalf_of;
 	// "" means reset.
@@ -106,9 +135,13 @@ const onBehalfOfSetting = "stet.on_behalf_of"
 // Classify parses sql (the text of one Query or Parse message). gated maps a
 // table name, optionally schema-qualified, to its primary key column.
 //
+// SQL that writes no gated table is Read when any of its statements reads
+// one, and Pass otherwise.
+//
 // An unqualified config name matches the table in any schema, and a
 // qualified one also matches unqualified references, since search_path may
-// resolve them there. Over-matching only means more writes get judged.
+// resolve them there. Over-matching only means more writes get judged and
+// more reads counted.
 func Classify(sql string, gated map[string]string) (Result, error) {
 	tree, err := pg.Parse(sql)
 	if err != nil {
@@ -132,7 +165,14 @@ func Classify(sql string, gated map[string]string) (Result, error) {
 		}
 	}
 	if touching == 0 {
-		return Result{Kind: Pass, OnBehalfOf: obo}, nil
+		r := Result{Kind: Pass, OnBehalfOf: obo}
+		if reads := readTables(tree.Stmts, m); reads != nil {
+			r.Kind, r.Reads = Read, reads
+		}
+		if len(tree.Stmts) == 1 {
+			r.Cursor = cursor(tree.Stmts[0].Stmt)
+		}
+		return r, nil
 	}
 
 	var r Result

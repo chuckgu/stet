@@ -1,6 +1,7 @@
 package sqlparse
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 )
@@ -17,11 +18,11 @@ func TestClassifyKinds(t *testing.T) {
 		reason string
 	}{
 		// Not gated: reads, other tables, DDL.
-		{"select", "select * from contacts where id = 1", Pass, ""},
+		{"select", "select * from contacts where id = 1", Read, ""},
 		{"insert other table", "insert into deals (id) values (1)", Pass, ""},
 		{"update other table", "update deals set stage = 'won' where id = 1", Pass, ""},
 		{"ddl", "create table x (id int)", Pass, ""},
-		{"copy out", "copy contacts to stdout", Pass, ""},
+		{"copy out", "copy contacts to stdout", Read, ""},
 		{"several reads", "select 1; select 2", Pass, ""},
 		{"empty", "", Pass, ""},
 
@@ -89,8 +90,121 @@ func TestClassifyKinds(t *testing.T) {
 			if (r.Kind == Measured) != (r.Measure != nil) {
 				t.Errorf("Measure = %+v for kind %v; want a Measure exactly when Measured", r.Measure, r.Kind)
 			}
+			if (r.Kind == Read) != (r.Reads != nil) {
+				t.Errorf("Reads = %v for kind %v; want Reads exactly when Read", r.Reads, r.Kind)
+			}
 		})
 	}
+}
+
+// gated2 adds a second gated table, so a statement can read two.
+var gated2 = map[string]string{"contacts": "id", "deals": "id"}
+
+func TestClassifyReads(t *testing.T) {
+	cases := []struct {
+		sql    string
+		kind   Kind
+		reason string
+		reads  []string
+	}{
+		{"select * from contacts", Read, "", []string{"contacts"}},
+		{"table contacts", Read, "", []string{"contacts"}},
+		{"select c.name from contacts c join deals d on d.contact_id = c.id", Read, "", []string{"contacts", "deals"}},
+		{"select 1 where exists (select 1 from contacts)", Read, "", []string{"contacts"}},
+		{"select * from (select * from deals) d", Read, "", []string{"deals"}},
+		{"with x as (select * from deals) select * from x", Read, "", []string{"deals"}},
+		{"copy contacts to stdout", Read, "", []string{"contacts"}},
+		{"copy (select * from contacts) to stdout", Read, "", []string{"contacts"}},
+		{"insert into log select * from contacts", Read, "", []string{"contacts"}},
+		{"update log set n = c.n from contacts c where log.id = c.id", Read, "", []string{"contacts"}},
+		{"delete from log using contacts c where log.id = c.id", Read, "", []string{"contacts"}},
+		{"merge into log l using contacts c on l.id = c.id when matched then do nothing", Read, "", []string{"contacts"}},
+		{"select 1; select * from contacts", Read, "", []string{"contacts"}},
+		{"select * from deals; select * from contacts, deals", Read, "", []string{"contacts", "deals"}},
+		{"select * from leads", Pass, "", nil},
+		{"alter table contacts add column x int", Pass, "", nil},
+		{"analyze contacts", Pass, "", nil},
+		{"lock table contacts", Pass, "", nil},
+		{"copy log from stdin", Pass, "", nil},
+
+		// A WITH query of the same name hides the table in the statement it
+		// is attached to. Without RECURSIVE its own query still sees the
+		// table, and a schema-qualified name always names the table.
+		{"with contacts as (select 1) select * from contacts", Pass, "", nil},
+		{"with contacts as (select * from contacts) select * from contacts", Read, "", []string{"contacts"}},
+		{"with recursive contacts (n) as (select 1 union all select n + 1 from contacts where n < 3) select * from contacts", Pass, "", nil},
+		{"with contacts as (select 1) select * from public.contacts", Read, "", []string{"contacts"}},
+		{"select * from contacts where exists (with contacts as (select 1) select * from contacts)", Read, "", []string{"contacts"}},
+		{"with contacts as (select 1) update log set n = 1 from contacts", Pass, "", nil},
+
+		// A statement that holds a query reads what the query reads, as a
+		// write held by EXPLAIN ANALYZE or PREPARE counts as a write.
+		{"create table t as select * from contacts", Read, "", []string{"contacts"}},
+		{"prepare p as select * from deals", Read, "", []string{"deals"}},
+
+		// A statement that writes a gated table keeps its write kind.
+		{"update contacts set title = l.t from deals l where contacts.id = 1", Unsupported, "join", nil},
+		{"insert into contacts (name) select name from deals", Measured, "insert_select", nil},
+		{"select * from deals; delete from contacts where id = 1", Unsupported, "multi_statement", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.sql, func(t *testing.T) {
+			r, err := Classify(tc.sql, gated2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r.Kind != tc.kind || r.Reason != tc.reason || !reflect.DeepEqual(r.Reads, tc.reads) {
+				t.Errorf("got %v/%q reads %v, want %v/%q reads %v", r.Kind, r.Reason, r.Reads, tc.kind, tc.reason, tc.reads)
+			}
+			if r.Cursor != nil {
+				t.Errorf("Cursor = %+v, want nil", *r.Cursor)
+			}
+		})
+	}
+}
+
+func TestClassifyCursors(t *testing.T) {
+	cases := []struct {
+		sql    string
+		kind   Kind
+		reads  []string
+		cursor *Cursor
+	}{
+		{"declare c cursor for select * from contacts", Read, []string{"contacts"}, &Cursor{CursorDeclare, "c", false}},
+		{`declare "My C" cursor with hold for select * from contacts`, Read, []string{"contacts"}, &Cursor{CursorDeclare, "My C", true}},
+		{"declare c cursor for select 1", Pass, nil, &Cursor{CursorDeclare, "c", false}},
+		// Options other than WITH HOLD set neighbouring bits.
+		{"declare c binary insensitive scroll cursor without hold for select * from deals", Read, []string{"deals"}, &Cursor{CursorDeclare, "c", false}},
+		{"fetch 100 from c", Pass, nil, &Cursor{CursorFetch, "c", false}},
+		{"FETCH FORWARD 5 FROM C", Pass, nil, &Cursor{CursorFetch, "c", false}},
+		{"move 10 in c", Pass, nil, nil},
+		{"close c", Pass, nil, &Cursor{CursorClose, "c", false}},
+		{`close "My C"`, Pass, nil, &Cursor{CursorClose, "My C", false}},
+		{"close all", Pass, nil, &Cursor{CursorCloseAll, "", false}},
+		{"fetch 1 from c; fetch 1 from d", Pass, nil, nil},
+		{"declare c cursor for select * from contacts; fetch 1 from c", Read, []string{"contacts"}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.sql, func(t *testing.T) {
+			r, err := Classify(tc.sql, gated2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r.Kind != tc.kind || r.Reason != "" || !reflect.DeepEqual(r.Reads, tc.reads) {
+				t.Errorf("got %v/%q reads %v, want %v reads %v", r.Kind, r.Reason, r.Reads, tc.kind, tc.reads)
+			}
+			if !reflect.DeepEqual(r.Cursor, tc.cursor) {
+				t.Errorf("Cursor = %s, want %s", cursorString(r.Cursor), cursorString(tc.cursor))
+			}
+		})
+	}
+}
+
+func cursorString(c *Cursor) string {
+	if c == nil {
+		return "nil"
+	}
+	return fmt.Sprintf("%+v", *c)
 }
 
 func TestClassifyMeasured(t *testing.T) {

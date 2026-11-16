@@ -101,7 +101,7 @@ func (g *Gate) Inspect(sql string) proxy.Statement {
 		// Postgres will reject it too; nothing to judge.
 		return proxy.Statement{SQL: sql}
 	}
-	return proxy.Statement{SQL: sql, Watch: r.Kind != sqlparse.Pass, OnBehalfOf: r.OnBehalfOf, Data: r}
+	return proxy.Statement{SQL: sql, Watch: r.Kind == sqlparse.Gated || r.Kind == sqlparse.Measured || r.Kind == sqlparse.Unsupported, OnBehalfOf: r.OnBehalfOf, Data: r}
 }
 
 // pending is one watched write between Begin and its recorded decision.
