@@ -41,6 +41,7 @@ type observation struct {
 	info proxy.SessionInfo
 	st   proxy.Statement
 	o    proxy.Outcome
+	at   time.Time // when Observe was called
 }
 
 type began struct {
@@ -111,9 +112,10 @@ func (g *recordingGate) End(h any, o proxy.Outcome) {
 }
 
 func (g *recordingGate) Observe(info proxy.SessionInfo, st proxy.Statement, o proxy.Outcome) {
+	at := time.Now()
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.reads = append(g.reads, observation{info, st, o})
+	g.reads = append(g.reads, observation{info, st, o, at})
 }
 
 // observed waits until n reads have been reported and returns every read
@@ -680,6 +682,8 @@ func TestGateObservesALostRead(t *testing.T) {
 	}
 }
 
+// The proxy keeping no copy of bind values is pinned by the internal
+// TestObservedPortalKeepsNoBindValues; this checks that none reach the gate.
 func TestObservedReadsKeepNoBindValues(t *testing.T) {
 	table := readTable(t)
 	g := newObservingGate(readsOf(table))
@@ -705,6 +709,75 @@ func TestObservedReadsKeepNoBindValues(t *testing.T) {
 	// Bind values reach a gate only through Begin.
 	if n := g.beginCount(); n != 0 {
 		t.Errorf("Begin ran %d times for a read, want never", n)
+	}
+}
+
+func TestGateSeesReadsInsideATransaction(t *testing.T) {
+	table := readTable(t)
+	g := newObservingGate(readsOf(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+	ctx := testCtx(t)
+	extended := func(id int) {
+		t.Helper()
+		rows, err := conn.Query(ctx, "select * from "+table+" where id = $1", id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		countRows(t, rows)
+	}
+
+	mustExec(t, conn, "select * from "+table+" where id = 1")
+	mustExec(t, conn, "begin")
+	mustExec(t, conn, "select * from "+table+" where id = 2")
+	mustExec(t, conn, "declare c cursor for select * from "+table)
+	mustExec(t, conn, "fetch 3 from c")
+	extended(4)
+	mustExec(t, conn, "commit")
+	extended(5)
+
+	obs := g.observed(t, 5)
+	for i, want := range []bool{false, true, true, true, false} {
+		if got := obs[i].info.TxOpen; got != want {
+			t.Errorf("read %d (%s): TxOpen = %v, want %v", i, obs[i].st.SQL, got, want)
+		}
+	}
+}
+
+func TestGateSeesWhenReadsArrived(t *testing.T) {
+	table := readTable(t)
+	g := newObservingGate(readsOf(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+	const runs = 200 * time.Millisecond // the pg_sleep in each read
+	slow := "select t.id, pg_sleep(0.2) from " + table + " t where id = "
+
+	var sent []time.Time // when each read left the client
+	sent = append(sent, time.Now())
+	mustExec(t, conn, slow+"1") // simple protocol
+	sent = append(sent, time.Now())
+	rows, err := conn.Query(testCtx(t), slow+"$1", 2) // extended protocol
+	if err != nil {
+		t.Fatal(err)
+	}
+	countRows(t, rows)
+	// A FETCH long after its DECLARE: the cursor's query runs in the FETCH.
+	mustExec(t, conn, "begin")
+	mustExec(t, conn, "declare c cursor for "+slow+"3")
+	time.Sleep(runs)
+	sent = append(sent, time.Now())
+	mustExec(t, conn, "fetch 1 from c")
+	mustExec(t, conn, "commit")
+
+	for i, ob := range g.observed(t, 3) {
+		switch a := ob.o.Arrived; {
+		case a.IsZero():
+			t.Errorf("read %d: no arrival time", i)
+		case a.Before(sent[i]) || a.After(ob.at):
+			t.Errorf("read %d arrived at %v, want between when it was sent (%v) and when Observe ran (%v)", i, a, sent[i], ob.at)
+		case ob.at.Sub(a) < runs:
+			t.Errorf("read %d: Observe ran %v after it arrived, want at least the %v it ran for", i, ob.at.Sub(a), runs)
+		}
 	}
 }
 

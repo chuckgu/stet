@@ -223,6 +223,19 @@ func TestAbandonReportsRowsInFlight(t *testing.T) {
 	}
 }
 
+// A read reported by finish is not reported again when the connection then
+// ends.
+func TestAnsweredReadIsObservedOnce(t *testing.T) {
+	g := newReadGate()
+	s := readySession(g)
+	s.fromClient('Q', body(&pgproto3.Query{String: "select 1"}), func() error { return nil })
+	serve(s, &pgproto3.RowDescription{}, row, tag("SELECT 1"), ready)
+	s.abandon()
+	if len(g.reads) != 1 || g.reads[0].Lost || !g.reads[0].Executed {
+		t.Errorf("reads = %+v, want the one answered read, once", g.reads)
+	}
+}
+
 func TestWatchWinsOverObserve(t *testing.T) {
 	g := newReadGate()
 	g.both = true

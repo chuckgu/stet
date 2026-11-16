@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -78,8 +79,14 @@ type Outcome struct {
 	// said so.
 	Lost bool
 	// Sent is how many row messages (DataRow, CopyData) went to the client in
-	// answer to the statement, also when it failed or was cancelled.
+	// answer to the statement, also when it failed or was cancelled. Set only
+	// for Observe; End's is 0. Rows are counted as their headers are read from
+	// the server, so when the connection drops Sent can include rows not yet
+	// written to the client, at most a buffer's worth.
 	Sent int64
+	// Arrived is when the proxy read the statement from the client. Set only
+	// for Observe.
+	Arrived time.Time
 }
 
 // session follows one client connection closely enough to tell the gate
@@ -137,7 +144,8 @@ type watchedWrite struct {
 type observedRead struct {
 	info SessionInfo // as it was when the statement arrived
 	st   Statement
-	idx  int // which Execute in the unit; 0 for a Query
+	idx  int       // which Execute in the unit; 0 for a Query
+	at   time.Time // when the statement arrived
 }
 
 func newSession(g Gate, info SessionInfo) *session {
@@ -318,10 +326,18 @@ func (s *session) begin(u *unit, idx int, st Statement, ps []Param, flush func()
 // observe notes a read in its unit. Nothing waits for the gate and nothing
 // queued is flushed first: the gate hears of the read once it was answered.
 func (s *session) observe(u *unit, idx int, st Statement) {
-	r := observedRead{info: s.info, st: st, idx: idx}
 	s.mu.Lock()
-	u.reads = append(u.reads, r)
+	u.reads = append(u.reads, s.arriving(st, idx))
 	s.mu.Unlock()
+}
+
+// arriving records a read reported as st, arriving now from the client as
+// Execute idx of its unit (0 for a Query). It runs on the client side with
+// s.mu held, and only for reads, so no other statement pays for the clock.
+func (s *session) arriving(st Statement, idx int) observedRead {
+	r := observedRead{info: s.info, st: st, idx: idx, at: time.Now()}
+	r.info.TxOpen = s.status != 'I' // as begin takes it for a write
+	return r
 }
 
 func (s *session) push(u *unit) *unit {
@@ -432,7 +448,7 @@ func (s *session) finish(u *unit, before, after byte) {
 	}
 	for _, r := range u.reads {
 		o := u.answered(r.idx, inTx)
-		o.Sent = u.sent[r.idx]
+		o.Sent, o.Arrived = u.sent[r.idx], r.at
 		s.gate.Observe(r.info, r.st, o)
 	}
 }
@@ -518,7 +534,7 @@ func (s *session) abandon() {
 		}
 		for _, r := range u.reads {
 			o := u.unanswered(r.idx, inTx)
-			o.Sent = u.sent[r.idx]
+			o.Sent, o.Arrived = u.sent[r.idx], r.at
 			s.gate.Observe(r.info, r.st, o)
 		}
 	}

@@ -54,7 +54,7 @@ func (s *session) cursor(u *unit, idx int, st Statement) {
 		s.cursors[c.Name] = &declared{st: st, hold: c.Hold, unit: u, prev: prev}
 	case CursorFetch:
 		if d := s.cursors[c.Name]; d != nil && d.st.Observe {
-			u.reads = append(u.reads, observedRead{info: s.info, st: d.st, idx: idx})
+			u.reads = append(u.reads, s.arriving(d.st, idx))
 		}
 	case CursorClose:
 		delete(s.cursors, c.Name)
