@@ -67,60 +67,96 @@ func runProxy(args []string) error {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
-	if cfg.Mode == config.ModeEnforce {
-		return fmt.Errorf("%s: mode enforce is not implemented yet; use shadow", *path)
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
-	var g *gate.Gate
-	if len(cfg.Tables) > 0 {
-		pool, err := openPool(ctx, cfg.Upstream)
-		if err != nil {
-			return err
-		}
-		defer pool.Close()
-		st := store.New(pool)
-		if err := st.Migrate(ctx); err != nil {
-			return err
-		}
-		d, err := decide.New(cfg.Model)
-		if err != nil {
-			return err
-		}
-		if g, err = gate.New(cfg, pool, st, d, log); err != nil {
-			return err
-		}
-		defer g.Close() // after the proxy: lets in-flight decisions finish
-	}
-
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return err
 	}
+	return run(ctx, cfg, ln, log)
+}
+
+// run serves cfg on ln until ctx is done, then stops in order: the proxy
+// first, waiting for its sessions to report their last statements; then the
+// gate, which records what it still holds; then Stet's own pool.
+func run(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog.Logger) error {
+	g, closeGate, err := openGate(ctx, cfg, log)
+	if err != nil {
+		ln.Close()
+		return err
+	}
+	// Deferred so it runs last, once the proxy's Close below has returned.
+	defer closeGate()
+
 	var pg proxy.Gate
 	if g != nil {
 		pg = g
 	}
 	srv := proxy.New(cfg.UpstreamAddr(), log, pg, proxy.Policy{Agents: cfg.AgentRoles, Enforce: cfg.Mode == config.ModeEnforce})
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
 	closed := make(chan struct{})
 	go func() {
 		<-ctx.Done()
-		srv.Close()
+		srv.Close() // waits for the sessions, which report to the gate as they end
 		close(closed)
 	}()
 
 	log.Info("stet proxy listening", "listen", ln.Addr(), "upstream", cfg.UpstreamAddr(),
-		"mode", cfg.Mode, "gated_tables", len(cfg.Tables), "model", cfg.Model.Adapter)
+		"mode", cfg.Mode, "agent_roles", cfg.AgentRoles, "gated_tables", len(cfg.Tables), "model", cfg.Model.Adapter)
 	err = srv.Serve(ln)
 	// Serve returns once the listener is closed, while sessions may still be
 	// reporting their last statements to the gate. Wait for Close, which waits
-	// for them, before the deferred g.Close writes what the gate holds. stop
-	// also closes the server when Serve failed by itself.
+	// for them, before closeGate writes what the gate holds. stop also closes
+	// the server when Serve failed by itself.
 	stop()
 	<-closed
 	return err
+}
+
+// openGate opens Stet's pool, brings the stet schema up to date, checks the
+// database (check), and builds the gate over cfg's tables. closeGate closes
+// the gate and then the pool. With no table there is no gate, no pool and no
+// check: the proxy passes every session through, in enforce mode too (spec
+// correction B10), which is logged.
+func openGate(ctx context.Context, cfg *config.Config, log *slog.Logger) (g *gate.Gate, closeGate func(), err error) {
+	if len(cfg.Tables) == 0 {
+		if cfg.Mode == config.ModeEnforce {
+			log.Warn("mode is enforce but there are no gated tables: without a gate every session, the agents' " +
+				"included, is passed through unchecked; fix: list the tables to gate under tables")
+		}
+		return nil, func() {}, nil
+	}
+	pool, err := openPool(ctx, cfg.Upstream)
+	if err != nil {
+		return nil, nil, err
+	}
+	fail := func(err error) (*gate.Gate, func(), error) {
+		pool.Close()
+		return nil, nil, err
+	}
+	st := store.New(pool)
+	if err := st.Migrate(ctx); err != nil {
+		return fail(err)
+	}
+	warnings, err := check(ctx, pool, cfg)
+	for _, w := range warnings {
+		log.Warn(w)
+	}
+	if err != nil {
+		return fail(fmt.Errorf("not starting: %w", err))
+	}
+	d, err := decide.New(cfg.Model)
+	if err != nil {
+		return fail(err)
+	}
+	if g, err = gate.New(cfg, pool, st, d, log); err != nil {
+		return fail(err)
+	}
+	return g, func() {
+		g.Close()
+		pool.Close()
+	}, nil
 }
 
 // openPool connects Stet's own sessions: state reads and decision writes.

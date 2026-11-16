@@ -1,16 +1,28 @@
 # Stet 설정 예. 형식은 docs/spec-v0.1.md 9장을 따른다.
 
 mode: shadow                 # shadow | enforce
+# 에이전트의 접속 계정(시작 패킷의 user) 목록. 대소문자까지 같아야 한다. enforce에서는 필수이고,
+# 판정은 이 계정들의 세션에만 적용된다. 섀도에서 없으면 모든 세션을 본다. upstream의 계정(Stet 자신)은
+# 넣을 수 없다. enforce로 시작할 때 Stet은 이 계정들을 확인해 경고한다(있는지, superuser인지,
+# stet 스키마에 권한이 있는지, 게이트 대상 테이블의 소유자인지, 역할 수준 search_path가 Stet의 것과 다른지).
+# Stet이 접속한 계정이 목록에 있거나 서버의 db_user_namespace가 켜져 있으면 시작하지 않는다.
+# 운영자가 DB에서 해 둘 일은 docs/spec-v0.2-enforce.md 8장에 있다.
+# agents:
+#   roles: [agent_enricher, agent_support]
+# 동시에 판단 중인 쓰기의 상한. 상태 읽기, 영향 측정, 모델 호출을 합친 수다. 기본 32
+# limits:
+#   max_inflight: 32
 listen: 0.0.0.0:6432
 upstream: postgres://app@db:5432/crm
 
 # jev는 환경 변수 TYPESAFE_API_KEY가 필요하다. 키는 이 파일에 두지 않는다.
-# 모델 없이 상태·쓰기·결과만 기록하려면 model: {adapter: none}으로 둔다.
+# 모델 없이 상태·쓰기·결과만 기록하려면 model: {adapter: none}으로 둔다. enforce에서 adapter: none은
+# on_failure: pass를 직접 적어야 받는다(값 판단 없이 영향 한도만 쓴다는 뜻).
 model:
   adapter: jev
   version: jev-1.14.0        # 고정 필수. jev-X.Y.Z 형식만 (latest·preview 거부)
-  timeout_ms: 800
-  on_failure: pass           # pass | hold
+  timeout_ms: 800            # enforce에서는 에이전트가 모델의 판단을 기다리는 시간의 상한이기도 하다
+  on_failure: pass           # pass | hold. 적지 않으면 섀도는 pass, enforce는 hold. enforce에서 pass면 시작할 때 경고한다
 
 retention: 90d
 
