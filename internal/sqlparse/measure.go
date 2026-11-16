@@ -1,6 +1,7 @@
 package sqlparse
 
 import (
+	"slices"
 	"strings"
 
 	pg "github.com/pganalyze/pg_query_go/v6"
@@ -144,7 +145,7 @@ func measure(n *pg.Node) *Measure {
 		m := &Measure{Method: MethodEstimate, Relation: relation(s.Relation)}
 		if s.WithClause == nil && len(s.FromClause) == 0 && !hasSubLink(s) {
 			if sql, ok := countSQL(s.Relation, s.WhereClause); ok {
-				m.Method, m.CountSQL = MethodCount, sql
+				m.Method, m.CountSQL, m.Qualified = MethodCount, sql, qualified(s.WhereClause)
 			}
 		}
 		return m
@@ -153,12 +154,35 @@ func measure(n *pg.Node) *Measure {
 		m := &Measure{Method: MethodEstimate, Relation: relation(s.Relation)}
 		if s.WithClause == nil && len(s.UsingClause) == 0 && !hasSubLink(s) {
 			if sql, ok := countSQL(s.Relation, s.WhereClause); ok {
-				m.Method, m.CountSQL = MethodCount, sql
+				m.Method, m.CountSQL, m.Qualified = MethodCount, sql, qualified(s.WhereClause)
 			}
 		}
 		return m
 	}
 	return &Measure{Method: MethodEstimate}
+}
+
+// qualified returns the last name of each column reference in where that
+// has a qualifier (t.f, s.t.f, c.s.t.f), sorted, without duplicates, or nil.
+// Postgres reads such a name as column f of t or, when t has no column f, as
+// the call f(t) of a one-argument function f that accepts t's row; only the
+// catalog can tell which. A bare name is a column or a whole row, never a
+// call, and t.* is a whole row.
+func qualified(where *pg.Node) []string {
+	if where == nil {
+		return nil
+	}
+	var names []string
+	walk(where, func(msg proto.Message) bool {
+		if ref, ok := msg.(*pg.ColumnRef); ok && len(ref.Fields) > 1 {
+			if s := ref.Fields[len(ref.Fields)-1].GetString_(); s != nil {
+				names = append(names, s.Sval)
+			}
+		}
+		return true
+	})
+	slices.Sort(names)
+	return slices.Compact(names)
 }
 
 // countSQL builds SELECT 1 FROM rel [WHERE where] from the parse tree, so
@@ -215,7 +239,9 @@ func selectOne(rel *pg.RangeVar, where *pg.Node) (string, error) {
 //
 // A function can be called without call syntax: Postgres resolves (x).f to
 // f(x) for any f that takes one argument, so field selection refuses too.
-// Array subscripts (x[1], x[1:2]) are the only indirection allowed.
+// Array subscripts (x[1], x[1:2]) are the only indirection allowed. A
+// qualified name t.f is the call f(t) when t has no column f; that takes the
+// catalog to tell, so such names are left to the caller (Measure.Qualified).
 //
 // The parser follows the PostgreSQL 17 grammar, where JSON_VALUE(...),
 // JSON(...), JSON_ARRAY(a, b), merge_action() and their relatives are keyword

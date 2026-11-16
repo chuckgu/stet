@@ -15,6 +15,9 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
+// PostgresMajor is the PostgreSQL version whose grammar Classify reads.
+const PostgresMajor = 17
+
 type Kind int
 
 const (
@@ -99,6 +102,12 @@ type Measure struct {
 	Relation string
 	CountSQL string // MethodCount: "SELECT 1 FROM <relation> [WHERE ...]", no LIMIT
 	Rows     int    // MethodSyntax: the number of VALUES lists
+	// Qualified lists the names the WHERE clause qualifies by a table, alias, or
+	// schema.table (c.x, public.contacts.x), sorted, without duplicates; nil when
+	// none. Such a name may be a function called as an attribute, so the count
+	// runs only when each is a column of Relation. Set only with MethodCount,
+	// the one method that runs the WHERE clause.
+	Qualified []string
 }
 
 type Result struct {
@@ -133,6 +142,11 @@ type Result struct {
 	// OnBehalfOf is set when the SQL sets or resets stet.on_behalf_of;
 	// "" means reset.
 	OnBehalfOf *string
+
+	Clean    bool     // every statement is BEGIN, START TRANSACTION, SET or SHOW; true for SQL with no statement
+	Do       bool     // some statement is a DO block
+	Executes []string // prepared statements run by SQL EXECUTE, wherever it sits (EXPLAIN EXECUTE, CREATE TABLE AS EXECUTE), in order
+	Portals  []string // portals read by FETCH or MOVE, in order
 }
 
 const onBehalfOfSetting = "stet.on_behalf_of"
@@ -167,6 +181,10 @@ func Classify(sql string, tables Tables) (Result, error) {
 		target   gatedWrite
 		obo      *string
 		cursors  []Cursor
+		executes []string
+		portals  []string
+		clean    = true
+		do       bool
 	)
 	for _, raw := range tree.Stmts {
 		if w, ok := firstGatedWrite(raw.Stmt, m); ok {
@@ -181,9 +199,18 @@ func Classify(sql string, tables Tables) (Result, error) {
 		if c, ok := cursor(raw.Stmt); ok {
 			cursors = append(cursors, c)
 		}
+		if f := raw.Stmt.GetFetchStmt(); f != nil {
+			portals = append(portals, f.Portalname)
+		}
+		executes = appendExecutes(executes, raw.Stmt)
+		clean = clean && leavesClean(raw.Stmt)
+		do = do || raw.Stmt.GetDoStmt() != nil
 	}
-	if touching == 0 {
-		r := Result{Kind: Pass, OnBehalfOf: obo, Cursors: cursors, Statements: len(tree.Stmts)}
+
+	var r Result
+	switch {
+	case touching == 0:
+		r.Kind = Pass
 		// With nothing to record them, reads are not looked for: the walk
 		// would cost every statement.
 		if tables.Reads {
@@ -191,20 +218,57 @@ func Classify(sql string, tables Tables) (Result, error) {
 				r.Kind, r.Reads = Read, reads
 			}
 		}
-		return r, nil
-	}
-
-	var r Result
-	if len(tree.Stmts) > 1 {
+	case len(tree.Stmts) > 1:
 		// Several statements in one Query run as one implicit transaction.
 		r = unsupported("multi_statement")
-	} else {
+	default:
 		n := tree.Stmts[0].Stmt
 		r = measured(n, m, classifyStmt(n, m))
 	}
-	r.Table, r.Op, r.OnBehalfOf = target.table, target.op, obo
-	r.Cursors, r.Statements = cursors, len(tree.Stmts)
+	r.Table, r.Op = target.table, target.op // empty when nothing gated is written
+	r.OnBehalfOf, r.Cursors, r.Statements = obo, cursors, len(tree.Stmts)
+	r.Clean, r.Do, r.Executes, r.Portals = clean, do, executes, portals
 	return r, nil
+}
+
+// leavesClean reports whether n leaves a transaction clean: it is BEGIN,
+// START TRANSACTION, SET, or SHOW. RESET is not one of them, nor is SET
+// CONSTRAINTS, which is not a VariableSetStmt.
+func leavesClean(n *pg.Node) bool {
+	switch {
+	case n.GetTransactionStmt() != nil:
+		k := n.GetTransactionStmt().Kind
+		return k == pg.TransactionStmtKind_TRANS_STMT_BEGIN || k == pg.TransactionStmtKind_TRANS_STMT_START
+	case n.GetVariableSetStmt() != nil:
+		switch n.GetVariableSetStmt().Kind {
+		case pg.VariableSetKind_VAR_SET_VALUE, pg.VariableSetKind_VAR_SET_DEFAULT,
+			pg.VariableSetKind_VAR_SET_CURRENT, pg.VariableSetKind_VAR_SET_MULTI:
+			return true
+		}
+	case n.GetVariableShowStmt() != nil:
+		return true
+	}
+	return false
+}
+
+// appendExecutes appends the names of the prepared statements n, a
+// top-level statement, runs with SQL EXECUTE. By the grammar an EXECUTE is a
+// statement of its own, the query of EXPLAIN or CREATE TABLE AS, or part of a
+// BEGIN ATOMIC function body (listed too, though only defined there). No
+// query or DML statement can hold one, so those are not walked: the walk
+// would cost every statement.
+func appendExecutes(names []string, n *pg.Node) []string {
+	switch n.Node.(type) {
+	case *pg.Node_SelectStmt, *pg.Node_InsertStmt, *pg.Node_UpdateStmt, *pg.Node_DeleteStmt, *pg.Node_MergeStmt:
+		return names
+	}
+	walk(n, func(msg proto.Message) bool {
+		if e, ok := msg.(*pg.ExecuteStmt); ok {
+			names = append(names, e.Name)
+		}
+		return true
+	})
+	return names
 }
 
 func classifyStmt(n *pg.Node, m matchFunc) Result {
@@ -439,8 +503,9 @@ func classifyDelete(s *pg.DeleteStmt, m matchFunc) Result {
 // pkEquality accepts `pk = value` (either order, value a non-null literal or
 // a parameter), alone or ANDed with any other conditions: those can only
 // narrow the write, so it still touches at most one row. Agents write such
-// guards naturally (`where id = 245 and stage = 'open'`). OR, IN lists, and
-// anything else may touch more than one row.
+// guards naturally (`where id = 245 and stage = 'open'`). An IN list of one
+// item is the same equality, as Postgres reads it: ORMs write `id IN ($1)`.
+// OR, longer IN lists, NOT IN, and anything else may touch more than one row.
 func pkEquality(where *pg.Node, rel *pg.RangeVar, pk string) (Value, bool) {
 	if b := where.GetBoolExpr(); b != nil && b.Boolop == pg.BoolExprType_AND_EXPR {
 		for _, arg := range b.Args {
@@ -451,10 +516,22 @@ func pkEquality(where *pg.Node, rel *pg.RangeVar, pk string) (Value, bool) {
 		return Value{}, false
 	}
 	e := where.GetAExpr()
-	if e == nil || e.Kind != pg.A_Expr_Kind_AEXPR_OP || len(e.Name) != 1 || e.Name[0].GetString_().GetSval() != "=" {
+	if e == nil || len(e.Name) != 1 || e.Name[0].GetString_().GetSval() != "=" {
 		return Value{}, false
 	}
-	for _, side := range [][2]*pg.Node{{e.Lexpr, e.Rexpr}, {e.Rexpr, e.Lexpr}} {
+	right := e.Rexpr
+	switch e.Kind {
+	case pg.A_Expr_Kind_AEXPR_OP:
+	case pg.A_Expr_Kind_AEXPR_IN: // NOT IN is named <>
+		items := e.Rexpr.GetList().GetItems()
+		if len(items) != 1 {
+			return Value{}, false
+		}
+		right = items[0]
+	default:
+		return Value{}, false
+	}
+	for _, side := range [][2]*pg.Node{{e.Lexpr, right}, {right, e.Lexpr}} {
 		if !isColumn(side[0], rel, pk) {
 			continue
 		}

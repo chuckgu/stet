@@ -407,7 +407,13 @@ func TestClassifyMeasured(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if r.Kind != Measured || r.Reason != tc.reason || r.Measure == nil || *r.Measure != tc.want {
+			// Qualified is checked by TestClassifyQualifiedNames.
+			var got Measure
+			if r.Measure != nil {
+				got = *r.Measure
+				got.Qualified = nil
+			}
+			if r.Kind != Measured || r.Reason != tc.reason || r.Measure == nil || !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("got %v/%q %+v, want measured/%q %+v", r.Kind, r.Reason, r.Measure, tc.reason, tc.want)
 			}
 		})
@@ -606,6 +612,187 @@ func TestClassifyOnBehalfOf(t *testing.T) {
 		case tc.want != nil && (r.OnBehalfOf == nil || *r.OnBehalfOf != *tc.want):
 			t.Errorf("%s: OnBehalfOf = %v, want %q", tc.sql, r.OnBehalfOf, *tc.want)
 		}
+	}
+}
+
+// A transaction stays clean while only BEGIN, START TRANSACTION, SET, and
+// SHOW have run in it. RESET is not on that list.
+func TestClassifyClean(t *testing.T) {
+	cases := []struct {
+		sql   string
+		clean bool
+	}{
+		{"", true},
+		{"-- ping", true},
+		{"begin", true},
+		{"BEGIN ISOLATION LEVEL SERIALIZABLE", true},
+		{"start transaction read only", true},
+		{"set search_path = public", true},
+		{"set local a.b = '1'", true},
+		{"set transaction isolation level serializable", true},
+		{"show a.b", true},
+		{"begin; set local statement_timeout = 0", true},
+
+		{"reset a.b", false},
+		{"reset all", false},
+		{"select 1", false},
+		{"commit", false},
+		{"rollback", false},
+		{"savepoint s", false},
+		{"discard all", false},
+		{"begin; select 1", false},
+		{"update contacts set title = 'x' where id = 1", false},
+		{"do $$ begin end $$", false},
+	}
+	for _, tc := range cases {
+		r, err := Classify(tc.sql, gated)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Clean != tc.clean {
+			t.Errorf("%q: Clean = %v, want %v", tc.sql, r.Clean, tc.clean)
+		}
+	}
+}
+
+// A DO block's writes cannot be seen, so the statement is Pass; Do says one
+// is there.
+func TestClassifyDo(t *testing.T) {
+	cases := []struct {
+		sql  string
+		kind Kind
+		do   bool
+	}{
+		{"do $$ begin update contacts set title = 'x'; end $$", Pass, true},
+		{"select 1; do $$ begin end $$", Pass, true},
+		{"select 'do'", Pass, false},
+	}
+	for _, tc := range cases {
+		r, err := Classify(tc.sql, gated)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Kind != tc.kind || r.Do != tc.do {
+			t.Errorf("%q: got %v Do %v, want %v Do %v", tc.sql, r.Kind, r.Do, tc.kind, tc.do)
+		}
+	}
+}
+
+// x IN (y) is x = y: a one-value IN on the primary key touches one row and
+// is judged on its values. Every other IN, and other shapes that happen to
+// pin one row, stay multi-row.
+func TestClassifySingleValueIn(t *testing.T) {
+	cases := []struct {
+		sql    string
+		kind   Kind
+		reason string
+		pk     *Value
+	}{
+		{"update contacts set title = 'x' where id in (5)", Gated, "", &Value{Kind: Literal, Text: "5"}},
+		{"delete from contacts where id in ($1)", Gated, "", &Value{Kind: Param, Param: 1}},
+		{"update contacts set title = 'x' where contacts.id in (5) and status = 'a'", Gated, "", &Value{Kind: Literal, Text: "5"}},
+		{"update contacts set title = 'x' where id in ('5'::int)", Gated, "", &Value{Kind: Literal, Text: "5"}},
+
+		{"update contacts set title = 'x' where id in (5, 6)", Measured, "not_single_row", nil},
+		{"update contacts set title = 'x' where id not in (5)", Measured, "not_single_row", nil},
+		{"update contacts set title = 'x' where id in (null)", Measured, "not_single_row", nil},
+		{"update contacts set title = 'x' where id = any($1)", Measured, "not_single_row", nil},
+		{"update contacts set title = 'x' where id between 5 and 5", Measured, "not_single_row", nil},
+		{"update contacts set title = 'x' where id = 5 or false", Measured, "not_single_row", nil},
+		// Neither a query nor another column pins the key.
+		{"update contacts set title = 'x' where id in (select 5)", Measured, "subquery", nil},
+		{"update contacts set title = 'x' where company_id in (5)", Measured, "not_single_row", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.sql, func(t *testing.T) {
+			r, err := Classify(tc.sql, gated)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r.Kind != tc.kind || r.Reason != tc.reason {
+				t.Fatalf("got %v/%q, want %v/%q", r.Kind, r.Reason, tc.kind, tc.reason)
+			}
+			if tc.kind == Gated {
+				if !reflect.DeepEqual(r.Write.PK, tc.pk) {
+					t.Errorf("Write.PK = %+v, want %+v", r.Write.PK, tc.pk)
+				}
+				return
+			}
+			if r.Write != nil || r.Measure == nil {
+				t.Errorf("Write = %+v, Measure = %+v; want no Write and a Measure", r.Write, r.Measure)
+			}
+		})
+	}
+}
+
+// Statements that run a prepared statement or read a portal by name: the
+// classifier sees no table behind the name.
+func TestClassifyRunsByName(t *testing.T) {
+	cases := []struct {
+		sql      string
+		executes []string
+		portals  []string
+		cursors  []Cursor
+	}{
+		{"execute s1(1)", []string{"s1"}, nil, nil},
+		{"explain analyze execute s1", []string{"s1"}, nil, nil},
+		{"create table x as execute s1", []string{"s1"}, nil, nil},
+		{`execute "S 1"`, []string{"S 1"}, nil, nil},
+		{"execute b; explain execute a", []string{"b", "a"}, nil, nil},
+		{"fetch all from p1", nil, []string{"p1"}, []Cursor{{CursorFetch, "p1", false}}},
+		{"move all in p1", nil, []string{"p1"}, nil},
+		{"move 1 in b; fetch 1 from a", nil, []string{"b", "a"}, []Cursor{{CursorFetch, "a", false}}},
+		{"select 1", nil, nil, nil},
+	}
+	for _, tc := range cases {
+		r, err := Classify(tc.sql, gated)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(r.Executes, tc.executes) || !reflect.DeepEqual(r.Portals, tc.portals) {
+			t.Errorf("%q: Executes %q Portals %q, want %q and %q", tc.sql, r.Executes, r.Portals, tc.executes, tc.portals)
+		}
+		if !reflect.DeepEqual(r.Cursors, tc.cursors) {
+			t.Errorf("%q: Cursors = %+v, want %+v", tc.sql, r.Cursors, tc.cursors)
+		}
+	}
+}
+
+// Postgres reads t.f as column f of t or, when t has none, as the call f(t).
+// The count runs the WHERE clause, so it lists such names for the gate to
+// look up; no other method runs it.
+func TestClassifyQualifiedNames(t *testing.T) {
+	cases := []struct {
+		sql       string
+		method    Method
+		qualified []string
+	}{
+		{"update contacts set status = 'x' where contacts.to_json is not null and public.contacts.company_id = 3 and status = 'a'",
+			MethodCount, []string{"company_id", "to_json"}},
+		{"update contacts c set status = 'x' where c.company_id = 3", MethodCount, []string{"company_id"}},
+		{"update contacts set status = 'x' where company_id = 3", MethodCount, nil},
+		{"update contacts c set status = 'x' where c.* is not null", MethodCount, nil},
+		{"delete from contacts c where c.company_id = 3 or c.company_id = 4", MethodCount, []string{"company_id"}},
+		{"update contacts set title = l.title from leads l where contacts.company_id = l.id", MethodEstimate, nil},
+	}
+	for _, tc := range cases {
+		r, err := Classify(tc.sql, gated)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Kind != Measured {
+			t.Errorf("%q: got %v/%q, want measured", tc.sql, r.Kind, r.Reason)
+			continue
+		}
+		if r.Measure.Method != tc.method || !reflect.DeepEqual(r.Measure.Qualified, tc.qualified) {
+			t.Errorf("%q: %s Qualified %q, want %s %q", tc.sql, r.Measure.Method, r.Measure.Qualified, tc.method, tc.qualified)
+		}
+	}
+}
+
+func TestPostgresMajorIsTheParsers(t *testing.T) {
+	if got := int(treeVersion / 10000); got != PostgresMajor {
+		t.Errorf("the parser reads PostgreSQL %d, PostgresMajor says %d", got, PostgresMajor)
 	}
 }
 
