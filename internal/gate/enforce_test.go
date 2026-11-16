@@ -624,29 +624,45 @@ func TestEnforceJudgesTheFirstWriteAfterBegin(t *testing.T) {
 			e.seed(t)
 			conn := e.agent(t, "tx")
 			ctx := context.Background()
-			end := "commit"
+			// Each transaction ends with COMMIT. After a refusal the server
+			// has failed the transaction (the refused write's replacement
+			// failed in it), so it answers COMMIT with ROLLBACK: nothing sent
+			// in it can have been committed. That tag, and the rows left as
+			// they were after it, carry the claim that the write did not run;
+			// the record's executed = false says the same.
+			commit := func() string {
+				tag, err := conn.Exec(ctx, "commit")
+				if err != nil {
+					t.Fatalf("commit: %v", err)
+				}
+				return tag.String()
+			}
+			wantTag := "COMMIT"
 			if name == "hold" {
-				end = "rollback"
+				wantTag = "ROLLBACK"
 			}
 
 			// psycopg's way: BEGIN, then Parse, Bind, Execute and Sync.
 			mustExec(t, conn, "begin")
 			res := conn.PgConn().ExecParams(ctx, "update "+e.table+" set title = $1 where id = $2",
 				[][]byte{[]byte("first"), []byte("1")}, nil, nil, nil).Read()
+			tags := []string{commit()}
 			// pgconn's pipeline: BEGIN and the write under one Sync.
-			mustExec(t, conn, end)
 			perr := pipeline(t, conn, func(pl *pgconn.Pipeline) {
 				pl.SendQueryParams("begin", nil, nil, nil, nil)
 				pl.SendQueryParams("update "+e.table+" set title = $1 where id = $2",
 					[][]byte{[]byte("second"), []byte("2")}, nil, nil, nil)
 			})
-			mustExec(t, conn, end)
+			tags = append(tags, commit())
 
 			for i, err := range []error{res.Err, perr} {
 				if name == "hold" {
 					wantRefused(t, err, "ST001", "write held by stet: ")
 				} else if err != nil {
 					t.Errorf("write %d: %v", i, err)
+				}
+				if tags[i] != wantTag {
+					t.Errorf("write %d: COMMIT answered %q, want %q", i, tags[i], wantTag)
 				}
 			}
 			want := 2
@@ -658,6 +674,9 @@ func TestEnforceJudgesTheFirstWriteAfterBegin(t *testing.T) {
 			}
 			for i, r := range e.enforced(t, 2) {
 				wantEnforced(t, i, r, c.verdict[0], c.verdict[1:]...)
+				if r.Executed != (name == "commit") {
+					t.Errorf("decision %d: executed = %v", i, r.Executed)
+				}
 			}
 			if n := d.callCount(); n != 2 {
 				t.Errorf("model called %d times, want twice", n)
@@ -756,17 +775,19 @@ func TestEnforceFailuresFollowOnFailure(t *testing.T) {
 	modelError := func() *fakeDecider { return &fakeDecider{err: errors.New("upstream 503")} }
 	update := func(e *env) string { return "update " + e.table + " set title = 'x' where id = 1" }
 	insert := func(e *env) string { return "insert into " + e.table + " (id, email) values (9, 'x@y.com')" }
+	const updated, inserted = "id = 1 and title = 'x'", "id = 9"
 	for name, c := range map[string]struct {
-		d      *fakeDecider
-		yaml   string
-		sql    func(*env) string
-		reason string
-		msg    string
+		d       *fakeDecider
+		yaml    string
+		sql     func(*env) string
+		written string // the rows the write leaves when it runs
+		reason  string
+		msg     string
 	}{
-		"model error":       {modelError(), enforceYAML, update, "model_error", "the judgment model did not answer"},
-		"state error":       {calm(), brokenYAML, insert, "state_error", "the state needed to judge it could not be read in time"},
-		"model error, pass": {modelError(), passOnFailure(enforceYAML), update, "model_error", ""},
-		"state error, pass": {calm(), passOnFailure(brokenYAML), insert, "state_error", ""},
+		"model error":       {modelError(), enforceYAML, update, updated, "model_error", "the judgment model did not answer"},
+		"state error":       {calm(), brokenYAML, insert, inserted, "state_error", "the state needed to judge it could not be read in time"},
+		"model error, pass": {modelError(), passOnFailure(enforceYAML), update, updated, "model_error", ""},
+		"state error, pass": {calm(), passOnFailure(brokenYAML), insert, inserted, "state_error", ""},
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := setupEnforce(t, c.d, c.yaml)
@@ -781,6 +802,9 @@ func TestEnforceFailuresFollowOnFailure(t *testing.T) {
 				if !r.Executed || r.Refused != nil {
 					t.Errorf("executed=%v refused=%v, want executed and NULL", r.Executed, deref(r.Refused))
 				}
+				if n := e.rowsWhere(t, c.written); n != 1 {
+					t.Errorf("%d rows where %s, want 1: the write must run", n, c.written)
+				}
 				return
 			}
 			wantRefused(t, err, "ST001", "write held by stet: "+c.msg)
@@ -788,6 +812,9 @@ func TestEnforceFailuresFollowOnFailure(t *testing.T) {
 			wantRefusedRecord(t, 0, r, "ST001")
 			if h := e.held(t, 1)[0]; h.Verdict != "hold" || !reflect.DeepEqual(h.Reasons, []string{c.reason}) {
 				t.Errorf("held write %s %v, want hold [%s]", h.Verdict, h.Reasons, c.reason)
+			}
+			if n := e.rowsWhere(t, c.written); n != 0 {
+				t.Errorf("%d rows where %s, want none: the held write must not run", n, c.written)
 			}
 		})
 	}
@@ -827,10 +854,61 @@ func TestEnforceHoldsWhenTooManyWritesAreInFlight(t *testing.T) {
 		t.Errorf("refused after %v, want about 500ms", waited)
 	}
 	wantEnforced(t, 0, e.enforced(t, 1)[0], "hold", "state_error")
+	if n := e.rowsWhere(t, "title = 'crowded'"); n != 0 {
+		t.Error("the held write ran")
+	}
 	wantNoModel(t, d)
-	// The slot comes back once Begin ends.
+	// The slots HoldInflight took are free again; the busy write itself
+	// never had one. TestEnforceGivesItsSlotBack checks that a judged write
+	// gives its slot back.
 	mustExec(t, conn, "update "+e.table+" set title = 'later' where id = 2")
 	wantEnforced(t, 1, e.enforced(t, 2)[1], "commit")
+}
+
+// Under max_inflight: 1, writes judged one after the other each find the
+// slot free: every way through Begin gives it back, a refusal included. Had
+// one kept it, the next would wait out its 500ms and be held for its state.
+func TestEnforceGivesItsSlotBack(t *testing.T) {
+	e := setupEnforce(t, churnDecider{}, enforceYAML+"limits: {max_inflight: 1}\n")
+	e.seed(t)
+	conn := e.agent(t, "serial")
+	ctx := context.Background()
+	start := time.Now()
+	mustExec(t, conn, "update "+e.table+" set title = 'one' where id = 1")
+	_, err := conn.Exec(ctx, "update "+e.table+" set status = 'churned' where id = 2")
+	wantRefused(t, err, "ST001", "write held by stet: it breaks policy rule 1")
+	mustExec(t, conn, "update "+e.table+" set title = 'three' where id = 2")
+	if took := time.Since(start); took > 400*time.Millisecond {
+		t.Errorf("three writes took %v: one of them waited for a slot", took)
+	}
+
+	rs := e.enforced(t, 3)
+	wantEnforced(t, 0, rs[0], "commit")
+	wantEnforced(t, 1, rs[1], "hold", "policy:1")
+	wantEnforced(t, 2, rs[2], "commit")
+}
+
+// A write in a dirty transaction is refused before it would take a slot
+// (spec 4): with every slot taken, it is refused at once, not after 500ms.
+func TestEnforceRefusesADirtyWriteWithoutASlot(t *testing.T) {
+	d := calm()
+	e := setupEnforce(t, d, enforceYAML+"limits: {max_inflight: 1}\n")
+	e.seed(t)
+	conn := e.agent(t, "tx")
+	mustExec(t, conn, "begin")
+	mustExec(t, conn, "select 1")
+	release := gate.HoldInflight(e.gate)
+	defer release()
+	start := time.Now()
+	_, err := conn.Exec(context.Background(), "update "+e.table+" set title = 'dirty' where id = 1")
+	took := time.Since(start)
+	wantRefused(t, err, "ST002", "write refused by stet: it came after another statement")
+	if took > 250*time.Millisecond {
+		t.Errorf("refused after %v, want well under the 500ms a slot is waited for", took)
+	}
+	mustExec(t, conn, "rollback")
+	wantEnforced(t, 0, e.enforced(t, 1)[0], "unsupported", "in_transaction")
+	wantNoModel(t, d)
 }
 
 func TestEnforceRefusesEvenWhenTheHeldWriteIsNotStored(t *testing.T) {
@@ -968,18 +1046,164 @@ func TestEnforceMarksAHiddenHoldUndelivered(t *testing.T) {
 	if sqlstate(err) != "42P01" {
 		t.Fatalf("pipeline: %v, want the client's own 42P01", err)
 	}
+	e.waitHeldStatus(t, "undelivered")
+	wantRefusedRecord(t, 0, e.enforced(t, 1)[0], "ST001")
+}
+
+// waitHeldStatus waits until the env's one held write has status.
+func (e *env) waitHeldStatus(t *testing.T, status string) {
+	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		hs := e.held(t, 1)
-		if hs[0].Status == "undelivered" {
-			break
+		if len(hs) != 1 {
+			t.Fatalf("%d held writes, want 1", len(hs))
+		}
+		if hs[0].Status == status {
+			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("held write status %s, want undelivered", hs[0].Status)
+			t.Fatalf("held write status %s, want %s", hs[0].Status, status)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// An insert into stet.held_writes that reports an error may still have
+// landed: pgx stops waiting at the deadline without cancelling the insert on
+// the server. The client was told of no held write, so a row that landed is
+// marked undelivered rather than left pending for approval.
+func TestEnforceMarksAnUnconfirmedHeldWriteUndelivered(t *testing.T) {
+	e := setupEnforce(t, holding())
+	gate.LandHeldWritesThenFail(e.gate, 1)
+	e.seed(t)
+	_, err := e.agent(t, "a").Exec(context.Background(), "update "+e.table+" set status = 'churned' where id = 2")
+	pgErr := wantRefused(t, err, "ST001", "write held by stet: it breaks policy rule 1")
+	if strings.Contains(pgErr.Detail, "held_write") || !strings.Contains(pgErr.Hint, "this write") {
+		t.Errorf("detail %q hint %q, want no held write named", pgErr.Detail, pgErr.Hint)
+	}
+	e.waitHeldStatus(t, "undelivered")
+	if n := e.rowsWhere(t, "status = 'churned'"); n != 0 {
+		t.Error("the held write ran")
+	}
 	wantRefusedRecord(t, 0, e.enforced(t, 1)[0], "ST001")
+}
+
+// A row version that cannot be read again is a state error, which
+// on_failure decides: under hold the write is held, under pass it is sent.
+func TestEnforceRowVersionThatCannotBeReadFollowsOnFailure(t *testing.T) {
+	for name, format := range map[string]string{"hold": enforceYAML, "pass": passOnFailure(enforceYAML)} {
+		t.Run(name, func(t *testing.T) {
+			d := calm()
+			e := setupEnforce(t, d, format)
+			gate.FailRowVersionReads(e.gate, 1)
+			e.seed(t)
+			_, err := e.agent(t, "a").Exec(context.Background(), "update "+e.table+" set title = 'x' where id = 1")
+			r := e.enforced(t, 1)[0]
+			written := e.rowsWhere(t, "id = 1 and title = 'x'")
+			if name == "hold" {
+				wantRefused(t, err, "ST001", "write held by stet: the state needed to judge it could not be read in time")
+				wantEnforced(t, 0, r, "hold", "state_error")
+				wantRefusedRecord(t, 0, r, "ST001")
+				if h := e.held(t, 1)[0]; !reflect.DeepEqual(h.Reasons, []string{"state_error"}) {
+					t.Errorf("held write reasons %v, want [state_error]", h.Reasons)
+				}
+				if written != 0 {
+					t.Error("the held write ran")
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("on_failure pass: %v, want the write sent", err)
+				}
+				wantEnforced(t, 0, r, "commit", "state_error")
+				if !r.Executed || r.Refused != nil || written != 1 {
+					t.Errorf("executed=%v refused=%v rows written %d, want the write sent", r.Executed, deref(r.Refused), written)
+				}
+			}
+			if n := d.callCount(); n != 1 {
+				t.Errorf("model called %d times, want once: a failed read is not a change", n)
+			}
+		})
+	}
+}
+
+// A row that was not there when the state was read, and is when the version
+// is read again, has changed: the write is judged again, on the row.
+func TestEnforceRejudgesWhenTheRowAppears(t *testing.T) {
+	d := calm()
+	e := setupEnforce(t, d)
+	e.seed(t)
+	d.onDecide = func(call int) {
+		if call == 1 {
+			e.adminExec(t, "insert into "+e.table+" (id, name, title) values (9, 'New', 'Old')")
+		}
+	}
+	tag, err := e.agent(t, "a").Exec(context.Background(), "update "+e.table+" set title = 'x' where id = 9")
+	if err != nil || tag.String() != "UPDATE 1" {
+		t.Fatalf("%q %v, want UPDATE 1", tag, err)
+	}
+	r := e.enforced(t, 1)[0]
+	wantEnforced(t, 0, r, "commit", "rejudged")
+	if n := d.callCount(); n != 2 {
+		t.Fatalf("model called %d times, want twice", n)
+	}
+	d.mu.Lock()
+	first := d.calls[0].state["current"]
+	d.mu.Unlock()
+	if cur, _ := r.State["current"].(map[string]any); first != nil || cur["name"] != "New" {
+		t.Errorf("first state.current = %v, recorded state.current = %v; want none, then the new row", first, r.State["current"])
+	}
+}
+
+// A refused write the proxy reports as run, or as lost, is a proxy defect,
+// and the worst one. End logs it as an error and records what the proxy
+// reported, not its own refusal's word: a write that ran says so, and its
+// rows count against the cumulative limit.
+func TestEndRecordsARefusedWriteTheProxyReportsAsSent(t *testing.T) {
+	e := setupEnforce(t, holding(), enforcePrefix+cumYAML)
+	e.seedMany(t)
+	var logs lockedBuffer
+	gate.SetLogger(e.gate, slog.New(slog.NewJSONHandler(&logs, nil)))
+	info := proxy.SessionInfo{ID: "defect", User: "stet_md5", Database: "stet_test", ApplicationName: "defect"}
+	for _, o := range []proxy.Outcome{
+		{Refused: true, Executed: true, Rows: ptr(int64(1))},
+		{Refused: true, Lost: true, Error: "connection closed"},
+	} {
+		h, refuse := e.gate.Begin(info, e.gate.Inspect("update "+e.table+" set status = 'churned' where id = 1"), nil)
+		if refuse == nil {
+			t.Fatal("the held write was let through")
+		}
+		e.gate.End(h, o)
+	}
+	// Measured, so the model is not asked.
+	h, refuse := e.gate.Begin(info, e.gate.Inspect("update "+e.table+" set status = 'x' where company_id = 9"), nil)
+	if refuse != nil {
+		t.Fatalf("a measured write of 2 rows was refused: %+v", refuse)
+	}
+	e.gate.End(h, proxy.Outcome{Executed: true, Rows: ptr(int64(2))})
+
+	rs := e.enforced(t, 3)
+	if r := rs[0]; !r.Executed || r.RowsAffected == nil || *r.RowsAffected != 1 || r.Refused == nil {
+		t.Errorf("reported run: executed=%v rows_affected=%v refused=%v, want true, 1, ST001",
+			r.Executed, deref(r.RowsAffected), deref(r.Refused))
+	}
+	if r := rs[1]; r.Executed || r.RowsAffected != nil || r.ExecError == nil || *r.ExecError != "connection closed" {
+		t.Errorf("reported lost: executed=%v rows_affected=%v exec_error=%v, want false, NULL, the proxy's error",
+			r.Executed, deref(r.RowsAffected), deref(r.ExecError))
+	}
+	// One row that ran, and one reservation kept for a write that may have.
+	if used := rs[2].Cumulative["used"]; used != 2.0 {
+		t.Errorf("next write: cumulative.used = %v, want 2 (cumulative %v)", used, rs[2].Cumulative)
+	}
+	logged := map[any]bool{}
+	for _, rec := range logRecords(t, &logs) {
+		if rec["level"] == "ERROR" && rec["msg"] == "refused write reported as sent" {
+			logged[rec["decision"]] = true
+		}
+	}
+	if !logged[rs[0].ID] || !logged[rs[1].ID] || len(logged) != 2 {
+		t.Errorf("errors logged for decisions %v, want %s and %s:\n%s", logged, rs[0].ID, rs[1].ID, logs.String())
+	}
 }
 
 // A write judged commit that the server refuses gets the server's error as
@@ -1232,43 +1456,67 @@ func inTransaction(ctx context.Context, c *pgx.Conn, sqls ...string) error {
 
 // The model's duplicate answer names a row only when it is one of the
 // candidates Stet sent: model output is shaped by agent-written data and
-// must not put text of its own into an error (CLAUDE.md rule 5).
+// must not put text of its own into an error (CLAUDE.md rule 5). Shadow mode
+// records the same reason, as both modes apply one set of rules (spec 3, 7);
+// the model's own answer stays in the answers column.
 func TestEnforceNamesOnlyACandidateAsTheDuplicate(t *testing.T) {
-	d := calm()
-	e := setupEnforce(t, d)
-	e.seed(t)
-	conn := e.agent(t, "sales")
-	insert := "insert into " + e.table + " (id, name, email) values (%d, 'Kim J', 'K@ACME.com')"
+	const evil = "7 (see row\nevil)"
+	for _, mode := range []string{"enforce", "shadow"} {
+		t.Run(mode, func(t *testing.T) {
+			d := calm()
+			format := enforceYAML
+			if mode == "shadow" {
+				format = "agents: {roles: [stet_md5]}\n" + tableYAML
+			}
+			e := setupEnforce(t, d, format)
+			e.seed(t)
+			conn := e.agent(t, "sales")
+			insert := "insert into " + e.table + " (id, name, email) values (%d, 'Kim J', 'K@ACME.com')"
+			answer := func(choice string) map[string]decide.Answer {
+				return map[string]decide.Answer{
+					"duplicate": {Choice: choice, Confidence: 0.95},
+					"policy_1":  {Choice: "false", Probability: ptr(0.05)},
+					"policy_2":  {Choice: "false", Probability: ptr(0.05)},
+				}
+			}
 
-	d.setAnswers(map[string]decide.Answer{
-		"duplicate": {Choice: "1", Confidence: 0.95},
-		"policy_1":  {Choice: "false", Probability: ptr(0.05)},
-		"policy_2":  {Choice: "false", Probability: ptr(0.05)},
-	})
-	_, err := conn.Exec(context.Background(), fmt.Sprintf(insert, 3))
-	pgErr := wantRefused(t, err, "ST001", "")
-	if want := "write held by stet: possible duplicate of " + e.table + ".id=1"; pgErr.Message != want {
-		t.Errorf("message = %q, want %q", pgErr.Message, want)
-	}
+			d.setAnswers(answer("1"))
+			_, err := conn.Exec(context.Background(), fmt.Sprintf(insert, 3))
+			if mode == "enforce" {
+				pgErr := wantRefused(t, err, "ST001", "")
+				if want := "write held by stet: possible duplicate of " + e.table + ".id=1"; pgErr.Message != want {
+					t.Errorf("message = %q, want %q", pgErr.Message, want)
+				}
+			} else if err != nil {
+				t.Fatalf("shadow write: %v", err)
+			}
+			// Shadow mode asks after the write: its answer must be in before
+			// the next one is set.
+			e.enforced(t, 1)
 
-	d.setAnswers(map[string]decide.Answer{
-		"duplicate": {Choice: "7 (see row\nevil)", Confidence: 0.95},
-		"policy_1":  {Choice: "false", Probability: ptr(0.05)},
-		"policy_2":  {Choice: "false", Probability: ptr(0.05)},
-	})
-	_, err = conn.Exec(context.Background(), fmt.Sprintf(insert, 4))
-	pgErr = wantRefused(t, err, "ST001", "")
-	if want := "write held by stet: possible duplicate of another row in " + e.table; pgErr.Message != want {
-		t.Errorf("message = %q, want %q", pgErr.Message, want)
-	}
-	if strings.Contains(pgErr.Detail+pgErr.Hint, "evil") || !strings.HasSuffix(pgErr.Detail, "reasons=duplicate:") {
-		t.Errorf("detail %q hint %q, want the reason without the model's id", pgErr.Detail, pgErr.Hint)
-	}
+			d.setAnswers(answer(evil))
+			_, err = conn.Exec(context.Background(), fmt.Sprintf(insert, 4))
+			if mode == "enforce" {
+				pgErr := wantRefused(t, err, "ST001", "")
+				if want := "write held by stet: possible duplicate of another row in " + e.table; pgErr.Message != want {
+					t.Errorf("message = %q, want %q", pgErr.Message, want)
+				}
+				if strings.Contains(pgErr.Detail+pgErr.Hint, "evil") || !strings.HasSuffix(pgErr.Detail, "reasons=duplicate:") {
+					t.Errorf("detail %q hint %q, want the reason without the model's id", pgErr.Detail, pgErr.Hint)
+				}
+				if hs := e.held(t, 2); !reflect.DeepEqual(hs[1].Reasons, []string{"duplicate:"}) {
+					t.Errorf("held write reasons %v, want [duplicate:]", hs[1].Reasons)
+				}
+			} else if err != nil {
+				t.Fatalf("shadow write: %v", err)
+			}
 
-	rs := e.enforced(t, 2)
-	wantEnforced(t, 0, rs[0], "hold", "duplicate:1")
-	wantEnforced(t, 1, rs[1], "hold", "duplicate:")
-	if hs := e.held(t, 2); !reflect.DeepEqual(hs[1].Reasons, []string{"duplicate:"}) {
-		t.Errorf("held write reasons %v, want [duplicate:]", hs[1].Reasons)
+			rs := e.enforced(t, 2)
+			wantEnforced(t, 0, rs[0], "hold", "duplicate:1")
+			wantEnforced(t, 1, rs[1], "hold", "duplicate:")
+			if a, _ := rs[1].Answers["duplicate"].(map[string]any); a["choice"] != evil {
+				t.Errorf("answers.duplicate = %v, want the model's own choice %q", rs[1].Answers["duplicate"], evil)
+			}
+		})
 	}
 }

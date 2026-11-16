@@ -68,9 +68,11 @@ type Gate struct {
 	inflight chan struct{}
 	wg       sync.WaitGroup
 
-	// insertHeld stores a held write (store.InsertHeldWrite); a field so
-	// tests can make it fail.
+	// insertHeld stores a held write (store.InsertHeldWrite), and rowVersion
+	// reads a row's version again before a judged write is sent
+	// (readRowVersion): fields so tests can make them fail.
 	insertHeld func(context.Context, *store.HeldWrite) error
+	rowVersion func(ctx context.Context, table, pk string) (string, error)
 
 	warnedRoles sync.Map // client roles Stet could not assume, logged once each
 }
@@ -100,6 +102,7 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, d decide.Decid
 
 		insertHeld: st.InsertHeldWrite,
 	}
+	g.rowVersion = g.readRowVersion
 	g.usage = newUsage(st.UsageBySecond, &g.wg)
 	readsOn := map[string]int{}
 	for key, t := range cfg.Tables {
@@ -232,6 +235,7 @@ type pending struct {
 	costUSD      float64        // every model call made for the write
 	refused      *proxy.Refusal // what the client was given instead; nil when the write was sent
 	heldID       string         // its stet.held_writes row; "" when not held or not stored
+	heldUnsure   string         // a held write whose insert reported an error, but may have landed
 }
 
 // errBusy is the state error of a write that found every inflight slot taken
@@ -364,13 +368,23 @@ func rowsAffected(r sqlparse.Result, o proxy.Outcome) *int64 {
 }
 
 // End records how the write ended, in the background: it does not block. A
-// write Begin refused is recorded as not sent whatever else o says: it did
-// not run, and its reservation goes as for a write the server refused, also
-// when the connection was lost (spec 11). When the client was not given the
-// refusal, its held write is marked undelivered (spec 9).
+// write Begin refused did not run: it is recorded with the refusal's error,
+// and its reservation goes as for a write the server refused (spec 11). When
+// the client was not given the refusal, its held write is marked undelivered
+// (spec 9).
+//
+// The proxy never reports a refused write as run or lost. Should it, that is
+// the worst of its defects, so End logs an error and records what the proxy
+// reported rather than its own refusal: a write that ran is recorded so, and
+// its rows count against the cumulative limit.
 func (g *Gate) End(h any, o proxy.Outcome) {
 	p := h.(*pending)
-	if p.refused != nil {
+	switch {
+	case p.refused == nil:
+	case o.Executed || o.Lost:
+		g.log.Error("refused write reported as sent", "decision", p.id, "table", p.res.Table,
+			"executed", o.Executed, "lost", o.Lost, "session", p.session.ID, "login_role", p.session.User)
+	default:
 		o = proxy.Outcome{Refused: true, Undelivered: o.Undelivered, InTransaction: o.InTransaction, Error: refusalText(p.refused)}
 	}
 	if o.Executed && p.res.Kind == sqlparse.Gated && p.pk != nil {
@@ -433,13 +447,21 @@ func asksInShadow(in decide.Input) bool {
 // judge records the decision on p. In shadow mode it decides what enforce
 // mode would have done, asking the model now; in enforce mode Begin decided,
 // and what the model answered then is recorded as it is (rule 4). It also
-// marks a refused write's held write undelivered when the client was not
-// given the refusal.
+// marks undelivered a held write the client was not told of: one whose
+// refusal did not reach the client, and one whose insert reported an error
+// although it may have landed (marking an id that never landed does nothing).
 func (g *Gate) judge(p *pending, o proxy.Outcome) {
+	var untold []string
 	if o.Undelivered && p.heldID != "" {
+		untold = append(untold, p.heldID)
+	}
+	if p.heldUnsure != "" {
+		untold = append(untold, p.heldUnsure)
+	}
+	for _, id := range untold {
 		ctx, cancel := context.WithTimeout(context.Background(), recordTimeout)
-		if err := g.store.MarkUndelivered(ctx, p.heldID); err != nil {
-			g.log.Error("held write not marked undelivered", "id", p.heldID, "decision", p.id, "err", err)
+		if err := g.store.MarkUndelivered(ctx, id); err != nil {
+			g.log.Error("held write not marked undelivered", "id", id, "decision", p.id, "err", err)
 		}
 		cancel()
 	}
@@ -510,7 +532,10 @@ func (g *Gate) judge(p *pending, o proxy.Outcome) {
 				g.log.Warn("model call failed", "table", p.res.Table, "err", err)
 			}
 		}
+		// The reason as enforce mode gives it (spec 3, 7); the model's own
+		// answer stays in d.Answers.
 		d.Verdict, d.Reasons = decide.Verdict(in)
+		d.Reasons = knownDuplicate(d.Reasons, p.candidateIDs)
 	}
 	// Recorded whenever a measurement was taken or failed, also for a write
 	// whose verdict another rule decided (spec-v0.2-impact 6).

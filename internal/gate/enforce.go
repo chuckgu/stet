@@ -213,16 +213,23 @@ func versioned(p *pending, v string) bool {
 func (g *Gate) rowChanged(p *pending) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), stateTimeout)
 	defer cancel()
-	q := fmt.Sprintf("select t.xmin::text from %s as t where t.%s = $1",
-		ident(p.res.Table), pgx.Identifier{g.tables[p.res.Table]}.Sanitize())
-	rows, err := g.queryText(ctx, q, []*string{p.pk})
-	switch {
-	case err != nil:
+	now, err := g.rowVersion(ctx, p.res.Table, *p.pk)
+	if err != nil || now == "" {
 		return false, err
-	case len(rows) == 0:
-		return false, nil
 	}
-	return *rows[0][0] != p.stateVersion["xmin"], nil
+	return now != p.stateVersion["xmin"], nil
+}
+
+// readRowVersion is the xmin of the row of table whose key is pk, read
+// through the pool outside any transaction, or "" when there is none.
+func (g *Gate) readRowVersion(ctx context.Context, table, pk string) (string, error) {
+	q := fmt.Sprintf("select t.xmin::text from %s as t where t.%s = $1",
+		ident(table), pgx.Identifier{g.tables[table]}.Sanitize())
+	rows, err := g.queryText(ctx, q, []*string{&pk})
+	if err != nil || len(rows) == 0 {
+		return "", err
+	}
+	return *rows[0][0], nil
 }
 
 // versionUnread is p's verdict when its row version could not be read again:
@@ -281,6 +288,11 @@ func (g *Gate) facts(p *pending) decide.Facts {
 // held write (spec 7). A write is stored only as it was sent. One whose bind
 // values were not read, or are text jsonb cannot hold as it is (not UTF-8,
 // or with a NUL), is not: approving a changed value would run another write.
+//
+// An insert that reports an error may still have landed: past its deadline
+// pgx stops waiting but does not cancel the insert on the server. Its id is
+// kept in p.heldUnsure, and End marks it undelivered, so that a row the
+// client was not told of is never left pending for approval.
 func (g *Gate) hold(p *pending) string {
 	h := &store.HeldWrite{
 		ID:          store.NewID(),
@@ -304,7 +316,9 @@ func (g *Gate) hold(p *pending) string {
 	err := unstorable(h, len(p.oids))
 	if err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), heldTimeout)
-		err = g.insertHeld(ctx, h)
+		if err = g.insertHeld(ctx, h); err != nil {
+			p.heldUnsure = h.ID
+		}
 		cancel()
 	}
 	if err != nil {

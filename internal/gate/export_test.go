@@ -115,6 +115,41 @@ func FailHeldWrites(g *Gate, n int) {
 	}
 }
 
+// LandHeldWritesThenFail makes g's next n inserts into stet.held_writes
+// store their row and then report an error, as an insert whose answer came
+// after its time was up does.
+func LandHeldWritesThenFail(g *Gate, n int) {
+	insert := g.insertHeld
+	var mu sync.Mutex
+	g.insertHeld = func(ctx context.Context, h *store.HeldWrite) error {
+		mu.Lock()
+		fail := n > 0
+		n--
+		mu.Unlock()
+		if err := insert(ctx, h); err != nil || !fail {
+			return err
+		}
+		return errors.New("injected failure after the insert")
+	}
+}
+
+// FailRowVersionReads makes g's next n re-reads of a row's version, before
+// a judged write is sent, fail.
+func FailRowVersionReads(g *Gate, n int) {
+	read := g.rowVersion
+	var mu sync.Mutex
+	g.rowVersion = func(ctx context.Context, table, pk string) (string, error) {
+		mu.Lock()
+		fail := n > 0
+		n--
+		mu.Unlock()
+		if fail {
+			return "", errors.New("injected failure")
+		}
+		return read(ctx, table, pk)
+	}
+}
+
 // HoldInflight takes every slot of g's inflight limit until release is called.
 func HoldInflight(g *Gate) (release func()) {
 	for range cap(g.inflight) {
