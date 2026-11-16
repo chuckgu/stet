@@ -109,6 +109,9 @@ type session struct {
 	ready   bool                 // the post-startup ReadyForQuery has arrived
 	status  byte                 // transaction status from the last ReadyForQuery
 	cursors map[string]*declared // SQL cursors by name; nil until a DECLARE needs it
+	// unsettled holds the names in cursors whose newest entry can still change
+	// at a ReadyForQuery: all but held cursors that outlived their transaction.
+	unsettled map[string]struct{}
 }
 
 type prepared struct {
@@ -406,8 +409,8 @@ func (s *session) fromServer(t byte, body []byte) {
 			return
 		}
 		s.units = s.units[1:]
-		if len(s.cursors) > 0 {
-			s.cursorsAnswered(head, before, status)
+		if len(s.unsettled) > 0 {
+			s.cursorsAnswered(head, status)
 		}
 		s.mu.Unlock()
 		s.finish(head, before, status)
@@ -521,7 +524,7 @@ func (s *session) abandon() {
 	s.mu.Lock()
 	units := s.units
 	s.units = nil
-	s.cursors = nil
+	s.cursors, s.unsettled = nil, nil
 	status := s.status
 	s.mu.Unlock()
 	if len(units) > 0 {

@@ -23,56 +23,72 @@ type Cursor struct {
 	Hold bool   // DECLARE ... WITH HOLD
 }
 
-// declared is a DECLARE of a cursor name, as the session remembers it. The
-// DECLAREs of a name that are not answered yet stack, newest first, on the
-// one in force, so a failed one can be taken out.
+// declared is a DECLARE or CLOSE of a cursor name, as the session remembers
+// it. Those not answered yet stack, newest first, on the one in force, so a
+// failed one can be taken out and the name means what it meant before.
 type declared struct {
-	st   Statement // the DECLARE; with Observe unset it only forgets the name
+	st   Statement // the DECLARE; with Observe unset (a CLOSE included) it forgets the name
 	hold bool
-	// unit holds the DECLARE until the transaction it ran in has ended. Only a
-	// held cursor outlives that, with unit nil.
+	// unit holds the statement until the transaction it ran in has ended. Only
+	// a held cursor outlives that, with unit nil: it is settled.
 	unit *unit
-	prev *declared // what the name meant before, until this DECLARE has run
+	prev *declared // what the name meant before, until this statement has run
 }
 
 // cursor applies a cursor statement as it arrives from the client, so that a
-// FETCH pipelined behind a DECLARE finds it. A FETCH of a remembered cursor
-// joins u as a read of the DECLARE; idx is as for observe.
+// FETCH pipelined behind a DECLARE or CLOSE sees it. A FETCH of a remembered
+// cursor joins u as a read of the DECLARE; idx is as for observe.
+//
+// When the cursor table must guess, it errs toward remembering: a cursor
+// remembered after the server dropped it costs a failed FETCH reported with
+// no rows, while one forgotten that the server still holds hides reads. So a
+// CLOSE forgets the name only once it ran, like an unobserved DECLARE.
 func (s *session) cursor(u *unit, idx int, st Statement) {
 	c := st.Cursor
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch c.Op {
 	case CursorDeclare:
-		prev := s.cursors[c.Name]
-		if !st.Observe && prev == nil {
-			return // nothing to forget
+		if st.Observe || s.cursors[c.Name] != nil {
+			s.stack(c.Name, &declared{st: st, hold: c.Hold, unit: u})
 		}
-		if s.cursors == nil {
-			s.cursors = map[string]*declared{}
-		}
-		s.cursors[c.Name] = &declared{st: st, hold: c.Hold, unit: u, prev: prev}
 	case CursorFetch:
 		if d := s.cursors[c.Name]; d != nil && d.st.Observe {
 			u.reads = append(u.reads, s.arriving(d.st, idx))
 		}
 	case CursorClose:
-		delete(s.cursors, c.Name)
+		if s.cursors[c.Name] != nil {
+			s.stack(c.Name, &declared{unit: u})
+		}
 	case CursorCloseAll:
-		s.cursors = nil
+		for name := range s.cursors {
+			s.stack(name, &declared{unit: u})
+		}
 	}
 }
 
-// cursorsAnswered brings the cursor table up to date once head was answered
-// and left s.units, before and after being the transaction status around it.
-// The DECLAREs of a failed unit are undone. When a transaction ends (after is
-// idle) the cursors declared in it are forgotten, except held ones whose
-// transaction did not fail. It runs on the server side with s.mu held.
-func (s *session) cursorsAnswered(head *unit, before, after byte) {
-	for name, top := range s.cursors {
+// stack puts d on top of what name means. It runs with s.mu held.
+func (s *session) stack(name string, d *declared) {
+	if s.cursors == nil {
+		s.cursors = map[string]*declared{}
+		s.unsettled = map[string]struct{}{}
+	}
+	d.prev = s.cursors[name]
+	s.cursors[name] = d
+	s.unsettled[name] = struct{}{}
+}
+
+// cursorsAnswered brings the unsettled names up to date once head was
+// answered and left s.units, after being the transaction status it reported.
+// The DECLAREs and CLOSEs of a failed unit are undone. Once a statement ran,
+// what the name meant before it is gone. When a transaction ends (after is
+// idle) the cursors declared in it are forgotten, except held ones. It runs
+// on the server side with s.mu held.
+func (s *session) cursorsAnswered(head *unit, after byte) {
+	for name := range s.unsettled {
 		var first *declared // what stays, newest first
 		tail := &first
-		for d := top; d != nil; {
+		for d := s.cursors[name]; d != nil; {
 			next := d.prev
 			keep := false
 			switch {
@@ -81,8 +97,7 @@ func (s *session) cursorsAnswered(head *unit, before, after byte) {
 			case d.unit != nil && s.pending(d.unit):
 				keep = true // not answered yet
 			default:
-				// It ran, so what the name meant before it is gone.
-				keep = d.stays(head, before, after)
+				keep = d.stays(after)
 				next = nil
 			}
 			if keep {
@@ -92,26 +107,35 @@ func (s *session) cursorsAnswered(head *unit, before, after byte) {
 			d = next
 		}
 		*tail = nil
-		if first == nil {
+		switch {
+		case first == nil:
 			delete(s.cursors, name)
-		} else {
+			delete(s.unsettled, name)
+		case first.unit == nil: // a held cursor alone: nothing left to change
+			s.cursors[name] = first
+			delete(s.unsettled, name)
+		default:
 			s.cursors[name] = first
 		}
 	}
 }
 
-// stays reports whether d, a DECLARE that ran, is still remembered once head
-// was answered. A held cursor that outlives its transaction loses its unit.
-func (d *declared) stays(head *unit, before, after byte) bool {
+// stays reports whether d, a DECLARE or CLOSE that ran, is still remembered
+// once a unit was answered with status after. A held cursor whose transaction
+// ended is settled.
+//
+// A held cursor stays whichever way its transaction ended. The status cannot
+// tell a COMMIT from a ROLLBACK, and an aborted transaction may not be the
+// one that declared it (COMMIT AND CHAIN commits without an idle status), so
+// a held cursor rolled back with its transaction stays remembered.
+func (d *declared) stays(after byte) bool {
 	switch {
 	case !d.st.Observe:
-		return false // it only forgot the name
+		return false // it forgot the name
 	case d.unit == nil || after != 'I':
-		return true // held from an earlier transaction, or its own is still open
+		return true // settled, or its transaction is still open
 	case !d.hold:
 		return false // its transaction ended
-	case d.unit != head && before == 'E':
-		return false // its transaction failed and was rolled back
 	}
 	d.unit = nil
 	return true

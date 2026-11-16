@@ -282,6 +282,12 @@ func (g *cursorGate) Inspect(sql string) Statement {
 		st.Observe = strings.HasSuffix(sql, " from t")
 	case "fetch":
 		st.Cursor = &Cursor{Op: CursorFetch, Name: f[len(f)-1]}
+	case "close":
+		if f[1] == "all" {
+			st.Cursor = &Cursor{Op: CursorCloseAll}
+		} else {
+			st.Cursor = &Cursor{Op: CursorClose, Name: f[1]}
+		}
 	}
 	return st
 }
@@ -313,5 +319,51 @@ func TestTransactionEndSparesCursorsDeclaredBehindIt(t *testing.T) {
 
 	if len(g.reads) != 1 || g.reads[0].st.SQL != declare || g.sent[0] != 2 {
 		t.Errorf("reads = %+v sent %v, want the FETCH as a 2-row read of %q", g.reads, g.sent, declare)
+	}
+}
+
+// A FETCH pipelined behind a CLOSE of its cursor is not a read, although the
+// CLOSE has not been answered yet.
+func TestFetchBehindACloseIsNotReported(t *testing.T) {
+	g := &cursorGate{fakeGate: newFakeGate()}
+	s := readySession(g)
+	flush := func() error { return nil }
+	query := func(sql string) { s.fromClient('Q', body(&pgproto3.Query{String: sql}), flush) }
+
+	query("declare c cursor with hold for select * from t")
+	serve(s, tag("DECLARE CURSOR"), readyWith('I'))
+	query("close c")
+	query("fetch 1 from c")
+	serve(s, tag("CLOSE CURSOR"), readyWith('I'))
+	serve(s, &pgproto3.ErrorResponse{Code: "34000", Message: `cursor "c" does not exist`}, readyWith('I'))
+
+	if len(g.reads) != 0 || len(s.cursors) != 0 {
+		t.Errorf("reads = %+v, cursors = %v; want no read and nothing remembered", g.reads, s.cursors)
+	}
+}
+
+// Only the names whose newest DECLARE or CLOSE can still change are walked
+// at a ReadyForQuery: a held cursor that outlived its transaction is not.
+func TestSettledCursorsAreNotRevisited(t *testing.T) {
+	g := &cursorGate{fakeGate: newFakeGate()}
+	s := readySession(g)
+	flush := func() error { return nil }
+	query := func(sql string) { s.fromClient('Q', body(&pgproto3.Query{String: sql}), flush) }
+
+	query("declare c cursor with hold for select * from t")
+	serve(s, tag("DECLARE CURSOR"), readyWith('I'))
+	if len(s.cursors) != 1 || len(s.unsettled) != 0 {
+		t.Fatalf("after a held DECLARE committed: cursors %v, unsettled %v; want c remembered and settled", s.cursors, s.unsettled)
+	}
+	query("begin")
+	query("declare d cursor for select * from t")
+	serve(s, tag("BEGIN"), readyWith('T'), tag("DECLARE CURSOR"), readyWith('T'))
+	if _, ok := s.unsettled["d"]; !ok || len(s.unsettled) != 1 {
+		t.Errorf("inside the transaction: unsettled %v, want only d", s.unsettled)
+	}
+	query("commit")
+	serve(s, tag("COMMIT"), readyWith('I'))
+	if _, ok := s.cursors["c"]; !ok || len(s.cursors) != 1 || len(s.unsettled) != 0 {
+		t.Errorf("after COMMIT: cursors %v, unsettled %v; want only c, settled", s.cursors, s.unsettled)
 	}
 }

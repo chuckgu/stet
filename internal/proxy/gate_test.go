@@ -942,20 +942,71 @@ func TestHeldCursorSurvivesCommit(t *testing.T) {
 	}
 }
 
-func TestHeldCursorIsForgottenWhenItsTransactionFails(t *testing.T) {
+// COMMIT AND CHAIN commits without an idle ReadyForQuery in between: the
+// held cursor it committed outlives the next transaction failing.
+func TestHeldCursorSurvivesCommitAndChain(t *testing.T) {
 	table := readTable(t)
 	g := newObservingGate(readsOf(table))
 	addr, _ := startProxy(t, upstream(t), g)
 	conn := connect(t, addr, "stet_scram", nil)
 
+	held := "declare c cursor with hold for select * from " + table
 	mustExec(t, conn, "begin")
-	mustExec(t, conn, "declare c cursor with hold for select * from "+table)
+	mustExec(t, conn, held)
+	mustExec(t, conn, "commit and chain")
 	mustFail(t, conn, "select 1/0", "22012")
 	mustExec(t, conn, "rollback")
-	mustFail(t, conn, "fetch 10 from c", "34000")
+	mustExec(t, conn, "fetch 10 from c")
+	mustExec(t, conn, "close c")
 
-	if obs := g.observed(t, 0); len(obs) != 0 {
-		t.Errorf("reads = %+v, want none", obs)
+	obs := g.observed(t, 1)
+	if len(obs) != 1 {
+		t.Fatalf("%d reads observed, want 1", len(obs))
+	}
+	if ob := obs[0]; ob.st.SQL != held || ob.o.Sent != 10 || !ob.o.Executed {
+		t.Errorf("FETCH after the failed transaction: %q %+v, want %q with 10 rows sent", ob.st.SQL, ob.o, held)
+	}
+}
+
+// A CLOSE the server refuses or skips leaves the cursor open, so the FETCHes
+// after it are still reads. A held cursor committed before survives the
+// transaction that failed around the CLOSE.
+func TestFailedCloseKeepsTheCursor(t *testing.T) {
+	table := readTable(t)
+	held := "declare c cursor with hold for select * from " + table
+	for _, closing := range []string{"close c", "close all"} {
+		run := func(name string, fail func(t *testing.T, conn *pgx.Conn)) {
+			t.Run(name, func(t *testing.T) {
+				g := newObservingGate(readsOf(table))
+				addr, _ := startProxy(t, upstream(t), g)
+				conn := connect(t, addr, "stet_scram", nil)
+				mustExec(t, conn, held)
+				fail(t, conn)
+				mustExec(t, conn, "fetch 10 from c")
+
+				obs := g.observed(t, 1)
+				if len(obs) != 1 {
+					t.Fatalf("%d reads observed, want 1", len(obs))
+				}
+				if ob := obs[0]; ob.st.SQL != held || ob.o.Sent != 10 || !ob.o.Executed {
+					t.Errorf("FETCH after the failed CLOSE: %q %+v, want %q with 10 rows sent", ob.st.SQL, ob.o, held)
+				}
+			})
+		}
+		run(closing+" in an aborted transaction", func(t *testing.T, conn *pgx.Conn) {
+			mustExec(t, conn, "begin")
+			mustFail(t, conn, "select 1/0", "22012")
+			mustFail(t, conn, closing, "25P02")
+			mustExec(t, conn, "rollback")
+		})
+		run(closing+" skipped under one Sync", func(t *testing.T, conn *pgx.Conn) {
+			b := &pgconn.Batch{}
+			b.ExecParams("select 1/0", nil, nil, nil, nil)
+			b.ExecParams(closing, nil, nil, nil, nil)
+			if _, err := conn.PgConn().ExecBatch(testCtx(t), b).ReadAll(); pgCode(err) != "22012" {
+				t.Fatalf("batch: %v, want 22012", err)
+			}
+		})
 	}
 }
 
@@ -1018,11 +1069,20 @@ func TestRedeclaredCursorReplacesTheOld(t *testing.T) {
 		mustExec(t, conn, sql)
 	}
 
-	obs := g.observed(t, 2)
-	if len(obs) != 2 {
-		t.Fatalf("%d reads observed, want 2", len(obs))
+	// Over a name still remembered: a held cursor whose transaction rolled
+	// back stays in the table although the server dropped it, so the next
+	// DECLARE of the name succeeds and replaces it.
+	stale := "declare c cursor with hold for select * from " + table + " where id <= 100"
+	fresh := "declare c cursor with hold for select * from " + table + " where id > 900"
+	for _, sql := range []string{"begin", stale, "rollback", fresh, "fetch 10 from c", "fetch 10 from c", "close c"} {
+		mustExec(t, conn, sql)
 	}
-	for i, want := range []string{before, after} {
+
+	obs := g.observed(t, 4)
+	if len(obs) != 4 {
+		t.Fatalf("%d reads observed, want 4", len(obs))
+	}
+	for i, want := range []string{before, after, fresh, fresh} {
 		if ob := obs[i]; ob.st.SQL != want || ob.o.Sent != 10 {
 			t.Errorf("FETCH %d: %q %+v, want %q with 10 rows sent", i+1, ob.st.SQL, ob.o, want)
 		}
