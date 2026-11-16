@@ -216,11 +216,17 @@ func selectOne(rel *pg.RangeVar, where *pg.Node) (string, error) {
 // A function can be called without call syntax: Postgres resolves (x).f to
 // f(x) for any f that takes one argument, so field selection refuses too.
 // Array subscripts (x[1], x[1:2]) are the only indirection allowed.
+//
+// The parser follows the PostgreSQL 17 grammar, where JSON_VALUE(...),
+// JSON(...), JSON_ARRAY(a, b), merge_action() and their relatives are keyword
+// forms with no FuncCall node. An older server reads the deparsed text as a
+// call to an ordinary function of that name, found through search_path. So
+// every SQL/JSON node and merge_action() refuse.
 func countable(where *pg.Node) bool {
 	ok := true
 	walk(where, func(msg proto.Message) bool {
 		switch e := msg.(type) {
-		case *pg.CurrentOfExpr, *pg.SelectStmt:
+		case *pg.CurrentOfExpr, *pg.SelectStmt, *pg.MergeSupportFunc:
 			ok = false
 		case *pg.FuncCall:
 			ok = countFunc(e.Funcname)
@@ -232,6 +238,9 @@ func countable(where *pg.Node) bool {
 					ok = false
 				}
 			}
+		}
+		if strings.HasPrefix(string(msg.ProtoReflect().Descriptor().Name()), "Json") {
+			ok = false
 		}
 		return ok
 	})
