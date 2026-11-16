@@ -97,3 +97,17 @@ func TestUnwatchedSessionLatencyBudget(t *testing.T) {
 		t.Errorf("an unwatched session adds %v at p95, budget is 2ms", added)
 	}
 }
+
+// Spec 15 of the enforce spec: on an enforcing proxy a watched session checks
+// each message for a closed point before forwarding it, and a statement let
+// through stays inside the same 2ms budget at p95.
+func TestEnforcedSessionLatencyBudget(t *testing.T) {
+	g := closedPointGate(isWrite)
+	added := addedLatencyWith(t, g, proxy.Policy{Enforce: true}, "stet_scram", "enforced select 1")
+	if g.inspectCount() == 0 {
+		t.Error("Inspect never ran: the session was not watched")
+	}
+	if added > 2*time.Millisecond {
+		t.Errorf("an enforced session adds %v at p95, budget is 2ms", added)
+	}
+}

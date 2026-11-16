@@ -112,14 +112,21 @@ func (g *Gate) Close() {
 // Inspect marks gated writes to be watched, and reads of tables that record
 // reads to be observed. A cursor statement always carries its cursor, so the
 // proxy can follow the names a DECLARE it observes binds.
+//
+// SQL the classifier cannot read, and SQL holding a DO block, whose writes
+// cannot be seen, are marked with Block whatever the mode: the proxy refuses
+// them on enforced sessions only.
 func (g *Gate) Inspect(sql string) proxy.Statement {
 	r, err := sqlparse.Classify(sql, g.gated)
 	if err != nil {
-		// Postgres will reject it too; nothing to judge. Not Clean: what
-		// cannot be read leaves the transaction dirty.
-		return proxy.Statement{SQL: sql}
+		// Usually Postgres rejects it too, but a newer server may run it.
+		// Not Clean: what cannot be read leaves the transaction dirty.
+		return proxy.Statement{SQL: sql, Block: proxy.BlockUnparsed}
 	}
 	st := proxy.Statement{SQL: sql, Watch: r.Kind == sqlparse.Gated || r.Kind == sqlparse.Measured || r.Kind == sqlparse.Unsupported, OnBehalfOf: r.OnBehalfOf, Clean: r.Clean}
+	if r.Do {
+		st.Block = proxy.BlockDo
+	}
 	if r.Kind == sqlparse.Read {
 		st.Observe = g.recordsAny(r.Reads)
 	}
@@ -131,6 +138,18 @@ func (g *Gate) Inspect(sql string) proxy.Statement {
 	st.Several = r.Statements > 1
 	st.Data = r
 	return st
+}
+
+// Blocked answers a message the proxy refuses on a watched session because it
+// cannot be inspected (spec 7): SQL the classifier cannot read, a DO block, a
+// message too large to read, a FunctionCall. No decision records it, since
+// no table can be named for it, so it is logged: the session and the reason,
+// never the statement, which may hold data.
+func (g *Gate) Blocked(s proxy.SessionInfo, reason string) proxy.Refusal {
+	a := decide.Blocked(reason)
+	g.log.Warn("message refused without a decision", "reason", reason,
+		"session", s.ID, "login_role", s.User, "database", s.Database, "agent", s.ApplicationName)
+	return proxy.Refusal{Code: a.Code, Message: a.Message, Hint: a.Hint("")}
 }
 
 var cursorOps = map[sqlparse.CursorOp]proxy.CursorOp{

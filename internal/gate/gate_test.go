@@ -168,7 +168,7 @@ func setup(t *testing.T, d decide.Decider, yamlFormat ...string) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := proxy.New(addr, slog.New(slog.DiscardHandler), e.gate, proxy.Policy{Agents: cfg.AgentRoles})
+	srv := proxy.New(addr, slog.New(slog.DiscardHandler), e.gate, proxy.Policy{Agents: cfg.AgentRoles, Enforce: cfg.Mode == config.ModeEnforce})
 	e.srv = srv
 	go srv.Serve(ln)
 	t.Cleanup(func() {
@@ -684,5 +684,71 @@ func TestRecordedStateRebuildsToTheBytesSent(t *testing.T) {
 	}
 	if !reordered {
 		t.Error("jsonb kept every state as sent; this test no longer covers the rebuild")
+	}
+}
+
+// What the classifier cannot read and DO blocks are marked whatever the
+// mode; the proxy refuses them only on enforced sessions (spec 7).
+func TestInspectMarksWhatCannotBeInspected(t *testing.T) {
+	e := setup(t, calm())
+	for sql, want := range map[string]string{
+		"selec 1":                      proxy.BlockUnparsed,
+		"do $$ begin end $$":           proxy.BlockDo,
+		"select 1; do $$ begin end $$": proxy.BlockDo,
+		"select 1":                     "",
+		"update " + e.table + " set title = 'x' where id = 1": "",
+	} {
+		if got := e.gate.Inspect(sql).Block; got != want {
+			t.Errorf("Inspect(%q).Block = %q, want %q", sql, got, want)
+		}
+	}
+	if st := e.gate.Inspect("update " + e.table + " set title = 'x' where id = 1"); !st.Watch {
+		t.Errorf("a gated write is not watched: %+v", st)
+	}
+}
+
+// A message refused without a decision gets decide.Blocked's error and a
+// warning that names the session, its login role and the reason, and nothing
+// of the statement.
+func TestBlockedAnswersAndLogs(t *testing.T) {
+	e := setup(t, calm())
+	var logs lockedBuffer
+	gate.SetLogger(e.gate, slog.New(slog.NewJSONHandler(&logs, nil)))
+	info := proxy.SessionInfo{ID: "f00d", User: "agent_a", Database: "stet_test", ApplicationName: "bot"}
+
+	got := e.gate.Blocked(info, proxy.BlockDo)
+	a := decide.Blocked(proxy.BlockDo)
+	if want := (proxy.Refusal{Code: a.Code, Message: a.Message, Hint: a.Hint("")}); got != want {
+		t.Errorf("Blocked = %+v, want %+v", got, want)
+	}
+	if got.Code != "ST002" || got.Message == "" || got.Hint == "" || got.Detail != "" {
+		t.Errorf("Blocked = %+v, want ST002 with a message and a hint, and no detail", got)
+	}
+
+	var warnings []map[string]any
+	for line := range strings.Lines(logs.String()) {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatal(err)
+		}
+		if rec["level"] == "WARN" {
+			warnings = append(warnings, rec)
+		}
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("%d warnings, want 1:\n%s", len(warnings), logs.String())
+	}
+	w := warnings[0]
+	if w["session"] != "f00d" || w["login_role"] != "agent_a" || w["reason"] != "do_block" {
+		t.Errorf("warning %v, want session f00d, login_role agent_a, reason do_block", w)
+	}
+	e.gate.Close() // waits for anything the gate was still recording
+	var n int
+	if err := e.admin.QueryRow(context.Background(),
+		"select count(*) from stet.decisions where session_id = $1", info.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("%d decisions recorded for the session, want none", n)
 	}
 }

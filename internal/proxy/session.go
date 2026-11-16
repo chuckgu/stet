@@ -28,7 +28,18 @@ type Gate interface {
 	// ended first. It is never called before the statement goes upstream, and it
 	// must not block.
 	Observe(s SessionInfo, st Statement, o Outcome)
+	// Blocked returns the error for a message refused for reason on a watched
+	// session, and logs it: no decision records such a message. It must not block.
+	Blocked(s SessionInfo, reason string) Refusal
 }
+
+// Reasons a message is refused without a decision.
+const (
+	BlockUnparsed     = "unparsed"
+	BlockTooLarge     = "too_large"
+	BlockFunctionCall = "function_call"
+	BlockDo           = "do_block"
+)
 
 type Statement struct {
 	SQL   string
@@ -50,6 +61,8 @@ type Statement struct {
 	Several bool
 	// Clean marks a message whose statements are all BEGIN, START TRANSACTION, SET or SHOW.
 	Clean bool
+	// Block says why the message cannot be inspected (BlockUnparsed, BlockDo); "" when it can.
+	Block string
 }
 
 type Param struct {
@@ -123,6 +136,9 @@ type Outcome struct {
 type session struct {
 	gate Gate
 	info SessionInfo
+	// enforce: a message that cannot be inspected is refused, not forwarded
+	// (Policy.Enforce). Fixed for the session's life.
+	enforce bool
 
 	// Touched only on the server side, and by abandon once both sides have
 	// stopped: row messages sent since the last completion or error.
@@ -288,6 +304,13 @@ func (s *session) acked(head *unit) {
 
 // fromClient follows a message from the client before it is forwarded, and
 // returns the message to send in its place when the gate refused it.
+//
+// On an enforced session the closed points (spec 7) are refused here, before
+// anything else is made of them: a Query or Parse the gate marks with Block,
+// a Query, Parse, Bind or Execute the proxy could not read, and every
+// FunctionCall. The gate is told through Blocked, and the message never ran,
+// so the statement and portal tables, on_behalf_of and the cursor table stay
+// as they were.
 func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, error) {
 	switch t {
 	case 'Q':
@@ -295,9 +318,17 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		var m pgproto3.Query
 		if body == nil || m.Decode(body) != nil {
 			s.markDirty(u) // it may hold anything
+			if s.enforce {
+				return s.block(u, 0, 'Q', "", unreadable(body)), nil
+			}
 			return nil, nil
 		}
-		return s.statement(u, 0, 0, 'Q', s.gate.Inspect(m.String), nil, nil, flush), nil
+		st := s.gate.Inspect(m.String)
+		if s.enforce && st.Block != "" {
+			s.dirties(u, st)
+			return s.block(u, 0, 'Q', "", st.Block), nil
+		}
+		return s.statement(u, 0, 0, 'Q', st, nil, nil, flush), nil
 
 	case 'P':
 		var m pgproto3.Parse
@@ -308,6 +339,22 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		}
 		s.mu.Lock()
 		u, pos := s.count()
+		if s.enforce && (!read || p.st.Block != "") {
+			s.mu.Unlock()
+			// The table is left as it was. The server keeps a named
+			// statement it holds when the replacement fails, as for any
+			// failing Parse. For the unnamed statement it does not: a Parse
+			// of it drops the old one first, while the table keeps the old
+			// meaning. That costs extra judgments of a statement the server
+			// no longer has (its Binds fail), never an unjudged write: the
+			// safe direction. A Parse that could not be read is replaced
+			// under a fresh name, since its own name is not known, so no
+			// name the session uses changes on the server.
+			if !read {
+				return s.block(u, pos, 'P', freshName(), unreadable(body)), nil
+			}
+			return s.block(u, pos, 'P', m.Name, p.st.Block), nil
+		}
 		if read {
 			s.stmts.put(u, pos, m.Name, true, p)
 		} else {
@@ -323,6 +370,12 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		var others []prepared
 		s.mu.Lock()
 		u, pos := s.count()
+		if s.enforce && !read {
+			s.mu.Unlock()
+			// The replacement names a statement that cannot exist, so the
+			// server fails it before it touches any portal.
+			return s.block(u, pos, 'B', "", unreadable(body)), nil
+		}
 		if read {
 			p, ok, others = s.stmts.get(u, m.PreparedStatement)
 		}
@@ -355,6 +408,12 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 			b, ok, others = s.portals.get(u, m.Portal)
 		}
 		s.mu.Unlock()
+		if s.enforce && !read {
+			// Its portal is not known; the server compares portal names by
+			// their first 63 bytes, so it may run any of them.
+			s.markDirty(u)
+			return s.block(u, pos, 'E', "", unreadable(body)), nil
+		}
 		if !ok || b.unread {
 			// It may run anything, or a statement Stet does not follow.
 			s.markDirty(u)
@@ -400,9 +459,35 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		s.mu.Unlock()
 
 	case 'F':
-		s.push(&unit{closed: true, dirty: true}) // the function may change anything
+		u := s.push(&unit{closed: true, dirty: true}) // the function may change anything
+		if s.enforce {
+			return s.block(u, 0, 'F', "", BlockFunctionCall), nil
+		}
 	}
 	return nil, nil
+}
+
+// unreadable is why a message whose body is body could not be inspected: nil
+// is a body past maxInspect, which was not read; any other could not be
+// decoded.
+func unreadable(body []byte) string {
+	if body == nil {
+		return BlockTooLarge
+	}
+	return BlockUnparsed
+}
+
+// block refuses the message t at pos of u (see refuse; name as there), which
+// cannot be inspected, for reason, and returns the message to send in its
+// place. The gate gives the client's error through Blocked and logs it; no
+// decision records the message, so nothing waits for its End. The gate is
+// called without s.mu held, and nothing queued is flushed first: Blocked does
+// not block.
+func (s *session) block(u *unit, pos int, t byte, name, reason string) []byte {
+	s.mu.Lock()
+	info := s.identity()
+	s.mu.Unlock()
+	return s.refuse(u, pos, t, name, s.gate.Blocked(info, reason))
 }
 
 // statement follows st, arriving as a Query (idx and pos 0) or as Execute idx

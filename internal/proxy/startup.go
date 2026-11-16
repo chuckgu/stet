@@ -13,6 +13,11 @@ type Policy struct {
 	// Agents lists the login roles whose sessions are watched, compared byte
 	// for byte with the role the server will authenticate. Empty: every session.
 	Agents []string
+	// Enforce makes watched sessions fail closed: a message that cannot be
+	// inspected is refused instead of forwarded. Sessions that are not
+	// watched, and every session when there is no gate, are relayed as
+	// without it.
+	Enforce bool
 }
 
 // watches reports whether the gate is shown a session whose startup packet

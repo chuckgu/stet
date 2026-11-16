@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/stetdb/stet/internal/config"
 	"github.com/stetdb/stet/internal/gate"
 	"github.com/stetdb/stet/internal/proxy"
 	"github.com/stetdb/stet/internal/store"
@@ -75,7 +76,7 @@ func (e *env) restart(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := proxy.New(os.Getenv("STET_TEST_PG"), slog.New(slog.DiscardHandler), g, proxy.Policy{Agents: e.cfg.AgentRoles})
+	srv := proxy.New(os.Getenv("STET_TEST_PG"), slog.New(slog.DiscardHandler), g, proxy.Policy{Agents: e.cfg.AgentRoles, Enforce: e.cfg.Mode == config.ModeEnforce})
 	go srv.Serve(ln)
 	t.Cleanup(func() {
 		srv.Close()

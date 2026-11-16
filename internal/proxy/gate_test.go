@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -34,6 +35,9 @@ type recordingGate struct {
 	// refuse, when set, is asked inside Begin whether to refuse the write; nil
 	// from it sends the write as before.
 	refuse func(st proxy.Statement) *proxy.Refusal
+	// block, when set, says why Inspect marks a statement as one that cannot
+	// be inspected (Statement.Block); "" for one that can.
+	block func(sql string) string
 
 	mu       sync.Mutex
 	inspects int // Inspect calls
@@ -41,6 +45,12 @@ type recordingGate struct {
 	ends     map[int]proxy.Outcome
 	endCalls int // End calls, to tell a second End for one write from the first
 	reads    []observation
+	blocked  []blockedCall
+}
+
+type blockedCall struct {
+	info   proxy.SessionInfo
+	reason string
 }
 
 type observation struct {
@@ -80,6 +90,9 @@ func (g *recordingGate) Inspect(sql string) proxy.Statement {
 		if c.Op == proxy.CursorDeclare { // remembered when its query is an observed read
 			st.Observe = g.observeMatch != nil && g.observeMatch(query)
 		}
+	}
+	if g.block != nil {
+		st.Block = g.block(sql)
 	}
 	return st
 }
@@ -135,6 +148,34 @@ func (g *recordingGate) Observe(info proxy.SessionInfo, st proxy.Statement, o pr
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.reads = append(g.reads, observation{info, st, o, at})
+}
+
+// Blocked records the call and answers with an ST002 that names the reason.
+func (g *recordingGate) Blocked(info proxy.SessionInfo, reason string) proxy.Refusal {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.blocked = append(g.blocked, blockedCall{info, reason})
+	return proxy.Refusal{Code: "ST002", Message: "blocked " + reason}
+}
+
+// wantBlocked fails the test unless Blocked was called once for each of
+// reasons, in order, each time for a session of user. Blocked runs before the
+// refused message's replacement is sent, so the calls are all in once the
+// client has its answers.
+func (g *recordingGate) wantBlocked(t *testing.T, user string, reasons ...string) {
+	t.Helper()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	var got []string
+	for _, b := range g.blocked {
+		got = append(got, b.reason)
+		if b.info.ID == "" || b.info.User != user {
+			t.Errorf("Blocked for session %+v, want a session of %s", b.info, user)
+		}
+	}
+	if !slices.Equal(got, reasons) {
+		t.Errorf("Blocked for %q, want %q", got, reasons)
+	}
 }
 
 // observed waits until n reads have been reported and returns every read
@@ -1113,7 +1154,15 @@ func untilReady(t *testing.T, fe *pgproto3.Frontend) (rows, suspended int) {
 // for example "1 2 C 1 2 E:ST001 Z".
 func replies(t *testing.T, fe *pgproto3.Frontend) string {
 	t.Helper()
+	got, _ := repliesWithErrors(t, fe)
+	return got
+}
+
+// repliesWithErrors is replies that also returns the ErrorResponses read.
+func repliesWithErrors(t *testing.T, fe *pgproto3.Frontend) (string, []pgproto3.ErrorResponse) {
+	t.Helper()
 	var got []string
+	var errs []pgproto3.ErrorResponse
 	for {
 		msg, err := fe.Receive()
 		if err != nil {
@@ -1122,6 +1171,7 @@ func replies(t *testing.T, fe *pgproto3.Frontend) string {
 		switch m := msg.(type) {
 		case *pgproto3.ErrorResponse:
 			got = append(got, "E:"+m.Code)
+			errs = append(errs, *m)
 		default:
 			b, err := msg.Encode(nil)
 			if err != nil {
@@ -1130,7 +1180,7 @@ func replies(t *testing.T, fe *pgproto3.Frontend) string {
 			got = append(got, string(b[0]))
 		}
 		if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
-			return strings.Join(got, " ")
+			return strings.Join(got, " "), errs
 		}
 	}
 }
@@ -1993,4 +2043,314 @@ func TestErrorAtTheSyncIsNotARefusal(t *testing.T) {
 		}
 	}
 	wantRefused(t, os[3], false)
+}
+
+// The closed-point tests run twice: through an enforcing proxy, which refuses
+// on watched sessions what it cannot inspect, and through a shadow one, which
+// forwards those messages as before.
+var closedPointModes = []struct {
+	name   string
+	policy proxy.Policy
+}{
+	{"enforce", proxy.Policy{Enforce: true}},
+	{"shadow", proxy.Policy{}},
+}
+
+// unreadableSQL runs on the server, but the test gates mark it as SQL the
+// classifier could not read.
+const unreadableSQL = "select 'unreadable'"
+
+var doRE = regexp.MustCompile(`(?i)^\s*do\b`)
+
+// blockClosedPoints marks what the real gate's Inspect marks: SQL it cannot
+// read (here unreadableSQL) and DO blocks.
+func blockClosedPoints(sql string) string {
+	switch {
+	case strings.Contains(sql, "'unreadable'"):
+		return proxy.BlockUnparsed
+	case doRE.MatchString(sql):
+		return proxy.BlockDo
+	}
+	return ""
+}
+
+func closedPointGate(match func(string) bool) *recordingGate {
+	g := newRecordingGate(match)
+	g.block = blockClosedPoints
+	return g
+}
+
+// wantReplies reads the replies up to ReadyForQuery and fails the test unless
+// they are want (see replies) and the ST002 errors among them carry msgs, in
+// order, with nothing else of the server's error.
+func wantReplies(t *testing.T, fe *pgproto3.Frontend, want string, msgs ...string) {
+	t.Helper()
+	got, errs := repliesWithErrors(t, fe)
+	if got != want {
+		t.Errorf("replies %q, want %q", got, want)
+	}
+	var gotMsgs []string
+	for _, e := range errs {
+		if e.Code != "ST002" {
+			continue
+		}
+		gotMsgs = append(gotMsgs, e.Message)
+		if e.Severity != "ERROR" || e.Detail != "" || e.Hint != "" || e.Position != 0 {
+			t.Errorf("client got %+v, want the gate's refusal alone", e)
+		}
+	}
+	if !slices.Equal(gotMsgs, msgs) {
+		t.Errorf("ST002 messages %q, want %q", gotMsgs, msgs)
+	}
+}
+
+// pick is enforced on an enforcing proxy, and shadow otherwise.
+func pick(policy proxy.Policy, enforced, shadow string) string {
+	if policy.Enforce {
+		return enforced
+	}
+	return shadow
+}
+
+// SQL the classifier cannot read is refused on an enforced session, sent as a
+// Query or as a Parse, and the session goes on. A refused Parse never reaches
+// the server, so its name stays free there. The shadow proxy forwards it.
+func TestUnreadableStatementsAreRefused(t *testing.T) {
+	for _, mode := range closedPointModes {
+		t.Run(mode.name, func(t *testing.T) {
+			g := closedPointGate(isWrite)
+			addr, _ := startProxyWith(t, upstream(t), g, mode.policy)
+			fe := rawSession(t, addr, "stet_trust", pgproto3.ProtocolVersionNumber)
+			p := mode.policy
+			var msgs []string
+			if p.Enforce {
+				msgs = []string{"blocked unparsed"}
+			}
+
+			sendAll(t, fe, &pgproto3.Query{String: unreadableSQL})
+			wantReplies(t, fe, pick(p, "E:ST002 Z", "T D C Z"), msgs...)
+			sendAll(t, fe, &pgproto3.Query{String: "select 1"})
+			wantReplies(t, fe, "T D C Z")
+
+			sendAll(t, fe, &pgproto3.Parse{Name: "s1", Query: unreadableSQL},
+				&pgproto3.Bind{PreparedStatement: "s1"}, &pgproto3.Execute{}, &pgproto3.Sync{})
+			wantReplies(t, fe, pick(p, "E:ST002 Z", "1 2 D C Z"), msgs...)
+			sendAll(t, fe, &pgproto3.Bind{PreparedStatement: "s1"}, &pgproto3.Execute{}, &pgproto3.Sync{})
+			wantReplies(t, fe, pick(p, "E:26000 Z", "2 D C Z"))
+			sendAll(t, fe, &pgproto3.Query{String: "select 1"})
+			wantReplies(t, fe, "T D C Z")
+
+			if p.Enforce {
+				g.wantBlocked(t, "stet_trust", proxy.BlockUnparsed, proxy.BlockUnparsed)
+			} else {
+				g.wantBlocked(t, "stet_trust")
+			}
+		})
+	}
+}
+
+// doCount runs a DO block that inserts into a temporary table of conn's
+// session and returns the table's rows after it, and the DO block's error.
+func doCount(t *testing.T, conn *pgx.Conn) (int, error) {
+	t.Helper()
+	ctx := testCtx(t)
+	mustExec(t, conn, "create temp table do_target (i int)")
+	_, err := conn.Exec(ctx, "do $$ begin insert into do_target values (1); end $$")
+	var n int
+	if err := conn.QueryRow(ctx, "select count(*) from do_target").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n, err
+}
+
+// wantST002 fails the test unless err is the test gate's refusal for reason.
+func wantST002(t *testing.T, err error, reason string) {
+	t.Helper()
+	var e *pgconn.PgError
+	if !errors.As(err, &e) || e.Code != "ST002" || e.Message != "blocked "+reason {
+		t.Errorf("error %v, want ST002 blocked %s", err, reason)
+	}
+}
+
+// What a DO block writes cannot be seen: an enforced session refuses it, so
+// the table stays as it was. The shadow proxy lets it run.
+func TestDoBlocksAreRefused(t *testing.T) {
+	for _, mode := range closedPointModes {
+		t.Run(mode.name, func(t *testing.T) {
+			g := closedPointGate(isWrite)
+			addr, _ := startProxyWith(t, upstream(t), g, mode.policy)
+			conn := connect(t, addr, "stet_scram", nil)
+
+			n, err := doCount(t, conn)
+			if mode.policy.Enforce {
+				wantST002(t, err, proxy.BlockDo)
+				if n != 0 {
+					t.Errorf("%d rows after the refused DO block, want 0", n)
+				}
+				g.wantBlocked(t, "stet_scram", proxy.BlockDo)
+				return
+			}
+			if err != nil || n != 1 {
+				t.Errorf("DO block: %v, %d rows; want it run", err, n)
+			}
+			g.wantBlocked(t, "stet_scram")
+		})
+	}
+}
+
+// backendPID is the OID of pg_backend_pid, a function a FunctionCall can call.
+func backendPID(t *testing.T) uint32 {
+	t.Helper()
+	admin := connect(t, upstream(t), "stet_scram", nil)
+	var oid uint32
+	if err := admin.QueryRow(testCtx(t), "select 'pg_backend_pid'::regproc::oid").Scan(&oid); err != nil {
+		t.Fatal(err)
+	}
+	return oid
+}
+
+// A FunctionCall cannot be inspected: an enforced session refuses it, and the
+// session goes on. The shadow proxy forwards it.
+func TestFunctionCallsAreRefused(t *testing.T) {
+	oid := backendPID(t)
+	for _, mode := range closedPointModes {
+		t.Run(mode.name, func(t *testing.T) {
+			g := closedPointGate(isWrite)
+			addr, _ := startProxyWith(t, upstream(t), g, mode.policy)
+			fe := rawSession(t, addr, "stet_trust", pgproto3.ProtocolVersionNumber)
+			p := mode.policy
+
+			sendAll(t, fe, &pgproto3.FunctionCall{Function: oid})
+			if p.Enforce {
+				wantReplies(t, fe, "E:ST002 Z", "blocked function_call")
+				g.wantBlocked(t, "stet_trust", proxy.BlockFunctionCall)
+			} else {
+				wantReplies(t, fe, "V Z")
+				g.wantBlocked(t, "stet_trust")
+			}
+			sendAll(t, fe, &pgproto3.Query{String: "select 1"})
+			wantReplies(t, fe, "T D C Z")
+		})
+	}
+}
+
+// A Query, Parse or Bind past the size the proxy reads cannot be inspected:
+// an enforced session refuses it, with its body read and dropped, and the
+// statements after it run. The shadow proxy forwards it unread. Each write
+// here would be judged if it were smaller.
+func TestOversizedMessagesAreRefused(t *testing.T) {
+	t.Cleanup(proxy.SetMaxInspect(1 << 20)) // restored once every proxy below has closed
+	big := strings.Repeat("x", 2<<20)
+	for _, mode := range closedPointModes {
+		t.Run(mode.name, func(t *testing.T) {
+			table := watchedTable(t)
+			g := closedPointGate(watches(table))
+			addr, _ := startProxyWith(t, upstream(t), g, mode.policy)
+			fe := rawAgent(t, addr, table)
+			p := mode.policy
+			var msgs []string
+			if p.Enforce {
+				msgs = []string{"blocked too_large"}
+			}
+			selectOne := func() {
+				t.Helper()
+				sendAll(t, fe, &pgproto3.Query{String: "select 1"})
+				wantReplies(t, fe, "T D C Z")
+			}
+
+			sendAll(t, fe, &pgproto3.Query{String: "insert into " + table + " values (1, '" + big + "')"})
+			wantReplies(t, fe, pick(p, "E:ST002 Z", "C Z"), msgs...)
+			selectOne()
+
+			sendAll(t, fe, &pgproto3.Parse{Query: "insert into " + table + " values ($1, $2)"},
+				&pgproto3.Bind{Parameters: [][]byte{[]byte("2"), []byte(big)}}, &pgproto3.Execute{}, &pgproto3.Sync{})
+			wantReplies(t, fe, pick(p, "1 E:ST002 Z", "1 2 C Z"), msgs...)
+			selectOne()
+
+			sendAll(t, fe, &pgproto3.Parse{Query: "insert into " + table + " values (3, '" + big + "')"},
+				&pgproto3.Bind{}, &pgproto3.Execute{}, &pgproto3.Sync{})
+			wantReplies(t, fe, pick(p, "E:ST002 Z", "1 2 C Z"), msgs...)
+			selectOne()
+
+			if p.Enforce {
+				if n := rowCount(t, table); n != 0 {
+					t.Errorf("%d rows, want none of the refused writes", n)
+				}
+				g.wantBlocked(t, "stet_trust", proxy.BlockTooLarge, proxy.BlockTooLarge, proxy.BlockTooLarge)
+			} else {
+				if n := rowCount(t, table); n != 3 {
+					t.Errorf("%d rows, want the 3 writes forwarded", n)
+				}
+				g.wantBlocked(t, "stet_trust")
+			}
+			// No message the proxy did not read reaches Begin. On the
+			// enforced session the Execute behind the refused Parse binds,
+			// as far as the proxy knows, the unnamed insert the unit before
+			// left; the gate may judge it, but the server skips it.
+			bs, os := g.outcomes(t, g.beginCount())
+			for i, b := range bs {
+				if strings.Contains(b.st.SQL, big) || os[i].Executed {
+					t.Errorf("write %d began: %.60q, %+v; want no unread message begun, nothing begun run", i+1, b.st.SQL, os[i])
+				}
+			}
+			if !p.Enforce && len(bs) != 0 {
+				t.Errorf("shadow: %d writes began, want none read", len(bs))
+			}
+		})
+	}
+}
+
+// A refused closed point fails the open transaction, as a server error
+// would: the next statement gets 25P02 until the client rolls back.
+func TestClosedPointsFailTheOpenTransaction(t *testing.T) {
+	g := closedPointGate(isWrite)
+	addr, _ := startProxyWith(t, upstream(t), g, proxy.Policy{Enforce: true})
+	conn := connect(t, addr, "stet_scram", nil)
+
+	mustExec(t, conn, "begin")
+	_, err := conn.Exec(testCtx(t), "do $$ begin perform 1; end $$")
+	wantST002(t, err, proxy.BlockDo)
+	mustFail(t, conn, "select 1", "25P02")
+	mustExec(t, conn, "rollback")
+	mustExec(t, conn, "select 1")
+	g.wantBlocked(t, "stet_scram", proxy.BlockDo)
+}
+
+// A session the policy does not watch has no closed points, also when the
+// proxy enforces: its DO block and FunctionCall run, and the gate hears of
+// neither.
+func TestUnwatchedSessionsSkipTheClosedPoints(t *testing.T) {
+	oid := backendPID(t)
+	g := closedPointGate(isWrite)
+	addr, _ := startProxyWith(t, upstream(t), g, proxy.Policy{Agents: []string{"stet_md5"}, Enforce: true})
+	conn := connect(t, addr, "stet_scram", nil)
+
+	if n, err := doCount(t, conn); err != nil || n != 1 {
+		t.Errorf("DO block: %v, %d rows; want it run", err, n)
+	}
+	nc := conn.PgConn().Conn()
+	nc.SetDeadline(time.Now().Add(10 * time.Second))
+	defer nc.SetDeadline(time.Time{})
+	fe := conn.PgConn().Frontend()
+	sendAll(t, fe, &pgproto3.FunctionCall{Function: oid})
+	wantReplies(t, fe, "V Z")
+
+	g.wantBlocked(t, "stet_scram")
+	if n := g.inspectCount(); n != 0 {
+		t.Errorf("Inspect ran %d times for a session that is not watched, want never", n)
+	}
+}
+
+// With no gate (no gated table: spec correction B10) no session is watched,
+// so an enforcing proxy only relays: a DO block and a FunctionCall run.
+func TestEnforceWithoutAGateOnlyRelays(t *testing.T) {
+	oid := backendPID(t)
+	addr, _ := startProxyWith(t, upstream(t), nil, proxy.Policy{Enforce: true})
+	conn := connect(t, addr, "stet_scram", nil)
+	if n, err := doCount(t, conn); err != nil || n != 1 {
+		t.Errorf("DO block: %v, %d rows; want it run", err, n)
+	}
+	fe := rawSession(t, addr, "stet_trust", pgproto3.ProtocolVersionNumber)
+	sendAll(t, fe, &pgproto3.FunctionCall{Function: oid})
+	wantReplies(t, fe, "V Z")
 }

@@ -442,3 +442,201 @@ func TestPumpSendsTheReplacement(t *testing.T) {
 		t.Errorf("pump sent %q after see's error, want nothing", dst.Bytes())
 	}
 }
+
+// blockGate is objGate that also marks a message holding "do $$" as a DO
+// block.
+type blockGate struct{ objGate }
+
+func newBlockGate() *blockGate { return &blockGate{objGate{fakeGate: newFakeGate()}} }
+
+func (g *blockGate) Inspect(sql string) Statement {
+	st := g.objGate.Inspect(sql)
+	if strings.Contains(sql, "do $$") {
+		st.Block = BlockDo
+	}
+	return st
+}
+
+// enforcedSession is a ready session of an enforcing proxy.
+func enforcedSession(g Gate) *session {
+	s := readySession(g)
+	s.enforce = true
+	return s
+}
+
+// wantBlockedError checks that what the client got in place of the server's
+// error is the gate's refusal for reason.
+func wantBlockedError(t *testing.T, got []byte, reason string) {
+	t.Helper()
+	if want := refusalError(Refusal{Code: "ST002", Message: "blocked " + reason}); !bytes.Equal(got, want) {
+		t.Errorf("client got %q, want %q", got, want)
+	}
+}
+
+// replacementError is how the server answers the replacement r (spec 6).
+func replacementError(t *testing.T, r []byte) *pgproto3.ErrorResponse {
+	t.Helper()
+	e := func(code, msg string) *pgproto3.ErrorResponse {
+		return &pgproto3.ErrorResponse{Severity: "ERROR", SeverityUnlocalized: "ERROR", Code: code, Message: msg}
+	}
+	switch r[0] {
+	case 'B':
+		var m pgproto3.Bind
+		m.Decode(whole(t, r, 'B'))
+		return e("26000", `prepared statement "`+m.PreparedStatement+`" does not exist`)
+	case 'E':
+		var m pgproto3.Execute
+		m.Decode(whole(t, r, 'E'))
+		return e("34000", `portal "`+m.Portal+`" does not exist`)
+	case 'F':
+		return e("42883", "function with OID 0 does not exist")
+	}
+	return syntaxError()
+}
+
+// On an enforced session each closed point is replaced, in kind, by a message
+// the server rejects, and the gate's Blocked gives the error for it. The same
+// messages on a session that does not enforce go as they came.
+func TestClosedPointsAreReplacedOnEnforcedSessions(t *testing.T) {
+	flush := func() error { return nil }
+	cases := []struct {
+		name   string
+		t      byte
+		body   []byte
+		reason string
+		check  func(t *testing.T, r []byte)
+	}{
+		{"DO Query", 'Q', body(queryMsg("do $$ begin end $$")), BlockDo, func(t *testing.T, r []byte) {
+			var m pgproto3.Query
+			if m.Decode(whole(t, r, 'Q')) != nil || m.String != refusedSQL {
+				t.Errorf("replaced by %q, want the syntax error", r)
+			}
+		}},
+		{"oversized Query", 'Q', nil, BlockTooLarge, nil},
+		{"unreadable Query", 'Q', []byte("select 1"), BlockUnparsed, nil},
+		{"DO Parse", 'P', body(parseMsg("s1", "do $$ begin end $$")), BlockDo, func(t *testing.T, r []byte) {
+			var m pgproto3.Parse
+			if m.Decode(whole(t, r, 'P')) != nil || m.Name != "s1" || m.Query != refusedSQL {
+				t.Errorf("replaced by %q, want the syntax error under s1", r)
+			}
+		}},
+		{"oversized Parse", 'P', nil, BlockTooLarge, func(t *testing.T, r []byte) {
+			var m pgproto3.Parse
+			if m.Decode(whole(t, r, 'P')) != nil || !freshNameRE.MatchString(m.Name) || m.Query != refusedSQL {
+				t.Errorf("replaced by %q, want the syntax error under a fresh name", r)
+			}
+		}},
+		{"unreadable Parse", 'P', []byte("s1\x00"), BlockUnparsed, nil},
+		{"oversized Bind", 'B', nil, BlockTooLarge, func(t *testing.T, r []byte) {
+			var m pgproto3.Bind
+			if m.Decode(whole(t, r, 'B')) != nil || !freshNameRE.MatchString(m.PreparedStatement) {
+				t.Errorf("replaced by %q, want a Bind of a fresh name", r)
+			}
+		}},
+		{"unreadable Bind", 'B', []byte("\x00s1"), BlockUnparsed, nil},
+		{"oversized Execute", 'E', nil, BlockTooLarge, func(t *testing.T, r []byte) {
+			var m pgproto3.Execute
+			if m.Decode(whole(t, r, 'E')) != nil || !freshNameRE.MatchString(m.Portal) {
+				t.Errorf("replaced by %q, want an Execute of a fresh portal", r)
+			}
+		}},
+		{"FunctionCall", 'F', body(&pgproto3.FunctionCall{Function: 2026}), BlockFunctionCall, func(t *testing.T, r []byte) {
+			var m pgproto3.FunctionCall
+			if m.Decode(whole(t, r, 'F')) != nil || m.Function != 0 {
+				t.Errorf("replaced by %q, want a call of OID 0", r)
+			}
+		}},
+		{"oversized FunctionCall", 'F', nil, BlockFunctionCall, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newBlockGate()
+			s := enforcedSession(g)
+			r, err := s.fromClient(tc.t, tc.body, flush)
+			if err != nil || r == nil {
+				t.Fatalf("forwarded (%v), want it replaced", err)
+			}
+			if r[0] != tc.t {
+				t.Errorf("replaced by a %c message, want a %c", r[0], tc.t)
+			}
+			if tc.check != nil {
+				tc.check(t, r)
+			}
+			if !slices.Equal(g.blocked, []string{tc.reason}) || g.n != 0 {
+				t.Errorf("Blocked for %q and Begin %d times, want Blocked for %s alone", g.blocked, g.n, tc.reason)
+			}
+			s.fromClient('S', nil, flush)
+			wantBlockedError(t, relayed(t, s, replacementError(t, r), ready)[0], tc.reason)
+
+			shadow := readySession(g)
+			g.blocked = nil
+			if r, _ := shadow.fromClient(tc.t, tc.body, flush); r != nil {
+				t.Errorf("shadow: replaced by %q, want it forwarded", r)
+			}
+			if len(g.blocked) != 0 {
+				t.Errorf("shadow: Blocked for %q, want never", g.blocked)
+			}
+		})
+	}
+}
+
+// A refused closed point did not run: it leaves the statement and portal
+// tables, on_behalf_of and the cursor table as they were, also when the
+// proxy could not read it.
+func TestBlockedMessageLeavesTheSessionAsItWas(t *testing.T) {
+	flush := func() error { return nil }
+	g := newBlockGate()
+	s := enforcedSession(g)
+	send(s, queryMsg("begin"))
+	serve(s, tag("BEGIN"), readyWith('T'))
+	send(s, parseMsg("s1", ins), bindMsg("p1", "s1"), syncMsg)
+	serve(s, parseOK, bindOK, readyWith('T'))
+
+	send(s, queryMsg("obo declare do $$ begin end $$"))
+	serve(s, syntaxError(), readyWith('E'))
+	send(s, parseMsg("s1", "obo declare do $$ begin end $$"), syncMsg)
+	serve(s, syntaxError(), readyWith('E'))
+	s.fromClient('P', nil, flush)
+	s.fromClient('B', nil, flush)
+	s.fromClient('S', nil, flush)
+	serve(s, syntaxError(), readyWith('E'))
+	if s.info.OnBehalfOf != "" || len(s.cursors) != 0 {
+		t.Errorf("on_behalf_of %q, cursors %v; want both unchanged", s.info.OnBehalfOf, s.cursors)
+	}
+	if want := []string{BlockDo, BlockDo, BlockTooLarge, BlockTooLarge}; !slices.Equal(g.blocked, want) {
+		t.Errorf("Blocked for %q, want %q", g.blocked, want)
+	}
+
+	s.mu.Lock()
+	u := s.openLocked()
+	p, ok, others := s.stmts.get(u, "s1")
+	b, bok, bothers := s.portals.get(u, "p1")
+	_, unnamed, _ := s.stmts.get(u, "")
+	blind := s.stmts.blind || s.portals.blind
+	s.mu.Unlock()
+	if !ok || p.st.SQL != ins || len(others) != 0 || unnamed || blind {
+		t.Errorf("s1 means %+v (%v, others %v), unnamed held %v, blind %v; want s1 the insert alone", p, ok, others, unnamed, blind)
+	}
+	if !bok || b.st.SQL != ins || len(bothers) != 0 {
+		t.Errorf("p1 means %+v (%v, others %v), want the insert bound before", b, bok, bothers)
+	}
+}
+
+// pump shows see an empty body as read (not nil): nil means past maxInspect.
+func TestPumpShowsAnEmptyBodyAsRead(t *testing.T) {
+	var bodies [][]byte
+	tp := &tap{
+		want: func(t byte) bool { return t == 'Q' },
+		see: func(_ byte, body []byte, _ func() error) ([]byte, error) {
+			bodies = append(bodies, body)
+			return nil, nil
+		},
+	}
+	empty := []byte{'Q', 0, 0, 0, 4}
+	if err := pump(io.Discard, bytes.NewReader(empty), tp); err != io.EOF {
+		t.Fatalf("pump: %v, want io.EOF at the end", err)
+	}
+	if len(bodies) != 1 || bodies[0] == nil || len(bodies[0]) != 0 {
+		t.Errorf("see was shown %q, want one empty body that is not nil", bodies)
+	}
+}

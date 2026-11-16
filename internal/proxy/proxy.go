@@ -186,7 +186,9 @@ func (s *Server) watch(pkt []byte) *session {
 		return nil
 	}
 	info.ID = newSessionID()
-	return newSession(s.gate, info)
+	ss := newSession(s.gate, info)
+	ss.enforce = s.policy.Enforce
+	return ss
 }
 
 // forwardCancel passes a CancelRequest to upstream on a fresh connection.
@@ -278,7 +280,9 @@ type tap struct {
 	each func(t byte)
 }
 
-const maxInspect = 64 << 20
+// maxInspect is the largest message body a tap is shown. A variable only so
+// tests can lower it (SetMaxInspect).
+var maxInspect int64 = 64 << 20
 
 // pump copies whole protocol messages from src to dst. Writes are batched
 // while src already has the next header buffered and flushed before any read
@@ -288,7 +292,8 @@ func pump(dst io.Writer, src io.Reader, tp *tap) error {
 	br := bufio.NewReaderSize(src, bufSize)
 	bw := bufio.NewWriterSize(dst, bufSize)
 	var hdr [5]byte // type byte + int32 length (which counts itself)
-	var body []byte
+	// Never nil, so an empty body that was read is not taken for one past maxInspect.
+	body := []byte{}
 	for {
 		if br.Buffered() < len(hdr) {
 			if err := bw.Flush(); err != nil {
