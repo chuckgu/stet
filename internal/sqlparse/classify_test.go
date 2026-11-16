@@ -523,6 +523,9 @@ func TestClassifyOnBehalfOf(t *testing.T) {
 		{"reset stet.on_behalf_of", str("")},
 		{"set stet.on_behalf_of to default", str("")},
 		{"reset all", str("")},
+		// DISCARD ALL runs RESET ALL among its steps; poolers send it.
+		{"discard all", str("")},
+		{"discard plans", nil},
 		{"set application_name = 'x'", nil},
 		{"select 1", nil},
 	}

@@ -216,7 +216,11 @@ func Fingerprint(sql string) string {
 }
 
 // onBehalfOf reads SET / RESET of stet.on_behalf_of. "" means reset.
+// DISCARD ALL resets it too: it runs RESET ALL among its steps.
 func onBehalfOf(n *pg.Node) (string, bool) {
+	if d := n.GetDiscardStmt(); d != nil {
+		return "", d.Target == pg.DiscardMode_DISCARD_ALL
+	}
 	s := n.GetVariableSetStmt()
 	if s == nil {
 		return "", false
