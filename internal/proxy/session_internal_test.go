@@ -20,7 +20,8 @@ func (g *fakeGate) Begin(SessionInfo, Statement, []Param) any {
 	g.n++
 	return g.n - 1
 }
-func (g *fakeGate) End(h any, o Outcome) { g.ends[h.(int)] = o }
+func (g *fakeGate) End(h any, o Outcome)                    { g.ends[h.(int)] = o }
+func (g *fakeGate) Observe(SessionInfo, Statement, Outcome) {}
 
 // body is a message's payload, as the taps hand it to the session.
 func body(m pgproto3.Message) []byte {
@@ -95,5 +96,158 @@ func TestAbandonLosesUnansweredWrites(t *testing.T) {
 	s.abandon()
 	if o := g.ends[0]; !o.Lost || o.Executed {
 		t.Errorf("completed but unconfirmed write: %+v, want lost", o)
+	}
+}
+
+// readGate watches inserts and observes every other statement, recording
+// each read it is told about.
+type readGate struct {
+	*fakeGate
+	both  bool // mark the observed statements watched as well
+	reads []Outcome
+}
+
+func newReadGate() *readGate { return &readGate{fakeGate: newFakeGate()} }
+
+func (g *readGate) Inspect(sql string) Statement {
+	if strings.HasPrefix(sql, "insert") {
+		return Statement{SQL: sql, Watch: true}
+	}
+	return Statement{SQL: sql, Observe: true, Watch: g.both}
+}
+
+func (g *readGate) Observe(_ SessionInfo, _ Statement, o Outcome) { g.reads = append(g.reads, o) }
+
+// serve hands the session server messages the way pump does: every type to
+// each, and the body of the wanted ones to see.
+func serve(s *session, msgs ...pgproto3.BackendMessage) {
+	tp := s.serverTap()
+	for _, m := range msgs {
+		b, _ := m.Encode(nil)
+		if tp.each != nil {
+			tp.each(b[0])
+		}
+		if tp.want(b[0]) {
+			tp.see(b[0], b[5:], nil)
+		}
+	}
+}
+
+func execute(s *session, name, sql string) {
+	flush := func() error { return nil }
+	s.fromClient('P', body(&pgproto3.Parse{Name: name, Query: sql}), flush)
+	s.fromClient('B', body(&pgproto3.Bind{PreparedStatement: name}), flush)
+	s.fromClient('E', body(&pgproto3.Execute{}), flush)
+}
+
+var (
+	row   = &pgproto3.DataRow{Values: [][]byte{[]byte("1")}}
+	ready = &pgproto3.ReadyForQuery{TxStatus: 'I'}
+)
+
+func tag(s string) *pgproto3.CommandComplete { return &pgproto3.CommandComplete{CommandTag: []byte(s)} }
+
+func TestRowsCountTowardTheirOwnExecute(t *testing.T) {
+	g := newReadGate()
+	s := readySession(g)
+	execute(s, "a", "select a")
+	execute(s, "w", "insert into t values (1) returning *")
+	execute(s, "b", "select b")
+	s.fromClient('S', nil, func() error { return nil })
+	serve(s,
+		&pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, row, row, tag("SELECT 2"),
+		&pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, row, tag("INSERT 0 1"),
+		&pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, row, row, row,
+		&pgproto3.ErrorResponse{Code: "22012", Message: "division by zero"},
+		ready)
+
+	if len(g.reads) != 2 {
+		t.Fatalf("%d reads observed, want 2", len(g.reads))
+	}
+	if o := g.reads[0]; o.Sent != 2 || !o.Executed || o.Rows == nil || *o.Rows != 2 {
+		t.Errorf("first read: %+v, want 2 rows sent and executed", o)
+	}
+	if o := g.reads[1]; o.Sent != 3 || o.Executed || !strings.Contains(o.Error, "22012") {
+		t.Errorf("failing read: %+v, want its own 3 rows and the 22012 error", o)
+	}
+	if o := g.ends[0]; !o.Executed {
+		t.Errorf("write between the reads: %+v, want executed", o)
+	}
+}
+
+func TestRowsOfAUnitWithoutReadsAreDropped(t *testing.T) {
+	g := newReadGate()
+	s := readySession(g)
+	flush := func() error { return nil }
+	s.fromClient('Q', body(&pgproto3.Query{String: "insert into t values (1) returning *"}), flush)
+	serve(s, &pgproto3.RowDescription{}, row, row, tag("INSERT 0 2"), ready)
+	s.fromClient('Q', body(&pgproto3.Query{String: "select 1 where false"}), flush)
+	serve(s, &pgproto3.RowDescription{}, tag("SELECT 0"), ready)
+
+	if len(g.reads) != 1 || g.reads[0].Sent != 0 {
+		t.Errorf("reads = %+v, want one with no rows sent", g.reads)
+	}
+}
+
+func TestAbandonReportsRowsInFlight(t *testing.T) {
+	g := newReadGate()
+	s := readySession(g)
+	flush := func() error { return nil }
+	s.fromClient('Q', body(&pgproto3.Query{String: "select * from t"}), flush)
+	serve(s, &pgproto3.RowDescription{}, row, row, row)
+	s.abandon()
+	if len(g.reads) != 1 {
+		t.Fatalf("%d reads observed, want 1", len(g.reads))
+	}
+	if o := g.reads[0]; !o.Lost || o.Executed || o.Sent != 3 || o.Error != "connection closed before ReadyForQuery" {
+		t.Errorf("read cut off: %+v, want lost with 3 rows sent", o)
+	}
+
+	// Two Executes under one Sync: the first completed, the second was
+	// still sending.
+	g = newReadGate()
+	s = readySession(g)
+	execute(s, "a", "select a")
+	execute(s, "b", "select b")
+	s.fromClient('S', nil, flush)
+	serve(s, &pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, row, row, tag("SELECT 2"),
+		&pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, row)
+	s.abandon()
+	if len(g.reads) != 2 {
+		t.Fatalf("%d reads observed, want 2", len(g.reads))
+	}
+	for i, want := range []int64{2, 1} {
+		if o := g.reads[i]; !o.Lost || o.Executed || o.Sent != want {
+			t.Errorf("read %d: %+v, want lost with %d rows sent", i, o, want)
+		}
+	}
+}
+
+func TestWatchWinsOverObserve(t *testing.T) {
+	g := newReadGate()
+	g.both = true
+	s := readySession(g)
+	s.fromClient('Q', body(&pgproto3.Query{String: "select 1"}), func() error { return nil })
+	serve(s, &pgproto3.RowDescription{}, row, tag("SELECT 1"), ready)
+	if g.n != 1 || len(g.reads) != 0 {
+		t.Errorf("Begin ran %d times and Observe %d, want a watched write only", g.n, len(g.reads))
+	}
+	if o := g.ends[0]; !o.Executed {
+		t.Errorf("write: %+v, want executed", o)
+	}
+}
+
+func TestObservedPortalKeepsNoBindValues(t *testing.T) {
+	g := newReadGate()
+	s := readySession(g)
+	flush := func() error { return nil }
+	s.fromClient('P', body(&pgproto3.Parse{Name: "r", Query: "select * from t where v = $1"}), flush)
+	s.fromClient('B', body(&pgproto3.Bind{PreparedStatement: "r", DestinationPortal: "p", Parameters: [][]byte{[]byte("secret")}}), flush)
+	b, ok := s.portals["p"]
+	if !ok || !b.st.Observe {
+		t.Fatalf("portal = %+v (found %v), want the observed read remembered", b, ok)
+	}
+	if b.params != nil {
+		t.Errorf("portal kept bind values %+v, want none", b.params)
 	}
 }

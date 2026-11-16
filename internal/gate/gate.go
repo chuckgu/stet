@@ -230,6 +230,9 @@ func (g *Gate) End(h any, o proxy.Outcome) {
 	}()
 }
 
+// Observe is told about reads the proxy observed. Inspect marks none yet.
+func (g *Gate) Observe(proxy.SessionInfo, proxy.Statement, proxy.Outcome) {}
+
 // judge decides what enforce mode would have done and records it.
 func (g *Gate) judge(p *pending, o proxy.Outcome) {
 	t := g.cfg.Tables[p.res.Table]

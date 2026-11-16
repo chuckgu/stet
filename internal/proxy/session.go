@@ -12,9 +12,9 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
-// Gate is told about the writes Stet watches. Implementations must be safe
-// for concurrent use: Begin runs on a session's client side, End on its
-// server side.
+// Gate is told about the writes Stet watches and the reads it observes.
+// Implementations must be safe for concurrent use: Begin runs on a session's
+// client side, End and Observe on its server side or after the session ended.
 type Gate interface {
 	// Inspect classifies the SQL of a Query or Parse message.
 	Inspect(sql string) Statement
@@ -23,13 +23,21 @@ type Gate interface {
 	Begin(s SessionInfo, st Statement, params []Param) any
 	// End reports how upstream answered. It must not block.
 	End(handle any, o Outcome)
+	// Observe reports a read after its response ended, or when the connection
+	// ended first. It is never called before the statement goes upstream, and it
+	// must not block.
+	Observe(s SessionInfo, st Statement, o Outcome)
 }
 
 type Statement struct {
-	SQL        string
-	Watch      bool
+	SQL   string
+	Watch bool
+	// Observe marks a read: it is forwarded at once, its bind values are not
+	// kept, and Observe is called when its response ends. A statement with
+	// Watch set is a watched write even when Observe is set too.
+	Observe    bool
 	OnBehalfOf *string // set when the statement sets stet.on_behalf_of; "" resets it
-	Data       any     // the gate's own classification, handed back in Begin
+	Data       any     // the gate's own classification, handed back in Begin and Observe
 }
 
 type Param struct {
@@ -65,11 +73,14 @@ type Outcome struct {
 	// statement may have run and committed; Executed is false because nothing
 	// said so.
 	Lost bool
+	// Sent is how many row messages (DataRow, CopyData) went to the client in
+	// answer to the statement, also when it failed or was cancelled.
+	Sent int64
 }
 
 // session follows one client connection closely enough to tell the gate
-// which watched statement ran, whether it failed, and whether a transaction
-// was open.
+// which watched statement ran, whether it failed, whether a transaction was
+// open, and how many rows each observed read sent.
 type session struct {
 	gate Gate
 	info SessionInfo
@@ -77,6 +88,10 @@ type session struct {
 	// Touched only on the client side.
 	stmts   map[string]prepared
 	portals map[string]bound
+
+	// Touched only on the server side, and by abandon once both sides have
+	// stopped: row messages sent since the last completion or error.
+	sent int64
 
 	mu     sync.Mutex
 	units  []*unit // sent, not yet answered by ReadyForQuery; oldest first
@@ -104,12 +119,20 @@ type unit struct {
 	err         string
 	errAt       int // the Execute the error belongs to (1-based)
 	writes      []watchedWrite
-	rows        map[int]int64 // row counts by completion (1-based); kept only once a watched write joined
+	reads       []observedRead
+	rows        map[int]int64 // row counts by completion (1-based); kept only once a watched write or observed read joined
+	sent        map[int]int64 // row messages sent by Execute (1-based), or 0 for a Query; kept only once an observed read joined
 }
 
 type watchedWrite struct {
 	handle any
 	idx    int // which Execute in the unit; 0 for a Query
+}
+
+type observedRead struct {
+	info SessionInfo // as it was when the statement arrived
+	st   Statement
+	idx  int // which Execute in the unit; 0 for a Query
 }
 
 func newSession(g Gate, info SessionInfo) *session {
@@ -162,6 +185,11 @@ func (s *session) serverTap() *tap {
 			return false
 		},
 		see: func(t byte, body []byte, _ func() error) { s.fromServer(t, body) },
+		each: func(t byte) {
+			if t == 'D' || t == 'd' { // DataRow, CopyData
+				s.sent++
+			}
+		},
 	}
 }
 
@@ -175,8 +203,11 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 		}
 		st := s.gate.Inspect(m.String)
 		s.apply(st)
-		if st.Watch {
+		switch {
+		case st.Watch:
 			s.begin(u, 0, st, nil, flush)
+		case st.Observe:
+			s.observe(u, 0, st)
 		}
 
 	case 'P':
@@ -194,11 +225,15 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 			return
 		}
 		p, ok := s.stmts[m.PreparedStatement]
-		if !ok || (!p.st.Watch && p.st.OnBehalfOf == nil) {
+		if !ok || (!p.st.Watch && !p.st.Observe && p.st.OnBehalfOf == nil) {
 			delete(s.portals, m.DestinationPortal)
 			return
 		}
-		s.portals[m.DestinationPortal] = bound{st: p.st, params: params(&m, p.oids)}
+		b := bound{st: p.st}
+		if p.st.Watch { // only Begin is handed bind values
+			b.params = params(&m, p.oids)
+		}
+		s.portals[m.DestinationPortal] = b
 
 	case 'E':
 		u := s.open()
@@ -215,8 +250,11 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 			return
 		}
 		s.apply(b.st)
-		if b.st.Watch {
+		switch {
+		case b.st.Watch:
 			s.begin(u, idx, b.st, b.params, flush)
+		case b.st.Observe:
+			s.observe(u, idx, b.st)
 		}
 
 	case 'C':
@@ -268,6 +306,15 @@ func (s *session) begin(u *unit, idx int, st Statement, ps []Param, flush func()
 	s.mu.Unlock()
 }
 
+// observe notes a read in its unit. Nothing waits for the gate and nothing
+// queued is flushed first: the gate hears of the read once it was answered.
+func (s *session) observe(u *unit, idx int, st Statement) {
+	r := observedRead{info: s.info, st: st, idx: idx}
+	s.mu.Lock()
+	u.reads = append(u.reads, r)
+	s.mu.Unlock()
+}
+
 func (s *session) push(u *unit) *unit {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -296,11 +343,12 @@ func (s *session) fromServer(t byte, body []byte) {
 	}
 	switch t {
 	case 'C', 'I', 's':
+		s.settle(head)
 		if head != nil {
 			head.completions++
-			// A watched write's CommandComplete always follows its Begin, so
-			// units without watched writes never need their tags read.
-			if t == 'C' && len(head.writes) > 0 {
+			// Watched writes and observed reads join their unit before they
+			// go upstream, so units with neither never need their tags read.
+			if t == 'C' && (len(head.writes) > 0 || len(head.reads) > 0) {
 				if n, ok := tagRows(body); ok {
 					if head.rows == nil {
 						head.rows = map[int]int64{}
@@ -310,11 +358,13 @@ func (s *session) fromServer(t byte, body []byte) {
 			}
 		}
 	case 'E':
+		s.settle(head)
 		if head != nil && head.err == "" {
 			head.err = errorText(body)
 			head.errAt = head.completions + 1
 		}
 	case 'Z':
+		s.settle(head) // normally nothing is left; never carry rows into the next unit
 		status := byte('I')
 		if len(body) > 0 {
 			status = body[0]
@@ -338,45 +388,80 @@ func (s *session) fromServer(t byte, body []byte) {
 	s.mu.Unlock()
 }
 
-// finish reports the writes of an answered unit. before and after are the
-// transaction status around it.
-// refusal reports the server's error for w when the server already said the
-// write failed or was skipped because an earlier statement in the same Sync
-// failed. It reports nothing when the server has not spoken for w.
-func (u *unit) refusal(w watchedWrite) (string, bool) {
-	switch {
-	case u.err == "":
-		return "", false
-	case u.query, w.idx == u.errAt:
-		return u.err, true
-	case w.idx > u.errAt:
-		return "not executed: an earlier statement in the same Sync failed: " + u.err, true
+// settle moves the row messages sent since the last completion or error to
+// head, under the statement that was answering: the Execute after its last
+// completion, or the Query as a whole. A unit without observed reads drops
+// them. It runs on the server side with s.mu held, or from abandon.
+func (s *session) settle(head *unit) {
+	n := s.sent
+	if n == 0 {
+		return
 	}
-	return "", false
+	s.sent = 0
+	if head == nil || len(head.reads) == 0 {
+		return
+	}
+	k := head.completions + 1
+	if head.query {
+		k = 0
+	}
+	if head.sent == nil {
+		head.sent = map[int]int64{}
+	}
+	head.sent[k] += n
 }
 
+// finish reports the statements of an answered unit. before and after are
+// the transaction status around it.
 func (s *session) finish(u *unit, before, after byte) {
 	inTx := before != 'I' || after != 'I' || u.executes > 1
 	for _, w := range u.writes {
-		o := Outcome{InTransaction: inTx}
-		if text, ok := u.refusal(w); ok {
-			o.Error = text
-		} else {
-			switch {
-			case u.query:
-				o.Executed = true
-				if u.completions == 1 { // several statements: no single count
-					o.Rows = u.rowsAt(1)
-				}
-			case u.completions >= w.idx:
-				o.Executed = true
-				o.Rows = u.rowsAt(w.idx)
-			default:
-				o.Error = "no completion before ReadyForQuery"
-			}
-		}
-		s.gate.End(w.handle, o)
+		s.gate.End(w.handle, u.answered(w.idx, inTx))
 	}
+	for _, r := range u.reads {
+		o := u.answered(r.idx, inTx)
+		o.Sent = u.sent[r.idx]
+		s.gate.Observe(r.info, r.st, o)
+	}
+}
+
+// answered is what the server said, before its ReadyForQuery, about the
+// statement at Execute idx of u (0 for a Query).
+func (u *unit) answered(idx int, inTx bool) Outcome {
+	o := Outcome{InTransaction: inTx}
+	if text, ok := u.refusal(idx); ok {
+		o.Error = text
+		return o
+	}
+	switch {
+	case u.query:
+		o.Executed = true
+		if u.completions == 1 { // several statements: no single count
+			o.Rows = u.rowsAt(1)
+		}
+	case u.completions >= idx:
+		o.Executed = true
+		o.Rows = u.rowsAt(idx)
+	default:
+		o.Error = "no completion before ReadyForQuery"
+	}
+	return o
+}
+
+// refusal reports the server's error for the statement at Execute idx (0 for
+// a Query) when the server already said it failed or was skipped because an
+// earlier statement in the same Sync failed. It reports nothing when the
+// server has not spoken for it.
+func (u *unit) refusal(idx int) (string, bool) {
+	switch {
+	case u.err == "":
+		return "", false
+	case u.query, idx == u.errAt:
+		return u.err, true
+	case idx > u.errAt:
+		return "not executed: an earlier statement in the same Sync failed: " + u.err, true
+	}
+	return "", false
 }
 
 // rowsAt returns the row count of the unit's k-th completion, or nil when its
@@ -402,25 +487,41 @@ func tagRows(body []byte) (int64, bool) {
 	return n, true
 }
 
-// abandon reports writes still waiting when the connection ended.
+// abandon reports the statements still waiting when the connection ended.
+// It runs once both sides have stopped.
 func (s *session) abandon() {
 	s.mu.Lock()
 	units := s.units
 	s.units = nil
 	status := s.status
 	s.mu.Unlock()
+	if len(units) > 0 {
+		s.settle(units[0]) // rows of the statement that was still answering
+	}
 	for _, u := range units {
+		inTx := status != 'I' || u.executes > 1
 		for _, w := range u.writes {
-			o := Outcome{InTransaction: status != 'I' || u.executes > 1}
-			if text, ok := u.refusal(w); ok {
-				o.Error = text // the server answered before the connection ended
-			} else {
-				o.Error = "connection closed before ReadyForQuery"
-				o.Lost = true
-			}
-			s.gate.End(w.handle, o)
+			s.gate.End(w.handle, u.unanswered(w.idx, inTx))
+		}
+		for _, r := range u.reads {
+			o := u.unanswered(r.idx, inTx)
+			o.Sent = u.sent[r.idx]
+			s.gate.Observe(r.info, r.st, o)
 		}
 	}
+}
+
+// unanswered is what is known of the statement at Execute idx of u (0 for a
+// Query) when the connection ended before u's ReadyForQuery.
+func (u *unit) unanswered(idx int, inTx bool) Outcome {
+	o := Outcome{InTransaction: inTx}
+	if text, ok := u.refusal(idx); ok {
+		o.Error = text // the server answered before the connection ended
+	} else {
+		o.Error = "connection closed before ReadyForQuery"
+		o.Lost = true
+	}
+	return o
 }
 
 func params(m *pgproto3.Bind, oids []uint32) []Param {

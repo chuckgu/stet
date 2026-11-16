@@ -1,8 +1,10 @@
 package proxy_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"net/url"
 	"regexp"
 	"strings"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgproto3"
 
 	"github.com/stetdb/stet/internal/proxy"
 )
@@ -24,10 +27,19 @@ func isWrite(sql string) bool { return writeRE.MatchString(sql) }
 type recordingGate struct {
 	match   func(sql string) bool
 	onBegin func(st proxy.Statement) // runs inside Begin, before the write is forwarded
+	// observeMatch chooses the statements observed as reads; nil observes none.
+	observeMatch func(sql string) bool
 
 	mu     sync.Mutex
 	begins []began
 	ends   map[int]proxy.Outcome
+	reads  []observation
+}
+
+type observation struct {
+	info proxy.SessionInfo
+	st   proxy.Statement
+	o    proxy.Outcome
 }
 
 type began struct {
@@ -43,7 +55,7 @@ func newRecordingGate(match func(string) bool) *recordingGate {
 var oboRE = regexp.MustCompile(`(?i)^\s*(?:set\s+stet\.on_behalf_of\s*=\s*'([^']*)'|reset\s+stet\.on_behalf_of)`)
 
 func (g *recordingGate) Inspect(sql string) proxy.Statement {
-	st := proxy.Statement{SQL: sql, Watch: g.match(sql)}
+	st := proxy.Statement{SQL: sql, Watch: g.match(sql), Observe: g.observeMatch != nil && g.observeMatch(sql)}
 	if m := oboRE.FindStringSubmatch(sql); m != nil {
 		st.OnBehalfOf = &m[1]
 	}
@@ -64,6 +76,39 @@ func (g *recordingGate) End(h any, o proxy.Outcome) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.ends[h.(int)] = o
+}
+
+func (g *recordingGate) Observe(info proxy.SessionInfo, st proxy.Statement, o proxy.Outcome) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.reads = append(g.reads, observation{info, st, o})
+}
+
+// observed waits until n reads have been reported and returns every read
+// reported so far, in order.
+func (g *recordingGate) observed(t *testing.T, n int) []observation {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		g.mu.Lock()
+		if len(g.reads) >= n {
+			obs := append([]observation(nil), g.reads...)
+			g.mu.Unlock()
+			return obs
+		}
+		got := len(g.reads)
+		g.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatalf("%d reads observed, want %d", got, n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (g *recordingGate) beginCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.begins)
 }
 
 // outcomes waits until n writes have ended and returns them in Begin order.
@@ -357,4 +402,322 @@ func deref[T any](p *T) any {
 		return "nil"
 	}
 	return *p
+}
+
+// readTable creates a watched table holding ids 1 to 1000.
+func readTable(t *testing.T) string {
+	t.Helper()
+	table := watchedTable(t)
+	admin := connect(t, upstream(t), "stet_scram", nil)
+	mustExec(t, admin, "insert into "+table+" select g, 'v' || g from generate_series(1, 1000) g")
+	return table
+}
+
+// readsOf chooses the statements that mention table without writing it.
+func readsOf(table string) func(string) bool {
+	return func(sql string) bool { return !isWrite(sql) && strings.Contains(sql, table) }
+}
+
+// newObservingGate watches every write and observes the reads observe picks.
+func newObservingGate(observe func(string) bool) *recordingGate {
+	g := newRecordingGate(isWrite)
+	g.observeMatch = observe
+	return g
+}
+
+// slowRead sends a row every millisecond or more for well over a minute, so
+// it is still sending when a test cancels it or drops the connection. The
+// padding fills the server's output buffer, which it flushes when full, in a
+// few dozen rows.
+const slowRead = "select i, repeat('x', 200), pg_sleep(0.001) from generate_series(1, 100000) i"
+
+func countRows(t *testing.T, rows pgx.Rows) int {
+	t.Helper()
+	n := 0
+	for rows.Next() {
+		n++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// The protocol scenarios once more with every statement that is not a write
+// observed as a read, so counting rows is proven not to change traffic.
+func TestObservedPassthrough(t *testing.T) {
+	for _, sc := range scenarios {
+		t.Run(sc.name, func(t *testing.T) {
+			g := newObservingGate(func(sql string) bool { return !isWrite(sql) })
+			addr, srv := startProxy(t, upstream(t), g)
+			sc.run(t, addr, srv)
+		})
+	}
+}
+
+func TestGateObservesReads(t *testing.T) {
+	table := readTable(t)
+	g := newObservingGate(readsOf(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", url.Values{"application_name": {"agent-r"}})
+	ctx := testCtx(t)
+
+	if _, err := conn.PgConn().Exec(ctx, "select * from "+table).ReadAll(); err != nil { // simple protocol
+		t.Fatal(err)
+	}
+	rows, err := conn.Query(ctx, "select * from "+table+" where id <= $1", 250) // extended protocol
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := countRows(t, rows); n != 250 {
+		t.Fatalf("client got %d rows, want 250", n)
+	}
+	var out bytes.Buffer
+	if _, err := conn.PgConn().CopyTo(ctx, &out, "copy "+table+" to stdout"); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, "select * from "+table+" where id < 0")
+
+	obs := g.observed(t, 4)
+	if len(obs) != 4 {
+		t.Fatalf("%d reads observed, want 4", len(obs))
+	}
+	for i, want := range []int64{1000, 250, 1000, 0} {
+		if o := obs[i].o; o.Sent != want || !o.Executed || o.Lost || o.Error != "" {
+			t.Errorf("read %d (%s): %+v, want %d rows sent and executed", i, obs[i].st.SQL, o, want)
+		}
+	}
+	if sql := obs[1].st.SQL; sql != "select * from "+table+" where id <= $1" {
+		t.Errorf("extended read statement = %q", sql)
+	}
+	for i, ob := range obs {
+		if info := ob.info; info.ID == "" || info.User != "stet_scram" || info.ApplicationName != "agent-r" {
+			t.Errorf("read %d: session info = %+v", i, info)
+		}
+	}
+	if n := g.beginCount(); n != 0 {
+		t.Errorf("Begin ran %d times for reads, want never", n)
+	}
+}
+
+func TestGateObservesRowsOfAFailedRead(t *testing.T) {
+	table := readTable(t)
+	g := newObservingGate(readsOf(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+	ctx := testCtx(t)
+
+	// The 500th row divides by zero, after the rows before it have gone out.
+	sql := "select id, 1 / (500 - id) from " + table + " order by id"
+	rows, err := conn.Query(ctx, sql) // extended protocol
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+	}
+	if code := pgCode(rows.Err()); code != "22012" {
+		t.Fatalf("extended read: %v, want 22012", rows.Err())
+	}
+	if _, err := conn.PgConn().Exec(ctx, sql).ReadAll(); pgCode(err) != "22012" { // simple protocol
+		t.Fatalf("simple read: %v, want 22012", err)
+	}
+
+	for i, ob := range g.observed(t, 2) {
+		if o := ob.o; o.Executed || !strings.Contains(o.Error, "22012") || o.Sent <= 0 || o.Sent >= 500 {
+			t.Errorf("read %d: %+v, want a 22012 error after more than 0 and fewer than 500 rows", i, o)
+		}
+	}
+}
+
+func TestGateObservesRowsOfACancelledRead(t *testing.T) {
+	g := newObservingGate(func(sql string) bool { return sql == slowRead })
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	ctx, cancel := context.WithCancel(testCtx(t))
+	defer cancel()
+	rows, err := conn.Query(ctx, slowRead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rows.Next() {
+		t.Fatalf("no row arrived: %v", rows.Err())
+	}
+	cancel()
+	for rows.Next() {
+	}
+	rows.Close()
+
+	// pgx may end the read with the server's 57014 or by dropping the
+	// connection; either way rows went out and the read did not complete.
+	if o := g.observed(t, 1)[0].o; o.Sent <= 0 || o.Executed {
+		t.Errorf("cancelled read: %+v, want rows sent and not executed", o)
+	}
+
+	// A CancelRequest, as psql sends on ^C: the server answers with 57014.
+	conn2 := connect(t, addr, "stet_scram", nil)
+	rows, err = conn2.Query(testCtx(t), slowRead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rows.Next() {
+		t.Fatalf("no row arrived: %v", rows.Err())
+	}
+	if err := conn2.PgConn().CancelRequest(testCtx(t)); err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+	}
+	if code := pgCode(rows.Err()); code != "57014" {
+		t.Fatalf("read after CancelRequest: %v, want 57014", rows.Err())
+	}
+	if o := g.observed(t, 2)[1].o; o.Sent <= 0 || o.Executed || o.Lost || !strings.Contains(o.Error, "57014") {
+		t.Errorf("read cancelled by the server: %+v, want rows sent and the 57014 error", o)
+	}
+}
+
+func TestGateObservesPortalFetchedInParts(t *testing.T) {
+	table := readTable(t)
+	admin := connect(t, upstream(t), "stet_scram", nil)
+	mustExec(t, admin, "grant select on "+table+" to stet_trust") // dropped with the table
+	g := newObservingGate(readsOf(table))
+	addr, _ := startProxy(t, upstream(t), g)
+
+	fe := rawSession(t, addr, "stet_trust")
+	fe.Send(&pgproto3.Parse{Query: "select * from " + table + " order by id"})
+	fe.Send(&pgproto3.Bind{})
+	for range 3 {
+		fe.Send(&pgproto3.Execute{MaxRows: 100})
+	}
+	fe.Send(&pgproto3.Sync{})
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if rows, suspended := untilReady(t, fe); rows != 300 || suspended != 3 {
+		t.Fatalf("client got %d rows and %d PortalSuspended, want 300 and 3", rows, suspended)
+	}
+
+	obs := g.observed(t, 3)
+	if len(obs) != 3 {
+		t.Fatalf("%d reads observed, want one per Execute", len(obs))
+	}
+	for i, ob := range obs {
+		if o := ob.o; o.Sent != 100 || !o.Executed {
+			t.Errorf("Execute %d: %+v, want 100 rows sent and executed", i+1, o)
+		}
+	}
+}
+
+func TestGateObservesReadsInAMultiStatementQuery(t *testing.T) {
+	table := readTable(t)
+	g := newObservingGate(readsOf(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	if _, err := conn.PgConn().Exec(testCtx(t), "select 1; select * from "+table).ReadAll(); err != nil {
+		t.Fatal(err)
+	}
+	obs := g.observed(t, 1)
+	if len(obs) != 1 {
+		t.Fatalf("%d reads observed, want 1 for the Query", len(obs))
+	}
+	if o := obs[0].o; o.Sent != 1001 || !o.Executed {
+		t.Errorf("multi-statement read: %+v, want 1001 rows sent and executed", o)
+	}
+}
+
+func TestGateObservesALostRead(t *testing.T) {
+	g := newObservingGate(func(sql string) bool { return sql == slowRead })
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	rows, err := conn.Query(testCtx(t), slowRead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatalf("no row arrived: %v", rows.Err())
+	}
+	// The server is still sending, so no ReadyForQuery can reach the proxy
+	// before it sees the close.
+	conn.PgConn().Conn().Close()
+
+	if o := g.observed(t, 1)[0].o; !o.Lost || o.Executed || o.Sent <= 0 {
+		t.Errorf("read cut off by the client: %+v, want lost with rows sent", o)
+	}
+}
+
+func TestObservedReadsKeepNoBindValues(t *testing.T) {
+	table := readTable(t)
+	g := newObservingGate(readsOf(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	sql := "select * from " + table + " where v = $1"
+	rows, err := conn.Query(testCtx(t), sql, "v7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := countRows(t, rows); n != 1 {
+		t.Fatalf("client got %d rows, want 1", n)
+	}
+
+	obs := g.observed(t, 1)
+	if st := obs[0].st; st.SQL != sql || !st.Observe || st.Watch {
+		t.Errorf("observed statement = %+v, want the observed read %q", st, sql)
+	}
+	if o := obs[0].o; o.Sent != 1 || !o.Executed {
+		t.Errorf("read: %+v, want 1 row sent and executed", o)
+	}
+	// Bind values reach a gate only through Begin.
+	if n := g.beginCount(); n != 0 {
+		t.Errorf("Begin ran %d times for a read, want never", n)
+	}
+}
+
+// rawSession opens a session through the proxy as a role that needs no
+// password and returns a frontend past startup, for messages pgx has no API
+// for.
+func rawSession(t *testing.T, addr, user string) *pgproto3.Frontend {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	fe := pgproto3.NewFrontend(conn, conn)
+	fe.Send(&pgproto3.StartupMessage{
+		ProtocolVersion: pgproto3.ProtocolVersionNumber,
+		Parameters:      map[string]string{"user": user, "database": "stet_test"},
+	})
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	untilReady(t, fe)
+	return fe
+}
+
+// untilReady reads messages up to ReadyForQuery, failing on an error, and
+// counts the DataRow and PortalSuspended messages on the way.
+func untilReady(t *testing.T, fe *pgproto3.Frontend) (rows, suspended int) {
+	t.Helper()
+	for {
+		msg, err := fe.Receive()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch m := msg.(type) {
+		case *pgproto3.DataRow:
+			rows++
+		case *pgproto3.PortalSuspended:
+			suspended++
+		case *pgproto3.ErrorResponse:
+			t.Fatalf("SQLSTATE %s: %s", m.Code, m.Message)
+		case *pgproto3.ReadyForQuery:
+			return rows, suspended
+		}
+	}
 }

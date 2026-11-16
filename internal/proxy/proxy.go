@@ -249,9 +249,12 @@ func relay(client, server net.Conn, fromClient, fromServer *tap) {
 // tap observes messages in one direction. For message types it wants, see
 // gets the whole body before the message is forwarded (nil past
 // maxInspect), plus a way to flush what is already queued for the peer.
+// each, when set, gets the type of every message as soon as its header is
+// read; it runs once per result row, so it must stay trivial.
 type tap struct {
 	want func(t byte) bool
 	see  func(t byte, body []byte, flush func() error)
+	each func(t byte)
 }
 
 const maxInspect = 64 << 20
@@ -280,6 +283,9 @@ func pump(dst io.Writer, src io.Reader, tp *tap) error {
 		}
 		size := int64(n - 4)
 
+		if tp != nil && tp.each != nil {
+			tp.each(hdr[0])
+		}
 		if tp != nil && tp.want(hdr[0]) {
 			if size > maxInspect {
 				tp.see(hdr[0], nil, bw.Flush)
