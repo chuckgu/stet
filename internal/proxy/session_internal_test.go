@@ -229,6 +229,138 @@ func TestTxDirtyFollowsWhatWasSent(t *testing.T) {
 	}
 }
 
+// A Query or FunctionCall sent before the Sync of the extended-protocol
+// messages ahead of it closes those messages into a unit the server answers
+// with no ReadyForQuery of its own when they all succeed. The unit ends once
+// they all completed: its table changes hold, and its transaction marks pass
+// to the session as at a ReadyForQuery that leaves a transaction open
+// (ruling P6), since the Query runs in the same implicit transaction.
+func TestUnsyncedUnitIsAnsweredWithoutReadyForQuery(t *testing.T) {
+	flush := &pgproto3.Flush{}
+
+	t.Run("Parse and Describe, then begin", func(t *testing.T) {
+		g := &txGate{fakeGate: newFakeGate()}
+		s := readySession(g)
+		send(s, parseMsg("s1", ins), describeMsg('S', "s1"), flush, queryMsg("begin"))
+		serve(s, parseOK, &pgproto3.ParameterDescription{}, &pgproto3.NoData{}, tag("BEGIN"), readyWith('T'))
+		if p, ok, others := s.stmts.get(nil, "s1"); !ok || p.st.SQL != ins || len(others) != 0 || s.stmts.waiting() != 0 {
+			t.Errorf("s1: %q (found %v), others %v, %d changes waiting; want the confirmed insert alone", p.st.SQL, ok, others, s.stmts.waiting())
+		}
+		if len(s.units) != 0 {
+			t.Errorf("%d units still waiting, want none", len(s.units))
+		}
+		send(s, bindMsg("", "s1"), execMsg(""), syncMsg)
+		if len(g.infos) != 1 || g.infos[0].TxDirty {
+			t.Errorf("writes begun with %+v, want one with TxDirty false", g.infos)
+		}
+	})
+
+	t.Run("an Execute ran, then a write", func(t *testing.T) {
+		g := &txGate{fakeGate: newFakeGate()}
+		s := readySession(g)
+		send(s, parseMsg("", "select 1"), bindMsg("", ""), execMsg(""), flush)
+		serve(s, parseOK, bindOK, row, tag("SELECT 1"))
+		send(s, queryMsg(ins))
+		if len(g.infos) != 1 || !g.infos[0].TxDirty {
+			t.Errorf("writes begun with %+v, want one with TxDirty true", g.infos)
+		}
+		serve(s, tag("INSERT 0 1"), ready)
+		if o := g.ends[0]; !o.Executed || o.Rows == nil || *o.Rows != 1 || !o.InTransaction {
+			t.Errorf("write: %+v, want executed, 1 row, in the implicit transaction of the select", o)
+		}
+	})
+
+	// The select's mark must outlive its unit: the BEGIN turns the implicit
+	// transaction it ran in into an explicit one.
+	t.Run("an Execute ran, then begin, then a write", func(t *testing.T) {
+		g := &txGate{fakeGate: newFakeGate()}
+		s := readySession(g)
+		send(s, parseMsg("", "select 1"), bindMsg("", ""), execMsg(""), flush)
+		serve(s, parseOK, bindOK, row, tag("SELECT 1"))
+		send(s, queryMsg("begin"))
+		serve(s, tag("BEGIN"), readyWith('T'))
+		send(s, queryMsg(ins))
+		if len(g.infos) != 1 || !g.infos[0].TxDirty {
+			t.Errorf("writes begun with %+v, want one with TxDirty true", g.infos)
+		}
+	})
+
+	// A Flush opens a unit with no message; the Query after it closes it.
+	t.Run("a Flush between two Queries", func(t *testing.T) {
+		g := newStmtGate()
+		s := readySession(g)
+		send(s, queryMsg("select 1"), flush, queryMsg(ins))
+		serve(s, &pgproto3.RowDescription{}, row, tag("SELECT 1"), ready, tag("INSERT 0 1"), ready)
+		if len(s.units) != 0 {
+			t.Errorf("%d units still waiting, want none", len(s.units))
+		}
+		if o := g.ends[0]; !o.Executed || o.Rows == nil || *o.Rows != 1 || o.InTransaction {
+			t.Errorf("write: %+v, want executed with 1 row, alone", o)
+		}
+	})
+
+	t.Run("a FunctionCall", func(t *testing.T) {
+		g := newStmtGate()
+		s := readySession(g)
+		send(s, parseMsg("s1", ins), flush, &pgproto3.FunctionCall{Function: 1})
+		serve(s, parseOK, &pgproto3.FunctionCallResponse{}, ready)
+		if len(s.units) != 0 {
+			t.Errorf("%d units still waiting, want none", len(s.units))
+		}
+		send(s, bindMsg("", "s1"), execMsg(""), syncMsg)
+		if !slices.Equal(g.begun, []string{ins}) {
+			t.Errorf("writes begun %q, want the insert s1 holds", g.begun)
+		}
+	})
+}
+
+// When a message of a unit closed without a Sync fails, the server skips
+// every message after it up to the next Sync, Queries and FunctionCalls
+// included, and answers them all with that Sync's one ReadyForQuery. The
+// statements it skipped were not executed, and their table changes are
+// dropped.
+func TestFailedUnsyncedUnitSkipsUpToTheSync(t *testing.T) {
+	g := newStmtGate()
+	s := readySession(g)
+	send(s, parseMsg("s1", "selec 1"), &pgproto3.Flush{})
+	serve(s, failed("42601"))
+	send(s, queryMsg(ins), parseMsg("s2", ins), bindMsg("", "s2"), execMsg(""), queryMsg(ins), syncMsg)
+	serve(s, ready)
+	if len(s.units) != 0 {
+		t.Fatalf("%d units still waiting, want none", len(s.units))
+	}
+	if len(g.ends) != 3 {
+		t.Fatalf("%d writes ended, want 3", len(g.ends))
+	}
+	for i, o := range g.ends {
+		if o.Executed || o.Lost || !strings.Contains(o.Error, "not executed: an earlier statement in the same Sync failed: SQLSTATE 42601") {
+			t.Errorf("write %d: %+v, want skipped after the 42601", i+1, o)
+		}
+	}
+	if _, ok, _ := s.stmts.get(nil, "s2"); ok {
+		t.Errorf("s2 is held, want the skipped Parse dropped")
+	}
+
+	// Answers after the Sync are matched to their own statements.
+	send(s, queryMsg(ins))
+	serve(s, tag("INSERT 0 1"), ready)
+	if o := g.ends[3]; !o.Executed || o.Error != "" {
+		t.Errorf("write after the Sync: %+v, want executed", o)
+	}
+
+	// The connection ends before the Sync is answered: what comes after the
+	// failed unit was still skipped, not lost.
+	g = newStmtGate()
+	s = readySession(g)
+	send(s, parseMsg("", "selec 1"), &pgproto3.Flush{})
+	serve(s, failed("42601"))
+	send(s, queryMsg(ins), syncMsg)
+	s.abandon()
+	if o := g.ends[0]; o.Executed || o.Lost || !strings.Contains(o.Error, "not executed") {
+		t.Errorf("write behind the failed unit: %+v, want skipped and not lost", o)
+	}
+}
+
 // readGate watches inserts and observes every other statement, recording
 // each read it is told about.
 type readGate struct {

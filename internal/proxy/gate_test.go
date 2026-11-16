@@ -2354,3 +2354,151 @@ func TestEnforceWithoutAGateOnlyRelays(t *testing.T) {
 	sendAll(t, fe, &pgproto3.FunctionCall{Function: oid})
 	wantReplies(t, fe, "V Z")
 }
+
+// nextReplies reads n messages and returns them as replies does, for answers
+// that end with no ReadyForQuery (a Flush, say).
+func nextReplies(t *testing.T, fe *pgproto3.Frontend, n int) string {
+	t.Helper()
+	var got []string
+	for range n {
+		msg, err := fe.Receive()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if e, ok := msg.(*pgproto3.ErrorResponse); ok {
+			got = append(got, "E:"+e.Code)
+			continue
+		}
+		b, err := msg.Encode(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, string(b[0]))
+	}
+	return strings.Join(got, " ")
+}
+
+// A Query sent after extended-protocol messages with no Sync between them is
+// followed as the server answers it (spec correction B6 ①): when those
+// messages succeeded, the Query's ReadyForQuery answers them too; when one
+// failed, the server skips the Query as well, up to the next Sync. Each
+// statement gets its own outcome and the answers stay in step, in both modes.
+func TestQueryBeforeSyncIsFollowed(t *testing.T) {
+	for _, mode := range closedPointModes {
+		t.Run(mode.name, func(t *testing.T) {
+			table := watchedTable(t)
+			g := newRecordingGate(watches(table))
+			addr, _ := startProxyWith(t, upstream(t), g, mode.policy)
+			fe := rawAgent(t, addr, table)
+			insert := func(id int) *pgproto3.Query {
+				return &pgproto3.Query{String: fmt.Sprintf("insert into %s values (%d, 'x')", table, id)}
+			}
+
+			sendAll(t, fe, &pgproto3.Parse{Query: "select 1"}, &pgproto3.Describe{ObjectType: 'S'}, &pgproto3.Flush{})
+			if got := nextReplies(t, fe, 3); got != "1 t T" {
+				t.Fatalf("replies to the Flush %q, want %q", got, "1 t T")
+			}
+			sendAll(t, fe, insert(1), insert(2))
+			wantReplies(t, fe, "C Z")
+			wantReplies(t, fe, "C Z")
+			_, os := g.outcomes(t, 2)
+			for i, o := range os {
+				if !o.Executed || o.Error != "" || o.Rows == nil || *o.Rows != 1 {
+					t.Errorf("write %d: %+v, want executed with 1 row", i+1, o)
+				}
+			}
+
+			sendAll(t, fe, &pgproto3.Parse{Query: "selec 1"}, &pgproto3.Flush{})
+			if got := nextReplies(t, fe, 1); got != "E:42601" {
+				t.Fatalf("replies to the Flush %q, want %q", got, "E:42601")
+			}
+			sendAll(t, fe, insert(3), &pgproto3.Sync{})
+			wantReplies(t, fe, "Z")
+			sendAll(t, fe, insert(4))
+			wantReplies(t, fe, "C Z")
+			_, os = g.outcomes(t, 4)
+			if o := os[2]; o.Executed || o.Lost || !strings.Contains(o.Error, "not executed") {
+				t.Errorf("write behind the failed Parse: %+v, want not executed", o)
+			}
+			if o := os[3]; !o.Executed || o.Error != "" || o.Rows == nil || *o.Rows != 1 {
+				t.Errorf("write after the Sync: %+v, want executed with 1 row", o)
+			}
+			if n := rowCount(t, table); n != 3 {
+				t.Errorf("%d rows, want 3", n)
+			}
+		})
+	}
+}
+
+// After a Query sent before Sync the proxy keeps no unit the server will not
+// answer: the statement table of later units still follows the server. A
+// watched Parse the server confirmed stays, so its Execute is judged, and a
+// re-Parse it refused (42P05) is dropped.
+func TestUnitsAfterAQueryBeforeSyncFollowTheServer(t *testing.T) {
+	for _, mode := range closedPointModes {
+		t.Run(mode.name, func(t *testing.T) {
+			table := watchedTable(t)
+			g := newRecordingGate(watches(table))
+			addr, _ := startProxyWith(t, upstream(t), g, mode.policy)
+			fe := rawAgent(t, addr, table)
+			run := func(id string) {
+				t.Helper()
+				sendAll(t, fe, &pgproto3.Bind{PreparedStatement: "s2", Parameters: [][]byte{[]byte(id)}}, &pgproto3.Execute{}, &pgproto3.Sync{})
+				wantReplies(t, fe, "2 C Z")
+			}
+
+			sendAll(t, fe, &pgproto3.Parse{Query: "select 1"}, &pgproto3.Describe{ObjectType: 'S'}, &pgproto3.Flush{})
+			if got := nextReplies(t, fe, 3); got != "1 t T" {
+				t.Fatalf("replies to the Flush %q, want %q", got, "1 t T")
+			}
+			sendAll(t, fe, &pgproto3.Query{String: "select 2"})
+			wantReplies(t, fe, "T D C Z")
+
+			sendAll(t, fe, &pgproto3.Parse{Name: "s2", Query: "insert into " + table + " values ($1, 'x')"}, &pgproto3.Sync{})
+			wantReplies(t, fe, "1 Z")
+			sendAll(t, fe, &pgproto3.Bind{PreparedStatement: "nosuch"}, &pgproto3.Sync{})
+			wantReplies(t, fe, "E:26000 Z")
+			run("1")
+			if n := g.beginCount(); n != 1 {
+				t.Errorf("after the confirmed Parse: %d writes begun, want 1", n)
+			}
+
+			sendAll(t, fe, &pgproto3.Parse{Name: "s2", Query: "select 3"}, &pgproto3.Sync{})
+			wantReplies(t, fe, "E:42P05 Z")
+			run("2")
+			if n := g.beginCount(); n != 2 {
+				t.Errorf("after the refused re-Parse: %d writes begun, want 2", n)
+			}
+			if n := rowCount(t, table); n != 2 {
+				t.Errorf("%d rows, want 2", n)
+			}
+		})
+	}
+}
+
+// After a Query sent before Sync, each refusal still reaches the client in
+// place of its own replacement's error, and an error of another statement
+// reaches it unchanged.
+func TestRefusalsAfterAQueryBeforeSyncAreDelivered(t *testing.T) {
+	table := watchedTable(t)
+	g := newRecordingGate(watches(table))
+	g.refuse = refuseMarked
+	addr, _ := startProxyWith(t, upstream(t), g, proxy.Policy{Enforce: true})
+	fe := rawAgent(t, addr, table)
+	refused := &pgproto3.Query{String: "insert into " + table + " values (1, 'held')"}
+
+	sendAll(t, fe, append(unnamed("select 1"), refused, &pgproto3.Sync{})...)
+	wantReplies(t, fe, "1 2 D C E:ST001 Z")
+	wantReplies(t, fe, "Z")
+	sendAll(t, fe, refused)
+	wantReplies(t, fe, "E:ST001 Z")
+	sendAll(t, fe, &pgproto3.Query{String: "select 1/0"})
+	wantReplies(t, fe, "E:22012 Z")
+
+	_, os := g.outcomes(t, 2)
+	wantRefused(t, os[0], false)
+	wantRefused(t, os[1], false)
+	if n := rowCount(t, table); n != 0 {
+		t.Errorf("%d rows, want none", n)
+	}
+}

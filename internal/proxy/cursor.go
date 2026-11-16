@@ -40,8 +40,8 @@ type declared struct {
 	rows int64
 }
 
-// undone reports whether d, stacked by head, a unit that failed, is taken
-// back.
+// undone reports whether d, stacked by head, a unit that failed or was
+// skipped, is taken back.
 //
 // Under one Sync the Executes before the failing one ran, and what they did
 // stays: a DECLARE then meets the transaction-end rule like any other (a held
@@ -62,6 +62,8 @@ type declared struct {
 // forgotten: a known gap, listed in the spec's section 9.
 func (d *declared) undone(head *unit) bool {
 	switch {
+	case head.skipped:
+		return true // the server skipped the whole unit
 	case !head.query:
 		return d.idx >= head.errAt
 	case d.st.Several:

@@ -189,8 +189,24 @@ type bound struct {
 
 // unit is the stretch of client messages answered by one ReadyForQuery: a
 // Query, a FunctionCall, or extended-protocol messages through Sync.
+//
+// Extended-protocol messages followed by a Query or FunctionCall before any
+// Sync make a unit of their own that the server answers with no
+// ReadyForQuery (unsynced): when they all succeed, the server runs the Query
+// in the same implicit transaction and its ReadyForQuery answers both; when
+// one fails, the server skips everything after it, the Query included, up to
+// the next Sync, whose ReadyForQuery answers them all (spec correction B6 ①).
 type unit struct {
-	closed      bool // its Query or Sync was sent; nothing more joins it
+	closed bool // nothing more joins it: see synced, unsynced; a Query or FunctionCall unit is closed from the start
+	// synced: closed by a Sync. unsynced: an extended-protocol unit closed
+	// by a Query or FunctionCall that came before any Sync.
+	synced, unsynced bool
+	// joined: a Query or FunctionCall unit that runs in the implicit
+	// transaction of the unsynced unit before it, which executed a statement.
+	joined bool
+	// skipped: the server skipped the whole unit because an unsynced unit
+	// before it failed; err is that unit's error.
+	skipped     bool
 	query       bool
 	dirty       bool // it holds a statement that is not clean (see Statement.Clean)
 	executes    int  // Execute messages so far
@@ -272,7 +288,7 @@ func (s *session) serverTap() *tap {
 			return false
 		},
 		see: func(t byte, body []byte, _ func() error) ([]byte, error) {
-			return s.fromServer(t, body), nil
+			return s.fromServer(t, body)
 		},
 		each: func(t byte) {
 			switch t {
@@ -289,10 +305,90 @@ func (s *session) serverTap() *tap {
 // the server side, once per completion, never per row.
 func (s *session) ack() {
 	s.mu.Lock()
+	done := s.answeredUnsynced(nil)
 	if len(s.units) > 0 {
 		s.acked(s.units[0])
 	}
 	s.mu.Unlock()
+	s.finishAll(done)
+}
+
+// answer is a unit the server has answered, to be reported (finish) once
+// s.mu is let go. inTx is Outcome.InTransaction for its statements.
+type answer struct {
+	u    *unit
+	inTx bool
+}
+
+// answeredUnsynced takes out of s.units, and appends to done, each unit at
+// their head that the server has answered with no ReadyForQuery: an unsynced
+// unit whose messages all completed. What comes after it runs in the same
+// implicit transaction, so its statements ran inside a transaction and its
+// marks pass to the session as at a ReadyForQuery that leaves one open
+// (ruling P6). It runs on the server side with s.mu held, before a server
+// message is matched to the unit it answers. The rows not yet settled
+// belong to the unit after it: its own were settled at its completions.
+func (s *session) answeredUnsynced(done []answer) []answer {
+	for len(s.units) > 0 {
+		u := s.units[0]
+		if !u.unsynced || u.err != "" || u.acks < u.msgs {
+			break
+		}
+		s.leave(u, 'T')
+		done = append(done, answer{u, true})
+	}
+	return done
+}
+
+// leave takes u, the head of s.units, out once the server has answered it,
+// with the transaction status after (the ReadyForQuery's, or 'T' for an
+// unsynced unit, whose implicit transaction goes on). Its table changes the
+// server completed hold and the rest are dropped; while a transaction stays
+// open its marks pass to the session; its cursor statements are settled; its
+// rows are tallied. Units leave in the order they were sent, through here
+// alone, so each unit's table changes are the oldest waiting (see names). It
+// runs with s.mu held.
+func (s *session) leave(u *unit, after byte) {
+	s.units = s.units[1:]
+	s.stmts.answered(u, u.acks)
+	s.portals.answered(u, u.acks)
+	if after != 'I' {
+		s.carry(u)
+	}
+	if len(s.unsettled) > 0 {
+		s.cursorsAnswered(u, after)
+	}
+	u.tally()
+}
+
+// skippedBehind reports how many of the units after units[0] the server
+// skips when units[0] is an unsynced unit that failed: those up to and
+// including the first closed by a Sync, where the server resumes, or all of
+// them when none is (synced false). n is 0 for any other head.
+func skippedBehind(units []*unit) (n int, synced bool) {
+	if head := units[0]; !head.unsynced || head.err == "" {
+		return 0, false
+	}
+	for i, u := range units[1:] {
+		if u.synced {
+			return i + 1, true
+		}
+	}
+	return len(units) - 1, false
+}
+
+// skip marks units, which the server skipped after a unit that failed with
+// err, as skipped.
+func skip(units []*unit, err string) {
+	for _, u := range units {
+		u.skipped, u.err = true, err
+	}
+}
+
+func (s *session) finishAll(done []answer) {
+	for _, a := range done {
+		s.finish(a.u, a.inTx)
+	}
 }
 
 // acked counts one more message of head, the unit being answered, as
@@ -453,11 +549,8 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 
 	case 'S':
 		s.mu.Lock()
-		if n := len(s.units); n > 0 && !s.units[n-1].closed {
-			s.units[n-1].closed = true
-		} else {
-			s.units = append(s.units, &unit{closed: true})
-		}
+		u := s.openLocked()
+		u.closed, u.synced = true, true
 		s.mu.Unlock()
 
 	case 'F':
@@ -640,9 +733,17 @@ func (s *session) identity() SessionInfo {
 	return info
 }
 
+// push adds u, the unit of a Query or FunctionCall arriving now. An
+// extended-protocol unit still collecting messages ends here, unsynced, and
+// u runs in its implicit transaction.
 func (s *session) push(u *unit) *unit {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if n := len(s.units); n > 0 && !s.units[n-1].closed {
+		last := s.units[n-1]
+		last.closed, last.unsynced = true, true
+		u.joined = last.executes > 0
+	}
 	s.units = append(s.units, u)
 	return u
 }
@@ -697,12 +798,14 @@ func binding(m *pgproto3.Bind, p prepared, ok bool, others []prepared) bound {
 // fromServer follows a message from the server before it is forwarded, and
 // returns the message to send in its place: the refusal, for the error that
 // answers a refused message's replacement.
-func (s *session) fromServer(t byte, body []byte) []byte {
+func (s *session) fromServer(t byte, body []byte) ([]byte, error) {
 	s.mu.Lock()
+	done := s.answeredUnsynced(nil)
 	var head *unit
 	if len(s.units) > 0 {
 		head = s.units[0]
 	}
+	var out []byte
 	switch t {
 	case 'C', 'I', 's':
 		s.settle(head)
@@ -732,55 +835,55 @@ func (s *session) fromServer(t byte, body []byte) []byte {
 				if rf := head.replaced(body); rf != nil {
 					rf.given = true
 					head.err = rf.text() // what the client got, for the statements it hid
-					r := rf.r
-					s.mu.Unlock()
-					return refusalError(r)
+					out = refusalError(rf.r)
 				}
 			}
 		}
 	case 'Z':
-		s.settle(head) // normally nothing is left; never carry rows into the next unit
-		status := byte('I')
-		if len(body) > 0 {
-			status = body[0]
-		}
-		before := s.status
-		s.status = status
-		if status == 'I' {
-			// No transaction is open: what was answered before cannot
-			// make the next one dirty. The units still waiting keep theirs.
-			s.dirty = false
-		}
-		if !s.ready {
-			s.ready = true
-			s.mu.Unlock()
-			return nil
-		}
-		if head != nil {
-			s.units = s.units[1:]
-			s.stmts.answered(head, head.acks)
-			s.portals.answered(head, head.acks)
-		}
-		if status == 'I' {
-			s.portals.forget() // the server drops every portal when a transaction ends
-		}
-		if head == nil {
-			s.mu.Unlock()
-			return nil
-		}
-		if status != 'I' {
-			s.carry(head)
-		}
-		if len(s.unsettled) > 0 {
-			s.cursorsAnswered(head, status)
-		}
-		head.tally()
-		s.mu.Unlock()
-		s.finish(head, before, status)
-		return nil
+		done = s.readyForQuery(head, body, done)
 	}
 	s.mu.Unlock()
-	return nil
+	s.finishAll(done)
+	return out, nil
+}
+
+// readyForQuery follows a ReadyForQuery with body body, which answers head
+// and, when head is an unsynced unit that failed, the units the server
+// skipped behind it (see unit). It appends them to done. It runs on the
+// server side with s.mu held.
+func (s *session) readyForQuery(head *unit, body []byte, done []answer) []answer {
+	s.settle(head) // normally nothing is left; never carry rows into the next unit
+	status := byte('I')
+	if len(body) > 0 {
+		status = body[0]
+	}
+	before := s.status
+	s.status = status
+	if status == 'I' {
+		// No transaction is open: what was answered before cannot make the
+		// next one dirty. The units still waiting keep theirs.
+		s.dirty = false
+	}
+	if !s.ready {
+		s.ready = true
+		return done
+	}
+	if head != nil {
+		n := 1
+		if k, synced := skippedBehind(s.units); synced {
+			skip(s.units[1:1+k], head.err)
+			n += k
+		}
+		inTx := before != 'I' || status != 'I'
+		for _, u := range s.units[:n] {
+			s.leave(u, status)
+			done = append(done, answer{u, inTx || u.executes > 1 || u.joined || u.unsynced})
+		}
+	}
+	if status == 'I' {
+		s.portals.forget() // the server drops every portal when a transaction ends
+	}
+	return done
 }
 
 // settle moves the row messages sent since the last completion or error to
@@ -819,10 +922,9 @@ func (u *unit) tally() {
 	}
 }
 
-// finish reports the statements of an answered unit. before and after are
-// the transaction status around it.
-func (s *session) finish(u *unit, before, after byte) {
-	inTx := before != 'I' || after != 'I' || u.executes > 1
+// finish reports the statements of an answered unit; inTx says they ran
+// inside a transaction (see answer).
+func (s *session) finish(u *unit, inTx bool) {
 	for _, w := range u.writes {
 		if w.refused {
 			s.gate.End(w.handle, u.refusedWrite(w, inTx, true))
@@ -871,13 +973,18 @@ func (u *unit) refusal(idx int) (string, bool) {
 	switch {
 	case u.err == "":
 		return "", false
+	case u.skipped, !u.query && idx > u.errAt:
+		return notExecuted + u.err, true
 	case u.query, idx == u.errAt:
 		return u.err, true
-	case idx > u.errAt:
-		return "not executed: an earlier statement in the same Sync failed: " + u.err, true
 	}
 	return "", false
 }
+
+// notExecuted begins the error of a statement the server skipped because an
+// earlier message failed: under the same Sync, or in an unsynced unit before
+// its own.
+const notExecuted = "not executed: an earlier statement in the same Sync failed: "
 
 // rowsAt returns the row count of the unit's k-th completion, or nil when its
 // tag carried none.
@@ -911,12 +1018,21 @@ func (s *session) abandon() {
 	s.cursors, s.unsettled = nil, nil
 	status := s.status
 	s.mu.Unlock()
-	if len(units) > 0 {
-		s.settle(units[0]) // rows of the statement that was still answering
-	}
 	for _, u := range units {
+		// The rows of the statement that was still answering belong to the
+		// first unit not answered in full: an unsynced unit that completed
+		// settled its own.
+		if !u.unsynced || u.err != "" || u.acks < u.msgs {
+			s.settle(u)
+			break
+		}
+	}
+	for i, u := range units {
+		if k, _ := skippedBehind(units[i:]); k > 0 {
+			skip(units[i+1:i+1+k], u.err) // never run, so not lost
+		}
 		u.tally()
-		inTx := status != 'I' || u.executes > 1
+		inTx := status != 'I' || u.executes > 1 || u.joined || u.unsynced
 		for _, w := range u.writes {
 			if w.refused {
 				s.gate.End(w.handle, u.refusedWrite(w, inTx, false))
