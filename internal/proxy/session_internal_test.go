@@ -9,13 +9,16 @@ import (
 )
 
 // fakeGate watches every statement and records each End. While refusal is
-// set, Begin refuses every write with it. Blocked records each reason and
-// answers with an ST002 that names it.
+// set, Begin refuses every write with it. Blocked records each reason, and
+// whether the proxy called it the first time for that reason, and answers
+// with an ST002 that names it. WouldBlock records each reason.
 type fakeGate struct {
 	n       int
 	ends    map[int]Outcome
 	refusal *Refusal
 	blocked []string
+	firsts  []bool
+	would   []string
 }
 
 func newFakeGate() *fakeGate { return &fakeGate{ends: map[int]Outcome{}} }
@@ -27,10 +30,12 @@ func (g *fakeGate) Begin(SessionInfo, Statement, []Param) (any, *Refusal) {
 }
 func (g *fakeGate) End(h any, o Outcome)                    { g.ends[h.(int)] = o }
 func (g *fakeGate) Observe(SessionInfo, Statement, Outcome) {}
-func (g *fakeGate) Blocked(_ SessionInfo, reason string) Refusal {
+func (g *fakeGate) Blocked(_ SessionInfo, reason string, first bool) Refusal {
 	g.blocked = append(g.blocked, reason)
+	g.firsts = append(g.firsts, first)
 	return Refusal{Code: "ST002", Message: "blocked " + reason}
 }
+func (g *fakeGate) WouldBlock(_ SessionInfo, reason string) { g.would = append(g.would, reason) }
 
 // body is a message's payload, as the taps hand it to the session.
 func body(m pgproto3.Message) []byte {

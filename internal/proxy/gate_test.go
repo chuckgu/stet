@@ -46,11 +46,13 @@ type recordingGate struct {
 	endCalls int // End calls, to tell a second End for one write from the first
 	reads    []observation
 	blocked  []blockedCall
+	would    []blockedCall // WouldBlock calls
 }
 
 type blockedCall struct {
 	info   proxy.SessionInfo
 	reason string
+	first  bool
 }
 
 type observation struct {
@@ -165,11 +167,18 @@ func (g *recordingGate) Observe(info proxy.SessionInfo, st proxy.Statement, o pr
 }
 
 // Blocked records the call and answers with an ST002 that names the reason.
-func (g *recordingGate) Blocked(info proxy.SessionInfo, reason string) proxy.Refusal {
+func (g *recordingGate) Blocked(info proxy.SessionInfo, reason string, first bool) proxy.Refusal {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.blocked = append(g.blocked, blockedCall{info, reason})
+	g.blocked = append(g.blocked, blockedCall{info, reason, first})
 	return proxy.Refusal{Code: "ST002", Message: "blocked " + reason}
+}
+
+// WouldBlock records the call.
+func (g *recordingGate) WouldBlock(info proxy.SessionInfo, reason string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.would = append(g.would, blockedCall{info: info, reason: reason})
 }
 
 // wantBlocked fails the test unless Blocked was called once for each of

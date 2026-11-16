@@ -24,11 +24,12 @@ func (s *session) ended() []byte {
 	s.mu.Lock()
 	reason := s.end
 	info := s.identity()
+	first := reason != "" && s.firstTime(reason)
 	s.mu.Unlock()
 	if reason == "" {
 		return nil
 	}
-	return errorMessage("FATAL", s.gate.Blocked(info, reason))
+	return errorMessage("FATAL", s.gate.Blocked(info, reason, first))
 }
 
 // admit is the first look an enforced session takes at a client message of

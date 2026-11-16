@@ -663,6 +663,87 @@ func TestClosedPointsAreReplacedOnEnforcedSessions(t *testing.T) {
 	}
 }
 
+// codeGate is blockGate that also marks a message holding "create function"
+// as one that defines code.
+type codeGate struct{ *blockGate }
+
+func (g codeGate) Inspect(sql string) Statement {
+	st := g.blockGate.Inspect(sql)
+	if strings.Contains(sql, "create function") {
+		st.Block = BlockDefinesCode
+	}
+	return st
+}
+
+// A session that does not enforce forwards each closed point it knows at no
+// extra cost as it came, and tells the gate that enforce would refuse it once
+// per reason, however often it is sent (ruling 31); the next session tells it
+// again. Blocked is never called.
+func TestShadowTellsOfClosedPointsOncePerSessionAndReason(t *testing.T) {
+	flush := func() error { return nil }
+	msgs := []struct {
+		t    byte
+		body []byte
+	}{
+		{'Q', []byte("select 1")}, // no terminator: unreadable
+		{'Q', nil},                // past maxInspect
+		{'Q', body(queryMsg("do $$ begin end $$"))},
+		{'P', body(parseMsg("s1", "create function f() returns int as 'select 1'"))},
+		{'F', body(&pgproto3.FunctionCall{Function: 2026})},
+		{'P', []byte("s1\x00")},
+		{'B', nil},
+		{'E', []byte("x")},
+		{'P', body(parseMsg("", "do $$ begin end $$"))},
+		{'F', nil},
+	}
+	want := []string{BlockUnparsed, BlockTooLarge, BlockDo, BlockDefinesCode, BlockFunctionCall}
+	g := codeGate{newBlockGate()}
+	for session := 1; session <= 2; session++ {
+		s := readySession(g)
+		g.would = nil
+		for range 3 {
+			for _, m := range msgs {
+				if r, err := s.fromClient(m.t, m.body, flush); r != nil || err != nil {
+					t.Fatalf("session %d: %c replaced by %q (%v), want it forwarded as it came", session, m.t, r, err)
+				}
+			}
+		}
+		if !slices.Equal(g.would, want) {
+			t.Errorf("session %d: WouldBlock for %q, want %q, once each", session, g.would, want)
+		}
+	}
+	if len(g.blocked) != 0 {
+		t.Errorf("Blocked for %q, want never", g.blocked)
+	}
+}
+
+// An enforced session refuses a closed point every time it is sent, with
+// the gate's Blocked error, and asks the gate to log it only the first time
+// the session is refused for its reason (ruling 31). Another session's first
+// is its own. Nothing is told through WouldBlock.
+func TestEnforcedSessionAsksToLogAReasonOnce(t *testing.T) {
+	g := codeGate{newBlockGate()}
+	do, fn := queryMsg("do $$ begin end $$"), queryMsg("create function f() returns int as 'select 1'")
+	s := enforcedSession(g)
+	for _, m := range []*pgproto3.Query{do, do, fn, do, fn} {
+		if r := sendOne(s, m); r == nil {
+			t.Fatalf("%q forwarded, want it refused", m.String)
+		}
+	}
+	if r := sendOne(enforcedSession(g), do); r == nil {
+		t.Fatal("another session's DO block forwarded, want it refused")
+	}
+	if want := []string{BlockDo, BlockDo, BlockDefinesCode, BlockDo, BlockDefinesCode, BlockDo}; !slices.Equal(g.blocked, want) {
+		t.Errorf("Blocked for %q, want %q", g.blocked, want)
+	}
+	if want := []bool{true, false, true, false, false, true}; !slices.Equal(g.firsts, want) {
+		t.Errorf("Blocked asked to log %v, want %v", g.firsts, want)
+	}
+	if len(g.would) != 0 {
+		t.Errorf("WouldBlock for %q, want never", g.would)
+	}
+}
+
 // A refused closed point did not run: it leaves the statement and portal
 // tables, on_behalf_of and the cursor table as they were, also when the
 // proxy could not read it.

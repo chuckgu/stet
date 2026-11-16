@@ -28,9 +28,20 @@ type Gate interface {
 	// ended first. It is never called before the statement goes upstream, and it
 	// must not block.
 	Observe(s SessionInfo, st Statement, o Outcome)
-	// Blocked returns the error for a message refused for reason on a watched
-	// session, and logs it: no decision records such a message. It must not block.
-	Blocked(s SessionInfo, reason string) Refusal
+	// Blocked returns the error for a message refused for reason on an
+	// enforced session, or for the session when the proxy ends it. Its answer
+	// depends on reason alone. No decision records either, so it is logged
+	// instead when first is set: the proxy sets it the first time it refuses
+	// the session anything for reason, so the log holds one line per session
+	// and reason however often a client repeats what is refused (ruling 31).
+	// It must not block.
+	Blocked(s SessionInfo, reason string, first bool) Refusal
+	// WouldBlock logs that a session that does not enforce sent a message an
+	// enforced session would refuse for reason: one of the closed points the
+	// proxy knows at no extra cost (unparsed, too_large, do_block,
+	// defines_code, function_call). The proxy calls it once per session and
+	// reason. Nothing is refused, and it must not block (ruling 31).
+	WouldBlock(s SessionInfo, reason string)
 }
 
 // Reasons a message is refused without a decision, or the session is ended.
@@ -195,6 +206,11 @@ type session struct {
 	// changed as the client sends, settled as the server answers.
 	stmts   names[prepared]
 	portals names[bound]
+
+	// told lists the reasons the gate was told of through Blocked or
+	// WouldBlock, which log once per session and reason (see firstTime);
+	// under mu.
+	told []string
 
 	// Enforced sessions only, under mu. utf8 and standard: the server last
 	// reported client_encoding UTF8 and standard_conforming_strings on (see
@@ -497,7 +513,10 @@ func (s *session) acked(head *unit) {
 // settings are not readable (see settings.go). The gate is told through
 // Blocked, and the message never ran, so the statement and portal tables,
 // on_behalf_of and the cursor table stay as they were. It returns an error
-// once the proxy is ending the session (see end.go).
+// once the proxy is ending the session (see end.go). On a session that does
+// not enforce, the closed points known at no extra cost (what could not be
+// read, what the gate marks with Block, a FunctionCall) go as they came, and
+// the gate is told through WouldBlock (see wouldBlock).
 func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, error) {
 	if s.enforce {
 		if err := s.admit(t); err != nil {
@@ -513,9 +532,13 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 			if s.enforce {
 				return s.block(u, 0, 'Q', "", unreadable(body)), nil
 			}
+			s.wouldBlock(unreadable(body))
 			return nil, nil
 		}
 		st := s.gate.Inspect(m.String)
+		if !s.enforce && st.Block != "" {
+			s.wouldBlock(st.Block)
+		}
 		if s.enforce {
 			s.mu.Lock()
 			reason := st.Block
@@ -542,6 +565,14 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		var p prepared
 		if read {
 			p = prepared{st: s.gate.Inspect(m.Query), oids: slices.Clone(m.ParameterOIDs)}
+		}
+		if !s.enforce {
+			switch {
+			case !read:
+				s.wouldBlock(unreadable(body))
+			case p.st.Block != "":
+				s.wouldBlock(p.st.Block)
+			}
 		}
 		s.mu.Lock()
 		u, pos := s.count()
@@ -587,6 +618,9 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		var p prepared
 		var ok bool
 		var others []prepared
+		if !s.enforce && !read {
+			s.wouldBlock(unreadable(body))
+		}
 		s.mu.Lock()
 		u, pos := s.count()
 		if s.enforce && !read {
@@ -630,6 +664,9 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 	case 'E':
 		var m pgproto3.Execute
 		read := body != nil && m.Decode(body) == nil
+		if !s.enforce && !read {
+			s.wouldBlock(unreadable(body))
+		}
 		s.mu.Lock()
 		u, pos := s.count()
 		u.executes++
@@ -709,6 +746,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		if s.enforce {
 			return s.block(u, 0, 'F', "", BlockFunctionCall), nil
 		}
+		s.wouldBlock(BlockFunctionCall)
 	}
 	return nil, nil
 }
@@ -725,15 +763,42 @@ func unreadable(body []byte) string {
 
 // block refuses the message t at pos of u (see refuse; name as there), which
 // cannot be inspected, for reason, and returns the message to send in its
-// place. The gate gives the client's error through Blocked and logs it; no
-// decision records the message, so nothing waits for its End. The gate is
-// called without s.mu held, and nothing queued is flushed first: Blocked does
-// not block.
+// place. The gate gives the client's error through Blocked, and logs it the
+// first time the session is refused for reason (firstTime); no decision
+// records the message, so nothing waits for its End. The gate is called
+// without s.mu held, and nothing queued is flushed first: Blocked does not
+// block.
 func (s *session) block(u *unit, pos int, t byte, name, reason string) []byte {
 	s.mu.Lock()
 	info := s.identity()
+	first := s.firstTime(reason)
 	s.mu.Unlock()
-	return s.refuse(u, pos, t, name, s.gate.Blocked(info, reason))
+	return s.refuse(u, pos, t, name, s.gate.Blocked(info, reason, first))
+}
+
+// wouldBlock tells the gate, the first time for reason, that this session,
+// which does not enforce, sent a message an enforced session would refuse for
+// reason: a closed point the proxy knows at no extra cost (ruling 31). The
+// message is forwarded as it came; nothing waits but the gate's log line,
+// once per session and reason. It runs without s.mu held.
+func (s *session) wouldBlock(reason string) {
+	s.mu.Lock()
+	first := s.firstTime(reason)
+	info := s.identity()
+	s.mu.Unlock()
+	if first {
+		s.gate.WouldBlock(info, reason)
+	}
+}
+
+// firstTime reports whether the gate was not yet told of reason for this
+// session, and notes that it now is. It runs with s.mu held.
+func (s *session) firstTime(reason string) bool {
+	if slices.Contains(s.told, reason) {
+		return false
+	}
+	s.told = append(s.told, reason)
+	return true
 }
 
 // statement follows st, arriving as a Query (idx and pos 0) or as Execute idx

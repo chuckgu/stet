@@ -882,7 +882,7 @@ func TestBlockedSaysWhatItEnded(t *testing.T) {
 		proxy.BlockSettingChanged: "session ended without a decision",
 	}
 	for reason := range reasons {
-		got := e.gate.Blocked(info, reason)
+		got := e.gate.Blocked(info, reason, true)
 		if ends := strings.HasPrefix(got.Message, "connection closed by stet: "); ends != proxy.EndsSession(reason) {
 			t.Errorf("Blocked(%s).Message = %q; it ends the session: %v", reason, got.Message, proxy.EndsSession(reason))
 		}
@@ -898,6 +898,51 @@ func TestBlockedSaysWhatItEnded(t *testing.T) {
 	}
 }
 
+// The proxy asks Blocked to log only the first time a session is refused for
+// a reason (ruling 31); the answer is the same either way.
+func TestBlockedLogsOnlyWhenAskedTo(t *testing.T) {
+	e := setup(t, calm())
+	var logs lockedBuffer
+	gate.SetLogger(e.gate, slog.New(slog.NewJSONHandler(&logs, nil)))
+	info := proxy.SessionInfo{ID: "f00d", User: "agent_a"}
+	first := e.gate.Blocked(info, proxy.BlockDo, true)
+	again := e.gate.Blocked(info, proxy.BlockDo, false)
+	if first != again {
+		t.Errorf("Blocked answered %+v, then %+v; want the same", first, again)
+	}
+	if n := len(strings.Split(strings.TrimSpace(logs.String()), "\n")); n != 1 {
+		t.Errorf("%d log lines, want 1:\n%s", n, logs.String())
+	}
+}
+
+// A shadow session that sent what enforce would refuse is told of in a
+// warning that names the session, its login role and the reason, and
+// nothing of the statement; nothing is recorded as a decision.
+func TestWouldBlockWarns(t *testing.T) {
+	e := setup(t, calm())
+	var logs lockedBuffer
+	gate.SetLogger(e.gate, slog.New(slog.NewJSONHandler(&logs, nil)))
+	info := proxy.SessionInfo{ID: "f00d", User: "agent_a", Database: "stet_test", ApplicationName: "bot"}
+	e.gate.WouldBlock(info, proxy.BlockDefinesCode)
+
+	var recs []map[string]any
+	for line := range strings.Lines(logs.String()) {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatal(err)
+		}
+		recs = append(recs, rec)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("%d log lines, want 1:\n%s", len(recs), logs.String())
+	}
+	r := recs[0]
+	if r["level"] != "WARN" || r["msg"] != "would be refused under enforce" || r["reason"] != "defines_code" ||
+		r["session"] != "f00d" || r["login_role"] != "agent_a" || r["database"] != "stet_test" || r["agent"] != "bot" {
+		t.Errorf("logged %v, want a warning that it would be refused under enforce, with the reason and the session", r)
+	}
+}
+
 // A session ended for a changed setting is the one accepted bypass (ruling
 // 22): a message sent behind the change was read under the old setting and
 // may have run unjudged. That is logged as an error, not as the warning of
@@ -908,7 +953,7 @@ func TestBlockedLogsAChangedSettingAsAnError(t *testing.T) {
 	gate.SetLogger(e.gate, slog.New(slog.NewJSONHandler(&logs, nil)))
 	info := proxy.SessionInfo{ID: "f00d", User: "agent_a", Database: "stet_test", ApplicationName: "bot"}
 
-	if got := e.gate.Blocked(info, proxy.BlockSettingChanged); got.Message != decide.Blocked(proxy.BlockSettingChanged).Message {
+	if got := e.gate.Blocked(info, proxy.BlockSettingChanged, true); got.Message != decide.Blocked(proxy.BlockSettingChanged).Message {
 		t.Errorf("Blocked = %+v, want decide.Blocked's error", got)
 	}
 	var recs []map[string]any
@@ -962,7 +1007,7 @@ func TestBlockedAnswersAndLogs(t *testing.T) {
 	gate.SetLogger(e.gate, slog.New(slog.NewJSONHandler(&logs, nil)))
 	info := proxy.SessionInfo{ID: "f00d", User: "agent_a", Database: "stet_test", ApplicationName: "bot"}
 
-	got := e.gate.Blocked(info, proxy.BlockDo)
+	got := e.gate.Blocked(info, proxy.BlockDo, true)
 	a := decide.Blocked(proxy.BlockDo)
 	if want := (proxy.Refusal{Code: a.Code, Message: a.Message, Hint: a.Hint("")}); got != want {
 		t.Errorf("Blocked = %+v, want %+v", got, want)

@@ -1408,6 +1408,65 @@ func TestStatementsThatDefineCodeAreRefused(t *testing.T) {
 	}
 }
 
+// A closed point is logged once per session and reason, however often the
+// agent repeats it (ruling 31): in enforce mode with the refusal, every one
+// of which is refused; in shadow mode as what enforce would refuse, every
+// one of which runs. A new session is logged again.
+func TestClosedPointsAreLoggedOncePerSessionAndReason(t *testing.T) {
+	for mode, msg := range map[string]string{
+		"enforce": "message refused without a decision",
+		"shadow":  "would be refused under enforce",
+	} {
+		t.Run(mode, func(t *testing.T) {
+			format := enforceYAML
+			if mode == "shadow" {
+				format = "agents: {roles: [stet_md5]}\n" + tableYAML
+			}
+			e := setupEnforce(t, calm(), format)
+			e.seed(t)
+			var logs lockedBuffer
+			gate.SetLogger(e.gate, slog.New(slog.NewJSONHandler(&logs, nil)))
+			ctx := context.Background()
+			sqls := []string{
+				"do $$ begin update " + e.table + " set title = 'do' where id = 1; end $$",
+				"create or replace temp view lg_v as select * from " + e.table,
+			}
+			for session := range 2 {
+				conn := e.agent(t, fmt.Sprint(mode, session))
+				for range 3 {
+					for _, sql := range sqls {
+						_, err := conn.Exec(ctx, sql)
+						if mode == "enforce" {
+							wantRefused(t, err, "ST002", "")
+						} else if err != nil {
+							t.Fatalf("shadow: %s: %v", sql, err)
+						}
+					}
+				}
+			}
+
+			count := map[string]int{}
+			for _, r := range logRecords(t, &logs) {
+				if r["msg"] == msg && r["level"] == "WARN" {
+					count[fmt.Sprint(r["session"], " ", r["reason"])]++
+				}
+			}
+			if len(count) != 4 {
+				t.Errorf("warnings by session and reason %v, want two sessions with do_block and defines_code; log:\n%s", count, logs.String())
+			}
+			for k, n := range count {
+				if n != 1 {
+					t.Errorf("%s: %d warnings, want 1", k, n)
+				}
+			}
+			want := map[string]int{"enforce": 0, "shadow": 1}[mode]
+			if n := e.rowsWhere(t, "title = 'do'"); n != want {
+				t.Errorf("%d rows the DO block wrote, want %d", n, want)
+			}
+		})
+	}
+}
+
 // A SQL PREPARE of a gated write would let each EXECUTE of it, and each
 // protocol Bind of its name, run what no Begin sees, with no record at all
 // (ruling 30). Enforce refuses it whatever the table's unsupported setting,
