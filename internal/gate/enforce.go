@@ -291,8 +291,10 @@ func (g *Gate) facts(p *pending) decide.Facts {
 //
 // An insert that reports an error may still have landed: past its deadline
 // pgx stops waiting but does not cancel the insert on the server. Its id is
-// kept in p.heldUnsure, and End marks it undelivered, so that a row the
-// client was not told of is never left pending for approval.
+// kept in p.heldUnsure, and End marks it undelivered. That narrows, but does
+// not close, the chance that a row the client was not told of is left
+// pending for approval: an insert still running on the server when the
+// marking runs lands afterwards as pending (spec 13).
 func (g *Gate) hold(p *pending) string {
 	h := &store.HeldWrite{
 		ID:          store.NewID(),

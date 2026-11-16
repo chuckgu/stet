@@ -188,8 +188,13 @@ var fixed = map[string]phrase{
 	"no_model":          {"it needs a judgment and no model is configured", approve},
 	"conflict":          {"it would undo a value another write set recently", "read the row again and keep the recent value, or " + approve},
 	"concurrent_change": {"the row changed while the write was being judged", "read the row again and retry"},
-	"in_transaction": {"it came after another statement in the same transaction and cannot be judged there",
-		"ROLLBACK, then send this write as its own statement or as the first statement after BEGIN"},
+	// A write is refused for in_transaction when something unclean was sent
+	// since the server last said the session was idle: in an explicit
+	// transaction, ahead of it in a pipeline whose answers the client had not
+	// read, or ahead of it under the same Sync (a batch). The sentence and
+	// the hint hold for each.
+	"in_transaction": {"it came after another statement that may run in the same transaction, and cannot be judged there",
+		"send this write as the first statement of its transaction, after the answer to the statement before it (ROLLBACK first if a transaction is open)"},
 	"no_login_role": {"the session had not finished logging in, so its login role is not known",
 		"wait until the connection is ready before sending statements"},
 	"multi_statement": {"several statements were sent in one query", "send each statement as its own query"},

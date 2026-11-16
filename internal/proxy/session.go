@@ -589,7 +589,8 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 			// safe direction. A Parse that could not be read is replaced
 			// under a fresh name, since its own name is not known, so no
 			// name the session uses changes on the server; so is one whose
-			// name the server would convert from client_encoding, or compare
+			// name is not ASCII, whatever it is refused for: the server may
+			// convert such a name from client_encoding, or compare it
 			// otherwise (see foreign).
 			name := m.Name
 			if !ascii(name) {
@@ -601,7 +602,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 			case misread:
 				return s.block(u, pos, 'P', name, BlockSessionSetting), nil
 			case p.st.Block != "":
-				return s.block(u, pos, 'P', m.Name, p.st.Block), nil
+				return s.block(u, pos, 'P', name, p.st.Block), nil
 			}
 			return s.block(u, pos, 'P', name, BlockNameEncoding), nil
 		}

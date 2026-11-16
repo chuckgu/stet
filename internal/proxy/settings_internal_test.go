@@ -429,6 +429,17 @@ func TestNamesThatAServerEncodingMayCompareOtherwiseAreRefused(t *testing.T) {
 				}
 				serve(s, ready)
 			}
+
+			// A Parse refused for a reason of its own (a DO block) under such
+			// a name is replaced under an ASCII name all the same.
+			bs := newSession(newBlockGate(), SessionInfo{})
+			bs.enforce = true
+			serve(bs, setting("client_encoding", "UTF8"), setting("standard_conforming_strings", "on"), setting("server_encoding", server), ready)
+			if r := sendOne(bs, parseMsg("s"+e, "do $$ begin end $$")); r == nil {
+				t.Error("a DO block's Parse was forwarded")
+			} else if m, _ := body2(t, r).(*pgproto3.Parse); m == nil || refuses && !ascii(m.Name) {
+				t.Errorf("a DO block's Parse under %q replaced by %q, want one under an ASCII name", "s"+e, r)
+			}
 		})
 	}
 }
