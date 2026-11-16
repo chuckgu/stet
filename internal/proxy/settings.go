@@ -61,6 +61,9 @@ func (s *session) parameter(head *unit, body []byte) error {
 		s.utf8 = string(value) == "UTF8" || string(value) == "UNICODE"
 	case "standard_conforming_strings":
 		s.standard = string(value) == "on"
+	case "server_encoding": // reported at startup, never changes
+		s.serverUTF8 = string(value) == "UTF8"
+		return nil
 	default:
 		return nil
 	}
@@ -191,6 +194,20 @@ func settingStatement(t []string) bool {
 		return len(t) == i+3 && is(i, "client_encoding", "standard_conforming_strings") && is(i+1, "to", "=") && value(i+2)
 	}
 	return false
+}
+
+// foreign reports whether the server of this enforced session may compare
+// name otherwise than the proxy and the classifier, which clip names to 63
+// bytes of UTF-8: name is not ASCII, and the server's server_encoding is not
+// (known to be) UTF8, so the server converts the name to it and clips it
+// there. It runs with s.mu held.
+func (s *session) foreign(name string) bool { return !s.serverUTF8 && !ascii(name) }
+
+// foreignNames reports whether st runs by name (SQL EXECUTE, FETCH, MOVE) a
+// prepared statement or portal the server may compare otherwise (foreign).
+// It runs with s.mu held.
+func (s *session) foreignNames(st Statement) bool {
+	return slices.ContainsFunc(st.Executes, s.foreign) || slices.ContainsFunc(st.Portals, s.foreign)
 }
 
 // ascii reports whether name holds only ASCII bytes, which every

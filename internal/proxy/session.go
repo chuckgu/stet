@@ -51,6 +51,10 @@ const (
 	// changed to such a value while statements read under the old one were
 	// already sent (see parameter).
 	BlockSettingChanged = "setting_changed"
+	// BlockNameEncoding: the server's server_encoding is not UTF8, so it may
+	// compare a name that is not ASCII otherwise than the proxy (see
+	// foreignNames).
+	BlockNameEncoding = "name_encoding"
 )
 
 // EndsSession reports whether reason is one the proxy ends the session for,
@@ -190,12 +194,13 @@ type session struct {
 
 	// Enforced sessions only, under mu. utf8 and standard: the server last
 	// reported client_encoding UTF8 and standard_conforming_strings on (see
-	// readable). end: why the proxy is ending the session, "" while it is
+	// readable); serverUTF8: it reported server_encoding UTF8 (see foreign). end: why the proxy is ending the session, "" while it is
 	// not (see endWith). lastQuery: the newest Query unit, until the client
 	// sends anything after it but a Flush, CopyDone or CopyFail; copying: the
 	// Query unit whose current COPY FROM STDIN the client has not ended yet
 	// (see admit, copyIn).
 	utf8, standard     bool
+	serverUTF8         bool
 	end                string
 	lastQuery, copying *unit
 }
@@ -514,6 +519,8 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 			case s.misread(m.String):
 				reason = BlockSessionSetting
 				st = Statement{} // what the classifier saw does not count
+			case reason == "" && s.foreignNames(st):
+				reason = BlockNameEncoding
 			case reason == "" && runsNames(st) && s.runsWatched(u, st, maxRunDepth):
 				reason = BlockPreparedWrite
 			}
@@ -535,7 +542,8 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		s.mu.Lock()
 		u, pos := s.count()
 		misread := read && s.enforce && s.misread(m.Query)
-		if s.enforce && (!read || misread || p.st.Block != "") {
+		foreign := read && s.enforce && (s.foreign(m.Name) || s.foreignNames(p.st))
+		if s.enforce && (!read || misread || p.st.Block != "" || foreign) {
 			s.mu.Unlock()
 			// The table is left as it was. The server keeps a named
 			// statement it holds when the replacement fails, as for any
@@ -546,16 +554,21 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 			// safe direction. A Parse that could not be read is replaced
 			// under a fresh name, since its own name is not known, so no
 			// name the session uses changes on the server; so is one whose
-			// name the server would convert from client_encoding.
+			// name the server would convert from client_encoding, or compare
+			// otherwise (see foreign).
+			name := m.Name
+			if !ascii(name) {
+				name = freshName()
+			}
 			switch {
 			case !read:
 				return s.block(u, pos, 'P', freshName(), unreadable(body)), nil
-			case misread && !ascii(m.Name):
-				return s.block(u, pos, 'P', freshName(), BlockSessionSetting), nil
 			case misread:
-				return s.block(u, pos, 'P', m.Name, BlockSessionSetting), nil
+				return s.block(u, pos, 'P', name, BlockSessionSetting), nil
+			case p.st.Block != "":
+				return s.block(u, pos, 'P', m.Name, p.st.Block), nil
 			}
-			return s.block(u, pos, 'P', m.Name, p.st.Block), nil
+			return s.block(u, pos, 'P', name, BlockNameEncoding), nil
 		}
 		if read {
 			s.stmts.put(u, pos, m.Name, true, p)
@@ -590,6 +603,10 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 			// it may bind another statement or portal than the tables say,
 			// or hand a watched write other values than Begin would judge.
 			return s.block(u, pos, 'B', "", BlockSessionSetting), nil
+		}
+		if s.enforce && read && (s.foreign(m.PreparedStatement) || s.foreign(m.DestinationPortal)) {
+			s.mu.Unlock()
+			return s.block(u, pos, 'B', "", BlockNameEncoding), nil
 		}
 		s.mu.Unlock()
 		// Bind values are copied without the lock: the server side takes it
@@ -630,6 +647,8 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 			// The server converts the name from client_encoding, so it may
 			// run another portal than the table says.
 			reason = BlockSessionSetting
+		case s.foreign(m.Portal):
+			reason = BlockNameEncoding
 		default:
 			reason = s.executeBlock(u, b, ok, others)
 		}

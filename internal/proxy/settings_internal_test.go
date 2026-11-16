@@ -94,7 +94,7 @@ func TestSettingsTheClassifierCannotReadAreRefused(t *testing.T) {
 	if r := sendOne(s, queryMsg("set client_encoding to 'UTF8'")); r != nil {
 		t.Errorf("a Query that repairs the settings was replaced by %q", r)
 	}
-	serve(s, setting("client_encoding", "UTF8"), setting("standard_conforming_strings", "on"), ready) // startup's
+	serve(s, setting("client_encoding", "UTF8"), setting("standard_conforming_strings", "on"), setting("server_encoding", "UTF8"), ready) // startup's
 	serve(s, syntaxError(), ready, tag("SET"), ready)
 	refused(t, false, queryMsg("select 1"))
 	send(s, parseMsg("w", ins), parseMsg("r", "select 1"), parseMsg(sjis, "select 1"), bindMsg("p", "r"), syncMsg)
@@ -374,6 +374,60 @@ func TestSettingReportedWhileAMessageIsInspected(t *testing.T) {
 			}
 			if _, ok, _ := s.stmts.get(nil, "s1"); ok {
 				t.Error("the refused Parse was put in the statement table")
+			}
+		})
+	}
+}
+
+// A server whose server_encoding is not UTF8 converts a name that is not
+// ASCII from client_encoding and clips it to 63 bytes in its own encoding,
+// so it may compare it otherwise than the proxy and the classifier, which
+// clip UTF-8. On such a server an enforced session refuses what names a
+// statement or portal so: a Parse, Bind or Execute, and a statement that
+// runs such a name with SQL EXECUTE, FETCH or MOVE. Ordinary statements run,
+// non-ASCII text included; a UTF8 server compares names as the proxy does.
+func TestNamesThatAServerEncodingMayCompareOtherwiseAreRefused(t *testing.T) {
+	const e = "\xc3\xa9" // é in UTF-8
+	for _, server := range []string{"LATIN1", "SQL_ASCII", "UTF8"} {
+		t.Run(server, func(t *testing.T) {
+			g := byNameGate{newStmtGate()}
+			s := newSession(g, SessionInfo{})
+			s.enforce = true
+			serve(s, setting("client_encoding", "UTF8"), setting("standard_conforming_strings", "on"), setting("server_encoding", server), ready)
+			send(s, parseMsg("s1", "select 1"), bindMsg("p", "s1"), syncMsg)
+			serve(s, parseOK, bindOK, ready)
+			refuses := server != "UTF8"
+			for _, c := range []struct {
+				m       pgproto3.FrontendMessage
+				refused bool
+			}{
+				{parseMsg("s"+e, "select 1"), refuses},
+				{parseMsg("s2", "execute s"+e), refuses},
+				{parseMsg("s3", "select '"+e+"'"), false},
+				{queryMsg("execute s" + e), refuses},
+				{queryMsg("fetch p" + e), refuses},
+				{queryMsg("execute s1"), false},
+				{queryMsg("select '" + e + "'"), false},
+				{bindMsg("", "s"+e), refuses},
+				{bindMsg("p"+e, "s1"), refuses},
+				{bindMsg("q", "s1"), false},
+				{execMsg("p" + e), refuses},
+				{execMsg("p"), false},
+			} {
+				g.blocked = nil
+				r := sendOne(s, c.m)
+				if (r != nil) != c.refused || c.refused && !slices.Equal(g.blocked, []string{BlockNameEncoding}) {
+					t.Errorf("%T %+v: replaced %v, Blocked for %q; want refused %v", c.m, c.m, r != nil, g.blocked, c.refused)
+				}
+				if p, ok := c.m.(*pgproto3.Parse); ok && r != nil {
+					if m, _ := body2(t, r).(*pgproto3.Parse); m == nil || m.Name != p.Name && !freshNameRE.MatchString(m.Name) || !ascii(m.Name) {
+						t.Errorf("Parse %q replaced under %q, want its own ASCII name or a fresh one", p.Name, m.Name)
+					}
+				}
+				if _, query := c.m.(*pgproto3.Query); !query {
+					send(s, syncMsg)
+				}
+				serve(s, ready)
 			}
 		})
 	}

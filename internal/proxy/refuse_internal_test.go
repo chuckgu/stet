@@ -530,7 +530,7 @@ func (g *blockGate) Inspect(sql string) Statement {
 func enforcedSession(g Gate) *session {
 	s := newSession(g, SessionInfo{})
 	s.enforce = true
-	serve(s, setting("client_encoding", "UTF8"), setting("standard_conforming_strings", "on"), ready)
+	serve(s, setting("client_encoding", "UTF8"), setting("standard_conforming_strings", "on"), setting("server_encoding", "UTF8"), ready)
 	return s
 }
 

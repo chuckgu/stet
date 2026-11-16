@@ -154,9 +154,10 @@ func (g *Gate) Inspect(sql string) proxy.Statement {
 // asking the gate to judge it, and logs it. That is a message it refuses: a
 // closed point of spec 7 (SQL the classifier cannot read, a DO block, a
 // message too large to read, a FunctionCall), a statement that runs a
-// watched write by name or a name whose meaning is not settled, or a
+// watched write by name or a name whose meaning is not settled, a
 // statement the server may read otherwise than the classifier under the
-// session's settings. Or it is a session the proxy ends (proxy.EndsSession),
+// session's settings, or a name it may compare otherwise under its
+// server_encoding. Or it is a session the proxy ends (proxy.EndsSession),
 // whose client gets the answer as a FATAL: a COPY or a change of setting
 // after which the server's answers no longer match what the proxy follows.
 // No decision records either, so the log line names the session and the

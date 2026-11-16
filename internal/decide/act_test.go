@@ -438,6 +438,8 @@ func TestBlocked(t *testing.T) {
 			"use client_encoding UTF8 and standard_conforming_strings on"},
 		{"setting_changed", "connection closed by stet: client_encoding or standard_conforming_strings changed to a value stet cannot read while later statements were already sent",
 			"keep client_encoding UTF8 and standard_conforming_strings on, and change them only when nothing else waits for an answer"},
+		{"name_encoding", "statement refused by stet: the server's encoding is not UTF8, so it may compare a name that is not ASCII otherwise than stet",
+			"use ASCII names for prepared statements and portals"},
 		{"something_new", "refused by stet (something_new)", ""},
 		{"", "refused by stet", ""},
 	}
