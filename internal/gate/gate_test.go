@@ -707,6 +707,26 @@ func TestInspectMarksWhatCannotBeInspected(t *testing.T) {
 	}
 }
 
+// Inspect passes on what SQL runs by name, as the server compares names, so
+// the proxy can look the names up in the session's tables (spec correction
+// B5).
+func TestInspectReportsWhatRunsByName(t *testing.T) {
+	e := setup(t, calm())
+	for sql, want := range map[string][2][]string{
+		"execute s1(1)":                {{"s1"}, nil},
+		`explain analyze execute "S2"`: {{"S2"}, nil},
+		"fetch all from P1":            {nil, {"p1"}},
+		"move all in p2; execute s3":   {{"s3"}, {"p2"}},
+		"select 1":                     {nil, nil},
+		"update " + e.table + " set title = 'x' where id = 1": {nil, nil},
+	} {
+		st := e.gate.Inspect(sql)
+		if !slices.Equal(st.Executes, want[0]) || !slices.Equal(st.Portals, want[1]) {
+			t.Errorf("Inspect(%q): Executes %q Portals %q, want %q and %q", sql, st.Executes, st.Portals, want[0], want[1])
+		}
+	}
+}
+
 // A message refused without a decision gets decide.Blocked's error and a
 // warning that names the session, its login role and the reason, and nothing
 // of the statement.

@@ -94,8 +94,22 @@ func (g *recordingGate) Inspect(sql string) proxy.Statement {
 	if g.block != nil {
 		st.Block = g.block(sql)
 	}
+	for _, m := range executeRE.FindAllStringSubmatch(sql, -1) {
+		st.Executes = append(st.Executes, strings.ToLower(m[1]))
+	}
+	if m := portalRE.FindStringSubmatch(sql); m != nil {
+		st.Portals = []string{strings.ToLower(m[1])}
+	}
 	return st
 }
+
+// The test double's view of what SQL runs by name: EXECUTE of a prepared
+// statement (EXPLAIN ANALYZE EXECUTE included), FETCH or MOVE of a portal.
+// The real gate takes both from the classifier.
+var (
+	executeRE = regexp.MustCompile(`(?i)\bexecute\s+(\w+)`)
+	portalRE  = regexp.MustCompile(`(?is)^\s*(?:fetch|move)\b.*\b(?:from|in)\s+(\w+)\s*$`)
+)
 
 // The test double's view of cursor statements; the real gate parses them.
 var (
@@ -2500,5 +2514,147 @@ func TestRefusalsAfterAQueryBeforeSyncAreDelivered(t *testing.T) {
 	wantRefused(t, os[1], false)
 	if n := rowCount(t, table); n != 0 {
 		t.Errorf("%d rows, want none", n)
+	}
+}
+
+// A statement prepared with a protocol Parse runs with SQL EXECUTE, where
+// the classifier sees no table (spec correction B5). An enforced session
+// refuses an EXECUTE of a name the statement table holds as a watched write,
+// also inside EXPLAIN ANALYZE; the shadow proxy forwards it as before. A name
+// the table does not hold gets the server's own answer.
+func TestSQLExecuteOfAPreparedWriteIsRefused(t *testing.T) {
+	for _, mode := range closedPointModes {
+		t.Run(mode.name, func(t *testing.T) {
+			table := watchedTable(t)
+			g := newRecordingGate(watches(table))
+			addr, _ := startProxyWith(t, upstream(t), g, mode.policy)
+			fe := rawAgent(t, addr, table)
+			p := mode.policy
+
+			sendAll(t, fe, &pgproto3.Parse{Name: "s1", Query: "insert into " + table + " values ($1, 'x')"}, &pgproto3.Sync{})
+			wantReplies(t, fe, "1 Z")
+			sendAll(t, fe, &pgproto3.Query{String: "execute s1(1)"})
+			sendAll(t, fe, &pgproto3.Query{String: "explain analyze execute s1(2)"})
+			if p.Enforce {
+				wantReplies(t, fe, "E:ST002 Z", "blocked prepared_write")
+				wantReplies(t, fe, "E:ST002 Z", "blocked prepared_write")
+			} else {
+				wantReplies(t, fe, "C Z")
+				if got := replies(t, fe); !strings.HasPrefix(got, "T D") || !strings.HasSuffix(got, "C Z") {
+					t.Errorf("EXPLAIN ANALYZE EXECUTE: replies %q, want its plan", got)
+				}
+			}
+			sendAll(t, fe, &pgproto3.Query{String: "execute nosuch(3)"})
+			wantReplies(t, fe, "E:26000 Z")
+
+			if n, want := rowCount(t, table), pick(p, "0", "2"); fmt.Sprint(n) != want {
+				t.Errorf("%d rows, want %s", n, want)
+			}
+			if n := g.beginCount(); n != 0 {
+				t.Errorf("%d writes begun, want none: an EXECUTE is not judged", n)
+			}
+			if p.Enforce {
+				g.wantBlocked(t, "stet_trust", proxy.BlockPreparedWrite, proxy.BlockPreparedWrite)
+			} else {
+				g.wantBlocked(t, "stet_trust")
+			}
+		})
+	}
+}
+
+// A portal bound with the protocol to an UPDATE ... RETURNING runs when SQL
+// FETCH or MOVE reads it inside its transaction (spec correction B5). An
+// enforced session refuses both, and the table stays as it was; the shadow
+// proxy forwards them as before.
+func TestFetchFromAWritePortalIsRefused(t *testing.T) {
+	for _, mode := range closedPointModes {
+		t.Run(mode.name, func(t *testing.T) {
+			table := watchedTable(t)
+			admin := connect(t, upstream(t), "stet_scram", nil)
+			mustExec(t, admin, "insert into "+table+" values (1, 'a')")
+			mustExec(t, admin, "grant select, update on "+table+" to stet_trust")
+			g := newRecordingGate(watches(table))
+			addr, _ := startProxyWith(t, upstream(t), g, mode.policy)
+			fe := rawSession(t, addr, "stet_trust", pgproto3.ProtocolVersionNumber)
+			p := mode.policy
+
+			for _, c := range []struct{ sql, shadow string }{
+				{"fetch all from p1", "T D C Z"},
+				{"move all in p1", "C Z"},
+			} {
+				sendAll(t, fe, &pgproto3.Query{String: "begin"})
+				wantReplies(t, fe, "C Z")
+				sendAll(t, fe, &pgproto3.Parse{Query: "update " + table + " set v = 'b' returning id"},
+					&pgproto3.Bind{DestinationPortal: "p1"}, &pgproto3.Sync{})
+				wantReplies(t, fe, "1 2 Z")
+				sendAll(t, fe, &pgproto3.Query{String: c.sql})
+				if p.Enforce {
+					wantReplies(t, fe, "E:ST002 Z", "blocked prepared_write")
+				} else {
+					wantReplies(t, fe, c.shadow)
+				}
+				sendAll(t, fe, &pgproto3.Query{String: "rollback"})
+				wantReplies(t, fe, "C Z")
+			}
+
+			var v string
+			if err := admin.QueryRow(testCtx(t), "select v from "+table+" where id = 1").Scan(&v); err != nil || v != "a" {
+				t.Errorf("row 1 has v = %q (%v), want a", v, err)
+			}
+			if n := g.beginCount(); n != 0 {
+				t.Errorf("%d writes begun, want none: a FETCH or MOVE is not judged", n)
+			}
+			if p.Enforce {
+				g.wantBlocked(t, "stet_trust", proxy.BlockPreparedWrite, proxy.BlockPreparedWrite)
+			}
+		})
+	}
+}
+
+// A name changed by a message the server has not answered yet may mean
+// either statement (spec correction B4). When one of them is a watched write,
+// an enforced session refuses the Execute of a portal bound to it, without
+// asking the gate; the shadow proxy goes by the newest meaning, as before. A
+// name none of whose meanings is watched runs.
+func TestUnsureNameIsRefused(t *testing.T) {
+	for _, mode := range closedPointModes {
+		t.Run(mode.name, func(t *testing.T) {
+			table := watchedTable(t)
+			g := newRecordingGate(watches(table))
+			addr, _ := startProxyWith(t, upstream(t), g, mode.policy)
+			fe := rawAgent(t, addr, table)
+			p := mode.policy
+			reparse := func(name, sql string) {
+				t.Helper()
+				sendAll(t, fe, &pgproto3.Parse{Name: name, Query: sql}, &pgproto3.Sync{})
+				wantReplies(t, fe, "1 Z")
+				// The re-Parse fails (42P05), but the Bind and Execute
+				// behind it arrive before the server says so.
+				sendAll(t, fe, &pgproto3.Parse{Name: name, Query: "select 1"}, &pgproto3.Sync{},
+					&pgproto3.Bind{PreparedStatement: name}, &pgproto3.Execute{}, &pgproto3.Sync{})
+				wantReplies(t, fe, "E:42P05 Z")
+			}
+
+			reparse("s1", "insert into "+table+" values (1, 'x')")
+			if p.Enforce {
+				wantReplies(t, fe, "2 E:ST002 Z", "blocked unsettled_name")
+			} else {
+				wantReplies(t, fe, "2 C Z")
+			}
+			if n, want := rowCount(t, table), pick(p, "0", "1"); fmt.Sprint(n) != want {
+				t.Errorf("%d rows, want %s", n, want)
+			}
+			if n := g.beginCount(); n != 0 {
+				t.Errorf("%d writes begun, want none", n)
+			}
+
+			reparse("s2", "select 2")
+			wantReplies(t, fe, "2 D C Z")
+			if p.Enforce {
+				g.wantBlocked(t, "stet_trust", proxy.BlockUnsettledName)
+			} else {
+				g.wantBlocked(t, "stet_trust")
+			}
+		})
 	}
 }

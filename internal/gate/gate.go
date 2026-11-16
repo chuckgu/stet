@@ -115,7 +115,8 @@ func (g *Gate) Close() {
 //
 // SQL the classifier cannot read, and SQL holding a DO block, whose writes
 // cannot be seen, are marked with Block whatever the mode: the proxy refuses
-// them on enforced sessions only.
+// them on enforced sessions only. The names SQL runs (EXECUTE, FETCH, MOVE)
+// are passed on for the proxy to look up in the session's tables.
 func (g *Gate) Inspect(sql string) proxy.Statement {
 	r, err := sqlparse.Classify(sql, g.gated)
 	if err != nil {
@@ -136,6 +137,7 @@ func (g *Gate) Inspect(sql string) proxy.Statement {
 		}
 	}
 	st.Several = r.Statements > 1
+	st.Executes, st.Portals = r.Executes, r.Portals
 	st.Data = r
 	return st
 }

@@ -33,12 +33,16 @@ type Gate interface {
 	Blocked(s SessionInfo, reason string) Refusal
 }
 
-// Reasons a message is refused without a decision.
+// Reasons a message is refused without a decision, or the session is ended.
 const (
-	BlockUnparsed     = "unparsed"
-	BlockTooLarge     = "too_large"
-	BlockFunctionCall = "function_call"
-	BlockDo           = "do_block"
+	BlockUnparsed      = "unparsed"
+	BlockTooLarge      = "too_large"
+	BlockFunctionCall  = "function_call"
+	BlockDo            = "do_block"
+	BlockPreparedWrite = "prepared_write" // SQL EXECUTE, FETCH or MOVE of a name the session prepared or bound as a watched statement
+	BlockUnsettledName = "unsettled_name" // the name may mean a watched statement, and the server has not said which meaning holds
+	BlockProtocolOrder = "protocol_order" // the session is ended: answers can no longer be matched to messages
+	BlockCopyExtended  = "copy_extended"  // the session is ended: COPY FROM STDIN through the extended protocol
 )
 
 type Statement struct {
@@ -63,6 +67,11 @@ type Statement struct {
 	Clean bool
 	// Block says why the message cannot be inspected (BlockUnparsed, BlockDo); "" when it can.
 	Block string
+	// Executes and Portals name what the SQL runs by name, as the server
+	// compares names: prepared statements it runs with EXECUTE, and portals
+	// it reads with FETCH or MOVE. The classifier sees no table behind them.
+	Executes []string
+	Portals  []string
 }
 
 type Param struct {
@@ -422,9 +431,19 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 			return nil, nil
 		}
 		st := s.gate.Inspect(m.String)
-		if s.enforce && st.Block != "" {
-			s.dirties(u, st)
-			return s.block(u, 0, 'Q', "", st.Block), nil
+		if s.enforce {
+			reason := st.Block
+			if reason == "" && runsNames(st) {
+				s.mu.Lock()
+				if s.runsWatched(u, st, maxRunDepth) {
+					reason = BlockPreparedWrite
+				}
+				s.mu.Unlock()
+			}
+			if reason != "" {
+				s.dirties(u, st)
+				return s.block(u, 0, 'Q', "", reason), nil
+			}
 		}
 		return s.statement(u, 0, 0, 'Q', st, nil, nil, flush), nil
 
@@ -476,6 +495,8 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		}
 		if read {
 			p, ok, others = s.stmts.get(u, m.PreparedStatement)
+			// An older meaning that is the same statement is no other meaning.
+			others = slices.DeleteFunc(others, func(q prepared) bool { return ok && p.same(q) })
 		}
 		s.mu.Unlock()
 		// Bind values are copied without the lock: the server side takes it
@@ -505,12 +526,20 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		if read {
 			b, ok, others = s.portals.get(u, m.Portal)
 		}
-		s.mu.Unlock()
-		if s.enforce && !read {
+		var reason string
+		switch {
+		case !s.enforce:
+		case !read:
 			// Its portal is not known; the server compares portal names by
 			// their first 63 bytes, so it may run any of them.
+			reason = unreadable(body)
+		default:
+			reason = s.executeBlock(u, b, ok, others)
+		}
+		s.mu.Unlock()
+		if reason != "" {
 			s.markDirty(u)
-			return s.block(u, pos, 'E', "", unreadable(body)), nil
+			return s.block(u, pos, 'E', "", reason), nil
 		}
 		if !ok || b.unread {
 			// It may run anything, or a statement Stet does not follow.
@@ -635,15 +664,104 @@ func unclean(st Statement) bool { return st.Watch || !st.Clean }
 // one of others, the portal name's other meanings (see names.get), or one
 // its statement's name meant at the Bind of b or of one of others.
 func mayRunUnclean(b bound, others []bound) bool {
-	uncleanStatement := func(ps []prepared) bool {
-		return slices.ContainsFunc(ps, func(p prepared) bool { return p.unread || unclean(p.st) })
+	return anyOther(b, others, func(st Statement, unread bool) bool { return unread || unclean(st) })
+}
+
+// anyOther reports whether f holds for a statement an Execute of a portal
+// whose newest meaning is b may run in its place: one of others, the portal
+// name's other meanings (see names.get), or one its statement's name meant
+// at the Bind of b or of one of others (bound.others). unread says what the
+// statement is is not known.
+func anyOther(b bound, others []bound, f func(st Statement, unread bool) bool) bool {
+	for _, p := range b.others {
+		if f(p.st, p.unread) {
+			return true
+		}
 	}
-	if uncleanStatement(b.others) {
+	for _, o := range others {
+		if f(o.st, o.unread) {
+			return true
+		}
+		for _, p := range o.others {
+			if f(p.st, p.unread) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// anyMeaning is anyOther with b's own statement too, when the portal has a
+// newest meaning (ok).
+func anyMeaning(b bound, ok bool, others []bound, f func(st Statement, unread bool) bool) bool {
+	return ok && f(b.st, b.unread) || anyOther(b, others, f)
+}
+
+// executeBlock is why an enforced session refuses an Execute arriving in u
+// of a portal whose newest meaning is b (ok: it has one) and whose other
+// meanings are others, or "".
+//
+// When the portal may run more than one statement and one of them is a
+// watched write or unknown, it is refused: the server has not said which
+// one holds, and Begin can judge only one (spec correction B4). A portal is
+// bound for its lifetime to the meanings its statement's name had at the
+// Bind, so it stays refused after the change was answered: the lesser
+// failure. When a statement it may run runs a watched name in turn, it is
+// refused as such (see runsWatched). The gate is not asked. It runs with s.mu
+// held.
+func (s *session) executeBlock(u *unit, b bound, ok bool, others []bound) string {
+	if len(b.others) > 0 || len(others) > 0 {
+		if anyMeaning(b, ok, others, func(st Statement, unread bool) bool { return unread || st.Watch }) {
+			return BlockUnsettledName
+		}
+	}
+	if anyMeaning(b, ok, others, func(st Statement, _ bool) bool { return s.runsWatched(u, st, maxRunDepth) }) {
+		return BlockPreparedWrite
+	}
+	return ""
+}
+
+// maxRunDepth is how many names deep runsWatched follows a statement that
+// runs a name whose statement runs a name in turn.
+const maxRunDepth = 4
+
+// runsNames reports whether st runs a prepared statement or a portal by name.
+func runsNames(st Statement) bool { return len(st.Executes) > 0 || len(st.Portals) > 0 }
+
+// runsWatched reports whether st, arriving now in u, may run a watched write
+// by name, where the classifier sees no table (spec correction B5): a
+// prepared statement it runs with SQL EXECUTE, or a portal it reads with
+// FETCH or MOVE, under any meaning the name may have (see names.get). A
+// meaning that is unknown counts as watched. A meaning that runs names in
+// turn is followed depth more names deep, and past that counts as watched;
+// a statement can run itself. It runs with s.mu held.
+func (s *session) runsWatched(u *unit, st Statement, depth int) bool {
+	if !runsNames(st) {
+		return false
+	}
+	if depth == 0 {
 		return true
 	}
-	return slices.ContainsFunc(others, func(o bound) bool {
-		return o.unread || unclean(o.st) || uncleanStatement(o.others)
-	})
+	watched := func(st Statement, unread bool) bool {
+		return unread || st.Watch || s.runsWatched(u, st, depth-1)
+	}
+	for _, name := range st.Executes {
+		p, ok, others := s.stmts.get(u, name)
+		if ok && watched(p.st, p.unread) {
+			return true
+		}
+		for _, o := range others {
+			if watched(o.st, o.unread) {
+				return true
+			}
+		}
+	}
+	for _, name := range st.Portals {
+		if b, ok, others := s.portals.get(u, name); anyMeaning(b, ok, others, watched) {
+			return true
+		}
+	}
+	return false
 }
 
 // markDirty notes that u holds a statement that is not clean.
@@ -777,8 +895,9 @@ func (s *session) count() (*unit, int) {
 
 // binding is what the portal of Bind m means, given what its statement's
 // name meant (see names.get). A portal is given a statement when its Execute
-// does something beyond leaving the transaction dirty; one left empty
-// dirties it. Only a watched statement keeps the bind values, for Begin.
+// does something beyond leaving the transaction dirty, or runs a name (see
+// runsWatched); one left empty dirties it. Only a watched statement keeps
+// the bind values, for Begin.
 func binding(m *pgproto3.Bind, p prepared, ok bool, others []prepared) bound {
 	b := bound{others: others}
 	switch {
@@ -789,7 +908,7 @@ func binding(m *pgproto3.Bind, p prepared, ok bool, others []prepared) bound {
 		b.st, b.params = p.st, params(m, p.oids)
 	case p.st.Observe:
 		b.st, b.rows = p.st, new(int64)
-	case p.st.Clean || p.st.OnBehalfOf != nil || len(p.st.Cursors) > 0:
+	case p.st.Clean || p.st.OnBehalfOf != nil || len(p.st.Cursors) > 0 || runsNames(p.st):
 		b.st = p.st
 	}
 	return b

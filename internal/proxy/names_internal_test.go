@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"slices"
 	"strconv"
 	"strings"
@@ -626,6 +627,151 @@ func BenchmarkDistinctParses(b *testing.B) {
 		s := readySession(newStmtGate())
 		for i := range 40000 {
 			send(s, parseMsg("s"+strconv.Itoa(i), "select 1"))
+		}
+	}
+}
+
+// byNameGate is stmtGate that also reads what SQL runs by name: "execute
+// <name>" and "fetch <name>".
+type byNameGate struct{ *stmtGate }
+
+func (g byNameGate) Inspect(sql string) Statement {
+	st := g.stmtGate.Inspect(sql)
+	switch f := strings.Fields(sql); {
+	case len(f) == 2 && f[0] == "execute":
+		st.Executes = []string{f[1]}
+	case len(f) == 2 && f[0] == "fetch":
+		st.Portals = []string{f[1]}
+	}
+	return st
+}
+
+// sendOne hands the session msgs as send does and returns what the last one
+// was replaced by, or nil.
+func sendOne(s *session, msgs ...pgproto3.FrontendMessage) []byte {
+	send(s, msgs[:len(msgs)-1]...)
+	b, _ := msgs[len(msgs)-1].Encode(nil)
+	r, _ := s.fromClient(b[0], b[5:], func() error { return nil })
+	return r
+}
+
+// On an enforced session a statement that runs names is refused when any
+// meaning of a name it runs is a watched write: run by SQL EXECUTE, or read
+// by FETCH, directly or through a statement or portal that runs it in turn.
+// Names whose every meaning is a read run, and so does a name the session
+// does not hold. A shadow session forwards them all.
+func TestWhatRunsAWatchedNameIsRefused(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		msgs    []pgproto3.FrontendMessage
+		refused bool
+	}{
+		{"EXECUTE of a watched statement", msgs(queryMsg("execute w")), true},
+		{"EXECUTE of a read", msgs(queryMsg("execute r")), false},
+		{"EXECUTE of a name not held", msgs(queryMsg("execute nosuch")), false},
+		{"EXECUTE of an EXECUTE of a watched statement", msgs(queryMsg("execute ew")), true},
+		{"EXECUTE of an EXECUTE of a read", msgs(queryMsg("execute er")), false},
+		{"EXECUTE of a statement that executes itself", msgs(queryMsg("execute loop")), true},
+		{"Execute of a portal that executes a watched statement", msgs(bindMsg("", "ew"), execMsg("")), true},
+		{"Execute of a portal that executes a read", msgs(bindMsg("", "er"), execMsg("")), false},
+		{"FETCH of a watched portal", msgs(queryMsg("fetch pw")), true},
+		{"FETCH of a read portal", msgs(queryMsg("fetch pr")), false},
+		{"FETCH of a portal whose re-Bind is not answered yet", msgs(bindMsg("pr", "w"), syncMsg, queryMsg("fetch pr")), true},
+		{"Execute of a portal that fetches a watched portal", msgs(bindMsg("", "fw"), execMsg("")), true},
+	} {
+		for _, enforce := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s, enforce %v", c.name, enforce), func(t *testing.T) {
+				g := byNameGate{newStmtGate()}
+				s := readySession(g)
+				s.enforce = enforce
+				send(s, queryMsg("begin"))
+				serve(s, tag("BEGIN"), readyWith('T'))
+				send(s, parseMsg("w", ins), parseMsg("r", "select 1"), parseMsg("ew", "execute w"), parseMsg("er", "execute r"),
+					parseMsg("loop", "execute loop"), parseMsg("fw", "fetch pw"), bindMsg("pw", "w"), bindMsg("pr", "r"), syncMsg)
+				serve(s, parseOK, parseOK, parseOK, parseOK, parseOK, parseOK, bindOK, bindOK, readyWith('T'))
+
+				r := sendOne(s, c.msgs...)
+				if refused := r != nil; refused != (c.refused && enforce) {
+					t.Errorf("replaced %v, want %v", refused, c.refused && enforce)
+				}
+				if want := []string(nil); c.refused && enforce {
+					want = []string{BlockPreparedWrite}
+					if !slices.Equal(g.blocked, want) {
+						t.Errorf("Blocked for %q, want %q", g.blocked, want)
+					}
+				} else if len(g.blocked) != 0 {
+					t.Errorf("Blocked for %q, want never", g.blocked)
+				}
+				if g.n != 0 {
+					t.Errorf("%d writes begun, want none", g.n)
+				}
+			})
+		}
+	}
+}
+
+func msgs(m ...pgproto3.FrontendMessage) []pgproto3.FrontendMessage { return m }
+
+// A portal whose name, or whose statement's name at its Bind, has several
+// meanings, one of them a watched write, is refused at Execute on an
+// enforced session, without asking the gate: a re-Parse or a Close not
+// answered yet may or may not hold. Meanings that are the same statement are
+// one meaning. A shadow session judges the newest meaning, as before.
+func TestUnsettledNamesAreRefused(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		send    func(s *session)
+		refused bool
+		begun   int // writes begun on the shadow session
+	}{
+		{"statement re-Parsed as a read", func(s *session) {
+			send(s, parseMsg("s1", "select 1"), syncMsg, bindMsg("", "s1"), execMsg(""))
+		}, true, 0},
+		{"statement re-Parsed as the same write", func(s *session) {
+			send(s, parseMsg("s1", ins), syncMsg, bindMsg("", "s1"), execMsg(""))
+		}, false, 1},
+		{"statement closed", func(s *session) {
+			send(s, closeMsg('S', "s1"), syncMsg, bindMsg("", "s1"), execMsg(""))
+		}, true, 0},
+		{"portal closed", func(s *session) {
+			send(s, closeMsg('P', "p1"), syncMsg, execMsg("p1"))
+		}, true, 0},
+		{"portal re-Bound to a read", func(s *session) {
+			send(s, parseMsg("r", "select 1"), syncMsg)
+			serve(s, parseOK, readyWith('T'))
+			send(s, bindMsg("p1", "r"), syncMsg, execMsg("p1"))
+		}, true, 0},
+	} {
+		for _, enforce := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s, enforce %v", c.name, enforce), func(t *testing.T) {
+				g := newStmtGate()
+				s := readySession(g)
+				s.enforce = enforce
+				send(s, queryMsg("begin"))
+				serve(s, tag("BEGIN"), readyWith('T'))
+				send(s, parseMsg("s1", ins), bindMsg("p1", "s1"), syncMsg)
+				serve(s, parseOK, bindOK, readyWith('T'))
+
+				c.send(s)
+				refused := len(s.units[len(s.units)-1].refused) > 0
+				if want := c.refused && enforce; refused != want {
+					t.Errorf("refused %v, want %v", refused, want)
+				}
+				switch {
+				case c.refused && enforce:
+					if !slices.Equal(g.blocked, []string{BlockUnsettledName}) || g.n != 0 {
+						t.Errorf("Blocked for %q, %d writes begun; want unsettled_name alone", g.blocked, g.n)
+					}
+				case enforce:
+					if len(g.blocked) != 0 || g.n != 1 {
+						t.Errorf("Blocked for %q, %d writes begun; want the write judged", g.blocked, g.n)
+					}
+				default:
+					if len(g.blocked) != 0 || g.n != c.begun {
+						t.Errorf("Blocked for %q, %d writes begun; want %d begun", g.blocked, g.n, c.begun)
+					}
+				}
+			})
 		}
 	}
 }
