@@ -38,6 +38,10 @@ type Statement struct {
 	Observe    bool
 	OnBehalfOf *string // set when the statement sets stet.on_behalf_of; "" resets it
 	Data       any     // the gate's own classification, handed back in Begin and Observe
+	// Cursor is set when the statement declares, fetches from or closes a SQL
+	// cursor. A FETCH is reported through Observe with the Statement that
+	// declared its cursor. Watch wins over Cursor, and Cursor over Observe.
+	Cursor *Cursor
 }
 
 type Param struct {
@@ -93,10 +97,11 @@ type session struct {
 	// stopped: row messages sent since the last completion or error.
 	sent int64
 
-	mu     sync.Mutex
-	units  []*unit // sent, not yet answered by ReadyForQuery; oldest first
-	ready  bool    // the post-startup ReadyForQuery has arrived
-	status byte    // transaction status from the last ReadyForQuery
+	mu      sync.Mutex
+	units   []*unit              // sent, not yet answered by ReadyForQuery; oldest first
+	ready   bool                 // the post-startup ReadyForQuery has arrived
+	status  byte                 // transaction status from the last ReadyForQuery
+	cursors map[string]*declared // SQL cursors by name; nil until a DECLARE needs it
 }
 
 type prepared struct {
@@ -206,6 +211,8 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 		switch {
 		case st.Watch:
 			s.begin(u, 0, st, nil, flush)
+		case st.Cursor != nil:
+			s.cursor(u, 0, st)
 		case st.Observe:
 			s.observe(u, 0, st)
 		}
@@ -225,7 +232,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 			return
 		}
 		p, ok := s.stmts[m.PreparedStatement]
-		if !ok || (!p.st.Watch && !p.st.Observe && p.st.OnBehalfOf == nil) {
+		if !ok || (!p.st.Watch && !p.st.Observe && p.st.OnBehalfOf == nil && p.st.Cursor == nil) {
 			delete(s.portals, m.DestinationPortal)
 			return
 		}
@@ -253,6 +260,8 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) {
 		switch {
 		case b.st.Watch:
 			s.begin(u, idx, b.st, b.params, flush)
+		case b.st.Cursor != nil:
+			s.cursor(u, idx, b.st)
 		case b.st.Observe:
 			s.observe(u, idx, b.st)
 		}
@@ -381,6 +390,9 @@ func (s *session) fromServer(t byte, body []byte) {
 			return
 		}
 		s.units = s.units[1:]
+		if len(s.cursors) > 0 {
+			s.cursorsAnswered(head, before, status)
+		}
 		s.mu.Unlock()
 		s.finish(head, before, status)
 		return
@@ -493,6 +505,7 @@ func (s *session) abandon() {
 	s.mu.Lock()
 	units := s.units
 	s.units = nil
+	s.cursors = nil
 	status := s.status
 	s.mu.Unlock()
 	if len(units) > 0 {

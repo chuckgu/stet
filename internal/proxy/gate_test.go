@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 
 	"github.com/stetdb/stet/internal/proxy"
@@ -59,7 +60,38 @@ func (g *recordingGate) Inspect(sql string) proxy.Statement {
 	if m := oboRE.FindStringSubmatch(sql); m != nil {
 		st.OnBehalfOf = &m[1]
 	}
+	if c, query := cursorOf(sql); c != nil {
+		st.Cursor = c
+		if c.Op == proxy.CursorDeclare { // remembered when its query is an observed read
+			st.Observe = g.observeMatch != nil && g.observeMatch(query)
+		}
+	}
 	return st
+}
+
+// The test double's view of cursor statements; the real gate parses them.
+var (
+	declareRE = regexp.MustCompile(`(?is)^\s*declare\s+(\w+)\s+cursor\s+(with\s+hold\s+)?for\s+(.+)$`)
+	fetchRE   = regexp.MustCompile(`(?is)^\s*fetch\b.*\bfrom\s+(\w+)\s*$`)
+	closeRE   = regexp.MustCompile(`(?is)^\s*close\s+(\w+)\s*$`)
+)
+
+// cursorOf says what sql does to a cursor, with a DECLARE's query, or nil.
+// Names are lowercased, as the parser normalizes unquoted names.
+func cursorOf(sql string) (*proxy.Cursor, string) {
+	if m := declareRE.FindStringSubmatch(sql); m != nil {
+		return &proxy.Cursor{Op: proxy.CursorDeclare, Name: strings.ToLower(m[1]), Hold: m[2] != ""}, m[3]
+	}
+	if m := fetchRE.FindStringSubmatch(sql); m != nil {
+		return &proxy.Cursor{Op: proxy.CursorFetch, Name: strings.ToLower(m[1])}, ""
+	}
+	if m := closeRE.FindStringSubmatch(sql); m != nil {
+		if strings.EqualFold(m[1], "all") {
+			return &proxy.Cursor{Op: proxy.CursorCloseAll}, ""
+		}
+		return &proxy.Cursor{Op: proxy.CursorClose, Name: strings.ToLower(m[1])}, ""
+	}
+	return nil, ""
 }
 
 func (g *recordingGate) Begin(info proxy.SessionInfo, st proxy.Statement, params []proxy.Param) any {
@@ -718,6 +750,281 @@ func untilReady(t *testing.T, fe *pgproto3.Frontend) (rows, suspended int) {
 			t.Fatalf("SQLSTATE %s: %s", m.Code, m.Message)
 		case *pgproto3.ReadyForQuery:
 			return rows, suspended
+		}
+	}
+}
+
+// mustFail runs sql and fails the test unless the server refuses it with code.
+func mustFail(t *testing.T, conn *pgx.Conn, sql, code string) {
+	t.Helper()
+	if _, err := conn.Exec(testCtx(t), sql); pgCode(err) != code {
+		t.Fatalf("%s: %v, want SQLSTATE %s", sql, err, code)
+	}
+}
+
+// Each statement is answered before the next one goes, and Observe runs
+// before the ReadyForQuery that ends a read is forwarded, so once the client
+// has its answer every read it caused has been reported: the counts below are
+// exact.
+func TestGateObservesFetchesAsReadsOfTheCursor(t *testing.T) {
+	table := readTable(t)
+	g := newObservingGate(readsOf(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	declare := "declare c cursor for select * from " + table
+	for _, sql := range []string{"begin", declare, "fetch 300 from c", "fetch 300 from c", "close c", "commit"} {
+		mustExec(t, conn, sql)
+	}
+
+	obs := g.observed(t, 2)
+	if len(obs) != 2 {
+		t.Fatalf("%d reads observed, want one per FETCH and none for the DECLARE", len(obs))
+	}
+	for i, ob := range obs {
+		if ob.st.SQL != declare {
+			t.Errorf("FETCH %d reported as %q, want the DECLARE %q", i+1, ob.st.SQL, declare)
+		}
+		if o := ob.o; o.Sent != 300 || !o.Executed || o.Error != "" || !o.InTransaction {
+			t.Errorf("FETCH %d: %+v, want 300 rows sent and executed in a transaction", i+1, o)
+		}
+	}
+}
+
+func TestCursorIsForgottenWhenClosed(t *testing.T) {
+	table := readTable(t)
+	g := newObservingGate(readsOf(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	for _, sql := range []string{"begin", "declare c cursor for select * from " + table, "fetch 10 from c", "close c"} {
+		mustExec(t, conn, sql)
+	}
+	mustFail(t, conn, "fetch 10 from c", "34000")
+	mustExec(t, conn, "rollback")
+
+	if obs := g.observed(t, 1); len(obs) != 1 {
+		t.Errorf("%d reads observed, want only the FETCH before CLOSE", len(obs))
+	}
+}
+
+func TestCursorIsForgottenAtTransactionEnd(t *testing.T) {
+	table := readTable(t)
+	g := newObservingGate(readsOf(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	for _, sql := range []string{"begin", "declare c cursor for select * from " + table, "fetch 5 from c", "commit"} {
+		mustExec(t, conn, sql)
+	}
+	// Nothing but the end of the transaction has forgotten c here.
+	mustFail(t, conn, "fetch 1 from c", "34000")
+	for _, sql := range []string{"begin", "declare c cursor for select 1", "fetch 1 from c", "commit"} {
+		mustExec(t, conn, sql)
+	}
+
+	if obs := g.observed(t, 1); len(obs) != 1 || obs[0].o.Sent != 5 {
+		t.Errorf("reads = %+v, want only the 5-row FETCH of the first transaction", obs)
+	}
+}
+
+func TestHeldCursorSurvivesCommit(t *testing.T) {
+	table := readTable(t)
+	g := newObservingGate(readsOf(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	held := "declare c cursor with hold for select * from " + table
+	for _, sql := range []string{"begin", held, "commit", "fetch 10 from c"} {
+		mustExec(t, conn, sql)
+	}
+	obs := g.observed(t, 1)
+	if len(obs) != 1 {
+		t.Fatalf("%d reads observed, want 1", len(obs))
+	}
+	if ob := obs[0]; ob.st.SQL != held || ob.o.Sent != 10 || !ob.o.Executed {
+		t.Errorf("FETCH after COMMIT: %q %+v, want the DECLARE with 10 rows sent", ob.st.SQL, ob.o)
+	}
+
+	// A later transaction that fails does not take c with it: c was
+	// declared in one that committed.
+	mustExec(t, conn, "begin")
+	mustFail(t, conn, "select 1/0", "22012")
+	mustExec(t, conn, "rollback")
+	mustExec(t, conn, "fetch 10 from c")
+	// Declared outside a transaction block, it commits at once.
+	auto := "declare d cursor with hold for select * from " + table
+	mustExec(t, conn, auto)
+	mustExec(t, conn, "fetch 10 from d")
+	mustExec(t, conn, "close all")
+
+	obs = g.observed(t, 3)
+	if len(obs) != 3 {
+		t.Fatalf("%d reads observed, want 3", len(obs))
+	}
+	for i, want := range []string{held, auto} {
+		if ob := obs[i+1]; ob.st.SQL != want || ob.o.Sent != 10 || !ob.o.Executed {
+			t.Errorf("read %d: %q %+v, want %q with 10 rows sent", i+2, ob.st.SQL, ob.o, want)
+		}
+	}
+}
+
+func TestHeldCursorIsForgottenWhenItsTransactionFails(t *testing.T) {
+	table := readTable(t)
+	g := newObservingGate(readsOf(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	mustExec(t, conn, "begin")
+	mustExec(t, conn, "declare c cursor with hold for select * from "+table)
+	mustFail(t, conn, "select 1/0", "22012")
+	mustExec(t, conn, "rollback")
+	mustFail(t, conn, "fetch 10 from c", "34000")
+
+	if obs := g.observed(t, 0); len(obs) != 0 {
+		t.Errorf("reads = %+v, want none", obs)
+	}
+}
+
+func TestFailedDeclareIsNotRemembered(t *testing.T) {
+	table := readTable(t)
+	// The failing DECLARE is one the gate observes, so Stet would remember
+	// it if it did not undo it.
+	g := newObservingGate(func(sql string) bool { return readsOf(table)(sql) || strings.Contains(sql, "no_such_table") })
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	mustExec(t, conn, "begin")
+	mustFail(t, conn, "declare c cursor for select * from no_such_table", "42P01")
+	// The transaction is still open: only undoing the failed DECLARE forgets c.
+	mustFail(t, conn, "fetch 1 from c", "25P02")
+	mustExec(t, conn, "rollback")
+	// A held cursor outside a transaction block: no transaction end forgets it.
+	mustFail(t, conn, "declare c cursor with hold for select * from no_such_table", "42P01")
+	mustFail(t, conn, "fetch 1 from c", "34000")
+	for _, sql := range []string{"begin", "declare c cursor for select 1", "fetch 1 from c", "commit"} {
+		mustExec(t, conn, sql)
+	}
+
+	if obs := g.observed(t, 0); len(obs) != 0 {
+		t.Errorf("reads = %+v, want none", obs)
+	}
+}
+
+func TestFailedRedeclareKeepsTheOldCursor(t *testing.T) {
+	table := readTable(t)
+	g := newObservingGate(readsOf(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	first := "declare c cursor with hold for select * from " + table + " where id <= 100"
+	mustExec(t, conn, first)
+	mustFail(t, conn, "declare c cursor with hold for select * from "+table, "42P03")
+	mustFail(t, conn, "declare c cursor with hold for select 1", "42P03") // unobserved: it would forget c
+	mustExec(t, conn, "fetch 5 from c")
+	mustExec(t, conn, "close c")
+
+	obs := g.observed(t, 1)
+	if len(obs) != 1 {
+		t.Fatalf("%d reads observed, want 1", len(obs))
+	}
+	if ob := obs[0]; ob.st.SQL != first || ob.o.Sent != 5 {
+		t.Errorf("FETCH: %q %+v, want the cursor still open, %q, with 5 rows sent", ob.st.SQL, ob.o, first)
+	}
+}
+
+func TestRedeclaredCursorReplacesTheOld(t *testing.T) {
+	table := readTable(t)
+	g := newObservingGate(readsOf(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	before := "declare c cursor for select * from " + table + " where id <= 100"
+	after := "declare c cursor for select * from " + table + " where id > 900"
+	for _, sql := range []string{"begin", before, "fetch 10 from c", "close c", after, "fetch 10 from c", "commit"} {
+		mustExec(t, conn, sql)
+	}
+
+	obs := g.observed(t, 2)
+	if len(obs) != 2 {
+		t.Fatalf("%d reads observed, want 2", len(obs))
+	}
+	for i, want := range []string{before, after} {
+		if ob := obs[i]; ob.st.SQL != want || ob.o.Sent != 10 {
+			t.Errorf("FETCH %d: %q %+v, want %q with 10 rows sent", i+1, ob.st.SQL, ob.o, want)
+		}
+	}
+}
+
+func TestCloseAllForgetsEveryCursor(t *testing.T) {
+	table := readTable(t)
+	g := newObservingGate(readsOf(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	// Held cursors outside a transaction block: only CLOSE ALL forgets them.
+	mustExec(t, conn, "declare a cursor with hold for select * from "+table)
+	mustExec(t, conn, "declare b cursor with hold for select * from "+table)
+	mustExec(t, conn, "fetch 1 from a")
+	mustExec(t, conn, "close all")
+	mustFail(t, conn, "fetch 1 from a", "34000")
+	mustFail(t, conn, "fetch 1 from b", "34000")
+
+	if obs := g.observed(t, 1); len(obs) != 1 {
+		t.Errorf("%d reads observed, want only the FETCH before CLOSE ALL", len(obs))
+	}
+}
+
+// Parse, Bind and Execute: the DECLARE and a FETCH pipelined behind it under
+// one Sync, then a FETCH prepared once and executed until the cursor runs
+// out, then after CLOSE.
+func TestCursorsThroughTheExtendedProtocol(t *testing.T) {
+	table := readTable(t)
+	g := newObservingGate(readsOf(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+	pc := conn.PgConn()
+	ctx := testCtx(t)
+	extended := func(sql string) error {
+		_, err := pc.ExecParams(ctx, sql, nil, nil, nil, nil).Close()
+		return err
+	}
+
+	if err := extended("begin"); err != nil {
+		t.Fatal(err)
+	}
+	declare := "declare c cursor for select * from " + table
+	b := &pgconn.Batch{}
+	b.ExecParams(declare, nil, nil, nil, nil)
+	b.ExecParams("fetch 300 from c", nil, nil, nil, nil)
+	if _, err := pc.ExecBatch(ctx, b).ReadAll(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pc.Prepare(ctx, "f", "fetch 300 from c", nil); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if _, err := pc.ExecPrepared(ctx, "f", nil, nil, nil).Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := extended("close c"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pc.ExecPrepared(ctx, "f", nil, nil, nil).Close(); pgCode(err) != "34000" {
+		t.Fatalf("FETCH after CLOSE: %v, want 34000", err)
+	}
+	if err := extended("rollback"); err != nil {
+		t.Fatal(err)
+	}
+
+	obs := g.observed(t, 4)
+	if len(obs) != 4 {
+		t.Fatalf("%d reads observed, want one per FETCH before CLOSE", len(obs))
+	}
+	for i, want := range []int64{300, 300, 300, 100} {
+		if ob := obs[i]; ob.st.SQL != declare || ob.o.Sent != want || !ob.o.Executed {
+			t.Errorf("FETCH %d: %q %+v, want the DECLARE with %d rows sent", i+1, ob.st.SQL, ob.o, want)
 		}
 	}
 }

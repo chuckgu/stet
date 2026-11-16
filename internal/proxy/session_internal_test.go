@@ -251,3 +251,54 @@ func TestObservedPortalKeepsNoBindValues(t *testing.T) {
 		t.Errorf("portal kept bind values %+v, want none", b.params)
 	}
 }
+
+// cursorGate marks cursor statements as the real gate does, observes the
+// DECLAREs over t, and records each read with its statement.
+type cursorGate struct {
+	*fakeGate
+	reads []observedRead
+	sent  []int64
+}
+
+func (g *cursorGate) Inspect(sql string) Statement {
+	st := Statement{SQL: sql}
+	f := strings.Fields(sql)
+	switch f[0] {
+	case "declare":
+		st.Cursor = &Cursor{Op: CursorDeclare, Name: f[1], Hold: strings.Contains(sql, " with hold ")}
+		st.Observe = strings.HasSuffix(sql, " from t")
+	case "fetch":
+		st.Cursor = &Cursor{Op: CursorFetch, Name: f[len(f)-1]}
+	}
+	return st
+}
+
+func (g *cursorGate) Observe(info SessionInfo, st Statement, o Outcome) {
+	g.reads = append(g.reads, observedRead{info: info, st: st})
+	g.sent = append(g.sent, o.Sent)
+}
+
+func readyWith(b byte) *pgproto3.ReadyForQuery { return &pgproto3.ReadyForQuery{TxStatus: b} }
+
+// A transaction that ends while a DECLARE pipelined behind it is still
+// unanswered does not take that cursor along.
+func TestTransactionEndSparesCursorsDeclaredBehindIt(t *testing.T) {
+	g := &cursorGate{fakeGate: newFakeGate()}
+	s := readySession(g)
+	flush := func() error { return nil }
+	query := func(sql string) { s.fromClient('Q', body(&pgproto3.Query{String: sql}), flush) }
+
+	declare := "declare c cursor for select * from t"
+	query("select 1")
+	query("begin")
+	query(declare)
+	serve(s, &pgproto3.RowDescription{}, row, tag("SELECT 1"), readyWith('I'))
+	serve(s, tag("BEGIN"), readyWith('T'))
+	serve(s, tag("DECLARE CURSOR"), readyWith('T'))
+	query("fetch 2 from c")
+	serve(s, &pgproto3.RowDescription{}, row, row, tag("FETCH 2"), readyWith('T'))
+
+	if len(g.reads) != 1 || g.reads[0].st.SQL != declare || g.sent[0] != 2 {
+		t.Errorf("reads = %+v sent %v, want the FETCH as a 2-row read of %q", g.reads, g.sent, declare)
+	}
+}
