@@ -187,7 +187,7 @@ func (g *Gate) judge(p *pending, o proxy.Outcome) {
 	}
 
 	switch {
-	case p.res.Kind == sqlparse.Unsupported:
+	case p.res.Kind == sqlparse.Unsupported, p.res.Kind == sqlparse.Measured:
 		in.Unsupported = p.res.Reason
 	case o.InTransaction:
 		in.Unsupported = "in_transaction"

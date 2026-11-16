@@ -21,6 +21,7 @@ const (
 	Pass        Kind = iota // writes no gated table
 	Gated                   // single-row write that v0.1 judges
 	Unsupported             // writes a gated table in a shape v0.1 does not judge
+	Measured                // multi-row write of a gated table whose row count can be learned
 )
 
 func (k Kind) String() string {
@@ -31,6 +32,8 @@ func (k Kind) String() string {
 		return "gated"
 	case Unsupported:
 		return "unsupported"
+	case Measured:
+		return "measured"
 	}
 	return "Kind(" + strconv.Itoa(int(k)) + ")"
 }
@@ -59,12 +62,31 @@ type Write struct {
 	PK      *Value   // update/delete: the WHERE pk = value; insert: the pk column's value if given
 }
 
-type Result struct {
-	Kind   Kind
-	Reason string // why Unsupported
-	Write  *Write // set when Gated
+type Method string
 
-	// Table and Op name the first gated write found (Gated or Unsupported).
+const (
+	MethodCount    Method = "count"
+	MethodEstimate Method = "estimate"
+	MethodSyntax   Method = "syntax"
+)
+
+// Measure says how to learn how many rows a multi-row write touches.
+type Measure struct {
+	Method   Method
+	CountSQL string // MethodCount: "SELECT 1 FROM <relation> [WHERE ...]", no LIMIT
+	Rows     int    // MethodSyntax: the number of VALUES lists
+}
+
+type Result struct {
+	Kind Kind
+	// Reason says why Unsupported. A Measured write keeps the reason it
+	// would otherwise be Unsupported for, so a table without impact limits
+	// records it as before.
+	Reason  string
+	Write   *Write   // set when Gated
+	Measure *Measure // set exactly when Kind is Measured
+
+	// Table and Op name the first gated write found (any Kind but Pass).
 	// Op is insert, update, delete, merge, copy, or truncate.
 	Table string
 	Op    string
@@ -113,7 +135,8 @@ func Classify(sql string, gated map[string]string) (Result, error) {
 		// Several statements in one Query run as one implicit transaction.
 		r = unsupported("multi_statement")
 	} else {
-		r = classifyStmt(tree.Stmts[0].Stmt, m)
+		n := tree.Stmts[0].Stmt
+		r = measured(n, m, classifyStmt(n, m))
 	}
 	r.Table, r.Op, r.OnBehalfOf = target.table, target.op, obo
 	return r, nil

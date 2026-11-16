@@ -38,28 +38,28 @@ func TestClassifyKinds(t *testing.T) {
 		{"trailing semicolon", "delete from contacts where id = 1;", Gated, ""},
 
 		// Writes to a gated table in shapes v0.1 does not judge.
-		{"multi row insert", "insert into contacts (name) values ('a'), ('b')", Unsupported, "multi_row"},
-		{"insert select", "insert into contacts (name) select name from leads", Unsupported, "insert_select"},
+		{"multi row insert", "insert into contacts (name) values ('a'), ('b')", Measured, "multi_row"},
+		{"insert select", "insert into contacts (name) select name from leads", Measured, "insert_select"},
 		{"upsert", "insert into contacts (email) values ('a') on conflict (email) do nothing", Unsupported, "on_conflict"},
-		{"range update", "update contacts set status = 'churned' where company_id = 3", Unsupported, "not_single_row"},
-		{"update all rows", "update contacts set status = 'x'", Unsupported, "not_single_row"},
+		{"range update", "update contacts set status = 'churned' where company_id = 3", Measured, "not_single_row"},
+		{"update all rows", "update contacts set status = 'x'", Measured, "not_single_row"},
 		// PK equality ANDed with more conditions still touches at most one row.
 		{"pk plus extra predicate", "update contacts set title = 'x' where id = 1 and status = 'a'", Gated, ""},
 		{"extra predicate first", "update contacts set title = 'x' where status = 'a' and id = $2", Gated, ""},
 		{"several extra predicates", "delete from contacts where id = 7 and status = 'a' and title is not null", Gated, ""},
-		{"pk or other", "update contacts set title = 'x' where id = 1 or status = 'a'", Unsupported, "not_single_row"},
-		{"pk inside an or", "update contacts set title = 'x' where (id = 1 and status = 'a') or id = 2", Unsupported, "not_single_row"},
-		{"pk in list", "update contacts set status = 'churned' where id in (1, 2, 3)", Unsupported, "not_single_row"},
-		{"pk compared to column", "update contacts set title = 'x' where id = company_id", Unsupported, "not_single_row"},
-		{"where current of", "update contacts set title = 'x' where current of c", Unsupported, "not_single_row"},
-		{"delete all rows", "delete from contacts", Unsupported, "not_single_row"},
+		{"pk or other", "update contacts set title = 'x' where id = 1 or status = 'a'", Measured, "not_single_row"},
+		{"pk inside an or", "update contacts set title = 'x' where (id = 1 and status = 'a') or id = 2", Measured, "not_single_row"},
+		{"pk in list", "update contacts set status = 'churned' where id in (1, 2, 3)", Measured, "not_single_row"},
+		{"pk compared to column", "update contacts set title = 'x' where id = company_id", Measured, "not_single_row"},
+		{"where current of", "update contacts set title = 'x' where current of c", Measured, "not_single_row"},
+		{"delete all rows", "delete from contacts", Measured, "not_single_row"},
 		{"update from", "update contacts set title = l.title from leads l where contacts.id = 1", Unsupported, "join"},
 		{"delete using", "delete from contacts using leads where contacts.id = 1", Unsupported, "join"},
 		{"multi assign", "update contacts set (title, status) = ('x', 'y') where id = 1", Unsupported, "multi_assign"},
 		{"column indirection", "update contacts set tags[1] = 'x' where id = 1", Unsupported, "indirection"},
-		{"pk equals null", "delete from contacts where id = null", Unsupported, "not_single_row"},
+		{"pk equals null", "delete from contacts where id = null", Measured, "not_single_row"},
 		{"subquery in values", "insert into contacts (company_id) values ((select id from companies limit 1))", Unsupported, "subquery"},
-		{"subquery in where", "update contacts set title = 'x' where id = (select max(id) from contacts)", Unsupported, "subquery"},
+		{"subquery in where", "update contacts set title = 'x' where id = (select max(id) from contacts)", Measured, "subquery"},
 		{"subquery in set", "update contacts set title = (select title from leads limit 1) where id = 1", Unsupported, "subquery"},
 		{"with on gated write", "with x as (select 1) insert into contacts (name) values ('a')", Unsupported, "with"},
 		{"copy in", "copy contacts from stdin", Unsupported, "copy"},
@@ -83,6 +83,87 @@ func TestClassifyKinds(t *testing.T) {
 			}
 			if (r.Kind == Gated) != (r.Write != nil) {
 				t.Errorf("Write = %+v for kind %v; want a Write exactly when Gated", r.Write, r.Kind)
+			}
+			if (r.Kind == Measured) != (r.Measure != nil) {
+				t.Errorf("Measure = %+v for kind %v; want a Measure exactly when Measured", r.Measure, r.Kind)
+			}
+		})
+	}
+}
+
+func TestClassifyMeasured(t *testing.T) {
+	cases := []struct {
+		name, sql string
+		reason    string
+		want      Measure
+	}{
+		{"range update", "update contacts set status = 'churned' where company_id = 3", "not_single_row",
+			Measure{Method: MethodCount, CountSQL: "SELECT 1 FROM contacts WHERE company_id = 3"}},
+		{"no where", "delete from contacts", "not_single_row",
+			Measure{Method: MethodCount, CountSQL: "SELECT 1 FROM contacts"}},
+		{"only, schema, alias, unused $1", "update only public.contacts as c set title = $1 where c.company_id = $2", "not_single_row",
+			Measure{Method: MethodCount, CountSQL: "SELECT 1 FROM ONLY public.contacts c WHERE c.company_id = $2"}},
+		{"in list, trailing semicolon", "delete from contacts where id in (1, 2, 3);", "not_single_row",
+			Measure{Method: MethodCount, CountSQL: "SELECT 1 FROM contacts WHERE id IN (1, 2, 3)"}},
+		{"listed function", "delete from contacts where lower(email) = $1", "not_single_row",
+			Measure{Method: MethodCount, CountSQL: "SELECT 1 FROM contacts WHERE lower(email) = $1"}},
+		{"unlisted function", "update contacts set status = 'x' where set_config('role', 'none', true) is not null", "not_single_row",
+			Measure{Method: MethodEstimate}},
+		{"pg_catalog function not on the list", "delete from contacts where trim(name) = 'x'", "not_single_row",
+			Measure{Method: MethodEstimate}},
+		{"schema-qualified function", "delete from contacts where public.f(id)", "not_single_row",
+			Measure{Method: MethodEstimate}},
+		{"schema-qualified operator", "delete from contacts where company_id operator(public.=) 3", "not_single_row",
+			Measure{Method: MethodEstimate}},
+		{"where current of", "update contacts set title = 'x' where current of c", "not_single_row",
+			Measure{Method: MethodEstimate}},
+		{"join", "update contacts set title = l.title from leads l where contacts.company_id = l.id", "join",
+			Measure{Method: MethodEstimate}},
+		{"subquery", "update contacts set title = 'x' where company_id in (select id from companies)", "subquery",
+			Measure{Method: MethodEstimate}},
+		{"with", "with x as (select 1) update contacts set status = 'x' where company_id = 3", "with",
+			Measure{Method: MethodEstimate}},
+		{"with writing another table", "with d as (delete from other returning id) update contacts set status = 'x' where company_id = 3", "with",
+			Measure{Method: MethodEstimate}},
+		{"multi row insert", "insert into contacts (name) values ('a'), ('b'), ('c')", "multi_row",
+			Measure{Method: MethodSyntax, Rows: 3}},
+		{"multi row insert with a subquery", "insert into contacts (company_id) values ((select 1)), (2)", "multi_row",
+			Measure{Method: MethodEstimate}},
+		{"insert select", "insert into contacts (name) select name from leads", "insert_select",
+			Measure{Method: MethodEstimate}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := Classify(tc.sql, gated)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r.Kind != Measured || r.Reason != tc.reason || r.Measure == nil || *r.Measure != tc.want {
+				t.Errorf("got %v/%q %+v, want measured/%q %+v", r.Kind, r.Reason, r.Measure, tc.reason, tc.want)
+			}
+		})
+	}
+}
+
+// Shapes that must not become Measured, with the reason they keep.
+func TestClassifyStaysUnsupported(t *testing.T) {
+	cases := map[string]struct{ sql, reason string }{
+		"multi row upsert":                {"insert into contacts (email) values ('a'), ('b') on conflict (email) do nothing", "multi_row"},
+		"multi assign over many rows":     {"update contacts set (title, status) = ('x', 'y') where company_id = 3", "multi_assign"},
+		"indirection over many rows":      {"update contacts set tags[1] = 'x' where company_id = 3", "indirection"},
+		"single row with subquery":        {"update contacts set title = (select title from leads limit 1) where id = 1", "subquery"},
+		"single row with join":            {"update contacts set title = l.title from leads l where contacts.id = 1", "join"},
+		"single row insert with a with":   {"with x as (select 1) insert into contacts (name) values ('a')", "with"},
+		"cte also writes the gated table": {"with d as (delete from contacts where company_id = 9 returning id) update contacts set status = 'x' where company_id = 3", "with"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			r, err := Classify(tc.sql, gated)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r.Kind != Unsupported || r.Reason != tc.reason || r.Measure != nil {
+				t.Errorf("got %v/%q %+v, want unsupported/%q", r.Kind, r.Reason, r.Measure, tc.reason)
 			}
 		})
 	}
