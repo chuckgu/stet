@@ -76,6 +76,10 @@ type Decision struct {
 
 	// Impact is the measured effect of a multi-row write; nil is stored as NULL.
 	Impact any
+
+	LoginRole    *string // the role the database authenticated; nil when unknown
+	RowsAffected *int64  // rows the write changed in the gated table; nil when unknown
+	Cumulative   any     // stored as jsonb; nil is NULL
 }
 
 func (s *Store) Insert(ctx context.Context, d *Decision) error {
@@ -106,17 +110,20 @@ func (s *Store) Insert(ctx context.Context, d *Decision) error {
 			id, created_at, mode, agent_id, on_behalf_of, session_id,
 			statement, statement_fp, params, op, target_table, target_pk, proposed,
 			state, state_version, model, model_version, questions, answers, policy_version,
-			verdict, reasons, executed, exec_error, latency_ms, model_latency_ms, cost_usd, impact
+			verdict, reasons, executed, exec_error, latency_ms, model_latency_ms, cost_usd, impact,
+			login_role, rows_affected, cumulative
 		) values (
 			$1, $2, $3, $4, $5, $6,
 			$7, $8, $9::jsonb, $10, $11, $12::jsonb, $13::jsonb,
 			$14::jsonb, $15::jsonb, $16, $17, $18::jsonb, $19::jsonb, $20,
-			$21, $22, $23, $24, $25, $26, $27, $28::jsonb
+			$21, $22, $23, $24, $25, $26, $27, $28::jsonb,
+			$29, $30, $31::jsonb
 		)`,
 		d.ID, d.CreatedAt, d.Mode, d.AgentID, d.OnBehalfOf, d.SessionID,
 		d.Statement, d.StatementFP, params, d.Op, d.TargetTable, pk, proposed,
 		state, stateVersion, d.Model, d.ModelVersion, jsonArg(d.Questions), jsonArg(d.Answers), d.PolicyVersion,
 		d.Verdict, reasons, d.Executed, d.ExecError, d.LatencyMS, d.ModelLatencyMS, d.CostUSD, jsonArg(d.Impact),
+		d.LoginRole, d.RowsAffected, jsonArg(d.Cumulative),
 	)
 	return err
 }
@@ -168,4 +175,33 @@ func jsonArg(v any) any {
 		return nil
 	}
 	return string(b)
+}
+
+// UsageEntry is one executed write counted toward a cumulative limit.
+type UsageEntry struct {
+	At   time.Time
+	Rows int64
+}
+
+// Usage returns executed writes by role to table since a time, oldest first.
+// A decision with no rows_affected counts as 0 rows and is left out.
+func (s *Store) Usage(ctx context.Context, role, table string, since time.Time) ([]UsageEntry, error) {
+	rows, err := s.pool.Query(ctx, `
+		select created_at, rows_affected from stet.decisions
+		where login_role = $1 and target_table = $2 and created_at >= $3
+		  and executed and rows_affected > 0
+		order by created_at, id`, role, table, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UsageEntry
+	for rows.Next() {
+		var e UsageEntry
+		if err := rows.Scan(&e.At, &e.Rows); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }

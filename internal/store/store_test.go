@@ -239,3 +239,76 @@ func TestInsertWithoutImpactLeavesItNull(t *testing.T) {
 		t.Error("impact is set for a write that was not measured")
 	}
 }
+
+func TestInsertRecordsLoginRoleAndRows(t *testing.T) {
+	s, pool := testStore(t)
+	d := sample(uniqueTable(t))
+	d.LoginRole = ptr("agent_a")
+	d.RowsAffected = ptr(int64(0))
+	d.Cumulative = map[string]any{"used": 480, "planned": 20, "limit": 500, "window_s": 600}
+	if err := s.Insert(context.Background(), d); err != nil {
+		t.Fatal(err)
+	}
+	var role string
+	var rows *int64
+	var limit string
+	err := pool.QueryRow(context.Background(),
+		`select login_role, rows_affected, cumulative->>'limit' from stet.decisions where id = $1`, d.ID).Scan(&role, &rows, &limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if role != "agent_a" || rows == nil || *rows != 0 || limit != "500" {
+		t.Errorf("role=%q rows=%v limit=%q", role, rows, limit)
+	}
+}
+
+func TestInsertLeavesNewColumnsNull(t *testing.T) {
+	s, pool := testStore(t)
+	d := sample(uniqueTable(t))
+	if err := s.Insert(context.Background(), d); err != nil {
+		t.Fatal(err)
+	}
+	var a, b, c bool
+	if err := pool.QueryRow(context.Background(),
+		`select login_role is null, rows_affected is null, cumulative is null from stet.decisions where id = $1`, d.ID).Scan(&a, &b, &c); err != nil {
+		t.Fatal(err)
+	}
+	if !a || !b || !c {
+		t.Errorf("null flags = %v %v %v", a, b, c)
+	}
+}
+
+func TestUsage(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	table := uniqueTable(t)
+	now := time.Now()
+	mk := func(role string, rows *int64, executed bool, at time.Time) *store.Decision {
+		d := sample(table)
+		d.LoginRole = ptr(role)
+		d.RowsAffected = rows
+		d.Executed = executed
+		d.CreatedAt = at
+		return d
+	}
+	want := mk("agent_a", ptr(int64(5)), true, now.Add(-5*time.Minute))
+	for _, d := range []*store.Decision{
+		want,
+		mk("agent_a", nil, true, now.Add(-4*time.Minute)),
+		mk("agent_a", ptr(int64(0)), true, now.Add(-3*time.Minute)),
+		mk("agent_a", ptr(int64(9)), false, now.Add(-2*time.Minute)),
+		mk("agent_b", ptr(int64(9)), true, now.Add(-2*time.Minute)),
+		mk("agent_a", ptr(int64(9)), true, now.Add(-2*time.Hour)),
+	} {
+		if err := s.Insert(ctx, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.Usage(ctx, "agent_a", table, now.Add(-30*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Rows != 5 || got[0].At.Sub(want.CreatedAt).Abs() > time.Millisecond {
+		t.Fatalf("got %+v", got)
+	}
+}

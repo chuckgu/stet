@@ -52,6 +52,12 @@ CREATE TABLE IF NOT EXISTS stet.decisions (
 -- 다중 행 쓰기의 영향 측정 (docs/spec-v0.2-impact.md 6장). 측정하지 않은 쓰기는 NULL.
 ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS impact jsonb;
 
+-- 누적 한도 (docs/spec-v0.2-accounting.md 3·4장). 모르는 값은 NULL.
+ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS login_role text;       -- DB가 인증한 접속 계정
+ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS rows_affected bigint;  -- 쓰기가 게이트 대상 테이블에서 바꾼 행 수
+ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS cumulative jsonb;      -- 누적 한도 판단 근거
+CREATE INDEX IF NOT EXISTS decisions_role_idx ON stet.decisions (login_role, target_table, created_at DESC);
+
 CREATE INDEX IF NOT EXISTS decisions_target_idx ON stet.decisions (target_table, target_pk, created_at DESC);
 CREATE INDEX IF NOT EXISTS decisions_verdict_idx ON stet.decisions (verdict, created_at DESC);
 CREATE INDEX IF NOT EXISTS decisions_agent_idx ON stet.decisions (agent_id, created_at DESC);
@@ -79,3 +85,29 @@ DROP TRIGGER IF EXISTS decisions_no_truncate ON stet.decisions;
 CREATE TRIGGER decisions_no_truncate
   BEFORE TRUNCATE ON stet.decisions
   FOR EACH STATEMENT EXECUTE FUNCTION stet.decisions_append_only();
+
+-- 읽기 집계 (docs/spec-v0.2-accounting.md 5장). 추가만 하는 장부가 아니므로 트리거를 두지 않는다.
+CREATE TABLE IF NOT EXISTS stet.reads (
+  bucket        timestamptz NOT NULL,          -- 분의 시작 시각
+  login_role    text NOT NULL,                 -- 모르면 ''
+  target_table  text NOT NULL,                 -- 설정의 테이블 키
+  statements    bigint NOT NULL,
+  rows          bigint NOT NULL,               -- 클라이언트에게 나간 행 수
+  max_rows      bigint NOT NULL DEFAULT 0,     -- 한 문장이 내보낸 가장 큰 행 수
+  PRIMARY KEY (bucket, login_role, target_table)
+);
+
+-- 큰 읽기 기록
+CREATE TABLE IF NOT EXISTS stet.read_log (
+  id            uuid PRIMARY KEY,
+  created_at    timestamptz NOT NULL,          -- 문장이 들어온 시각
+  login_role    text,
+  agent_id      text NOT NULL,                 -- application_name. 스스로 적는 값
+  on_behalf_of  text,
+  session_id    text,
+  statement     text NOT NULL,
+  statement_fp  text NOT NULL,
+  target_tables text[] NOT NULL,               -- 읽은 게이트 대상 테이블의 설정 키
+  rows          bigint NOT NULL,               -- 클라이언트에게 나간 행 수
+  exec_error    text                           -- 실패하거나 끊긴 문장이면 그 원인
+);
