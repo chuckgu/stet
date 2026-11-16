@@ -316,6 +316,39 @@ func TestGateSeesOpenTransaction(t *testing.T) {
 	}
 }
 
+func TestGateSeesLostWrites(t *testing.T) {
+	table := watchedTable(t)
+	g := newRecordingGate(watches(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+	ctx := testCtx(t)
+
+	// The server refuses this one: it answered, so nothing was lost.
+	mustExec(t, conn, "insert into "+table+" values (1, 'a')")
+	if _, err := conn.Exec(ctx, "insert into "+table+" values (1, 'dup')"); pgCode(err) != "23505" {
+		t.Fatalf("duplicate insert: %v", err)
+	}
+
+	// Slow write; the client's network connection is cut while the server
+	// is still sleeping, so no answer can reach the proxy first. Exec has
+	// written the query before it returns, and the proxy reads the client's
+	// bytes in order, so Begin runs before it sees the close.
+	conn2 := connect(t, addr, "stet_scram", nil)
+	conn2.PgConn().Exec(ctx, "insert into "+table+" select 2, 'x' from pg_sleep(1)")
+	conn2.PgConn().Conn().Close()
+
+	_, os := g.outcomes(t, 3)
+	if o := os[0]; !o.Executed || o.Lost {
+		t.Errorf("answered write: %+v, want executed and not lost", o)
+	}
+	if o := os[1]; o.Executed || o.Lost || !strings.Contains(o.Error, "23505") {
+		t.Errorf("refused write: %+v, want a 23505 error and not lost", o)
+	}
+	if o := os[2]; o.Executed || !o.Lost {
+		t.Errorf("unanswered write: %+v, want lost and not executed", o)
+	}
+}
+
 func ptr[T any](v T) *T { return &v }
 
 // deref is for messages: the pointed-to value, or "nil".

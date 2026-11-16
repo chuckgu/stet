@@ -61,6 +61,10 @@ type Outcome struct {
 	// Rows is the row count from the statement's CommandComplete tag; nil when
 	// it did not complete or the tag carries no count.
 	Rows *int64
+	// Lost means the connection ended before the server answered. The
+	// statement may have run and committed; Executed is false because nothing
+	// said so.
+	Lost bool
 }
 
 // session follows one client connection closely enough to tell the gate
@@ -396,6 +400,7 @@ func (s *session) abandon() {
 		for _, w := range u.writes {
 			s.gate.End(w.handle, Outcome{
 				Error:         "connection closed before ReadyForQuery",
+				Lost:          true,
 				InTransaction: status != 'I' || u.executes > 1,
 			})
 		}
