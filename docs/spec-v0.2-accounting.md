@@ -1,6 +1,6 @@
 # Stet v0.2 스펙 2: 접속 계정별 누적 한도와 읽기 기록 (섀도)
 
-작성: 2026-11-16 · 상태: 초안, 승인 전 · 상위 문서: concept-v0.2.md 9장의 1번 단계, decisions.md D30 · 앞 문서: spec-v0.2-impact.md
+작성: 2026-11-16 · 상태: 구현됨 (섀도) · 상위 문서: concept-v0.2.md 9장의 1번 단계, decisions.md D30 · 앞 문서: spec-v0.2-impact.md
 
 ## 1. 목표와 비목표
 
@@ -98,6 +98,7 @@ tables:
 | 서버가 실패했다고 답했다, 또는 앞 문장의 실패로 건너뛰었다 | 지운다 |
 | 서버의 답이 오기 전에 연결이 끊겼다 | `planned` 그대로. 쓰기가 이미 커밋됐을 수 있다 |
 
+- 서버가 이미 실패했다고 답했거나 앞 문장의 실패로 건너뛴 쓰기는, ReadyForQuery 전에 연결이 끊겨도 실패로 본다(지운다). 연결이 끊긴 것으로 치는 것은 서버가 아직 아무것도 답하지 않은 쓰기뿐이다. 이런 쓰기는 `planned`를 그대로 누적 값에 둔다.
 - 먼저 잡아 두는 이유: 결과가 온 뒤에만 더하면, 같은 계정이 동시에 여러 연결로 보낸 쓰기가 서로를 보지 못하고 모두 한도 안으로 판정된다.
 - 트랜잭션 안의 쓰기도 센다. 뒤에 롤백됐는지는 보지 않는다. 덜 세는 것보다 더 세는 쪽이 안전하다.
 - 창은 미끄러진다. 지금부터 `window` 전까지의 항목만 더한다.
@@ -159,6 +160,8 @@ tables:
 1. 게이트 대상 테이블에 쓰지 않는다. 쓰는 문장은 지금처럼 쓰기로 분류되고, 그 문장이 다른 게이트 대상 테이블을 읽는 것은 세지 않는다.
 2. 문장 어딘가에서 게이트 대상 테이블을 읽는다. `SELECT`의 `FROM`(조인, 서브쿼리, `WITH` 포함), `COPY 테이블 TO`, `TABLE 테이블`, 그리고 다른 테이블에 쓰는 문장의 `FROM`·`USING`·`INSERT ... SELECT`가 여기에 든다.
 
+- `EXPLAIN`과 `CREATE VIEW`는 행을 내보내지 않으므로 읽기가 아니다. `EXPLAIN ANALYZE`는 문장을 실제로 실행하므로, 게이트 대상 테이블을 읽고 그 행을 어딘가에 남기는 문장(`CREATE TABLE AS`, `SELECT INTO`, `INSERT ... SELECT` 등)이면 읽기다. 행을 버리는 `EXPLAIN ANALYZE SELECT`는 읽기가 아니다.
+- `CREATE TABLE AS`, `SELECT INTO`, `CREATE MATERIALIZED VIEW`, `PREPARE`는 질의가 읽는 테이블을 읽는다. 나중에 나가는 SQL `EXECUTE`의 행은 세지 않는다.
 - 분류 결과에 읽은 테이블의 설정 키 목록을 담는다. 한 문장이 여러 게이트 대상 테이블을 읽을 수 있다.
 - 읽은 테이블 가운데 `reads`가 켜진 것이 하나도 없으면 게이트는 그 문장을 보지 않는다. 지금과 완전히 같다.
 
@@ -169,6 +172,8 @@ tables:
 - 한 메시지에 문장이 여럿이면 그 메시지의 응답으로 나간 행 전체를 센다.
 - 조인으로 두 게이트 대상 테이블을 읽어 n행이 나가면 두 테이블 각각에 n행으로 센다.
 - 트랜잭션 안의 읽기도 센다.
+- 실행되지 못한 읽기도 문장 1건에 행 0으로 센다. 같은 Sync 아래에서 앞 문장이 실패해 건너뛴 읽기와, 서버에 더는 없는 커서의 `FETCH`가 그렇다. `statements`는 클라이언트가 보낸 문장의 수다.
+- 행은 서버에서 메시지 머리를 읽을 때 센다. 그래서 연결이 끊기면 아직 클라이언트에게 쓰지 못한 행이 (버퍼 하나 분량까지) 들어갈 수 있다.
 
 **커서.** SQL 커서는 읽기를 두 문장으로 나눈다. 테이블 이름은 `DECLARE`에 있고 행은 `FETCH`에서 나간다.
 
@@ -182,17 +187,19 @@ FETCH 1000 FROM c;                             -- 1,000행이 나간다. 테이�
 - `DECLARE 이름 CURSOR FOR <질의>`가 `reads`가 켜진 게이트 대상 테이블을 읽고 성공하면, 그 세션에 커서 이름과 읽는 테이블, 선언한 문장을 적어 둔다. `DECLARE` 자체는 읽기 한 건으로 세지 않는다. 나가는 행이 없다.
 - `FETCH ... FROM 이름`이 오면 그 이름을 찾는다. 있으면 그 테이블들의 읽기로 세고 나간 행을 더한다. `FETCH`마다 문장 수가 하나 는다.
 - 큰 읽기 기록(`stet.read_log`)의 `statement`에는 `FETCH`가 아니라 커서를 선언한 문장을 남긴다. 무엇을 읽었는지는 거기에 있다.
-- 적어 둔 것은 `CLOSE 이름`, `CLOSE ALL`, 세션이 끝날 때 지운다. 트랜잭션이 끝나면 `WITH HOLD`로 선언하지 않은 커서를 지운다. 같은 이름으로 다시 선언하면 덮어쓴다.
+- 적어 둔 것은 `CLOSE 이름`, `CLOSE ALL`, `DISCARD ALL`, 세션이 끝날 때 지운다. `DISCARD ALL`은 `CLOSE ALL`로 본다(`stet.on_behalf_of`도 `RESET ALL`처럼 초기화한다). 트랜잭션이 끝나면 `WITH HOLD`로 선언하지 않은 커서를 지운다. 같은 이름으로 다시 선언하면 덮어쓴다.
+- 실패했거나 건너뛴 `CLOSE`와 `CLOSE ALL`은 커서를 지우지 않는다. 실패한 `DECLARE`도 적어 두지 않고, 같은 이름의 앞선 커서를 그대로 둔다.
+- 알 수 없을 때는 커서를 계속 기억하는 쪽으로 정한다. 서버가 이미 버린 커서를 기억하면 `FETCH`가 실패하고 문장 1건에 행 0으로 세어질 뿐이다. 서버가 아직 가진 커서를 잊으면 읽기가 가려진다.
 - `MOVE`는 행을 내보내지 않으므로 세지 않는다.
 - 이름은 파서가 정규화한 값으로 비교한다(따옴표 없는 이름은 소문자).
 
 **프록시가 하는 일.** 읽기는 쓰기의 경로를 타지 않는다.
 
 - 쓰기는 보내기 전에 게이트를 기다린다(`Begin`). 읽기는 기다릴 것이 없다. 프록시는 읽기를 보내기 전에 게이트를 부르지 않고, 밀린 메시지를 먼저 내보내지 않으며, 바인딩 값을 복사해 두지 않는다.
-- 응답이 끝나면(ReadyForQuery, 또는 연결이 끊길 때) 게이트에 한 번 알린다: 세션 정보, 문장, 나간 행 수, 실패 여부.
+- 응답이 끝나면(ReadyForQuery, 또는 연결이 끊길 때) 게이트에 한 번 알린다(`Observe`): 세션 정보, 문장, 나간 행 수, 실패 여부. 세션 정보의 `TxOpen`은 문장이 도착했을 때 명시적 트랜잭션이 열려 있었는지이고, 결과의 `Arrived`는 프록시가 문장을 클라이언트에게서 읽은 시각이다.
 - 나간 행은 서버→클라이언트 경로에서 메시지의 종류만 보고 센다. 세션마다 정수 하나를 올리는 일이고, 잠금을 잡지 않는다.
 
-**집계.** 게이트는 (분, 접속 계정, 테이블)별로 문장 수, 행 수, 한 문장의 최대 행 수를 메모리에 든다. 1분마다, 그리고 종료할 때 `stet.reads`에 쓴다.
+**집계.** 게이트는 (분, 접속 계정, 테이블)별로 문장 수, 행 수, 한 문장의 최대 행 수를 메모리에 든다. 1분마다, 그리고 종료할 때 `stet.reads`에 쓴다. 분은 문장이 프록시에 들어온 시각(`Arrived`)으로 정한다. 오래 걸린 읽기는 이미 쓴 분에 더해질 수 있고, 쓰는 쪽이 합친다.
 
 ```sql
 CREATE TABLE IF NOT EXISTS stet.reads (
@@ -207,7 +214,8 @@ CREATE TABLE IF NOT EXISTS stet.reads (
 ```
 
 - 같은 키가 이미 있으면 더한다(`ON CONFLICT ... DO UPDATE`). 분 도중에 재시작해도 합쳐진다.
-- 쓰기에 실패하면 메모리에 두고 다음 분에 다시 시도한다. 한 시간이 지난 것은 버리고 로그를 남긴다.
+- 쓰기에 실패하면 메모리에 두고 다음 분에 다시 시도한다. 처음 쓰기에 실패한 때부터 한 시간이 지난 것은 버리고 로그를 남긴다(그 분이 끝난 때부터가 아니다).
+- 게이트가 닫힌 뒤에 보고된 읽기는 쓰지 않고 세어서 로그에 남긴다. `stet proxy`는 종료할 때 세션이 끝나기를 기다린 뒤에 게이트를 닫는다. 그래서 종료로 끊긴 읽기도 쓰인다.
 - 집계의 키에 `application_name`을 넣지 않는다. 클라이언트가 값을 바꿔 가며 키를 끝없이 늘릴 수 있다.
 
 **큰 읽기.** `log_above`가 있고 한 문장이 내보낸 행 수가 그보다 크면 `stet.read_log`에 한 줄을 남긴다. 판단 기록처럼 별도 고루틴에서 쓴다.
@@ -216,7 +224,7 @@ CREATE TABLE IF NOT EXISTS stet.reads (
 CREATE TABLE IF NOT EXISTS stet.read_log (
   id            uuid PRIMARY KEY,
   created_at    timestamptz NOT NULL,          -- 문장이 들어온 시각
-  login_role    text,
+  login_role    text,                          -- 모르면 NULL (stet.decisions와 같다)
   agent_id      text NOT NULL,                 -- application_name. 스스로 적는 값
   on_behalf_of  text,
   session_id    text,
@@ -229,6 +237,7 @@ CREATE TABLE IF NOT EXISTS stet.read_log (
 ```
 
 - 한 문장이 읽은 테이블이 여럿이면 그중 하나라도 `log_above`를 넘을 때 한 줄을 남긴다.
+- 큰 읽기는 길이 1024의 대기열을 거쳐, 분 집계를 쓰는 것과 같은 백그라운드 고루틴이 쓴다. 대기열이 차면 그 줄은 버리고 버린 수를 로그에 남긴다. 집계에는 영향이 없다.
 - 바인딩 값은 남기지 않는다. 바이너리 값을 텍스트로 바꾸려면 DB에 물어야 하고, 읽기 경로에 그 왕복을 넣지 않는다.
 
 ## 6. 패키지별 변경
@@ -253,8 +262,10 @@ CREATE TABLE IF NOT EXISTS stet.read_log (
 |---|---|
 | 접속 계정을 모른다 | 누적 한도를 적용하지 않고 `cumulative.error`에 남긴다. 읽기는 `login_role = ''`로 집계한다 |
 | 처음 볼 때 `stet.decisions`를 읽지 못했다 (실패, 500ms 예산 초과) | 그 쓰기는 누적 한도를 적용하지 않고 `cumulative.error`에 남긴다. 잡아 두는 것은 그대로 한다. 다음 쓰기에서 다시 읽는다 |
-| `stet.reads`에 쓰지 못했다 | 메모리에 두고 다음 분에 다시 시도한다. 한 시간이 지나면 버린다 |
+| `stet.reads`에 쓰지 못했다 | 메모리에 두고 다음 분에 다시 시도한다. 처음 실패한 때부터 한 시간이 지나면 버리고 로그를 남긴다 |
 | `stet.read_log`에 쓰지 못했다 | 로그만 남긴다. 판단 기록과 같다 |
+| 큰 읽기 대기열이 찼다 | 그 줄을 버리고 버린 수를 로그에 남긴다. 집계는 그대로다 |
+| 게이트가 닫힌 뒤에 읽기가 보고됐다 | 쓰지 않고 센 수를 로그에 남긴다 |
 | 프로세스가 죽었다 | 아직 쓰지 않은 집계(최대 1분)가 사라진다. 누적 값은 재시작 뒤 `stet.decisions`에서 다시 채운다 |
 
 ## 8. 지연과 부하
@@ -281,29 +292,38 @@ CREATE TABLE IF NOT EXISTS stet.read_log (
 - 한 메시지에 문장이 여럿이면 게이트 대상 테이블을 읽지 않는 문장의 행도 함께 세어진다.
 - 바이너리 형식의 `COPY ... TO`는 머리와 꼬리 메시지가 있어 행 수가 조금 많게 세어진다.
 - 큰 읽기 기록에는 바인딩 값이 없다.
+- `WITH HOLD` 커서를 선언한 트랜잭션이 단순 `ROLLBACK`으로 끝났거나 `COMMIT`이 실패해도, 그 커서는 `CLOSE`, `CLOSE ALL`, `DISCARD ALL`, 같은 이름의 새 `DECLARE`, 세션의 끝까지 기억된다.
+- 세이브포인트는 따라가지 않는다. `DECLARE` 앞에 잡은 세이브포인트로 `ROLLBACK TO` 하면 서버는 커서를 버리지만 프록시는 기억한다.
+- `COMMIT AND CHAIN`으로 커밋한 `WITH HOLD` 아닌 커서는 세션이 다음에 유휴가 될 때까지 기억된다.
+- 파이프라인으로 보내면 `FETCH`는 도착했을 때의 커서 표와 맞춘다. 확장 프로토콜에서 한 Sync 아래의 단위가 실패하면, 그 단위 안의 `DECLARE`는 이미 커밋됐더라도 취소된다.
+- 한 메시지에 문장이 여럿이면 그 안의 커서 문장은 보지 않는다(`close c; declare c ...`를 한 Query로 보내는 경우).
+- SQL `PREPARE` / `EXECUTE`로 읽은 행은 세지 않는다. `EXECUTE`에는 테이블 이름이 없다.
+- `DO` 블록 안의 읽기와, `query_to_xml`, `table_to_xml`처럼 텍스트로 받은 질의를 실행하는 함수를 통한 읽기는 보지 않는다.
+- 아직 서버가 답하지 않은 `BEGIN` 바로 뒤에 보낸 읽기의 `TxOpen`은 false다. 쓰기도 같다.
+- 설정 키 둘이 스키마만 다르고 관계 이름이 같으면(`a.contacts`, `b.contacts`), 스키마 없이 쓴 이름이 둘 중 어느 것으로 잡히는지는 정해져 있지 않다. 이미 있던 한계다.
 - `stet.reads`와 `stet.read_log`에는 append-only 트리거가 없다. 규칙 3은 `stet.decisions`의 것이다. 감사 기록으로 쓰려면 enforce 전에 정해야 한다.
 
 ## 10. 수용 기준
 
-- [ ] `cumulative`도 `reads`도 없는 테이블의 기록은 이 변경 전과 같다. 더해지는 것은 `login_role`과 `rows_affected` 두 컬럼의 값뿐이다. 기존 테스트의 단언을 고치지 않고 통과한다.
-- [ ] 모든 기록에 `login_role`이 채워진다. `rows_affected`는 3장대로다: 0행에 걸린 쓰기는 0, 실행되지 않은 쓰기와 다른 문장 안의 쓰기와 문장이 여럿인 메시지의 쓰기는 NULL이다.
-- [ ] 한도 아래의 쓰기 여럿이 창 안에서 한도를 넘으면, 넘는 쓰기부터 `hold`와 `impact:cumulative`가 기록된다. 단일 행 쓰기와 다중 행 쓰기가 섞여도 같다.
-- [ ] 창이 지나면 다시 한도 안으로 판정된다.
-- [ ] 접속 계정이 다르면 따로 센다. 같은 계정이 다시 접속해도 이어서 센다.
-- [ ] 같은 계정이 동시에 여러 연결로 보낸 쓰기가 모두 한도 안으로 판정되지 않는다.
-- [ ] 재시작한 뒤에도 창 안의 사용량이 이어진다.
-- [ ] 단일 행 쓰기가 누적 한도에 걸려도 섀도 모드에서는 질문과 답이 기록된다.
-- [ ] 미지원이거나 트랜잭션 안인 쓰기는 verdict가 바뀌지 않고 누적 값에는 더해진다.
-- [ ] 서버가 실패했다고 답한 쓰기는 누적 값에 남지 않는다. 답이 오기 전에 연결이 끊긴 쓰기는 남는다.
-- [ ] `reads`가 켜진 테이블을 읽는 문장이 분류된다: 단순 `SELECT`, 조인, 서브쿼리, `WITH`, `COPY ... TO`, 다른 테이블에 쓰면서 읽는 문장. 게이트 대상 테이블에 쓰는 문장은 읽기로 분류되지 않는다.
-- [ ] 읽기의 문장 수와 나간 행 수가 접속 계정과 테이블별로 `stet.reads`에 쌓인다. Simple Query와 Extended Query 모두에서 맞다.
-- [ ] 행을 내보내다 실패하거나 취소된 읽기의 나간 행이 세어진다. 행 수 상한을 걸고 나눠 가져간 읽기의 행이 모두 세어진다.
-- [ ] 커서로 읽은 행이 그 커서가 읽는 테이블의 읽기로 세어진다. `FETCH`마다 나간 행이 더해지고, `CLOSE`한 뒤나 트랜잭션이 끝난 뒤의 같은 이름은 세지 않는다. `WITH HOLD` 커서는 커밋 뒤에도 센다. 선언에 실패한 커서는 적어 두지 않는다.
-- [ ] `log_above`를 넘는 읽기만 `stet.read_log`에 남는다. 커서로 읽은 경우 `statement`는 커서를 선언한 문장이다.
-- [ ] `reads`가 꺼진 테이블을 읽는 문장은 게이트에 알려지지 않는다.
-- [ ] 종료할 때 아직 쓰지 않은 집계가 쓰인다.
-- [ ] 읽기가 클라이언트에게 돌려주는 결과는 직접 연결했을 때와 같다. 기존 프로토콜 테스트(큰 결과 집합, `COPY`, 파이프라인 포함)가 그대로 통과한다.
-- [ ] `STET_TEST_PG`를 설정한 `go test -race ./...`와 2ms 지연 예산을 통과한다. `reads`가 켜진 테이블의 읽기도 같은 예산 안이다.
+- [ ] `cumulative`도 `reads`도 없는 테이블의 기록은 이 변경 전과 같다. 더해지는 것은 `login_role`과 `rows_affected` 두 컬럼의 값뿐이다. 기존 테스트의 단언을 고치지 않고 통과한다. (확인 못 함: 기존 단언 둘이 바뀌었다. `TestClassifyKinds`의 `select`와 `copy out`은 `Pass`에서 `Read`로, `TestExampleConfigShowsImpact`의 `Impact` 비교는 구조체 전체 비교에서 필드별 비교로 고쳤다. 나머지 기존 단언은 그대로이고, 새 컬럼이 NULL로 남는 것은 `TestInsertLeavesNewColumnsNull`이 본다)
+- [x] 모든 기록에 `login_role`이 채워진다. `rows_affected`는 3장대로다: 0행에 걸린 쓰기는 0, 실행되지 않은 쓰기와 다른 문장 안의 쓰기와 문장이 여럿인 메시지의 쓰기는 NULL이다. (`TestEveryDecisionRecordsRoleAndRows`, `TestRowsAffectedIsNullWhenTheTagIsNotTheTablesCount`, `TestInsertRecordsLoginRoleAndRows`)
+- [x] 한도 아래의 쓰기 여럿이 창 안에서 한도를 넘으면, 넘는 쓰기부터 `hold`와 `impact:cumulative`가 기록된다. 단일 행 쓰기와 다중 행 쓰기가 섞여도 같다. (`TestCumulativeHoldsOnceTheWindowIsFull`, `TestCumulativeCountsWritesItDoesNotJudge`, `TestVerdictCumulative`)
+- [x] 창이 지나면 다시 한도 안으로 판정된다. (`TestCumulativeWindowSlides`)
+- [x] 접속 계정이 다르면 따로 센다. 같은 계정이 다시 접속해도 이어서 센다. (`TestCumulativeIsPerLoginRole`)
+- [x] 같은 계정이 동시에 여러 연결로 보낸 쓰기가 모두 한도 안으로 판정되지 않는다. (`TestCumulativeCountsConcurrentWrites`)
+- [x] 재시작한 뒤에도 창 안의 사용량이 이어진다. (`TestCumulativeSurvivesARestart`, `TestCumulativeLoadsTheWindowOnceForConcurrentFirstWrites`)
+- [x] 단일 행 쓰기가 누적 한도에 걸려도 섀도 모드에서는 질문과 답이 기록된다. (`TestCumulativeHoldsOnceTheWindowIsFull`)
+- [x] 미지원이거나 트랜잭션 안인 쓰기는 verdict가 바뀌지 않고 누적 값에는 더해진다. (`TestCumulativeCountsWritesItDoesNotJudge`)
+- [x] 서버가 실패했다고 답한 쓰기는 누적 값에 남지 않는다. 답이 오기 전에 연결이 끊긴 쓰기는 남는다. (`TestCumulativeForgetsFailedWrites`, `TestCumulativeKeepsALostWrite`)
+- [x] `reads`가 켜진 테이블을 읽는 문장이 분류된다: 단순 `SELECT`, 조인, 서브쿼리, `WITH`, `COPY ... TO`, 다른 테이블에 쓰면서 읽는 문장. 게이트 대상 테이블에 쓰는 문장은 읽기로 분류되지 않는다. (`TestClassifyReads`, `TestWritesAreNotCountedAsReads`)
+- [x] 읽기의 문장 수와 나간 행 수가 접속 계정과 테이블별로 `stet.reads`에 쌓인다. Simple Query와 Extended Query 모두에서 맞다. (`TestReadsAreAggregatedPerRoleAndTable`, `TestGateObservesReads`)
+- [x] 행을 내보내다 실패하거나 취소된 읽기의 나간 행이 세어진다. 행 수 상한을 걸고 나눠 가져간 읽기의 행이 모두 세어진다. (`TestFailedReadCountsTheRowsItSent`, `TestGateObservesRowsOfACancelledRead`, `TestGateObservesPortalFetchedInParts`)
+- [x] 커서로 읽은 행이 그 커서가 읽는 테이블의 읽기로 세어진다. `FETCH`마다 나간 행이 더해지고, `CLOSE`한 뒤나 트랜잭션이 끝난 뒤의 같은 이름은 세지 않는다. `WITH HOLD` 커서는 커밋 뒤에도 센다. 선언에 실패한 커서는 적어 두지 않는다. (`TestCursorReadsAreCounted`, `TestGateObservesFetchesAsReadsOfTheCursor`, `TestCursorIsForgottenWhenClosed`, `TestCursorIsForgottenAtTransactionEnd`, `TestHeldCursorSurvivesCommit`, `TestFailedDeclareIsNotRemembered`)
+- [x] `log_above`를 넘는 읽기만 `stet.read_log`에 남는다. 커서로 읽은 경우 `statement`는 커서를 선언한 문장이다. (`TestLargeReadsAreLogged`, `TestCursorReadsAreCounted`)
+- [x] `reads`가 꺼진 테이블을 읽는 문장은 게이트에 알려지지 않는다. (`TestReadsWithoutTheBlockAreNotSeen`)
+- [x] 종료할 때 아직 쓰지 않은 집계가 쓰인다. (`TestCloseWritesWhatIsStillInMemory`)
+- [x] 읽기가 클라이언트에게 돌려주는 결과는 직접 연결했을 때와 같다. 기존 프로토콜 테스트(큰 결과 집합, `COPY`, 파이프라인 포함)가 그대로 통과한다. (`TestObservedPassthrough`, `TestReadsAreAggregatedPerRoleAndTable`)
+- [x] `STET_TEST_PG`를 설정한 `go test -race ./...`와 2ms 지연 예산을 통과한다. `reads`가 켜진 테이블의 읽기도 같은 예산 안이다. (`TestPassthroughLatencyBudget`, `TestObservedReadLatencyBudget`; 전체는 `STET_TEST_PG=127.0.0.1:55432 go test -race -count=1 ./...`가 통과한다)
 
 ## 11. 정한 것과 남긴 것
 
