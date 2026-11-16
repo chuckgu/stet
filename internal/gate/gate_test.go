@@ -96,6 +96,7 @@ type env struct {
 	pool  *pgxpool.Pool
 	admin *pgx.Conn
 	gate  *gate.Gate
+	srv   *proxy.Server
 	addr  string
 }
 
@@ -168,6 +169,7 @@ func setup(t *testing.T, d decide.Decider, yamlFormat ...string) *env {
 		t.Fatal(err)
 	}
 	srv := proxy.New(addr, slog.New(slog.DiscardHandler), e.gate)
+	e.srv = srv
 	go srv.Serve(ln)
 	t.Cleanup(func() {
 		srv.Close()

@@ -611,6 +611,8 @@ func TestCursorStatementsAmongSeveral(t *testing.T) {
 	})
 	t.Run("fetch next to a gated write", func(t *testing.T) {
 		e := setupReads(t, readsYAML)
+		var logs lockedBuffer
+		gate.SetLogger(e.gate, slog.New(slog.NewTextHandler(&logs, nil)))
 		e.seedMany(t)
 		conn := e.connect(t, "agent")
 		declare := "declare c cursor with hold for select * from " + e.table
@@ -619,8 +621,20 @@ func TestCursorStatementsAmongSeveral(t *testing.T) {
 		mustSimple(t, conn, "close c", 0)
 		wantReads(t, e, 1, 5) // the write is judged as before, and the FETCH is still a read
 		wantLogged(t, e, declare, 5)
-		if a := e.accounts(t, 1); len(a) != 1 {
-			t.Errorf("%d decisions, want the write's", len(a))
+		// Once the session has ended and every judgment is done, the write
+		// has exactly one decision, and no second one was refused: a second
+		// End would judge the same decision again, and its insert would fail
+		// on the id.
+		conn.Close(context.Background())
+		e.srv.Close()
+		e.gate.Close()
+		var n int
+		if err := e.admin.QueryRow(context.Background(),
+			"select count(*) from stet.decisions where target_table = $1", e.table).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 1 || strings.Contains(logs.String(), "not recorded") {
+			t.Errorf("%d decisions, want the write's one; log:\n%s", n, logs.String())
 		}
 	})
 	// The server refuses the second DECLARE of a name it holds (42P03) and
