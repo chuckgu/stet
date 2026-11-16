@@ -196,8 +196,9 @@ type ownedTable struct {
 
 // agentRoles warns about each agent role what spec 8 asks the operator to
 // set up and Stet can see: the role exists, is not a superuser, has no right
-// on the stet schema, does not own a gated table, and has no role-level
-// search_path other than Stet's. own are roles already refused as Stet's own.
+// on the stet schema, may create no objects (createRights), does not own a
+// gated table, and has no role-level search_path other than Stet's. own are
+// roles already refused as Stet's own.
 func (c *checker) agentRoles(own map[string]bool) {
 	if len(c.cfg.AgentRoles) == 0 {
 		return
@@ -300,6 +301,7 @@ func (c *checker) agentRole(role string, tables []ownedTable, stetPath, database
 	}
 
 	c.schemaRights(role, id, oid)
+	c.createRights(role, id, oid)
 
 	for _, t := range tables {
 		var owns bool
@@ -415,6 +417,197 @@ func (c *checker) schemaRights(role, id string, oid uint32) {
 	slices.Sort(fixes)
 	c.warn("agent role %q has rights on schema stet: %s; it can read and change Stet's decisions and held writes; "+
 		"fix: %s", role, strings.Join(rights, ", "), strings.Join(slices.Compact(fixes), "; "))
+}
+
+// unseen is why the rights createRights finds matter, and what enforce mode
+// does about them.
+const unseen = "through which it can write a gated table where no statement Stet judges shows it " +
+	"(enforce refuses the statements that define a function, procedure, rule, trigger or a view over a gated " +
+	"table on agent sessions, not every object a write can pass through)"
+
+// publicNote follows a fix that revokes a right from PUBLIC.
+const publicNote = " (a REVOKE from PUBLIC takes the right from every role: grant it again to the roles that need it)"
+
+// createRights warns when the agent may create objects through which a write
+// to a gated table would pass where no statement shows it (ruling 29):
+// TEMPORARY on the database (temporary views and functions), CREATE on it
+// (schemas of its own to create them in), and CREATE on, or ownership of, a
+// schema that is not a system one (the stet schema aside: schemaRights warns
+// of it). TEMPORARY is PUBLIC's by default on every PostgreSQL version, and
+// CREATE on schema public through PostgreSQL 14. Rights count as
+// schemaRights counts them: granted to the agent, to PUBLIC, or to a role it
+// can SET ROLE to, NOINHERIT memberships included, or held as an owner. Each
+// is named with the role it is held through, and the fix with what removes
+// it.
+func (c *checker) createRights(role, id string, oid uint32) {
+	var (
+		database               string
+		dbRights, dbFixes      []string
+		dbDirect, dbPublic     []string
+		nsRights, nsFixes      []string
+		publicFix              bool
+		dbOwner, dbOwnerMember bool
+		dbOwnerName            string
+		dbOwnerVia             *string
+	)
+	err := c.read(func(tx pgx.Tx) error {
+		err := tx.QueryRow(c.ctx, `
+			select d.datname, d.datdba = $1::oid, pg_has_role($1::oid, d.datdba, 'MEMBER'), pg_get_userbyid(d.datdba),
+			       `+viaRole("$1::oid", "d.datdba")+`
+			from pg_database d where d.datname = current_database()`, oid).
+			Scan(&database, &dbOwner, &dbOwnerMember, &dbOwnerName, &dbOwnerVia)
+		if err != nil {
+			return err
+		}
+		// The owner's own entries are its ownership, reported apart.
+		rows, err := tx.Query(c.ctx, `
+			select a.privilege_type, a.grantee = 0, a.grantee = $1::oid, coalesce(g.rolname, ''),
+			       case when a.grantee not in (0, $1::oid) then `+viaRole("$1::oid", "a.grantee")+` end
+			from pg_database d
+			cross join lateral aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) a
+			left join pg_roles g on g.oid = a.grantee
+			where d.datname = current_database() and a.privilege_type in ('TEMPORARY', 'CREATE')
+			  and a.grantee <> d.datdba and (a.grantee = 0 or pg_has_role($1::oid, a.grantee, 'MEMBER'))
+			order by 2 desc, 3 desc, 4, 1 desc`, oid)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var public, mine bool
+			var privilege, grantee string
+			var via *string
+			if err := rows.Scan(&privilege, &public, &mine, &grantee, &via); err != nil {
+				rows.Close()
+				return err
+			}
+			switch {
+			case public:
+				dbPublic = append(dbPublic, privilege)
+				dbRights = append(dbRights, privilege+" through PUBLIC")
+			case mine:
+				dbDirect = append(dbDirect, privilege)
+				dbRights = append(dbRights, privilege)
+			default:
+				dbRights = append(dbRights, fmt.Sprintf("%s through role %q", privilege, grantee))
+				dbFixes = append(dbFixes, revokeVia(via, id, grantee))
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		// Schemas: the system ones, pg_* and information_schema, take no
+		// agent's objects; stet is schemaRights'.
+		const userSchema = `n.nspname not like 'pg\_%' and n.nspname not in ('information_schema', 'stet')`
+		rows, err = tx.Query(c.ctx, `
+			select n.nspname, a.grantee = 0, a.grantee = $1::oid, coalesce(g.rolname, ''),
+			       case when a.grantee not in (0, $1::oid) then `+viaRole("$1::oid", "a.grantee")+` end
+			from pg_namespace n
+			cross join lateral aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) a
+			left join pg_roles g on g.oid = a.grantee
+			where `+userSchema+` and a.privilege_type = 'CREATE'
+			  and a.grantee <> n.nspowner and (a.grantee = 0 or pg_has_role($1::oid, a.grantee, 'MEMBER'))
+			order by 1, 2 desc, 3 desc, 4`, oid)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var public, mine bool
+			var schema, grantee string
+			var via *string
+			if err := rows.Scan(&schema, &public, &mine, &grantee, &via); err != nil {
+				rows.Close()
+				return err
+			}
+			on := pgx.Identifier{schema}.Sanitize()
+			switch {
+			case public:
+				nsRights = append(nsRights, fmt.Sprintf("CREATE on schema %s through PUBLIC", on))
+				nsFixes = append(nsFixes, fmt.Sprintf("REVOKE CREATE ON SCHEMA %s FROM PUBLIC", on))
+				publicFix = true
+			case mine:
+				nsRights = append(nsRights, "CREATE on schema "+on)
+				nsFixes = append(nsFixes, fmt.Sprintf("REVOKE CREATE ON SCHEMA %s FROM %s", on, id))
+			default:
+				nsRights = append(nsRights, fmt.Sprintf("CREATE on schema %s through role %q", on, grantee))
+				nsFixes = append(nsFixes, revokeVia(via, id, grantee))
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		rows, err = tx.Query(c.ctx, `
+			select n.nspname, n.nspowner = $1::oid, pg_get_userbyid(n.nspowner),
+			       case when n.nspowner <> $1::oid then `+viaRole("$1::oid", "n.nspowner")+` end
+			from pg_namespace n
+			where `+userSchema+` and pg_has_role($1::oid, n.nspowner, 'MEMBER')
+			order by 1`, oid)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var mine bool
+			var schema, owner string
+			var via *string
+			if err := rows.Scan(&schema, &mine, &owner, &via); err != nil {
+				return err
+			}
+			on := pgx.Identifier{schema}.Sanitize()
+			if mine {
+				nsRights = append(nsRights, "ownership of schema "+on)
+				nsFixes = append(nsFixes, fmt.Sprintf("ALTER SCHEMA %s OWNER TO <a role the agent is not a member of>", on))
+				continue
+			}
+			nsRights = append(nsRights, fmt.Sprintf("ownership of schema %s through role %q", on, owner))
+			nsFixes = append(nsFixes, revokeVia(via, id, owner))
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		c.warn("agent role %q could not be checked for rights to create objects (TEMPORARY or CREATE on the "+
+			"database, CREATE on its schemas): %v", role, err)
+		return
+	}
+
+	db := pgx.Identifier{database}.Sanitize()
+	if len(dbDirect) > 0 {
+		dbFixes = append(dbFixes, fmt.Sprintf("REVOKE %s ON DATABASE %s FROM %s", strings.Join(dbDirect, ", "), db, id))
+	}
+	if len(dbPublic) > 0 {
+		dbFixes = append(dbFixes, fmt.Sprintf("REVOKE %s ON DATABASE %s FROM PUBLIC", strings.Join(dbPublic, ", "), db))
+	}
+	switch {
+	case dbOwner:
+		dbRights = append(dbRights, "ownership")
+		dbFixes = append(dbFixes, fmt.Sprintf("ALTER DATABASE %s OWNER TO <a role the agent is not a member of>", db))
+	case dbOwnerMember:
+		dbRights = append(dbRights, fmt.Sprintf("its owner's rights through role %q", dbOwnerName))
+		dbFixes = append(dbFixes, revokeVia(dbOwnerVia, id, dbOwnerName))
+	}
+	if len(dbRights) > 0 {
+		c.warn("agent role %q may create objects in database %s: %s; it can create temporary views and functions "+
+			"(TEMPORARY), or schemas of its own to create them in (CREATE), "+unseen+"; fix: %s",
+			role, db, strings.Join(dbRights, ", "), fixes(dbFixes, len(dbPublic) > 0))
+	}
+	if len(nsRights) > 0 {
+		c.warn("agent role %q may create objects in schemas: %s; a view, function, rule or trigger there is an "+
+			"object "+unseen+"; fix: %s", role, strings.Join(nsRights, ", "), fixes(nsFixes, publicFix))
+	}
+}
+
+// fixes joins the statements that remove what a warning names, sorted and
+// each once, and says what a REVOKE from PUBLIC costs when public is set.
+func fixes(statements []string, public bool) string {
+	slices.Sort(statements)
+	s := strings.Join(slices.Compact(statements), "; ")
+	if public {
+		s += publicNote
+	}
+	return s
 }
 
 // searchPath warns when the role has a role-level search_path, for this

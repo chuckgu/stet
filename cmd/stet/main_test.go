@@ -36,8 +36,14 @@ func testPG(t *testing.T) string {
 // connect opens a connection to addr (the database or a proxy) as user.
 func connect(t *testing.T, addr, user, password string) *pgx.Conn {
 	t.Helper()
+	return connectTo(t, addr, "stet_test", user, password)
+}
+
+// connectTo is connect to database db.
+func connectTo(t *testing.T, addr, db, user, password string) *pgx.Conn {
+	t.Helper()
 	u := url.URL{
-		Scheme: "postgres", Host: addr, Path: "/stet_test",
+		Scheme: "postgres", Host: addr, Path: "/" + db,
 		User: url.UserPassword(user, password), RawQuery: "sslmode=disable",
 	}
 	conn, err := pgx.Connect(context.Background(), u.String())
@@ -74,8 +80,36 @@ func freshTable(t *testing.T, conn *pgx.Conn, n int) string {
 // stetPool is a pool of Stet's own account, with the stet schema in place.
 func stetPool(t *testing.T, pg string) *pgxpool.Pool {
 	t.Helper()
+	return stetPoolIn(t, pg, "stet_test")
+}
+
+// cleanDatabase creates a database of the test's own, owned by Stet's
+// account, in which PUBLIC has neither TEMPORARY on the database nor CREATE
+// on schema public, and drops it when the test ends; it returns its name.
+// The shared stet_test keeps PostgreSQL 14's defaults, which give every role
+// both, and its roles have CREATE on it besides, so no agent role is free
+// there of what check warns about (ruling 29); nothing is revoked from
+// PUBLIC there, since the other packages' tests share it. A role whose
+// rights in this database the test grants must be created before it, so
+// that the database is dropped, with those rights, before the role is.
+func cleanDatabase(t *testing.T, pg string) string {
+	t.Helper()
+	name := fmt.Sprintf("stet_chk_db_%d", time.Now().UnixNano())
+	su := superuser(t, pg)
+	mustExec(t, su, "create database "+name+" template template0 owner stet_scram")
+	t.Cleanup(func() { su.Exec(context.Background(), "drop database if exists "+name+" with (force)") })
+	in := connectTo(t, pg, name, "postgres", "postgres-pw")
+	mustExec(t, in, "revoke temporary on database "+name+" from public")
+	mustExec(t, in, "revoke create on schema public from public")
+	mustExec(t, in, "grant create on schema public to stet_scram") // for the tests' tables
+	return name
+}
+
+// stetPoolIn is stetPool in database db.
+func stetPoolIn(t *testing.T, pg, db string) *pgxpool.Pool {
+	t.Helper()
 	ctx := context.Background()
-	pool, err := openPool(ctx, "postgres://stet_scram:scram-pw@"+pg+"/stet_test?sslmode=disable")
+	pool, err := openPool(ctx, "postgres://stet_scram:scram-pw@"+pg+"/"+db+"?sslmode=disable")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -384,11 +418,14 @@ func enforceConfig(role, table string) *config.Config {
 	}
 }
 
+// It runs in a database of its own (cleanDatabase), where a role can be
+// free of every finding: in stet_test each one may create objects.
 func TestCheckWarnsAboutAgentRoles(t *testing.T) {
 	pg := testPG(t)
 	ctx := context.Background()
-	pool := stetPool(t, pg)
-	admin := connect(t, pg, "stet_scram", "scram-pw")
+	db := cleanDatabase(t, pg)
+	pool := stetPoolIn(t, pg, db)
+	admin := connectTo(t, pg, db, "stet_scram", "scram-pw")
 	table := freshTable(t, admin, 1)
 
 	cases := []struct {
@@ -399,13 +436,17 @@ func TestCheckWarnsAboutAgentRoles(t *testing.T) {
 		{"missing", "stet_no_such_role", nil, "does not exist"},
 		{"superuser", "postgres", nil, "superuser"},
 		{"stet schema", "stet_clear", func(t *testing.T) string {
-			su := superuser(t, pg)
+			su := connectTo(t, pg, db, "postgres", "postgres-pw")
 			mustExec(t, su, "grant usage on schema stet to stet_clear")
 			t.Cleanup(func() { su.Exec(ctx, "revoke usage on schema stet from stet_clear") })
 			return table
 		}, "schema stet"},
 		{"table owner", "stet_md5", func(t *testing.T) string {
-			return freshTable(t, connect(t, pg, "stet_md5", "md5-pw"), 1)
+			// stet_md5 may create no table here: it is given one.
+			su := connectTo(t, pg, db, "postgres", "postgres-pw")
+			owned := freshTable(t, su, 1)
+			mustExec(t, su, "alter table "+owned+" owner to stet_md5")
+			return owned
 		}, "owns"},
 		{"search_path", "stet_clear", func(t *testing.T) string {
 			su := superuser(t, pg)
@@ -415,8 +456,8 @@ func TestCheckWarnsAboutAgentRoles(t *testing.T) {
 		}, "search_path"},
 		{"search_path in this database", "stet_clear", func(t *testing.T) string {
 			su := superuser(t, pg)
-			mustExec(t, su, "alter role stet_clear in database stet_test set search_path = public")
-			t.Cleanup(func() { su.Exec(ctx, "alter role stet_clear in database stet_test reset search_path") })
+			mustExec(t, su, "alter role stet_clear in database "+db+" set search_path = public")
+			t.Cleanup(func() { su.Exec(ctx, "alter role stet_clear in database "+db+" reset search_path") })
 			return table
 		}, "search_path"},
 		{"search_path as Stet's", "stet_clear", func(t *testing.T) string {
@@ -467,10 +508,13 @@ func TestCheckRefusesStetsOwnAccount(t *testing.T) {
 	}
 }
 
+// It runs in a database of its own, where stet_md5 has nothing else to warn
+// of (see TestCheckWarnsAboutAgentRoles).
 func TestCheckWarnsAboutPassSettings(t *testing.T) {
 	pg := testPG(t)
-	pool := stetPool(t, pg)
-	admin := connect(t, pg, "stet_scram", "scram-pw")
+	db := cleanDatabase(t, pg)
+	pool := stetPoolIn(t, pg, db)
+	admin := connectTo(t, pg, db, "stet_scram", "scram-pw")
 	table := freshTable(t, admin, 1)
 	cfg := enforceConfig("stet_md5", table)
 	cfg.Model.OnFailure = "pass"
@@ -678,6 +722,87 @@ func TestCheckFollowsRoleMembership(t *testing.T) {
 		}
 		if _, ok := warningWith(warnings, agent, "owns", owned, owner, fix); !ok {
 			t.Errorf("warnings %q, want one that %s owns %s through %s, with %s", warnings, agent, owned, owner, fix)
+		}
+	})
+}
+
+// An agent role that may create objects can write a gated table through a
+// temporary view or a function it creates, which no statement Stet judges
+// shows (ruling 29): enforce warns of TEMPORARY and CREATE on the database
+// and of CREATE on, or ownership of, any schema but the system ones, each
+// with the role it is held through and the statement that removes it.
+func TestCheckWarnsAboutRightsToCreateObjects(t *testing.T) {
+	pg := testPG(t)
+	ctx := context.Background()
+	su := superuser(t, pg)
+	run := func(t *testing.T, pool *pgxpool.Pool, agent, table string) []string {
+		t.Helper()
+		warnings, err := check(ctx, pool, enforceConfig(agent, table))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("warnings: %q", warnings)
+		return warnings
+	}
+	want := func(t *testing.T, warnings []string, parts ...string) {
+		t.Helper()
+		if _, ok := warningWith(warnings, parts...); !ok {
+			t.Errorf("warnings %q, want one with each of %q", warnings, parts)
+		}
+	}
+
+	// stet_test keeps PostgreSQL 14's defaults: TEMPORARY on the database and
+	// CREATE on schema public are PUBLIC's.
+	t.Run("through PUBLIC", func(t *testing.T) {
+		agent := createRole(t, su, "agent", "login")
+		w := run(t, stetPool(t, pg), agent, freshTable(t, connect(t, pg, "stet_scram", "scram-pw"), 1))
+		want(t, w, agent, `database "stet_test"`, "TEMPORARY through PUBLIC", `REVOKE TEMPORARY ON DATABASE "stet_test" FROM PUBLIC`)
+		want(t, w, agent, `CREATE on schema "public" through PUBLIC`, `REVOKE CREATE ON SCHEMA "public" FROM PUBLIC`)
+	})
+
+	t.Run("through a role", func(t *testing.T) {
+		agent := createRole(t, su, "agent", "login noinherit")
+		mid := createRole(t, su, "mid", "nologin")
+		schema := fmt.Sprintf("stet_chk_s_%d", time.Now().UnixNano())
+		mustExec(t, su, "create schema "+schema)
+		t.Cleanup(func() { su.Exec(ctx, "drop schema "+schema+" cascade") })
+		mustExec(t, su, "grant create on schema "+schema+" to "+mid)
+		mustExec(t, su, "grant "+mid+" to "+agent)
+		w := run(t, stetPool(t, pg), agent, freshTable(t, connect(t, pg, "stet_scram", "scram-pw"), 1))
+		want(t, w, agent, fmt.Sprintf(`CREATE on schema "%s" through role "%s"`, schema, mid),
+			fmt.Sprintf(`REVOKE "%s" FROM "%s"`, mid, agent))
+	})
+
+	// In a database whose PUBLIC holds neither right, a role's own grants
+	// and schema warn, and once they are revoked nothing does.
+	t.Run("granted, then revoked", func(t *testing.T) {
+		agent := createRole(t, su, "agent", "login") // before the database: see cleanDatabase
+		db := cleanDatabase(t, pg)
+		pool := stetPoolIn(t, pg, db)
+		table := freshTable(t, connectTo(t, pg, db, "stet_scram", "scram-pw"), 1)
+		in := connectTo(t, pg, db, "postgres", "postgres-pw")
+		if w := run(t, pool, agent, table); len(w) != 0 {
+			t.Errorf("before the grants: warnings %q, want none", w)
+		}
+
+		mustExec(t, in, "grant temporary, create on database "+db+" to "+agent)
+		mustExec(t, in, "grant create on schema public to "+agent)
+		mustExec(t, in, "create schema owned_by_agent authorization "+agent)
+		w := run(t, pool, agent, table)
+		revokeDB := fmt.Sprintf(`REVOKE TEMPORARY, CREATE ON DATABASE "%s" FROM "%s"`, db, agent)
+		revokePublic := fmt.Sprintf(`REVOKE CREATE ON SCHEMA "public" FROM "%s"`, agent)
+		want(t, w, agent, fmt.Sprintf(`database "%s"`, db), "TEMPORARY, CREATE", revokeDB)
+		want(t, w, agent, `CREATE on schema "public"`, revokePublic,
+			`ownership of schema "owned_by_agent"`, `ALTER SCHEMA "owned_by_agent" OWNER TO`)
+		if strings.Contains(strings.Join(w, "\n"), "PUBLIC") {
+			t.Errorf("warnings %q name PUBLIC, which holds neither right here", w)
+		}
+
+		mustExec(t, in, "drop schema owned_by_agent")
+		mustExec(t, in, revokeDB)
+		mustExec(t, in, revokePublic)
+		if w := run(t, pool, agent, table); len(w) != 0 {
+			t.Errorf("after the REVOKEs: warnings %q, want none", w)
 		}
 	})
 }
