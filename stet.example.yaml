@@ -43,9 +43,9 @@ tables:
     impact:                  # 없으면 다중 행 쓰기는 unsupported로 기록된다
       max_rows: 100          # 필수. 이보다 많이 걸리면 hold
       max_share: 0.1         # 선택. UPDATE·DELETE가 테이블의 10%를 넘게 걸리면 hold
-      cumulative:            # 선택. 로그인 역할 하나가 window 안에 이 테이블에서 건드린 행의 합계 한도
+      cumulative:            # 선택. 접속 계정 하나가 window 안에 이 테이블에서 건드린 행의 합계 한도. 쓰면 두 값 모두 필수
         max_rows: 500        # impact.max_rows 이상. 합계가 이를 넘으면 hold
-        window: 10m          # 0보다 크고 24h 이하
-    reads:                   # 선택. 있으면 이 테이블의 읽기를 기록한다
-      log_above: 1000        # 선택. 한 번에 이보다 많은 행을 보낸 읽기는 따로 기록한다 (없으면 집계만)
+        window: 10m          # 초 단위로 떨어지는 값. 1s 이상 24h 이하
+    reads:                   # 선택. 있으면 (값 없이 reads:만 써도) 이 테이블의 읽기를 기록한다
+      log_above: 1000        # 선택. 한 읽기가 이보다 많은 행을 보내면 따로 기록한다 (없으면 집계만). 커서와 나눠 가져가는 포털은 합계로 본다
     unsupported: reject

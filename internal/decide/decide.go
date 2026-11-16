@@ -196,7 +196,22 @@ type Input struct {
 	Cumulative *Cumulative // the login role's usage in the window; nil when no limit applies
 }
 
-// Verdict applies spec 6: the first matching rule decides.
+// Verdict applies spec 6, with the cumulative limit of spec-v0.2-accounting
+// 4: the first matching rule decides, in this order.
+//
+//  1. A shape v0.1 does not judge, or a write in a transaction: unsupported.
+//  2. A measured write (Impact set) goes by its measurement: measuring
+//     failed is unsupported; too many rows, then too large a share, hold;
+//     then over the cumulative limit, hold; an estimate escalates; else
+//     commit.
+//  3. A single-row write over the cumulative limit: hold, impact:cumulative.
+//     Its questions were still asked; the answers are recorded, not used.
+//  4. State or model failure: on_failure decides.
+//  5. An answer the model is unsure of: escalate.
+//  6. A duplicate, a conflict, or a broken rule: hold.
+//  7. Otherwise commit.
+//
+// A cumulative limit whose usage is unknown (Cumulative.Error) is not applied.
 func Verdict(in Input) (string, []string) {
 	if in.Unsupported != "" {
 		return Unsupported, []string{in.Unsupported}
