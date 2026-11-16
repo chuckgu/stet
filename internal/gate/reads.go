@@ -2,6 +2,7 @@ package gate
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +18,9 @@ const (
 	// readLogQueue bounds the large reads waiting to be logged. Past it they
 	// are dropped and counted, so Observe never waits for the store.
 	readLogQueue = 1024
+	// lateReadReport is how long reads observed after the gate closed are
+	// counted before one line reports them.
+	lateReadReport = 100 * time.Millisecond
 )
 
 // readFlushEvery is how often read buckets of past minutes are written.
@@ -35,6 +39,11 @@ type readStats struct {
 	buckets map[readKey]*readCount
 	write   func(context.Context, []store.ReadBucket) error // under mu
 	now     func() time.Time                                // under mu
+	// closed is set when record takes the buckets for the last time. Reads
+	// observed after it are counted in late and reported in one line.
+	closed    bool
+	late      int64
+	lateTimer bool // a report of late is pending
 
 	logs    chan readEvent
 	dropped atomic.Int64 // large reads not logged since last reported
@@ -83,38 +92,25 @@ func newReadStats(tables map[string]int, write func(context.Context, []store.Rea
 	}
 }
 
-// recorded returns the tables in keys whose reads are recorded, keeping
-// their order. It returns keys itself when all are.
-func (g *Gate) recorded(keys []string) []string {
+// recordsAny reports whether reads of any of the gated tables in keys are
+// recorded.
+func (g *Gate) recordsAny(keys []string) bool {
 	if g.reads == nil {
-		return nil
+		return false
 	}
-	n := 0
 	for _, k := range keys {
 		if _, ok := g.reads.logAbove[k]; ok {
-			n++
+			return true
 		}
 	}
-	switch n {
-	case 0:
-		return nil
-	case len(keys):
-		return keys
-	}
-	out := make([]string, 0, n)
-	for _, k := range keys {
-		if _, ok := g.reads.logAbove[k]; ok {
-			out = append(out, k)
-		}
-	}
-	return out
+	return false
 }
 
-// Observe counts a read of tables that record reads: one statement and the
-// rows sent, in the bucket of the minute it arrived, for each such table. A
-// read that sent more than any of its tables' log_above is also logged, once.
-// The proxy calls it before forwarding the read's ReadyForQuery, so it does
-// no I/O and never waits for the store.
+// Observe counts a read in the bucket of the minute it arrived, for each table
+// it read that records reads: one statement and the rows sent. A read that
+// sent more than any of those tables' log_above is also logged, once, naming
+// every gated table it read. The proxy calls it before forwarding the read's
+// ReadyForQuery, so it does no I/O and never waits for the store.
 func (g *Gate) Observe(s proxy.SessionInfo, st proxy.Statement, o proxy.Outcome) {
 	r, ok := st.Data.(sqlparse.Result)
 	a := g.reads
@@ -125,11 +121,33 @@ func (g *Gate) Observe(s proxy.SessionInfo, st proxy.Statement, o proxy.Outcome)
 	if at.IsZero() { // the proxy always sets it
 		at = time.Now()
 	}
-	a.add(s.User, r.Reads, at, o.Sent)
+	minute := at.Truncate(time.Minute).Unix()
 
+	// Under mu throughout, so that once record has taken the buckets for the
+	// last time, every read is either in them or counted as late, and every
+	// large read it counted is already queued for the last drain.
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		a.lateRead(g.log)
+		return
+	}
 	large := false
 	for _, t := range r.Reads {
-		if n := a.logAbove[t]; n > 0 && o.Sent > int64(n) {
+		logAbove, ok := a.logAbove[t]
+		if !ok {
+			continue
+		}
+		k := readKey{minute, s.User, t}
+		c := a.buckets[k]
+		if c == nil {
+			c = &readCount{}
+			a.buckets[k] = c
+		}
+		c.statements++
+		c.rows += o.Sent
+		c.maxRows = max(c.maxRows, o.Sent)
+		if logAbove > 0 && o.Sent > int64(logAbove) {
 			large = true
 		}
 	}
@@ -143,21 +161,21 @@ func (g *Gate) Observe(s proxy.SessionInfo, st proxy.Statement, o proxy.Outcome)
 	}
 }
 
-func (a *readStats) add(role string, tables []string, at time.Time, sent int64) {
-	minute := at.Truncate(time.Minute).Unix()
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	for _, t := range tables {
-		k := readKey{minute, role, t}
-		c := a.buckets[k]
-		if c == nil {
-			c = &readCount{}
-			a.buckets[k] = c
-		}
-		c.statements++
-		c.rows += sent
-		c.maxRows = max(c.maxRows, sent)
+// lateRead counts a read observed after the gate closed. The first of a
+// burst sets a timer, and one line reports them all. It runs with a.mu held.
+func (a *readStats) lateRead(log *slog.Logger) {
+	a.late++
+	if a.lateTimer {
+		return
 	}
+	a.lateTimer = true
+	time.AfterFunc(lateReadReport, func() {
+		a.mu.Lock()
+		n := a.late
+		a.late, a.lateTimer = 0, false
+		a.mu.Unlock()
+		log.Warn("reads observed after the gate closed were not recorded", "count", n)
+	})
 }
 
 // record runs while the gate records reads. It logs large reads as they
@@ -173,15 +191,15 @@ func (g *Gate) record(every time.Duration) {
 		case ev := <-a.logs:
 			g.logRead(context.Background(), ev)
 		case <-tick.C:
-			g.flushReads(false)
+			g.flushReads(false, false)
 			g.reportDropped()
 		case done := <-a.flushes:
 			g.drainReadLogs(context.Background())
-			g.flushReads(true)
+			g.flushReads(true, false)
 			g.reportDropped()
 			close(done)
 		case <-a.stop:
-			g.flushReads(true)
+			g.flushReads(true, true)
 			ctx, cancel := context.WithTimeout(context.Background(), recordTimeout)
 			g.drainReadLogs(ctx)
 			cancel()
@@ -205,13 +223,18 @@ func (g *Gate) closeReads() {
 // flushReads writes the buckets of minutes before the current one, or all of
 // them. Buckets are taken out while they are written, so Observe never waits
 // on the write. Ones that fail go back to be written next time, until they
-// have failed for readRetention.
+// have failed for readRetention; the hour counts from the first failure, so a
+// long read that lands in an old minute still gets its retries.
 //
 // A read is bucketed by when it arrived, so a long one can add to a minute
 // already written; it is written as it appears, and stet.reads sums it in.
-func (g *Gate) flushReads(all bool) {
+//
+// last is the write at Close: it takes every bucket and closes the gate to
+// later reads, and what fails is dropped, since nothing will retry it.
+func (g *Gate) flushReads(all, last bool) {
 	a := g.reads
 	a.mu.Lock()
+	a.closed = a.closed || last
 	now, write := a.now(), a.write
 	current := now.Truncate(time.Minute).Unix()
 	var keys []readKey
@@ -237,6 +260,10 @@ func (g *Gate) flushReads(all bool) {
 	defer cancel()
 	err := write(ctx, buckets)
 	if err == nil {
+		return
+	}
+	if last {
+		g.log.Error("reads dropped: not written when the gate closed", "buckets", len(buckets), "err", err)
 		return
 	}
 	kept, dropped := 0, 0

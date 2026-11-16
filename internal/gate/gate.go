@@ -98,7 +98,8 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, d decide.Decid
 }
 
 // Close writes the reads still held in memory and waits for decisions still
-// being judged. Close the proxy first so no new statements arrive.
+// being judged. Close the proxy first, and wait for it, so that no session is
+// still reporting: a read reported after Close is only counted in a log line.
 func (g *Gate) Close() {
 	g.closeReads()
 	g.wg.Wait()
@@ -115,9 +116,7 @@ func (g *Gate) Inspect(sql string) proxy.Statement {
 	}
 	st := proxy.Statement{SQL: sql, Watch: r.Kind == sqlparse.Gated || r.Kind == sqlparse.Measured || r.Kind == sqlparse.Unsupported, OnBehalfOf: r.OnBehalfOf}
 	if r.Kind == sqlparse.Read {
-		// Narrowed to the tables that record reads: Observe counts these.
-		r.Reads = g.recorded(r.Reads)
-		st.Observe = len(r.Reads) > 0
+		st.Observe = g.recordsAny(r.Reads)
 	}
 	if c := r.Cursor; c != nil {
 		if op, ok := cursorOps[c.Op]; ok {

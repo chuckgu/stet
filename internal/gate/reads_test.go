@@ -291,9 +291,10 @@ func TestReadOfTwoTablesCountsOnlyTheOneTurnedOn(t *testing.T) {
 	if rows := e.readsOf(t, e.deals()); len(rows) != 0 {
 		t.Errorf("reads of %s counted: %+v", e.deals(), rows)
 	}
+	// The line names every gated table the statement read (spec 5).
 	logs := e.readLog(t)
-	if len(logs) != 1 || !reflect.DeepEqual(logs[0].Tables, []string{e.table}) {
-		t.Errorf("read_log = %+v, want one line naming only %s", logs, e.table)
+	if len(logs) != 1 || !reflect.DeepEqual(logs[0].Tables, []string{e.table, e.deals()}) {
+		t.Errorf("read_log = %+v, want one line naming [%s %s]", logs, e.table, e.deals())
 	}
 }
 
@@ -498,37 +499,46 @@ func TestReadsDoNotTouchTheDatabaseBeforeTheStatement(t *testing.T) {
 }
 
 // A read whose connection ended before the server answered still counts the
-// rows that went out.
+// rows that went out, and a large one is logged with why it ended.
 func TestLostReadCountsTheRowsItSent(t *testing.T) {
 	e := setupReads(t, readsYAML)
 	e.seedMany(t)
 	conn := e.connect(t, "dropped")
-	// Rows far larger than Postgres's send buffer go out as they are made;
-	// the fifth waits a second, and the client hangs up before then.
+	// Rows far larger than Postgres's send buffer go out as they are made,
+	// each pushing out the end of the one before. The sixth waits a second,
+	// so rows 1 to 4 arrive whole; the client takes them and hangs up.
 	rows, err := conn.Query(context.Background(), "select s.id, repeat('x', 100000), "+
-		"pg_sleep(case when s.id = 5 then 1 else 0 end)::text from (select id from "+e.table+" order by id offset 0) s")
+		"pg_sleep(case when s.id = 6 then 1 else 0 end)::text from (select id from "+e.table+" order by id offset 0) s")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !rows.Next() {
-		t.Fatalf("no row arrived: %v", rows.Err())
+	for i := range 4 {
+		if !rows.Next() {
+			t.Fatalf("row %d did not arrive: %v", i+1, rows.Err())
+		}
 	}
 	conn.PgConn().Conn().Close()
 
 	// The proxy reports the read once it sees the connection end.
+	var c count
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		e.gate.FlushReads()
-		if c := perRole(e.reads(t))["stet_scram"]; c.Statements > 0 {
-			if c.Statements != 1 || c.Rows < 1 {
-				t.Errorf("counted %+v, want one statement with the rows sent", c)
-			}
+		if c = perRole(e.reads(t))["stet_scram"]; c.Statements > 0 {
 			break
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("the lost read was never counted")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	if c.Statements != 1 || c.Rows < 4 {
+		t.Errorf("counted %+v, want one statement with at least the 4 rows received", c)
+	}
+	logs := e.readLog(t)
+	if len(logs) != 1 || logs[0].Rows != c.Rows || logs[0].ExecError == nil ||
+		!strings.Contains(*logs[0].ExecError, "connection closed") {
+		t.Errorf("read_log = %+v, want one %d-row line whose exec_error says the connection closed", logs, c.Rows)
 	}
 }
 
@@ -678,5 +688,64 @@ func TestObserveDoesNotWaitForASlowStore(t *testing.T) {
 	}
 	if want := fmt.Sprintf("count=%d", n-logged); !strings.Contains(logs.String(), want) {
 		t.Errorf("want a line counting %d dropped large reads, got:\n%s", n-logged, logs.String())
+	}
+}
+
+// When the final write at Close fails, nothing is left to retry it: the
+// buckets are dropped, and the log says so.
+func TestCloseDropsWhatItCannotWrite(t *testing.T) {
+	e := setupReads(t, readsYAML)
+	var logs lockedBuffer
+	gate.SetLogger(e.gate, slog.New(slog.NewTextHandler(&logs, nil)))
+	gate.FailReadWrites(e.gate, 1)
+	st := e.gate.Inspect("select * from " + e.table)
+	for _, role := range []string{"a", "b"} {
+		e.gate.Observe(proxy.SessionInfo{User: role}, st, proxy.Outcome{Executed: true, Sent: 1, Arrived: time.Now()})
+	}
+	e.gate.Close()
+	if strings.Contains(logs.String(), "retry") || !strings.Contains(logs.String(), "dropped") ||
+		!strings.Contains(logs.String(), "buckets=2") {
+		t.Errorf("want a line dropping 2 buckets and none promising a retry, got:\n%s", logs.String())
+	}
+	if rows := e.reads(t); len(rows) != 0 {
+		t.Errorf("stet.reads = %+v", rows)
+	}
+}
+
+// Reads reported after the gate closed are not recorded, but counted, and the
+// count is logged in one line. Observe neither panics nor waits.
+func TestReadsObservedAfterCloseAreCounted(t *testing.T) {
+	e := setupReads(t, readsYAML)
+	var logs lockedBuffer
+	gate.SetLogger(e.gate, slog.New(slog.NewTextHandler(&logs, nil)))
+	st := e.gate.Inspect("select * from " + e.table)
+	e.gate.Close()
+
+	start := time.Now()
+	for range 3 { // large reads: they would be logged
+		e.gate.Observe(proxy.SessionInfo{User: "late"}, st, proxy.Outcome{Executed: true, Sent: 10, Arrived: time.Now()})
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Errorf("Observe after Close took %v", elapsed)
+	}
+	e.gate.FlushReads() // returns at once: nothing writes any more
+
+	const msg = "after the gate closed"
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(logs.String(), msg) {
+		if time.Now().After(deadline) {
+			t.Fatalf("no line counting the late reads, got:\n%s", logs.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond) // a second line would show up by now
+	if n := strings.Count(logs.String(), msg); n != 1 || !strings.Contains(logs.String(), "count=3") {
+		t.Errorf("want one line counting 3 late reads, got:\n%s", logs.String())
+	}
+	if rows := e.reads(t); len(rows) != 0 {
+		t.Errorf("stet.reads = %+v, want nothing written after Close", rows)
+	}
+	if l := e.readLog(t); len(l) != 0 {
+		t.Errorf("read_log = %+v, want nothing written after Close", l)
 	}
 }
