@@ -108,8 +108,8 @@ func (g *Gate) recordsAny(keys []string) bool {
 
 // Observe counts a read in the bucket of the minute it arrived, for each table
 // it read that records reads: one statement and the rows sent. A read that
-// sent more than any of those tables' log_above is also logged, once, naming
-// every gated table it read. The proxy calls it before forwarding the read's
+// sent more than the smallest of those tables' log_above is also logged,
+// once, naming every gated table it read. The proxy calls it before forwarding the read's
 // ReadyForQuery, so it does no I/O and never waits for the store.
 //
 // A read taken in parts (the FETCHes of one cursor, the Executes of one
@@ -137,8 +137,8 @@ func (g *Gate) Observe(s proxy.SessionInfo, st proxy.Statement, o proxy.Outcome)
 		a.lateRead(g.log)
 		return
 	}
-	large := false
 	total := o.Before + o.Sent
+	var limit int64 // the smallest log_above of the tables read; 0 when none logs
 	for _, t := range r.Reads {
 		logAbove, ok := a.logAbove[t]
 		if !ok {
@@ -153,11 +153,14 @@ func (g *Gate) Observe(s proxy.SessionInfo, st proxy.Statement, o proxy.Outcome)
 		c.statements++
 		c.rows += o.Sent
 		c.maxRows = max(c.maxRows, total)
-		if logAbove > 0 && o.Before <= int64(logAbove) && total > int64(logAbove) {
-			large = true
+		if logAbove > 0 && (limit == 0 || int64(logAbove) < limit) {
+			limit = int64(logAbove)
 		}
 	}
-	if !large {
+	// Once per read: the part that first takes the total past the smallest
+	// log_above logs it, and no later part does, whatever other tables' limits
+	// it passes.
+	if limit == 0 || o.Before > limit || total <= limit {
 		return
 	}
 	select {

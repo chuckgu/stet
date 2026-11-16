@@ -456,6 +456,34 @@ func TestReadInPartsIsLoggedOnce(t *testing.T) {
 	})
 }
 
+// A cursor over two tables whose log_above differ (3 and 10) is logged once,
+// when its total first passes the smaller: 5 rows, then 7 more pass 10 as
+// well, and add no second line.
+func TestReadInPartsOfTwoTablesIsLoggedOnce(t *testing.T) {
+	e := setupReads(t, dealsYAML+"    reads: {log_above: 10}\n")
+	e.seedMany(t)
+	e.seedDeals(t)
+	conn := e.connect(t, "exporter")
+	declare := "declare c cursor for select c.id, d.id from " + e.table + " c, " + e.deals() + " d"
+	mustExec(t, conn, "begin")
+	mustExec(t, conn, declare)
+	for _, n := range []int{5, 7} {
+		if got := collect(t, conn, fmt.Sprintf("fetch %d from c", n)); len(got) != n {
+			t.Fatalf("fetched %d rows, want %d", len(got), n)
+		}
+	}
+	mustExec(t, conn, "commit")
+
+	e.gate.FlushReads()
+	want := map[string]count{"stet_scram": {Statements: 2, Rows: 12, MaxRows: 12}}
+	wantCounts(t, e.reads(t), want)
+	wantCounts(t, e.readsOf(t, e.deals()), want)
+	logs := e.readLog(t)
+	if len(logs) != 1 || logs[0].Rows != 5 || logs[0].Statement != declare || !reflect.DeepEqual(logs[0].Tables, []string{e.table, e.deals()}) {
+		t.Errorf("read_log = %+v, want one 5-row line holding %q and naming both tables", logs, declare)
+	}
+}
+
 // executeInParts binds sql to portal p, as JDBC does with a fetch size, and
 // executes it n rows at a time, one Sync each, until it completes. It returns
 // the rows each Execute sent. Run it inside a transaction, so p outlives Sync.
