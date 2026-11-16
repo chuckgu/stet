@@ -69,7 +69,8 @@ func (g *Gate) measure(ctx context.Context, p *pending, lim *config.Impact) *dec
 // built-in functions. The boundary is what runs here. The agent's statement
 // is only prepared and EXPLAINed (never with ANALYZE), which does not execute
 // it; the only predicate executed is Measure.CountSQL, which sqlparse builds
-// for vetted predicates only, and only when the method is count.
+// for vetted predicates only, and only when the method is count and every
+// name the predicate qualifies by its table is one of the table's columns.
 //
 // Bind values arrive here as text. Binary ones were decoded before, by
 // paramTexts, which prepares the statement as Stet's own account, also in a
@@ -150,7 +151,7 @@ func (g *Gate) queryImpact(ctx context.Context, p *pending, m *sqlparse.Measure,
 	im.Estimate = &est
 
 	// Last: a count past the timeout aborts the transaction.
-	if m.Method != sqlparse.MethodCount {
+	if m.Method != sqlparse.MethodCount || !allColumns(ctx, pg, rel, m.Qualified) {
 		im.Method, im.Rows = string(sqlparse.MethodEstimate), &est
 		return nil
 	}
@@ -181,6 +182,32 @@ func (g *Gate) queryImpact(ctx context.Context, p *pending, m *sqlparse.Measure,
 	}
 	im.Method, im.Rows = string(sqlparse.MethodCount), &n
 	return nil
+}
+
+// allColumns reports whether every name in names is a column of rel, system
+// columns included, in the measurement's transaction. Postgres reads t.f as
+// the call f(t) when t has no column f, so a name the classifier saw as a
+// column may run a function on Stet's connection. Any doubt is a no: a
+// failed lookup counts as a name that is not a column, and the caller falls
+// back to the estimate (spec 12).
+func allColumns(ctx context.Context, pg *pgconn.PgConn, rel [][]byte, names []string) bool {
+	if len(names) == 0 {
+		return true
+	}
+	rows, err := rowsOf(ctx, pg, "select attname from pg_attribute where attrelid = $1::regclass and not attisdropped", rel, nil)
+	if err != nil {
+		return false
+	}
+	cols := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		cols[string(r[0])] = true
+	}
+	for _, n := range names {
+		if !cols[n] {
+			return false
+		}
+	}
+	return true
 }
 
 // txConn acquires a pooled connection for one transaction. done rolls back

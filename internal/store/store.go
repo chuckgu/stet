@@ -178,32 +178,3 @@ func jsonArg(v any) any {
 	}
 	return string(b)
 }
-
-// UsageEntry is one executed write counted toward a cumulative limit.
-type UsageEntry struct {
-	At   time.Time
-	Rows int64
-}
-
-// Usage returns executed writes by role to table since a time, oldest first.
-// A decision with no rows_affected counts as 0 rows and is left out.
-func (s *Store) Usage(ctx context.Context, role, table string, since time.Time) ([]UsageEntry, error) {
-	rows, err := s.pool.Query(ctx, `
-		select created_at, rows_affected from stet.decisions
-		where login_role = $1 and target_table = $2 and created_at >= $3
-		  and executed and rows_affected > 0
-		order by created_at, id`, role, table, since)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []UsageEntry
-	for rows.Next() {
-		var e UsageEntry
-		if err := rows.Scan(&e.At, &e.Rows); err != nil {
-			return nil, err
-		}
-		out = append(out, e)
-	}
-	return out, rows.Err()
-}

@@ -55,7 +55,10 @@ type Gate struct {
 	usage   *usage
 	reads   *readStats // nil when no table records reads
 	sem     chan struct{}
-	wg      sync.WaitGroup
+	// inflight holds a slot for each write being judged (limits.max_inflight):
+	// in shadow mode, while its Begin reads state or measures.
+	inflight chan struct{}
+	wg       sync.WaitGroup
 
 	warnedRoles sync.Map // client roles Stet could not assume, logged once each
 }
@@ -66,18 +69,23 @@ type named struct {
 }
 
 func New(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, d decide.Decider, log *slog.Logger) (*Gate, error) {
+	if cfg.MaxInflight < 1 {
+		// No slot would ever be free: every write would wait out its state read.
+		return nil, fmt.Errorf("limits.max_inflight is %d; it must be at least 1", cfg.MaxInflight)
+	}
 	g := &Gate{
-		cfg:     cfg,
-		tables:  map[string]string{},
-		cands:   map[string]named{},
-		ctxs:    map[string]named{},
-		pool:    pool,
-		store:   st,
-		decider: d,
-		log:     log,
-		recent:  &recentLog{byRow: map[string][]store.Change{}},
-		usage:   newUsage(st.Usage),
-		sem:     make(chan struct{}, maxModelCalls),
+		cfg:      cfg,
+		tables:   map[string]string{},
+		cands:    map[string]named{},
+		ctxs:     map[string]named{},
+		pool:     pool,
+		store:    st,
+		decider:  d,
+		log:      log,
+		recent:   &recentLog{byRow: map[string][]store.Change{}},
+		usage:    newUsage(st.UsageBySecond),
+		sem:      make(chan struct{}, maxModelCalls),
+		inflight: make(chan struct{}, cfg.MaxInflight),
 	}
 	readsOn := map[string]int{}
 	for key, t := range cfg.Tables {
@@ -184,6 +192,12 @@ type pending struct {
 	added        time.Duration // time the client waited on Begin
 }
 
+// errBusy is the state error of a write that found every inflight slot taken
+// until its time to read state was up (spec 7). It follows on_failure, as any
+// state error does, also for a measured write: it is not a failed
+// measurement, which the table's unsupported setting would decide.
+var errBusy = errors.New("too many writes are being judged")
+
 func (g *Gate) Begin(s proxy.SessionInfo, st proxy.Statement, ps []proxy.Param) (any, *proxy.Refusal) {
 	start := time.Now()
 	p := &pending{id: store.NewID(), at: start, session: s, sql: st.SQL, res: st.Data.(sqlparse.Result)}
@@ -193,8 +207,21 @@ func (g *Gate) Begin(s proxy.SessionInfo, st proxy.Statement, ps []proxy.Param) 
 	ctx, cancel := context.WithTimeout(context.Background(), stateTimeout)
 	defer cancel()
 
-	var err error
-	if p.params, err = g.paramTexts(ctx, st.SQL, ps); err != nil {
+	// First, a slot: the wait counts toward the state read's bound (spec 10).
+	// In shadow mode the slot is let go when Begin returns; the model is asked
+	// after the write, under maxModelCalls instead.
+	select {
+	case g.inflight <- struct{}{}:
+		defer func() { <-g.inflight }()
+	case <-ctx.Done():
+		p.stateErr = errBusy
+	}
+
+	// Text values need no database; binary ones cannot be decoded once the
+	// time is up, and then the decision records no values.
+	params, err := g.paramTexts(ctx, st.SQL, ps)
+	p.params = params
+	if err != nil && p.stateErr == nil {
 		p.stateErr = fmt.Errorf("bind values: %w", err)
 	}
 	if p.res.Kind == sqlparse.Gated && p.stateErr == nil {
@@ -202,17 +229,23 @@ func (g *Gate) Begin(s proxy.SessionInfo, st proxy.Statement, ps []proxy.Param) 
 			p.stateErr = err
 		}
 	}
-	// Inside an explicit transaction the verdict is in_transaction anyway,
-	// and Stet's connection cannot see the session's uncommitted rows.
-	if p.res.Kind == sqlparse.Measured && p.stateErr == nil && !s.TxOpen {
-		if lim := g.cfg.Tables[p.res.Table].Impact; lim != nil {
+	lim := g.cfg.Tables[p.res.Table].Impact
+	// In a dirty transaction the verdict is in_transaction anyway, and Stet's
+	// connection cannot see what the transaction changed before the write
+	// (spec 4): the impact stays NULL.
+	if p.res.Kind == sqlparse.Measured && lim != nil && !s.TxDirty {
+		switch {
+		case p.stateErr == nil:
 			p.impact = g.measure(ctx, p, lim)
+		case !errors.Is(p.stateErr, errBusy):
+			// The bind values could not be read: the measurement failed.
+			p.impact = &decide.Impact{Error: p.stateErr.Error()}
 		}
 	}
 	if p.stateErr != nil {
 		g.log.Warn("state not assembled", "table", p.res.Table, "err", p.stateErr)
 	}
-	if lim := g.cfg.Tables[p.res.Table].Impact; lim != nil && lim.Cumulative != nil {
+	if lim != nil && lim.Cumulative != nil {
 		g.reserve(ctx, p, lim.Cumulative)
 	}
 	p.added = time.Since(start)
@@ -258,9 +291,9 @@ func plannedRows(p *pending) int64 {
 }
 
 // rowsAffected is how many of the gated table's rows the write changed, from
-// its completion tag (spec 3). Nil when it did not run, or when the tag is
-// not that table's count: a write nested in another statement, or one of
-// several statements in a Query.
+// its completion tag (spec 3), also when the connection ended after the tag.
+// Nil when it did not run, or when the tag is not that table's count: a write
+// nested in another statement, or one of several statements in a Query.
 func rowsAffected(r sqlparse.Result, o proxy.Outcome) *int64 {
 	if !o.Executed || r.Reason == "nested_write" || r.Reason == "multi_statement" {
 		return nil
@@ -287,10 +320,49 @@ func (g *Gate) End(h any, o proxy.Outcome) {
 	}()
 }
 
+// input is what the verdict rules know of a write before any model answer:
+// its shape, the transaction it arrived in, its login role, its measurement,
+// its cumulative usage, and whether its state was read. Shadow mode's judge
+// and enforce mode's Begin both decide from it, so the two modes apply one
+// set of rules (spec 3); decide.Verdict fixes their order.
+func (g *Gate) input(p *pending) decide.Input {
+	t := g.cfg.Tables[p.res.Table]
+	in := decide.Input{
+		Thresholds:    t.Thresholds,
+		OnFailure:     g.cfg.Model.OnFailure,
+		Questions:     p.questions,
+		StateErr:      p.stateErr,
+		Cumulative:    p.cumulative,
+		InTransaction: p.session.TxDirty,
+		NoLoginRole:   p.session.User == "",
+	}
+	switch {
+	case p.res.Kind == sqlparse.Unsupported,
+		p.res.Kind == sqlparse.Measured && t.Impact == nil:
+		in.Unsupported = p.res.Reason
+	case p.res.Kind == sqlparse.Measured:
+		// Begin left the impact nil only in a dirty transaction, which
+		// decides first, or when it found no slot, a state error.
+		in.Op, in.ShapeReason, in.Impact, in.ImpactLimit = p.res.Op, p.res.Reason, p.impact, t.Impact
+	}
+	return in
+}
+
+// asksInShadow reports whether shadow mode asks the model about a write: it
+// has questions, and no rule ahead of the cumulative limit decides it. A
+// write held by the cumulative limit alone, or because its usage is not
+// known, is still asked, so that its answers are recorded and the write can
+// be rescored under another limit (spec-v0.2-accounting 4). A write in a
+// dirty transaction or with no login role is not.
+func asksInShadow(in decide.Input) bool {
+	in.Cumulative = nil
+	_, _, decided := decide.Deterministic(in)
+	return !decided
+}
+
 // judge decides what enforce mode would have done and records it.
 func (g *Gate) judge(p *pending, o proxy.Outcome) {
-	t := g.cfg.Tables[p.res.Table]
-	in := decide.Input{Thresholds: t.Thresholds, OnFailure: g.cfg.Model.OnFailure, Questions: p.questions}
+	in := g.input(p)
 	d := &store.Decision{
 		ID:            p.id,
 		CreatedAt:     p.at,
@@ -323,31 +395,10 @@ func (g *Gate) judge(p *pending, o proxy.Outcome) {
 	}
 	d.RowsAffected = rowsAffected(p.res, o)
 	if p.cumulative != nil {
-		// A single-row write over the limit still goes on to the model below:
-		// in shadow mode its answers are recorded, and Verdict applies the
-		// limit first.
-		in.Cumulative, d.Cumulative = p.cumulative, p.cumulative
+		d.Cumulative = p.cumulative
 	}
 
-	switch {
-	case p.res.Kind == sqlparse.Unsupported,
-		p.res.Kind == sqlparse.Measured && t.Impact == nil:
-		in.Unsupported = p.res.Reason // shape first, as before
-	case o.InTransaction:
-		in.Unsupported = "in_transaction"
-	case p.res.Kind == sqlparse.Measured:
-		if p.impact == nil {
-			// Skipped in Begin: the bind values could not be read, or the
-			// write looked to be in a transaction and turned out not to be.
-			p.impact = &decide.Impact{Error: "not measured"}
-			if p.stateErr != nil {
-				p.impact.Error = p.stateErr.Error()
-			}
-		}
-		in.Op, in.ShapeReason, in.Impact, in.ImpactLimit = p.res.Op, p.res.Reason, p.impact, t.Impact
-	case p.stateErr != nil:
-		in.StateErr = p.stateErr
-	case len(p.questions) > 0:
+	if asksInShadow(in) {
 		d.Questions = p.questions
 		answers, latency, err := g.ask(p)
 		in.ModelErr, in.Answers = err, answers.ByQuestion
@@ -361,8 +412,8 @@ func (g *Gate) judge(p *pending, o proxy.Outcome) {
 			g.log.Warn("model call failed", "table", p.res.Table, "err", err)
 		}
 	}
-	// Recorded whenever a measurement was taken, also for a write that
-	// turned out to share an implicit transaction (spec 4, 6).
+	// Recorded whenever a measurement was taken or failed, also for a write
+	// whose verdict another rule decided (spec-v0.2-impact 6).
 	if p.impact != nil {
 		p.impact.ActualRows = o.Rows
 		d.Impact = p.impact

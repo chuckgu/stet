@@ -277,38 +277,3 @@ func TestInsertLeavesNewColumnsNull(t *testing.T) {
 		t.Errorf("null flags = %v %v %v", a, b, c)
 	}
 }
-
-func TestUsage(t *testing.T) {
-	s, _ := testStore(t)
-	ctx := context.Background()
-	table := uniqueTable(t)
-	now := time.Now()
-	mk := func(role string, rows *int64, executed bool, at time.Time) *store.Decision {
-		d := sample(table)
-		d.LoginRole = ptr(role)
-		d.RowsAffected = rows
-		d.Executed = executed
-		d.CreatedAt = at
-		return d
-	}
-	want := mk("agent_a", ptr(int64(5)), true, now.Add(-5*time.Minute))
-	for _, d := range []*store.Decision{
-		want,
-		mk("agent_a", nil, true, now.Add(-4*time.Minute)),
-		mk("agent_a", ptr(int64(0)), true, now.Add(-3*time.Minute)),
-		mk("agent_a", ptr(int64(9)), false, now.Add(-2*time.Minute)),
-		mk("agent_b", ptr(int64(9)), true, now.Add(-2*time.Minute)),
-		mk("agent_a", ptr(int64(9)), true, now.Add(-2*time.Hour)),
-	} {
-		if err := s.Insert(ctx, d); err != nil {
-			t.Fatal(err)
-		}
-	}
-	got, err := s.Usage(ctx, "agent_a", table, now.Add(-30*time.Minute))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 1 || got[0].Rows != 5 || got[0].At.Sub(want.CreatedAt).Abs() > time.Millisecond {
-		t.Fatalf("got %+v", got)
-	}
-}

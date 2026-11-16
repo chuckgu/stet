@@ -286,6 +286,9 @@ func TestImpactIsNotMeasuredInsideATransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := tx.Exec(ctx, "select 1"); err != nil { // makes the transaction dirty
+		t.Fatal(err)
+	}
 	if _, err := tx.Exec(ctx, "update "+e.table+" set status = 'x' where company_id = 9"); err != nil {
 		t.Fatal(err)
 	}
@@ -301,35 +304,51 @@ func TestImpactIsNotMeasuredInsideATransaction(t *testing.T) {
 	wantNoModel(t, d)
 }
 
-// Several Executes under one Sync run as one implicit transaction, which
-// Begin cannot see coming. The write is measured; only the verdict changes.
+// Several Executes under one Sync run as one implicit transaction. A write
+// that is the first Execute of its Sync arrives in a clean one and is judged
+// and measured; one behind another Execute arrives in a dirty one (spec 4).
 func TestImpactIsRecordedInAnImplicitTransaction(t *testing.T) {
 	d := calm()
 	e := setup(t, d, impactYAML)
 	e.seedMany(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	pl := e.connect(t, "batcher").PgConn().StartPipeline(ctx)
-	pl.SendQueryParams("update "+e.table+" set status = 'x' where company_id = 9", nil, nil, nil, nil)
-	pl.SendQueryParams("select 1", nil, nil, nil, nil)
-	pl.SendPipelineSync()
-	if err := pl.Flush(); err != nil {
-		t.Fatal(err)
-	}
-	if err := pl.Close(); err != nil {
-		t.Fatal(err)
+	conn := e.connect(t, "batcher")
+	for _, sqls := range [][]string{
+		{"update " + e.table + " set status = 'x' where company_id = 9", "select 1"},
+		{"select 1", "update " + e.table + " set status = 'y' where company_id = 9"},
+	} {
+		pl := conn.PgConn().StartPipeline(ctx)
+		for _, sql := range sqls {
+			pl.SendQueryParams(sql, nil, nil, nil, nil)
+		}
+		pl.SendPipelineSync()
+		if err := pl.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		if err := pl.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	r := e.impacts(t, 1)[0]
-	wantVerdict(t, r, "unsupported", "in_transaction")
-	wantImpact(t, r.Impact, map[string]any{"method": "count", "rows": 2.0, "actual_rows": 2.0})
+	rs := e.impacts(t, 2)
+	wantVerdict(t, rs[0], "commit")
+	wantImpact(t, rs[0].Impact, map[string]any{"method": "count", "rows": 2.0, "actual_rows": 2.0})
+	wantVerdict(t, rs[1], "unsupported", "in_transaction")
+	if rs[1].Impact != nil {
+		t.Errorf("impact = %v, want NULL: a write in a dirty transaction is not measured", rs[1].Impact)
+	}
+	if !rs[0].Executed || !rs[1].Executed {
+		t.Errorf("executed = %v, %v; want both writes to have run", rs[0].Executed, rs[1].Executed)
+	}
 	wantNoModel(t, d)
 }
 
-// A client that pipelines COMMIT and an autocommit write makes Begin see the
-// transaction still open, so it skips measuring, while End finds the write
-// ran on its own. That is recorded as a measurement that failed.
-func TestImpactRecordsAWriteSkippedOnAStaleTransactionStatus(t *testing.T) {
+// A client that pipelines COMMIT and an autocommit write sends the write
+// while the server has not yet answered what came before it: the last idle
+// status the proxy saw was before BEGIN, so the write arrives in a dirty
+// transaction and is not judged (spec 4: the wrong way is the blocking way).
+func TestWriteSentBehindUnansweredStatementsIsNotJudged(t *testing.T) {
 	d := calm()
 	e := setup(t, d, impactYAML)
 	e.seedMany(t)
@@ -354,9 +373,10 @@ func TestImpactRecordsAWriteSkippedOnAStaleTransactionStatus(t *testing.T) {
 	}
 
 	r := e.impacts(t, 1)[0]
-	wantVerdict(t, r, "unsupported", "not_single_row")
-	wantImpact(t, r.Impact, map[string]any{"error": "not measured", "actual_rows": 2.0})
-	wantNoKeys(t, r.Impact, "method", "rows")
+	wantVerdict(t, r, "unsupported", "in_transaction")
+	if r.Impact != nil {
+		t.Errorf("impact = %v, want NULL: a write in a dirty transaction is not measured", r.Impact)
+	}
 	wantNoModel(t, d)
 }
 
@@ -651,6 +671,55 @@ func TestImpactNeverRunsAFunctionReachedThroughFieldNotation(t *testing.T) {
 	}
 	wantNoModel(t, d)
 	e.wantCleanPool(t)
+}
+
+// Postgres reads T.f as the call f(T) when T has no column f, so a name
+// qualified by the table can run a function the classifier never sees as a
+// call. Counted on Stet's connection, the lock would be taken there, and the
+// client's own write would then find it held and match no row.
+func TestImpactDoesNotCountThroughATableQualifiedFunction(t *testing.T) {
+	d := calm()
+	e := setup(t, d, looseYAML)
+	e.seedMany(t)
+	mustExec(t, e.admin, "analyze "+e.table)
+	ctx := context.Background()
+	key := time.Now().UnixNano() % math.MaxInt32
+	fn := e.table + "_lock"
+	mustExec(t, e.admin, fmt.Sprintf("create function %s(%s) returns boolean language sql as $$ select pg_try_advisory_lock(%d) $$", fn, e.table, key))
+	t.Cleanup(func() { e.admin.Exec(context.Background(), "drop function "+fn+"("+e.table+")") }) // before the table's
+	conn := e.connect(t, "sneaky")
+	var client int32
+	if err := conn.QueryRow(ctx, "select pg_backend_pid()").Scan(&client); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, fmt.Sprintf("update %[1]s set status = 'x' where %[1]s.%[2]s and company_id = 9", e.table, fn))
+
+	r := e.impacts(t, 1)[0]
+	wantVerdict(t, r, "escalate", "impact:uncertain")
+	wantImpact(t, r.Impact, map[string]any{"method": "estimate", "actual_rows": 2.0})
+	wantNoKeys(t, r.Impact, "cap", "capped", "error") // no cap: counting was never tried
+	if h := e.advisoryHolders(t, key); !reflect.DeepEqual(h, []int32{client}) {
+		t.Errorf("advisory lock held by %v, want only the client's backend %d", h, client)
+	}
+	wantNoModel(t, d)
+	e.wantCleanPool(t)
+}
+
+// Names qualified by the table that are its columns, system columns
+// included, are still counted.
+func TestImpactStillCountsQualifiedColumns(t *testing.T) {
+	d := calm()
+	e := setup(t, d, impactYAML)
+	e.seedMany(t)
+	conn := e.connect(t, "bulk")
+	mustExec(t, conn, "update "+e.table+" set status = 'x' where "+e.table+".company_id = 9")
+	mustExec(t, conn, "update "+e.table+" as c set status = 'y' where c.company_id = 9 and c.ctid is not null")
+
+	for _, r := range e.impacts(t, 2) {
+		wantVerdict(t, r, "commit")
+		wantImpact(t, r.Impact, map[string]any{"method": "count", "rows": 2.0, "actual_rows": 2.0})
+	}
+	wantNoModel(t, d)
 }
 
 func TestImpactFallsBackToTheEstimateWhenCountingIsSlow(t *testing.T) {
@@ -1147,7 +1216,7 @@ func TestImpactIsNotMeasuredBeforeAuthentication(t *testing.T) {
 	e.unauthenticatedQuery(t, "stet_scram", "update "+e.table+" set status = 'x' where company_id = 9")
 
 	r := e.impacts(t, 1)[0]
-	wantVerdict(t, r, "unsupported", "not_single_row")
+	wantVerdict(t, r, "unsupported", "no_login_role")
 	if msg, _ := r.Impact["error"].(string); !strings.Contains(msg, "login role") || !strings.Contains(msg, "authenticated") {
 		t.Errorf("impact = %v, want an error naming the missing login role and the session not yet authenticated", r.Impact)
 	}
@@ -1173,7 +1242,7 @@ func TestImpactIsNotMeasuredWithoutALoginRole(t *testing.T) {
 	}
 
 	r := e.impacts(t, 1)[0]
-	wantVerdict(t, r, "unsupported", "not_single_row")
+	wantVerdict(t, r, "unsupported", "no_login_role")
 	if msg, _ := r.Impact["error"].(string); !strings.Contains(msg, "login role") {
 		t.Errorf("impact = %v, want an error naming the missing login role", r.Impact)
 	}

@@ -408,6 +408,9 @@ func TestShadowWriteInTransactionIsNotJudged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := tx.Exec(ctx, "select 1"); err != nil { // makes the transaction dirty
+		t.Fatal(err)
+	}
 	if _, err := tx.Exec(ctx, "update "+e.table+" set status = 'churned' where id = 2"); err != nil {
 		t.Fatal(err)
 	}
@@ -421,6 +424,77 @@ func TestShadowWriteInTransactionIsNotJudged(t *testing.T) {
 	}
 	if d.callCount() != 0 {
 		t.Errorf("model called inside a transaction")
+	}
+}
+
+// A transaction that has run nothing but BEGIN is clean: its first write is
+// judged as an autocommit write is, and measured (spec 4).
+func TestShadowJudgesTheFirstWriteOfATransaction(t *testing.T) {
+	d := calm()
+	e := setup(t, d, impactYAML)
+	e.seedMany(t)
+	conn := e.connect(t, "tx-agent")
+	ctx := context.Background()
+	for _, sql := range []string{
+		"update " + e.table + " set title = 'x' where id = 1",
+		"update " + e.table + " set status = 'x' where company_id = 9",
+	} {
+		tx, err := conn.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rs, ims := e.decisions(t, 2), e.impacts(t, 2)
+	if r := rs[0]; r.Verdict != "commit" || len(r.Reasons) != 0 || !r.Executed {
+		t.Errorf("single-row write: verdict %s %v executed=%v, want commit [] executed", r.Verdict, r.Reasons, r.Executed)
+	}
+	if rs[0].Questions == nil || rs[0].Answers == nil {
+		t.Errorf("single-row write: questions=%v answers=%v, want both recorded", rs[0].Questions, rs[0].Answers)
+	}
+	wantVerdict(t, ims[1], "commit")
+	wantImpact(t, ims[1].Impact, map[string]any{"method": "count", "rows": 2.0, "actual_rows": 2.0})
+	if !ims[1].Executed {
+		t.Error("measured write: executed = false, want it to have run")
+	}
+	if n := d.callCount(); n != 1 {
+		t.Errorf("model called %d times, want once: for the single-row write", n)
+	}
+}
+
+// A write that finds every inflight slot taken until its time to read state
+// is up is a state error, and follows on_failure (spec 7): pass, in shadow.
+func TestInflightLimitTurnsIntoAStateError(t *testing.T) {
+	d := calm()
+	e := setup(t, d, tableYAML+"limits: {max_inflight: 1}\n")
+	e.seed(t)
+	conn := e.connect(t, "crowded")
+	release := gate.HoldInflight(e.gate)
+	mustExec(t, conn, "update "+e.table+" set title = 'crowded' where id = 1")
+	release()
+	mustExec(t, conn, "update "+e.table+" set title = 'later' where id = 2")
+
+	rs := e.decisions(t, 2)
+	if r := rs[0]; r.Verdict != "commit" || !reflect.DeepEqual(r.Reasons, []string{"state_error"}) || !r.Executed {
+		t.Errorf("crowded write: verdict %s %v executed=%v, want commit [state_error] executed", r.Verdict, r.Reasons, r.Executed)
+	}
+	if l := rs[0].LatencyMS; l == nil || *l < 450 {
+		t.Errorf("crowded write: latency_ms = %v, want at least 450: it waited for a slot", deref(l))
+	}
+	if r := rs[1]; r.Verdict != "commit" || len(r.Reasons) != 0 {
+		t.Errorf("write after release: verdict %s %v, want commit []", r.Verdict, r.Reasons)
+	}
+	if n := d.callCount(); n != 1 {
+		t.Errorf("model called %d times, want once: not for the write with no state", n)
+	}
+	if n := e.rowsWhere(t, "title in ('crowded', 'later')"); n != 2 {
+		t.Errorf("%d rows written, want 2: shadow mode must let both writes through", n)
 	}
 }
 

@@ -79,7 +79,7 @@ func SetReadClock(g *Gate, now func() time.Time) {
 func FailUsageLoads(g *Gate, n int) {
 	load := g.usage.load
 	var mu sync.Mutex
-	g.usage.load = func(ctx context.Context, role, table string, since time.Time) ([]store.UsageEntry, error) {
+	g.usage.load = func(ctx context.Context, role, table string, since, before time.Time) ([]store.UsageSecond, error) {
 		mu.Lock()
 		fail := n > 0
 		n--
@@ -87,6 +87,26 @@ func FailUsageLoads(g *Gate, n int) {
 		if fail {
 			return nil, errors.New("injected failure")
 		}
-		return load(ctx, role, table, since)
+		return load(ctx, role, table, since, before)
+	}
+}
+
+// SetUsageRetry changes how long a pair waits after a failed load before
+// loading again, until restore is called. Not for parallel tests.
+func SetUsageRetry(d time.Duration) (restore func()) {
+	old := usageRetry
+	usageRetry = d
+	return func() { usageRetry = old }
+}
+
+// HoldInflight takes every slot of g's inflight limit until release is called.
+func HoldInflight(g *Gate) (release func()) {
+	for range cap(g.inflight) {
+		g.inflight <- struct{}{}
+	}
+	return func() {
+		for range cap(g.inflight) {
+			<-g.inflight
+		}
 	}
 }

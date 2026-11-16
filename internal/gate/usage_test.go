@@ -241,7 +241,9 @@ func TestCumulativeWindowSlides(t *testing.T) {
 	e.seedMany(t)
 	conn := e.connect(t, "bulk")
 	e.fill(t, conn)
-	time.Sleep(2200 * time.Millisecond)
+	// The window is 2s; a second counts until all of it has left the window,
+	// so up to a second longer (spec correction B9).
+	time.Sleep(3200 * time.Millisecond)
 	mustExec(t, conn, "update "+e.table+" set title = 'later' where id = 1")
 
 	as := e.accounts(t, 4)
@@ -394,6 +396,7 @@ func TestCumulativeLoadsTheWindowOnceForConcurrentFirstWrites(t *testing.T) {
 // A failed load is retried by the next write, and what this gate recorded
 // meanwhile is not counted twice: it is already in memory.
 func TestCumulativeLoadsAgainAfterAFailedLoad(t *testing.T) {
+	defer gate.SetUsageRetry(0)()
 	e := setup(t, calm(), cumYAML)
 	e.seedMany(t)
 	mustExec(t, e.connect(t, "before"), "update "+e.table+" set status = 'x' where company_id = 9")
@@ -415,6 +418,51 @@ func TestCumulativeLoadsAgainAfterAFailedLoad(t *testing.T) {
 	wantUsage(t, 2, e.accounts(t, 3)[2], 3, 1)
 }
 
+// After a failed load, the pair's writes do not load again until the retry
+// interval has passed: their usage is unknown, and they are held (spec 7).
+func TestCumulativeWaitsBeforeLoadingAgain(t *testing.T) {
+	defer gate.SetUsageRetry(time.Hour)()
+	e := setup(t, calm(), cumYAML)
+	e.seedMany(t)
+	gate.FailUsageLoads(e.gate, 1)
+	conn := e.connect(t, "waiting")
+	for i := range 3 {
+		mustExec(t, conn, fmt.Sprintf("update %s set title = 'w%d' where id = %d", e.table, i, i+1))
+	}
+
+	as := e.accounts(t, 3)
+	for i, a := range as {
+		// Only the first load fails: had a second been tried, it would have
+		// given the write a usage.
+		wantAccount(t, i, a, "hold", "impact:cumulative_unknown")
+		if want := map[string]any{"error": "usage not loaded: injected failure"}; !reflect.DeepEqual(a.Cumulative, want) {
+			t.Errorf("decision %d: cumulative = %v, want %v", i, a.Cumulative, want)
+		}
+		if !a.Executed {
+			t.Errorf("decision %d: executed = false, want the write to have run (shadow)", i)
+		}
+	}
+}
+
+// A write whose connection ended after the server completed it ran, and its
+// count is known: that count is settled, not the reservation (spec 12).
+func TestCumulativeSettlesAWriteLostAfterItCompleted(t *testing.T) {
+	e := setup(t, calm(), cumYAML)
+	e.seedMany(t)
+	info := proxy.SessionInfo{ID: "lost-after", User: "stet_scram", Database: "stet_test", ApplicationName: "lost"}
+	h, refuse := e.gate.Begin(info, e.gate.Inspect("update "+e.table+" set status = 'x' where company_id = 9"), nil)
+	if refuse != nil {
+		t.Fatalf("shadow mode refused a write: %+v", refuse)
+	}
+	e.gate.End(h, proxy.Outcome{Executed: true, Lost: true, Rows: ptr(int64(1))})
+	mustExec(t, e.connect(t, "next"), "update "+e.table+" set title = 'n' where id = 1")
+
+	as := e.accounts(t, 2)
+	wantUsage(t, 0, as[0], 0, 2)
+	wantRows(t, 0, as[0], ptr(int64(1)))
+	wantUsage(t, 1, as[1], 1, 1)
+}
+
 // Writes Stet does not judge still touch rows, so they count.
 func TestCumulativeCountsWritesItDoesNotJudge(t *testing.T) {
 	d := calm()
@@ -425,6 +473,9 @@ func TestCumulativeCountsWritesItDoesNotJudge(t *testing.T) {
 	mustExec(t, conn, "insert into "+e.table+" (id, name) values (10, 'a'), (11, 'b') on conflict (id) do update set name = excluded.name")
 	tx, err := conn.Begin(ctx)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "select 1"); err != nil { // makes the transaction dirty
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, "update "+e.table+" set status = 'x' where company_id = 9"); err != nil {
@@ -509,6 +560,7 @@ func TestCumulativeIsNotAppliedWithoutALoginRole(t *testing.T) {
 
 	as := e.accounts(t, 7)
 	for i, a := range as[:6] {
+		wantAccount(t, i, a, "unsupported", "no_login_role")
 		if a.LoginRole != nil {
 			t.Errorf("decision %d: login_role = %s, want NULL", i, *a.LoginRole)
 		}
@@ -521,4 +573,43 @@ func TestCumulativeIsNotAppliedWithoutALoginRole(t *testing.T) {
 	}
 	wantRole(t, 6, as[6], "stet_scram")
 	wantUsage(t, 6, as[6], 0, 1)
+}
+
+// A write whose login role is not known is not judged (spec 7). Shadow mode
+// still lets it through, and the model is not asked.
+func TestWritesWithoutALoginRoleAreUnsupported(t *testing.T) {
+	d := calm()
+	e := setup(t, d)
+	e.seed(t)
+	mustExec(t, e.admin, "grant all on "+e.table+" to stet_trust")
+	if code := e.earlyQuery(t, "stet_trust", "update "+e.table+" set title = 'early' where id = 1"); code != "" {
+		t.Fatalf("the write failed with SQLSTATE %s", code)
+	}
+
+	a := e.accounts(t, 1)[0]
+	wantAccount(t, 0, a, "unsupported", "no_login_role")
+	if !a.Executed || e.rowsWhere(t, "title = 'early'") != 1 {
+		t.Errorf("executed = %v: shadow mode must let the write through", a.Executed)
+	}
+	if a.LoginRole != nil {
+		t.Errorf("login_role = %s, want NULL", *a.LoginRole)
+	}
+	if a.Questions != nil || a.Answers != nil {
+		t.Errorf("questions=%v answers=%v, want neither: the write is not judged", a.Questions, a.Answers)
+	}
+	wantNoModel(t, d)
+}
+
+// A startup packet of protocol 3.1 names its role as 3.0's does (spec 8).
+func TestProtocol31SessionsRecordTheirLoginRole(t *testing.T) {
+	e := setup(t, calm())
+	e.seed(t)
+	mustExec(t, e.admin, "grant all on "+e.table+" to stet_trust")
+	if code := e.rawSimpleQuery(t, 3<<16+1, "stet_trust", "update "+e.table+" set title = 'x' where id = 1"); code != "" {
+		t.Fatalf("the write failed with SQLSTATE %s", code)
+	}
+
+	a := e.accounts(t, 1)[0]
+	wantRole(t, 0, a, "stet_trust")
+	wantAccount(t, 0, a, "commit")
 }
