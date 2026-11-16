@@ -3,11 +3,14 @@ package gate_test
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
+	"net"
 	"net/url"
 	"os"
 	"reflect"
@@ -1017,4 +1020,86 @@ func (e *env) contents(t *testing.T, table string) [][]any {
 		t.Fatal(err)
 	}
 	return got
+}
+
+// rawSimpleQuery opens a session through the proxy with a hand-built startup
+// packet for a role that needs no password, runs one simple query, and
+// returns the SQLSTATE of its error, or "" when it succeeded.
+func (e *env) rawSimpleQuery(t *testing.T, protocol uint32, user, sql string) string {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", e.addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	params := "user\x00" + user + "\x00database\x00stet_test\x00\x00"
+	startup := binary.BigEndian.AppendUint32(nil, uint32(8+len(params)))
+	startup = binary.BigEndian.AppendUint32(startup, protocol)
+	if _, err := conn.Write(append(startup, params...)); err != nil {
+		t.Fatal(err)
+	}
+
+	// untilReady reads messages up to ReadyForQuery and returns the SQLSTATE
+	// of an ErrorResponse seen on the way.
+	untilReady := func() string {
+		code := ""
+		for {
+			var hdr [5]byte
+			if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+				t.Fatalf("read: %v (SQLSTATE so far %q)", err, code)
+			}
+			body := make([]byte, binary.BigEndian.Uint32(hdr[1:])-4)
+			if _, err := io.ReadFull(conn, body); err != nil {
+				t.Fatal(err)
+			}
+			switch hdr[0] {
+			case 'E':
+				for _, field := range bytes.Split(body, []byte{0}) {
+					if len(field) > 1 && field[0] == 'C' {
+						code = string(field[1:])
+					}
+				}
+			case 'Z':
+				return code
+			}
+		}
+	}
+	if code := untilReady(); code != "" {
+		t.Fatalf("startup failed with SQLSTATE %s", code)
+	}
+	query := append([]byte(sql), 0)
+	msg := append([]byte{'Q'}, binary.BigEndian.AppendUint32(nil, uint32(4+len(query)))...)
+	if _, err := conn.Write(append(msg, query...)); err != nil {
+		t.Fatal(err)
+	}
+	return untilReady()
+}
+
+// A session whose login role Stet does not know is not measured. Postgres
+// serves protocol 3.1 by negotiating it down, but the proxy cannot read that
+// startup packet, so the session has no role to measure as. Measuring anyway
+// would count as Stet's own account.
+func TestImpactIsNotMeasuredWithoutALoginRole(t *testing.T) {
+	d := calm()
+	e := setup(t, d, impactYAML)
+	e.seedMany(t)
+	mustExec(t, e.admin, "grant all on "+e.table+" to stet_trust")
+
+	if code := e.rawSimpleQuery(t, 3<<16|1, "stet_trust", "update "+e.table+" set status = 'x' where company_id = 9"); code != "" {
+		t.Fatalf("the write failed with SQLSTATE %s", code)
+	}
+
+	r := e.impacts(t, 1)[0]
+	wantVerdict(t, r, "unsupported", "not_single_row")
+	if msg, _ := r.Impact["error"].(string); !strings.Contains(msg, "login role") {
+		t.Errorf("impact = %v, want an error naming the missing login role", r.Impact)
+	}
+	wantNoKeys(t, r.Impact, "method", "rows", "cap")
+	if n := e.rowsWhere(t, "status = 'x'"); n != 2 {
+		t.Errorf("%d rows changed, want 2: the write itself must go through", n)
+	}
+	wantNoModel(t, d)
+	e.wantCleanPool(t)
 }
