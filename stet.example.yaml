@@ -37,6 +37,9 @@ tables:
       policy: 0.8            # 규칙을 어겼을 확률이 0.8 이상이면 hold
       policy_escalate: 0.5   # 0.5 이상 0.8 미만이면 escalate
       escalate_below: 0.60
+    # 측정은 클라이언트의 역할로 한다. 그래서 Stet의 upstream 계정에 에이전트 역할을
+    # 하나씩 부여해야 한다: GRANT agent_x TO <Stet 계정>. 부여되지 않은 역할의 쓰기는
+    # 측정 실패로 기록된다.
     impact:                  # 없으면 다중 행 쓰기는 unsupported로 기록된다
       max_rows: 100          # 필수. 이보다 많이 걸리면 hold
       max_share: 0.1         # 선택. UPDATE·DELETE가 테이블의 10%를 넘게 걸리면 hold
