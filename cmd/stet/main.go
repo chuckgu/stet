@@ -104,14 +104,23 @@ func runProxy(args []string) error {
 		pg = g
 	}
 	srv := proxy.New(cfg.UpstreamAddr(), log, pg)
+	closed := make(chan struct{})
 	go func() {
 		<-ctx.Done()
 		srv.Close()
+		close(closed)
 	}()
 
 	log.Info("stet proxy listening", "listen", ln.Addr(), "upstream", cfg.UpstreamAddr(),
 		"mode", cfg.Mode, "gated_tables", len(cfg.Tables), "model", cfg.Model.Adapter)
-	return srv.Serve(ln)
+	err = srv.Serve(ln)
+	// Serve returns once the listener is closed, while sessions may still be
+	// reporting their last statements to the gate. Wait for Close, which waits
+	// for them, before the deferred g.Close writes what the gate holds. stop
+	// also closes the server when Serve failed by itself.
+	stop()
+	<-closed
+	return err
 }
 
 // openPool connects Stet's own sessions: state reads and decision writes.
