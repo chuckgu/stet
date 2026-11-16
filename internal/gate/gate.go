@@ -51,6 +51,7 @@ type Gate struct {
 	decider decide.Decider
 	log     *slog.Logger
 	recent  *recentLog
+	usage   *usage
 	sem     chan struct{}
 	wg      sync.WaitGroup
 
@@ -73,6 +74,7 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, d decide.Decid
 		decider: d,
 		log:     log,
 		recent:  &recentLog{byRow: map[string][]store.Change{}},
+		usage:   newUsage(st.Usage),
 		sem:     make(chan struct{}, maxModelCalls),
 	}
 	for key, t := range cfg.Tables {
@@ -115,6 +117,9 @@ type pending struct {
 	pk       *string
 	impact   *decide.Impact // set when Begin measured a Measured write
 
+	cumulative *decide.Cumulative // set when the table has a cumulative limit
+	reserved   bool               // the write holds a reservation in Gate.usage
+
 	state        json.RawMessage
 	stateVersion map[string]string
 	questions    []decide.Question
@@ -150,8 +155,60 @@ func (g *Gate) Begin(s proxy.SessionInfo, st proxy.Statement, ps []proxy.Param) 
 	if p.stateErr != nil {
 		g.log.Warn("state not assembled", "table", p.res.Table, "err", p.stateErr)
 	}
+	if lim := g.cfg.Tables[p.res.Table].Impact; lim != nil && lim.Cumulative != nil {
+		g.reserve(ctx, p, lim.Cumulative)
+	}
 	p.added = time.Since(start)
 	return p
+}
+
+// reserve counts the write toward its login role's cumulative limit before it
+// is sent, whatever its shape, and keeps what the role had used for the
+// verdict (spec 4).
+func (g *Gate) reserve(ctx context.Context, p *pending, lim *config.Cumulative) {
+	if p.session.User == "" {
+		// Not mixed into any role's usage; the limit is not applied (spec 7).
+		p.cumulative = &decide.Cumulative{Error: "no login role"}
+		return
+	}
+	planned := plannedRows(p)
+	used, err := g.usage.reserve(ctx, p.session.User, p.res.Table, p.id, p.at, planned, lim.Window)
+	p.reserved = true
+	if err != nil {
+		if ctx.Err() != nil {
+			err = errors.New("timeout")
+		}
+		g.log.Warn("cumulative usage not loaded", "table", p.res.Table, "role", p.session.User, "err", err)
+		p.cumulative = &decide.Cumulative{Error: "usage not loaded: " + err.Error()}
+		return
+	}
+	p.cumulative = &decide.Cumulative{
+		Used: &used, Planned: &planned, Limit: int64(lim.MaxRows), WindowS: int(lim.Window / time.Second),
+	}
+}
+
+// plannedRows is what a write is expected to touch, counted before it is
+// sent: 1 for a single-row write, the measured rows (the cap when capped) for
+// a measured one, and 0 for any other, settled once its outcome is known.
+func plannedRows(p *pending) int64 {
+	switch {
+	case p.res.Kind == sqlparse.Gated:
+		return 1
+	case p.impact != nil && p.impact.Method != "" && p.impact.Rows != nil:
+		return *p.impact.Rows
+	}
+	return 0
+}
+
+// rowsAffected is how many of the gated table's rows the write changed, from
+// its completion tag (spec 3). Nil when it did not run, or when the tag is
+// not that table's count: a write nested in another statement, or one of
+// several statements in a Query.
+func rowsAffected(r sqlparse.Result, o proxy.Outcome) *int64 {
+	if !o.Executed || r.Reason == "nested_write" || r.Reason == "multi_statement" {
+		return nil
+	}
+	return o.Rows
 }
 
 func (g *Gate) End(h any, o proxy.Outcome) {
@@ -160,6 +217,11 @@ func (g *Gate) End(h any, o proxy.Outcome) {
 		g.recent.add(p.res.Table, *p.pk, store.Change{
 			DecisionID: p.id, At: p.at, AgentID: p.session.ApplicationName, Op: p.res.Op, Proposed: p.proposed,
 		}, g.cfg.Tables[p.res.Table].RecentWindow)
+	}
+	// Settled here rather than when the decision is recorded, so the role's
+	// next write sees it.
+	if p.reserved {
+		g.usage.settle(p.session.User, p.res.Table, p.id, rowsAffected(p.res, o), o.Executed, o.Lost)
 	}
 	g.wg.Add(1)
 	go func() {
@@ -198,6 +260,16 @@ func (g *Gate) judge(p *pending, o proxy.Outcome) {
 	}
 	if o.Error != "" {
 		d.ExecError = ptr(o.Error)
+	}
+	if p.session.User != "" {
+		d.LoginRole = ptr(p.session.User)
+	}
+	d.RowsAffected = rowsAffected(p.res, o)
+	if p.cumulative != nil {
+		// A single-row write over the limit still goes on to the model below:
+		// in shadow mode its answers are recorded, and Verdict applies the
+		// limit first.
+		in.Cumulative, d.Cumulative = p.cumulative, p.cumulative
 	}
 
 	switch {
