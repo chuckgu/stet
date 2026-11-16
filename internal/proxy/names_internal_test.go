@@ -682,8 +682,7 @@ func TestWhatRunsAWatchedNameIsRefused(t *testing.T) {
 		for _, enforce := range []bool{true, false} {
 			t.Run(fmt.Sprintf("%s, enforce %v", c.name, enforce), func(t *testing.T) {
 				g := byNameGate{newStmtGate()}
-				s := readySession(g)
-				s.enforce = enforce
+				s := sessionOf(g, enforce)
 				send(s, queryMsg("begin"))
 				serve(s, tag("BEGIN"), readyWith('T'))
 				send(s, parseMsg("w", ins), parseMsg("r", "select 1"), parseMsg("ew", "execute w"), parseMsg("er", "execute r"),
@@ -745,8 +744,7 @@ func TestUnsettledNamesAreRefused(t *testing.T) {
 		for _, enforce := range []bool{true, false} {
 			t.Run(fmt.Sprintf("%s, enforce %v", c.name, enforce), func(t *testing.T) {
 				g := newStmtGate()
-				s := readySession(g)
-				s.enforce = enforce
+				s := sessionOf(g, enforce)
 				send(s, queryMsg("begin"))
 				serve(s, tag("BEGIN"), readyWith('T'))
 				send(s, parseMsg("s1", ins), bindMsg("p1", "s1"), syncMsg)

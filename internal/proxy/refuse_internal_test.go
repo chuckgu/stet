@@ -525,11 +525,26 @@ func (g *blockGate) Inspect(sql string) Statement {
 	return st
 }
 
-// enforcedSession is a ready session of an enforcing proxy.
+// enforcedSession is a ready session of an enforcing proxy, whose server
+// reported at startup the settings the classifier reads statements by.
 func enforcedSession(g Gate) *session {
-	s := readySession(g)
+	s := newSession(g, SessionInfo{})
 	s.enforce = true
+	serve(s, setting("client_encoding", "UTF8"), setting("standard_conforming_strings", "on"), ready)
 	return s
+}
+
+func setting(name, value string) *pgproto3.ParameterStatus {
+	return &pgproto3.ParameterStatus{Name: name, Value: value}
+}
+
+// sessionOf is an enforced session when enforce is set, and a session that
+// does not enforce otherwise.
+func sessionOf(g Gate, enforce bool) *session {
+	if enforce {
+		return enforcedSession(g)
+	}
+	return readySession(g)
 }
 
 // wantBlockedError checks that what the client got in place of the server's

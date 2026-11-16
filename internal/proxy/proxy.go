@@ -30,6 +30,7 @@ const (
 
 	startupTimeout = 10 * time.Second
 	dialTimeout    = 5 * time.Second
+	fatalTimeout   = 5 * time.Second // to write the error of a session the proxy ends
 	bufSize        = 32 << 10
 )
 
@@ -167,9 +168,9 @@ func (s *Server) handle(client net.Conn) {
 	start := time.Now()
 	s.log.Debug("session started", "remote", client.RemoteAddr())
 	if ss := s.watch(pkt); ss == nil {
-		relay(client, server, nil, nil)
+		relay(client, server, nil, nil, nil)
 	} else {
-		relay(client, server, ss.clientTap(), ss.serverTap())
+		relay(client, server, ss.clientTap(), ss.serverTap(), ss.ended)
 		ss.abandon()
 	}
 	s.log.Debug("session ended", "remote", client.RemoteAddr(), "duration", time.Since(start))
@@ -253,14 +254,34 @@ func readStartupPacket(r io.Reader) ([]byte, error) {
 }
 
 // relay copies messages both ways until either side closes. Taps may be nil.
-func relay(client, server net.Conn, fromClient, fromServer *tap) {
+//
+// ended, when set, is asked once either side has stopped whether the proxy
+// itself ended the session (a tap's see returned an error), and returns the
+// error to give the client then. The server connection is closed and the
+// other side stopped before that error is written, so it is the last thing
+// the client reads. A message the server was sending when its connection
+// closed may reach the client cut short, ahead of it.
+func relay(client, server net.Conn, fromClient, fromServer *tap, ended func() []byte) {
 	done := make(chan struct{}, 2)
 	go func() { pump(server, client, fromClient); done <- struct{}{} }()
 	go func() { pump(client, server, fromServer); done <- struct{}{} }()
 	<-done
-	client.Close()
+	var fatal []byte
+	if ended != nil {
+		fatal = ended()
+	}
+	if fatal == nil {
+		client.Close()
+		server.Close()
+		<-done
+		return
+	}
 	server.Close()
+	client.SetReadDeadline(time.Now()) // stops the pump reading the client
 	<-done
+	client.SetWriteDeadline(time.Now().Add(fatalTimeout))
+	client.Write(fatal)
+	client.Close()
 }
 
 // tap observes messages in one direction. For message types it wants, see
@@ -275,7 +296,8 @@ type tap struct {
 	// see may return one whole message (type, length, body) to send in
 	// place of the one it was shown; nil forwards it unchanged. For a message
 	// past maxInspect a replacement makes pump read and discard the body. A
-	// non-nil err ends the pump.
+	// non-nil err ends the pump: the messages before it are flushed, and it
+	// is not sent.
 	see  func(t byte, body []byte, flush func() error) (replace []byte, err error)
 	each func(t byte)
 }
@@ -327,6 +349,7 @@ func pump(dst io.Writer, src io.Reader, tp *tap) error {
 			}
 			replace, err := tp.see(hdr[0], shown, bw.Flush)
 			if err != nil {
+				bw.Flush()
 				return err
 			}
 			switch {

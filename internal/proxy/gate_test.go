@@ -2658,3 +2658,189 @@ func TestUnsureNameIsRefused(t *testing.T) {
 		})
 	}
 }
+
+// rawSessionWith is rawSession with protocol 3.0 and more startup
+// parameters; it also returns the server process's id.
+func rawSessionWith(t *testing.T, addr, user string, params map[string]string) (*pgproto3.Frontend, uint32) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	all := map[string]string{"user": user, "database": "stet_test"}
+	for k, v := range params {
+		all[k] = v
+	}
+	fe := pgproto3.NewFrontend(conn, conn)
+	fe.Send(&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: all})
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	var pid uint32
+	for {
+		msg, err := fe.Receive()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch m := msg.(type) {
+		case *pgproto3.BackendKeyData:
+			pid = m.ProcessID
+		case *pgproto3.ErrorResponse:
+			t.Fatalf("startup: SQLSTATE %s: %s", m.Code, m.Message)
+		case *pgproto3.ReadyForQuery:
+			return fe, pid
+		}
+	}
+}
+
+// wantEnded reads what the client gets until its connection ends, and fails
+// the test unless that is want (as replies writes it) followed by a FATAL
+// ST002 for reason, the last thing read.
+func wantEnded(t *testing.T, fe *pgproto3.Frontend, want, reason string) {
+	t.Helper()
+	var got []string
+	var fatal *pgproto3.ErrorResponse
+	for {
+		msg, err := fe.Receive()
+		if err != nil {
+			break
+		}
+		if fatal != nil {
+			t.Errorf("read %T after the FATAL", msg)
+		}
+		if e, ok := msg.(*pgproto3.ErrorResponse); ok && e.Severity == "FATAL" {
+			c := *e
+			fatal = &c
+			continue
+		}
+		if e, ok := msg.(*pgproto3.ErrorResponse); ok {
+			got = append(got, "E:"+e.Code)
+			continue
+		}
+		b, _ := msg.Encode(nil)
+		got = append(got, string(b[0]))
+	}
+	if s := strings.Join(got, " "); s != want {
+		t.Errorf("before the end the client got %q, want %q", s, want)
+	}
+	if fatal == nil || fatal.Code != "ST002" || fatal.SeverityUnlocalized != "FATAL" || fatal.Message != "blocked "+reason {
+		t.Errorf("the session ended with %+v, want a FATAL ST002 blocked %s", fatal, reason)
+	}
+}
+
+// waitForBackendGone fails the test unless the server process pid exits.
+func waitForBackendGone(t *testing.T, pid uint32) {
+	t.Helper()
+	admin := connect(t, upstream(t), "stet_scram", nil)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var n int
+		if err := admin.QueryRow(testCtx(t), "select count(*) from pg_stat_activity where pid = $1", pid).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("server process %d still runs", pid)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// Under client_encoding SJIS a multibyte character can end in a backslash,
+// and with standard_conforming_strings off \' escapes a quote: the server
+// then ends a string literal where the classifier does not, and runs a write
+// the classifier takes for part of a string (ruling 22). An enforced session
+// refuses every statement until the server reports UTF8 and on; the shadow
+// proxy forwards these as before.
+func TestStatementsTheClassifierMisreadsAreRefused(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		params map[string]string
+		sql    string // %s is the table
+	}{
+		{"client_encoding SJIS", map[string]string{"client_encoding": "SJIS"},
+			"select E'\xc5\x95\x5c'; insert into %s values (1, 'x'); select count(*) from %[1]s; -- '"},
+		{"standard_conforming_strings off", map[string]string{"options": "-c standard_conforming_strings=off"},
+			"select 'x\\''; insert into %s values (1, 'x'); select count(*) from %[1]s; -- '"},
+	} {
+		for _, mode := range closedPointModes {
+			t.Run(c.name+", "+mode.name, func(t *testing.T) {
+				table := watchedTable(t)
+				mustExec(t, connect(t, upstream(t), "stet_scram", nil), "grant select, insert on "+table+" to stet_trust")
+				g := closedPointGate(watches(table))
+				addr, _ := startProxyWith(t, upstream(t), g, mode.policy)
+				fe, _ := rawSessionWith(t, addr, "stet_trust", c.params)
+
+				sendAll(t, fe, &pgproto3.Query{String: fmt.Sprintf(c.sql, table)})
+				got, errs := repliesWithErrors(t, fe)
+				if mode.policy.Enforce {
+					if got != "E:ST002 Z" || len(errs) != 1 || errs[0].Message != "blocked session_setting" {
+						t.Errorf("replies %q (%+v), want the ST002 for session_setting", got, errs)
+					}
+					g.wantBlocked(t, "stet_trust", proxy.BlockSessionSetting)
+				} else if len(errs) != 0 {
+					t.Errorf("replies %q, want the statements run: %+v", got, errs)
+				}
+				if n, want := rowCount(t, table), pick(mode.policy, "0", "1"); fmt.Sprint(n) != want {
+					t.Errorf("%d rows, want %s", n, want)
+				}
+				if n := g.beginCount(); n != 0 {
+					t.Errorf("%d writes begun, want none: the classifier saw no write", n)
+				}
+			})
+		}
+	}
+}
+
+// A session that starts with settings the classifier cannot read can repair
+// them with a SET, and then works as any other: its writes are judged.
+func TestUnreadableSessionRepairsItsSettings(t *testing.T) {
+	table := watchedTable(t)
+	mustExec(t, connect(t, upstream(t), "stet_scram", nil), "grant insert on "+table+" to stet_trust")
+	g := closedPointGate(watches(table))
+	addr, _ := startProxyWith(t, upstream(t), g, proxy.Policy{Enforce: true})
+	fe, _ := rawSessionWith(t, addr, "stet_trust", map[string]string{"client_encoding": "SJIS"})
+	insert := &pgproto3.Query{String: "insert into " + table + " values (1, 'x')"}
+
+	sendAll(t, fe, insert)
+	wantReplies(t, fe, "E:ST002 Z", "blocked session_setting")
+	sendAll(t, fe, &pgproto3.Query{String: "set client_encoding to 'UTF8'"})
+	wantReplies(t, fe, "C S Z")
+	sendAll(t, fe, insert)
+	wantReplies(t, fe, "C Z")
+	if n := g.beginCount(); n != 1 {
+		t.Errorf("%d writes begun, want the insert after the repair", n)
+	}
+	if n := rowCount(t, table); n != 1 {
+		t.Errorf("%d rows, want 1", n)
+	}
+	g.wantBlocked(t, "stet_trust", proxy.BlockSessionSetting)
+}
+
+// A statement sent behind a change of setting, before the server reported
+// the change, was inspected under the old value. When the change makes the
+// session unreadable, an enforced session is ended with a FATAL, and so is
+// its server session (ruling 22). The shadow proxy answers both.
+func TestSettingChangedAheadOfAStatementEndsTheSession(t *testing.T) {
+	for _, mode := range closedPointModes {
+		t.Run(mode.name, func(t *testing.T) {
+			g := closedPointGate(isWrite)
+			addr, _ := startProxyWith(t, upstream(t), g, mode.policy)
+			fe, pid := rawSessionWith(t, addr, "stet_trust", nil)
+
+			sendAll(t, fe, &pgproto3.Query{String: "set client_encoding to 'SJIS'"}, &pgproto3.Query{String: "select 1"})
+			if !mode.policy.Enforce {
+				wantReplies(t, fe, "C S Z")
+				wantReplies(t, fe, "T D C Z")
+				return
+			}
+			wantEnded(t, fe, "C", proxy.BlockSessionSetting)
+			waitForBackendGone(t, pid)
+			g.wantBlocked(t, "stet_trust", proxy.BlockSessionSetting)
+		})
+	}
+}

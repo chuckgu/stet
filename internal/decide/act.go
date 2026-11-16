@@ -167,6 +167,8 @@ var blocked = map[string]phrase{
 		"send only copy data until the copy ends"},
 	"copy_extended": {"connection closed by stet: COPY FROM STDIN through the extended protocol is not supported here",
 		"send COPY ... FROM STDIN as a simple query"},
+	"session_setting": {"statement refused by stet: this session's client_encoding or standard_conforming_strings makes its statements unreadable to stet",
+		"use client_encoding UTF8 and standard_conforming_strings on"},
 }
 
 // fixed are the reasons whose sentence needs no fact.

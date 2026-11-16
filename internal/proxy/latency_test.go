@@ -1,6 +1,8 @@
 package proxy_test
 
 import (
+	"context"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -24,6 +26,16 @@ func addedLatency(t *testing.T, gate proxy.Gate, label string) time.Duration {
 // connections logged in as user.
 func addedLatencyWith(t *testing.T, gate proxy.Gate, policy proxy.Policy, user, label string) time.Duration {
 	t.Helper()
+	return addedLatencyOf(t, gate, policy, user, label, func(ctx context.Context, conn *pgx.Conn, _ int) error {
+		var one int
+		return conn.QueryRow(ctx, "select 1").Scan(&one)
+	})
+}
+
+// addedLatencyOf is addedLatencyWith for the round trip trip, which is
+// handed the round trip's number.
+func addedLatencyOf(t *testing.T, gate proxy.Gate, policy proxy.Policy, user, label string, trip func(ctx context.Context, conn *pgx.Conn, i int) error) time.Duration {
+	t.Helper()
 	if testing.Short() {
 		t.Skip("latency measurement skipped in -short mode")
 	}
@@ -33,10 +45,11 @@ func addedLatencyWith(t *testing.T, gate proxy.Gate, policy proxy.Policy, user, 
 	proxied := connect(t, addr, user, nil)
 	ctx := testCtx(t)
 
+	n := 0
 	roundTrip := func(conn *pgx.Conn) time.Duration {
+		n++
 		start := time.Now()
-		var one int
-		if err := conn.QueryRow(ctx, "select 1").Scan(&one); err != nil {
+		if err := trip(ctx, conn, n); err != nil {
 			t.Fatal(err)
 		}
 		return time.Since(start)
@@ -109,5 +122,20 @@ func TestEnforcedSessionLatencyBudget(t *testing.T) {
 	}
 	if added > 2*time.Millisecond {
 		t.Errorf("an enforced session adds %v at p95, budget is 2ms", added)
+	}
+}
+
+// Ruling 22: an enforced session follows the ParameterStatus messages the
+// server sends, here one per round trip (application_name is reported on
+// every change). That stays inside the same 2ms budget at p95.
+func TestEnforcedSessionSettingsLatencyBudget(t *testing.T) {
+	g := closedPointGate(isWrite)
+	added := addedLatencyOf(t, g, proxy.Policy{Enforce: true}, "stet_scram", "enforced SET application_name",
+		func(ctx context.Context, conn *pgx.Conn, i int) error {
+			_, err := conn.Exec(ctx, fmt.Sprintf("set application_name = 'latency_%d'", i%2))
+			return err
+		})
+	if added > 2*time.Millisecond {
+		t.Errorf("an enforced session following its settings adds %v at p95, budget is 2ms", added)
 	}
 }

@@ -149,10 +149,13 @@ func (rf *refusal) answers(e *pgproto3.ErrorResponse) bool {
 }
 
 // refusalError is the ErrorResponse a client is given in place of the
-// server's error: severity ERROR and r's fields, nothing else. Code and
-// Message are always present, as the protocol requires of every
-// ErrorResponse; a NUL, which would end a field early, is dropped.
-func refusalError(r Refusal) []byte {
+// server's error: severity ERROR and r's fields, nothing else.
+func refusalError(r Refusal) []byte { return errorMessage("ERROR", r) }
+
+// errorMessage is an ErrorResponse of severity with r's fields, nothing
+// else. Code and Message are always present, as the protocol requires of
+// every ErrorResponse; a NUL, which would end a field early, is dropped.
+func errorMessage(severity string, r Refusal) []byte {
 	b := []byte{'E', 0, 0, 0, 0}
 	field := func(k byte, v string, always bool) {
 		if v == "" && !always {
@@ -162,8 +165,8 @@ func refusalError(r Refusal) []byte {
 		b = append(b, strings.ReplaceAll(v, "\x00", "")...)
 		b = append(b, 0)
 	}
-	field('S', "ERROR", true)
-	field('V', "ERROR", true)
+	field('S', severity, true)
+	field('V', severity, true)
 	field('C', r.Code, true)
 	field('M', r.Message, true)
 	field('D', r.Detail, false)

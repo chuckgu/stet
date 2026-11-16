@@ -43,6 +43,11 @@ const (
 	BlockUnsettledName = "unsettled_name" // the name may mean a watched statement, and the server has not said which meaning holds
 	BlockProtocolOrder = "protocol_order" // the session is ended: answers can no longer be matched to messages
 	BlockCopyExtended  = "copy_extended"  // the session is ended: COPY FROM STDIN through the extended protocol
+	// BlockSessionSetting: the session's client_encoding or
+	// standard_conforming_strings makes the server read statements otherwise
+	// than the classifier (see readable); the session is ended when that
+	// happened under statements already sent.
+	BlockSessionSetting = "session_setting"
 )
 
 type Statement struct {
@@ -169,6 +174,13 @@ type session struct {
 	// changed as the client sends, settled as the server answers.
 	stmts   names[prepared]
 	portals names[bound]
+
+	// Enforced sessions only, under mu. utf8 and standard: the server last
+	// reported client_encoding UTF8 and standard_conforming_strings on (see
+	// readable). end: why the proxy is ending the session, "" while it is
+	// not (see endWith).
+	utf8, standard bool
+	end            string
 }
 
 type prepared struct {
@@ -215,7 +227,11 @@ type unit struct {
 	joined bool
 	// skipped: the server skipped the whole unit because an unsynced unit
 	// before it failed; err is that unit's error.
-	skipped     bool
+	skipped bool
+	// late: a Parse, Bind, Describe, Close or Execute came after an Execute
+	// of the unit, so the server may read it after that Execute changed a
+	// setting (see sentAfter).
+	late        bool
 	query       bool
 	dirty       bool // it holds a statement that is not clean (see Statement.Clean)
 	executes    int  // Execute messages so far
@@ -288,14 +304,25 @@ func (s *session) clientTap() *tap {
 }
 
 func (s *session) serverTap() *tap {
-	return &tap{
-		want: func(t byte) bool {
+	want := func(t byte) bool {
+		switch t {
+		case 'C', 'I', 's', 'E', 'Z':
+			return true
+		}
+		return false
+	}
+	if s.enforce {
+		// Also ParameterStatus (see parameter). Rows are still not shown.
+		want = func(t byte) bool {
 			switch t {
-			case 'C', 'I', 's', 'E', 'Z':
+			case 'C', 'I', 's', 'E', 'Z', 'S':
 				return true
 			}
 			return false
-		},
+		}
+	}
+	return &tap{
+		want: want,
 		see: func(t byte, body []byte, _ func() error) ([]byte, error) {
 			return s.fromServer(t, body)
 		},
@@ -414,11 +441,20 @@ func (s *session) acked(head *unit) {
 //
 // On an enforced session the closed points (spec 7) are refused here, before
 // anything else is made of them: a Query or Parse the gate marks with Block,
-// a Query, Parse, Bind or Execute the proxy could not read, and every
-// FunctionCall. The gate is told through Blocked, and the message never ran,
-// so the statement and portal tables, on_behalf_of and the cursor table stay
-// as they were.
+// a Query, Parse, Bind or Execute the proxy could not read, every
+// FunctionCall, a statement that runs a watched name (runsWatched), an
+// Execute of a name whose meaning is not settled (executeBlock), and what
+// the server may read otherwise than the classifier while the session's
+// settings are not readable (see settings.go). The gate is told through
+// Blocked, and the message never ran, so the statement and portal tables,
+// on_behalf_of and the cursor table stay as they were. It returns an error
+// once the proxy is ending the session (see end.go).
 func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, error) {
+	if s.enforce {
+		if err := s.admit(); err != nil {
+			return nil, err
+		}
+	}
 	switch t {
 	case 'Q':
 		u := s.push(&unit{closed: true, query: true})
@@ -429,6 +465,10 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 				return s.block(u, 0, 'Q', "", unreadable(body)), nil
 			}
 			return nil, nil
+		}
+		if s.enforce && s.misread(m.String) {
+			s.markDirty(u)
+			return s.block(u, 0, 'Q', "", BlockSessionSetting), nil
 		}
 		st := s.gate.Inspect(m.String)
 		if s.enforce {
@@ -450,13 +490,14 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 	case 'P':
 		var m pgproto3.Parse
 		read := body != nil && m.Decode(body) == nil
+		misread := read && s.enforce && s.misread(m.Query)
 		var p prepared
-		if read {
+		if read && !misread {
 			p = prepared{st: s.gate.Inspect(m.Query), oids: slices.Clone(m.ParameterOIDs)}
 		}
 		s.mu.Lock()
 		u, pos := s.count()
-		if s.enforce && (!read || p.st.Block != "") {
+		if s.enforce && (!read || misread || p.st.Block != "") {
 			s.mu.Unlock()
 			// The table is left as it was. The server keeps a named
 			// statement it holds when the replacement fails, as for any
@@ -466,9 +507,15 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 			// no longer has (its Binds fail), never an unjudged write: the
 			// safe direction. A Parse that could not be read is replaced
 			// under a fresh name, since its own name is not known, so no
-			// name the session uses changes on the server.
-			if !read {
+			// name the session uses changes on the server; so is one whose
+			// name the server would convert from client_encoding.
+			switch {
+			case !read:
 				return s.block(u, pos, 'P', freshName(), unreadable(body)), nil
+			case misread && !ascii(m.Name):
+				return s.block(u, pos, 'P', freshName(), BlockSessionSetting), nil
+			case misread:
+				return s.block(u, pos, 'P', m.Name, BlockSessionSetting), nil
 			}
 			return s.block(u, pos, 'P', m.Name, p.st.Block), nil
 		}
@@ -497,6 +544,14 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 			p, ok, others = s.stmts.get(u, m.PreparedStatement)
 			// An older meaning that is the same statement is no other meaning.
 			others = slices.DeleteFunc(others, func(q prepared) bool { return ok && p.same(q) })
+		}
+		if s.enforce && read && !s.readable() &&
+			(!ascii(m.PreparedStatement) || !ascii(m.DestinationPortal) || mayWrite(p, ok, others)) {
+			s.mu.Unlock()
+			// The server converts names and bind values from client_encoding:
+			// it may bind another statement or portal than the tables say,
+			// or hand a watched write other values than Begin would judge.
+			return s.block(u, pos, 'B', "", BlockSessionSetting), nil
 		}
 		s.mu.Unlock()
 		// Bind values are copied without the lock: the server side takes it
@@ -533,6 +588,10 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 			// Its portal is not known; the server compares portal names by
 			// their first 63 bytes, so it may run any of them.
 			reason = unreadable(body)
+		case !s.readable() && !ascii(m.Portal):
+			// The server converts the name from client_encoding, so it may
+			// run another portal than the table says.
+			reason = BlockSessionSetting
 		default:
 			reason = s.executeBlock(u, b, ok, others)
 		}
@@ -558,9 +617,11 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		s.mu.Lock()
 		u, pos := s.count()
 		// A Close the proxy could not read changes nothing here: a name it
-		// may have closed stays remembered.
+		// may have closed stays remembered. So does a name the server would
+		// convert from client_encoding, which may close another name.
 		switch {
 		case !read:
+		case s.enforce && !s.readable() && !ascii(m.Name):
 		case m.ObjectType == 'S':
 			s.stmts.put(u, pos, m.Name, false, prepared{})
 		case m.ObjectType == 'P':
@@ -689,6 +750,14 @@ func anyOther(b bound, others []bound, f func(st Statement, unread bool) bool) b
 		}
 	}
 	return false
+}
+
+// mayWrite reports whether a statement name whose newest meaning is p (ok:
+// it has one) and whose other meanings are others may be a watched write,
+// one Stet cannot read, or one that runs names.
+func mayWrite(p prepared, ok bool, others []prepared) bool {
+	w := func(q prepared) bool { return q.unread || q.st.Watch || runsNames(q.st) }
+	return ok && w(p) || slices.ContainsFunc(others, w)
 }
 
 // anyMeaning is anyOther with b's own statement too, when the portal has a
@@ -890,6 +959,7 @@ func (s *session) openLocked() *unit {
 func (s *session) count() (*unit, int) {
 	u := s.openLocked()
 	u.msgs++
+	u.late = u.late || u.executes > 0
 	return u, u.msgs
 }
 
@@ -925,6 +995,7 @@ func (s *session) fromServer(t byte, body []byte) ([]byte, error) {
 		head = s.units[0]
 	}
 	var out []byte
+	var err error
 	switch t {
 	case 'C', 'I', 's':
 		s.settle(head)
@@ -960,10 +1031,12 @@ func (s *session) fromServer(t byte, body []byte) ([]byte, error) {
 		}
 	case 'Z':
 		done = s.readyForQuery(head, body, done)
+	case 'S': // enforced sessions only
+		err = s.parameter(head, body)
 	}
 	s.mu.Unlock()
 	s.finishAll(done)
-	return out, nil
+	return out, err
 }
 
 // readyForQuery follows a ReadyForQuery with body body, which answers head
