@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -18,7 +19,8 @@ import (
 )
 
 // queryTimeout is the statement_timeout of a measurement's queries other
-// than the count: the prepare, the catalog reads and EXPLAIN.
+// than the count (the prepare, the catalog reads and EXPLAIN), and of the
+// decoding of binary bind values.
 const queryTimeout = 200 * time.Millisecond
 
 // countTimeout is the statement_timeout of the count. A count that runs past
@@ -66,26 +68,18 @@ func (g *Gate) measure(ctx context.Context, p *pending, lim *config.Impact) *dec
 // is only prepared and EXPLAINed (never with ANALYZE), which does not execute
 // it; the only predicate executed is Measure.CountSQL, which sqlparse builds
 // for vetted predicates only, and only when the method is count.
+//
+// Bind values arrive here as text. Binary ones were decoded before, by
+// paramTexts, which prepares the statement as Stet's own account, also in a
+// read-only transaction under the timeout.
 func (g *Gate) queryImpact(ctx context.Context, p *pending, m *sqlparse.Measure, lim *config.Impact, im *decide.Impact) error {
-	conn, err := g.pool.Acquire(ctx)
+	pg, done, err := g.txConn(ctx)
 	if err != nil {
 		return fmt.Errorf("acquire: %w", err)
 	}
-	defer conn.Release()
-	pg := conn.Conn().PgConn()
-	// Runs before Release on every path. A connection the rollback did not
-	// return to idle is closed, so no transaction or role reaches the pool.
-	defer func() {
-		rctx, cancel := context.WithTimeout(context.Background(), rollbackTimeout)
-		defer cancel()
-		if err := pg.Exec(rctx, "rollback").Close(); err != nil || pg.TxStatus() != 'I' {
-			pg.Close(rctx)
-		}
-	}()
+	defer done()
 
-	begin := fmt.Sprintf("begin read only; set local role %s; set local statement_timeout = '%dms'",
-		pgx.Identifier{p.session.User}.Sanitize(), queryTimeout.Milliseconds())
-	if err := pg.Exec(ctx, begin).Close(); err != nil {
+	if err := pg.Exec(ctx, beginReadOnly(p.session.User)).Close(); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "42501" { // not a member of the role
 			g.warnRole(p.session.User)
@@ -96,8 +90,7 @@ func (g *Gate) queryImpact(ctx context.Context, p *pending, m *sqlparse.Measure,
 
 	// The count query keeps only the WHERE clause, so some parameters may go
 	// unused there; Postgres needs their types, inferred from the statement.
-	// Prepared here rather than first so that the agent's statement is only
-	// ever parsed as the client's role, read-only, under the timeout.
+	// This prepare runs as the client's role, read-only, under the timeout.
 	var values [][]byte
 	var oids []uint32
 	if len(p.params) > 0 {
@@ -179,6 +172,39 @@ func (g *Gate) queryImpact(ctx context.Context, p *pending, m *sqlparse.Measure,
 	}
 	im.Method, im.Rows = string(sqlparse.MethodCount), &n
 	return nil
+}
+
+// txConn acquires a pooled connection for one transaction. done rolls back
+// whatever is open on it, with its own context because the caller's may have
+// expired, closes the connection if the rollback did not return it to idle,
+// and releases it, so no transaction, role, or setting reaches the pool.
+// Call done on every path once txConn succeeds.
+func (g *Gate) txConn(ctx context.Context) (pg *pgconn.PgConn, done func(), err error) {
+	conn, err := g.pool.Acquire(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	pg = conn.Conn().PgConn()
+	return pg, func() {
+		rctx, cancel := context.WithTimeout(context.Background(), rollbackTimeout)
+		defer cancel()
+		if err := pg.Exec(rctx, "rollback").Close(); err != nil || pg.TxStatus() != 'I' {
+			pg.Close(rctx)
+		}
+		conn.Release()
+	}, nil
+}
+
+// beginReadOnly opens a read-only transaction whose statements time out
+// after queryTimeout, as role unless role is "".
+func beginReadOnly(role string) string {
+	var b strings.Builder
+	b.WriteString("begin read only; ")
+	if role != "" {
+		fmt.Fprintf(&b, "set local role %s; ", pgx.Identifier{role}.Sanitize())
+	}
+	fmt.Fprintf(&b, "set local statement_timeout = '%dms'", queryTimeout.Milliseconds())
+	return b.String()
 }
 
 // warnRole logs, once per role, that Stet's account cannot assume a client's

@@ -410,6 +410,12 @@ func (s State) CouldUndoRecent() bool {
 
 // paramTexts turns bind values into text. Binary values are decoded by
 // Postgres itself, using the statement's parameter types.
+//
+// Decoding runs the types' code, a domain's CHECK included, on Stet's
+// connection as Stet's own account, and the agent chose both the statement
+// and the values. So the statement is prepared and the values decoded in a
+// read-only transaction under the timeout, then rolled back. No role is
+// assumed: tables without impact limits need no role membership.
 func (g *Gate) paramTexts(ctx context.Context, sql string, ps []proxy.Param) ([]*string, error) {
 	if len(ps) == 0 {
 		return nil, nil
@@ -429,12 +435,14 @@ func (g *Gate) paramTexts(ctx context.Context, sql string, ps []proxy.Param) ([]
 		return out, nil
 	}
 
-	conn, err := g.pool.Acquire(ctx)
+	pg, done, err := g.txConn(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Release()
-	pg := conn.Conn().PgConn()
+	defer done()
+	if err := pg.Exec(ctx, beginReadOnly("")).Close(); err != nil {
+		return nil, err
+	}
 
 	clientOIDs := make([]uint32, len(ps))
 	for i, p := range ps {

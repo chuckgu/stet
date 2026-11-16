@@ -711,6 +711,68 @@ func TestImpactRecordsWhyBindValuesWereNotRead(t *testing.T) {
 	wantNoModel(t, d)
 }
 
+// Binary bind values are decoded by Postgres, on Stet's connection, with the
+// types the statement gives its parameters. A domain's CHECK runs as part of
+// decoding. Here it tries to write, which must fail there: decoding is
+// read-only. On the client's own connection it writes as usual.
+func TestBindValuesAreDecodedReadOnly(t *testing.T) {
+	d := calm()
+	e := setup(t, d, impactYAML)
+	e.seedMany(t)
+	ctx := context.Background()
+	sink, check, dom := e.table+"_sink", e.table+"_check", e.table+"_dom"
+	mustExec(t, e.admin, "create table "+sink+" (pid int)")
+	mustExec(t, e.admin, "create function "+check+"(int) returns boolean language plpgsql as $$ begin insert into "+sink+" values (pg_backend_pid()); return true; end $$")
+	mustExec(t, e.admin, "create domain "+dom+" as int check ("+check+"(value))")
+	t.Cleanup(func() {
+		e.admin.Exec(context.Background(), "drop domain "+dom+"; drop function "+check+"(int); drop table "+sink)
+	})
+	twin := e.table + "_twin"
+	mustExec(t, e.admin, "create table "+twin+" (like "+e.table+" including all)")
+	t.Cleanup(func() { e.admin.Exec(context.Background(), "drop table "+twin) })
+	mustExec(t, e.admin, "insert into "+twin+" select * from "+e.table)
+
+	// No type from the client, so the server types $1 as the domain, and a
+	// binary int4 9.
+	run := func(c *pgx.Conn, table string) (pgconn.CommandTag, error) {
+		r := c.PgConn().ExecParams(ctx, "update "+table+" set status = 'x' where company_id = $1::"+dom,
+			[][]byte{{0, 0, 0, 9}}, []uint32{0}, []int16{1}, nil).Read()
+		return r.CommandTag, r.Err
+	}
+	conn := e.connect(t, "typed")
+	var client int32
+	if err := conn.QueryRow(ctx, "select pg_backend_pid()").Scan(&client); err != nil {
+		t.Fatal(err)
+	}
+	got, gotErr := run(conn, e.table)
+
+	r := e.impacts(t, 1)[0]
+	wantVerdict(t, r, "unsupported", "not_single_row")
+	if msg, _ := r.Impact["error"].(string); !strings.HasPrefix(msg, "bind values: ") || !strings.Contains(msg, "read-only transaction") {
+		t.Errorf("impact.error = %q, want the bind values refused as read-only (impact %v)", msg, r.Impact)
+	}
+	wantNoKeys(t, r.Impact, "method")
+	wantImpact(t, r.Impact, map[string]any{"actual_rows": 2.0})
+	rows, err := e.admin.Query(ctx, "select pid from "+sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writers, err := pgx.CollectRows(rows, pgx.RowTo[int32])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(writers, []int32{client}) {
+		t.Errorf("the domain's check wrote from backends %v, want only the client's %d", writers, client)
+	}
+
+	want, wantErr := run(e.admin, twin)
+	if got.String() != want.String() || sqlstate(gotErr) != sqlstate(wantErr) || want.String() != "UPDATE 2" {
+		t.Errorf("%q %q through Stet, %q %q directly; want UPDATE 2 both ways", got, sqlstate(gotErr), want, sqlstate(wantErr))
+	}
+	wantNoModel(t, d)
+	e.wantCleanPool(t)
+}
+
 func TestImpactIsRecordedWhenTheWriteFails(t *testing.T) {
 	d := calm()
 	e := setup(t, d, impactYAML)
