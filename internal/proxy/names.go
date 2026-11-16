@@ -29,6 +29,11 @@ type names[T meaning[T]] struct {
 	// held does not list may mean unread, what that change set.
 	blind  bool
 	unread T
+	// freed: the server may let go of any name the table holds without a
+	// message the table follows, so held does not mean the server still holds
+	// it. Set for portals: the server drops them all when a transaction ends,
+	// which a COMMIT not answered yet may already have done.
+	freed bool
 }
 
 // meaning is what a name means in a names table.
@@ -90,11 +95,17 @@ func (n *names[T]) putUnread(u *unit, pos int, v T) {
 	n.changes = append(n.changes, change[T]{u: u, pos: pos, set: true, blind: true, v: v})
 }
 
+// lookBack is how many waiting changes put looks back over. What it looks
+// for only spares memory, so it stops there rather than walk a long unit on
+// every message.
+const lookBack = 16
+
 // last returns the index of the newest waiting change u made to the name
-// with key k, or -1 when there is none or an unread change of u came after
-// it (it may have been to k).
+// with key k, or -1 when there is none among the last lookBack changes, or
+// an unread change of u came after it (it may have been to k).
 func (n *names[T]) last(u *unit, k string) int {
-	for i := len(n.changes) - 1; i >= n.done && n.changes[i].u == u; i-- {
+	stop := max(n.done, len(n.changes)-lookBack)
+	for i := len(n.changes) - 1; i >= stop && n.changes[i].u == u; i-- {
 		switch c := &n.changes[i]; {
 		case c.blind:
 			return -1
@@ -112,14 +123,15 @@ func (n *names[T]) last(u *unit, k string) int {
 //
 // A change the proxy could not read adds a meaning to the unnamed name, and
 // to a named one the server may not hold at that point; a name the server
-// holds stays as it is, since a Parse or Bind of it fails.
+// surely holds stays as it is, since a Parse or Bind of it fails. A portal
+// name is never sure (see freed).
 //
 // u is the unit still collecting messages, so its changes are the newest.
 // The newest of them to name decides, and the walk starts there.
 func (n *names[T]) get(u *unit, name string) (v T, ok bool, others []T) {
 	k := nameKey(name)
 	v, ok = n.held[k]
-	free := !ok || k == "" // the server may not hold the name
+	free := !ok || k == "" || n.freed // the server may not hold the name
 	if !ok && n.blind {
 		v, ok = n.unread, true
 	}
@@ -127,7 +139,7 @@ func (n *names[T]) get(u *unit, name string) (v T, ok bool, others []T) {
 	for i := len(n.changes) - 1; i >= n.done && n.changes[i].u == u; i-- {
 		if c := &n.changes[i]; c.name == k && !c.blind {
 			v, ok, from = c.v, c.set, i+1
-			free = !c.set || k == ""
+			free = !c.set || k == "" || n.freed
 			break
 		}
 	}

@@ -244,7 +244,9 @@ type observedRead struct {
 }
 
 func newSession(g Gate, info SessionInfo) *session {
-	return &session{gate: g, info: info, status: 'I'}
+	s := &session{gate: g, info: info, status: 'I'}
+	s.portals.freed = true // see names.freed
+	return s
 }
 
 func (s *session) clientTap() *tap {

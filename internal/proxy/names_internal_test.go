@@ -502,3 +502,130 @@ func TestBatchUnderOneSyncKeepsFewChanges(t *testing.T) {
 		}
 	})
 }
+
+// The server drops every portal when a transaction ends, and a COMMIT the
+// proxy has not heard answered yet may end it: a Query of its own, or an
+// Execute under the same Sync. Then a Bind the proxy could not read may set a
+// portal name the table holds, so that name keeps the unread meaning among
+// its own.
+func TestUnreadBindAfterAPendingCommitMayChangeAHeldPortal(t *testing.T) {
+	setup := func() (*txGate, *session) {
+		g := &txGate{fakeGate: newFakeGate()}
+		s := readySession(g)
+		send(s, queryMsg("begin"))
+		serve(s, tag("BEGIN"), readyWith('T'))
+		send(s, parseMsg("show", "show x"), parseMsg("commit", "commit"), bindMsg("p", "show"), syncMsg)
+		serve(s, parseOK, parseOK, bindOK, readyWith('T'))
+		return g, s
+	}
+	flush := func() error { return nil }
+	wantUnread := func(t *testing.T, s *session, u *unit) {
+		t.Helper()
+		if b, ok, others := s.portals.get(u, "p"); !ok || !b.unread || len(others) != 1 || others[0].st.SQL != "show x" {
+			t.Errorf("portal p: %+v (found %v), others %v; want unread, and show x among others", b, ok, others)
+		}
+	}
+
+	t.Run("commit as a Query", func(t *testing.T) {
+		_, s := setup()
+		send(s, queryMsg("commit"))
+		s.fromClient('B', nil, flush)
+		send(s, syncMsg, execMsg("p"))
+		u := s.units[len(s.units)-1]
+		wantUnread(t, s, u)
+		if !u.dirty {
+			t.Errorf("the unit that executes p is clean, want dirty")
+		}
+	})
+
+	t.Run("commit under the same Sync", func(t *testing.T) {
+		_, s := setup()
+		send(s, bindMsg("p", "show"), bindMsg("", "commit"), execMsg(""))
+		s.fromClient('B', nil, flush)
+		wantUnread(t, s, s.units[0])
+	})
+}
+
+// A change that will not hold must not take the place of one that may: the
+// replacement is only for a unit that already failed. Here the Parse
+// completes and the Describe fails, so the Close behind it is skipped and s1
+// is still the insert.
+func TestChangeIsReplacedOnlyInAFailedUnit(t *testing.T) {
+	g := newStmtGate()
+	s := readySession(g)
+	send(s, parseMsg("s1", ins), describeMsg('S', "missing"), closeMsg('S', "s1"), syncMsg)
+	serve(s, parseOK, failed("26000"), readyWith('I'))
+	send(s, bindMsg("", "s1"), execMsg(""), syncMsg)
+	if !slices.Equal(g.begun, []string{ins}) {
+		t.Errorf("writes begun %q, want the insert s1 still holds", g.begun)
+	}
+}
+
+// A completion makes only the changes up to it hold: the second Parse of the
+// unnamed statement fails, so the first one's statement stays.
+func TestCompletionAppliesOnlyTheChangesItCompleted(t *testing.T) {
+	g := newStmtGate()
+	s := readySession(g)
+	send(s, parseMsg("", ins), parseMsg("", "select 1"), syncMsg)
+	serve(s, parseOK, failed("42601"), readyWith('I'))
+	if p, ok, _ := s.stmts.get(nil, ""); !ok || p.st.SQL != ins {
+		t.Errorf("unnamed: %q (found %v), want the insert that completed", p.st.SQL, ok)
+	}
+	send(s, bindMsg("", ""), execMsg(""), syncMsg)
+	if !slices.Equal(g.begun, []string{ins}) {
+		t.Errorf("writes begun %q, want the insert", g.begun)
+	}
+}
+
+// A portal's other meaning may itself have been bound to a statement name of
+// several meanings; a statement among those that is not clean dirties the
+// transaction too. Here p's newest meaning is show x, and the Bind before it
+// (not answered either) bound s1, which is set x = 1 or, if that re-Parse
+// fails, the update.
+func TestOtherMeaningOfAnOtherPortalMeaningDirties(t *testing.T) {
+	g := &txGate{fakeGate: newFakeGate()}
+	s := readySession(g)
+	send(s, parseMsg("s1", "update u set x = 1"), parseMsg("s2", "show x"), syncMsg)
+	serve(s, parseOK, parseOK, readyWith('I'))
+	send(s, queryMsg("begin"))
+	serve(s, tag("BEGIN"), readyWith('T'))
+	send(s, parseMsg("s1", "set x = 1"), syncMsg) // refused by the server (42P05), not answered yet
+	send(s, bindMsg("p", "s1"), syncMsg)
+	send(s, bindMsg("p", "s2"), syncMsg)
+	send(s, execMsg("p"), syncMsg)
+	send(s, queryMsg("insert into t values (1)"))
+	if len(g.infos) != 1 || !g.infos[0].TxDirty {
+		t.Errorf("writes begun with %+v, want one with TxDirty true", g.infos)
+	}
+}
+
+// Finding a change to replace or not to keep twice is only an optimisation,
+// so put looks back over a fixed number of changes and no further: a unit
+// of many distinct names costs each put the same.
+func TestPutLooksBackAFixedWay(t *testing.T) {
+	s := readySession(newStmtGate())
+	const names = 40000
+	send(s, parseMsg("s0", "select 1"))
+	for i := 1; i < names; i++ {
+		send(s, parseMsg("s"+strconv.Itoa(i), "select 1"))
+	}
+	send(s, parseMsg("s0", "select 1")) // the same as the first, far behind
+	if n := s.stmts.waiting(); n != names+1 {
+		t.Errorf("%d statement changes waiting, want %d: the first is too far back to be found", n, names+1)
+	}
+	send(s, parseMsg("s1", "select 1"), parseMsg("s1", "select 1")) // close behind: not kept twice
+	if n := s.stmts.waiting(); n != names+2 {
+		t.Errorf("%d statement changes waiting, want %d", n, names+2)
+	}
+}
+
+// BenchmarkDistinctParses times a unit of many distinct statement names sent
+// before any answer.
+func BenchmarkDistinctParses(b *testing.B) {
+	for b.Loop() {
+		s := readySession(newStmtGate())
+		for i := range 40000 {
+			send(s, parseMsg("s"+strconv.Itoa(i), "select 1"))
+		}
+	}
+}
