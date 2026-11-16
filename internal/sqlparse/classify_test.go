@@ -140,8 +140,24 @@ func TestClassifyReads(t *testing.T) {
 		// EXPLAIN and CREATE VIEW send none of the table's rows. Statements
 		// that copy the rows elsewhere, or prepare the query, read the table.
 		{"explain select * from contacts", Pass, "", nil},
+		{"explain create table t as select * from contacts", Pass, "", nil},
 		{"explain analyze select * from contacts c join deals d on d.contact_id = c.id", Pass, "", nil},
+		{"explain (analyze) select * from contacts", Pass, "", nil},
 		{"explain analyze delete from contacts where id = 1", Unsupported, "nested_write", nil},
+		// EXPLAIN ANALYZE runs the statement: one that keeps the rows reads
+		// as it would unexplained.
+		{"explain analyze create table t as select * from contacts", Read, "", []string{"contacts"}},
+		{"explain (analyze) select * into t from contacts", Read, "", []string{"contacts"}},
+		{"explain (analyze true) create materialized view mv as select * from deals", Read, "", []string{"deals"}},
+		{"explain (analyze, buffers) insert into log select * from contacts", Read, "", []string{"contacts"}},
+		{"explain analyze verbose update log set n = c.n from contacts c where log.id = c.id", Read, "", []string{"contacts"}},
+		{"explain (analyze on) delete from log using deals d where log.id = d.id", Read, "", []string{"deals"}},
+		{"explain (analyze 1) merge into log l using contacts c on l.id = c.id when matched then do nothing", Read, "", []string{"contacts"}},
+		{"explain analyze with x as (insert into log select * from deals returning 1) select * from x", Read, "", []string{"deals"}},
+		{"explain (analyze false) create table t as select * from contacts", Pass, "", nil},
+		{"explain (analyze off) insert into log select * from contacts", Pass, "", nil},
+		{"explain (analyze 'OFF') insert into log select * from contacts", Pass, "", nil},
+		{"explain (analyze 0) insert into log select * from contacts", Pass, "", nil},
 		{"create view v as select * from contacts", Pass, "", nil},
 		{"create or replace view v as select * from deals", Pass, "", nil},
 		{"explain select * from deals; select * from contacts", Read, "", []string{"contacts"}},

@@ -2,6 +2,7 @@ package sqlparse
 
 import (
 	"slices"
+	"strings"
 
 	pg "github.com/pganalyze/pg_query_go/v6"
 	"google.golang.org/protobuf/proto"
@@ -42,10 +43,11 @@ func cursor(n *pg.Node) *Cursor {
 // anywhere in the tree: the FROM of a SELECT (joins and subqueries in it
 // included), the FROM of an UPDATE, the USING of a DELETE, the source of a
 // MERGE, and the table of COPY ... TO. DDL and maintenance statements name
-// tables outside these positions. EXPLAIN [ANALYZE] and CREATE VIEW read
-// nothing. Any other statement that holds a query, such as CREATE TABLE AS,
-// CREATE MATERIALIZED VIEW, or PREPARE, reads what its query reads; the rows
-// a later SQL EXECUTE sends are not counted.
+// tables outside these positions. CREATE VIEW reads nothing, and EXPLAIN
+// reads nothing unless ANALYZE runs a statement that keeps the rows (see
+// keepsRows). Any other statement that holds a query, such as CREATE TABLE
+// AS, CREATE MATERIALIZED VIEW, or PREPARE, reads what its query reads; the
+// rows a later SQL EXECUTE sends are not counted.
 func readTables(stmts []*pg.RawStmt, m matchFunc) []string {
 	r := reader{m: m}
 	for _, raw := range stmts {
@@ -76,8 +78,15 @@ func (r *reader) visit(msg proto.Message, ctes []string, reading bool) {
 			r.read(s, ctes)
 		}
 		return
-	case *pg.ExplainStmt, *pg.ViewStmt:
-		// Neither sends the query's rows: EXPLAIN sends plan lines, and
+	case *pg.ExplainStmt:
+		// EXPLAIN sends plan lines, not the query's rows. With ANALYZE it
+		// also runs the statement, which reads as it would unexplained when
+		// it keeps the rows somewhere.
+		if explainAnalyze(s) && keepsRows(s.Query) {
+			r.visit(s.Query, ctes, false)
+		}
+		return
+	case *pg.ViewStmt:
 		// CREATE VIEW only defines the query.
 		return
 	case *pg.SelectStmt:
@@ -118,6 +127,44 @@ func (r *reader) visit(msg proto.Message, ctes []string, reading bool) {
 		r.visit(v.Message().Interface(), ctes, rd)
 		return true
 	})
+}
+
+// explainAnalyze reports whether EXPLAIN runs its statement. As Postgres
+// reads the option (defGetBoolean), the last ANALYZE wins, and no value, a
+// nonzero integer, true, or on turns it on. A value Postgres rejects counts
+// as on: the statement then fails anyway.
+func explainAnalyze(s *pg.ExplainStmt) bool {
+	on := false
+	for _, o := range s.Options {
+		d := o.GetDefElem()
+		if d.GetDefname() != "analyze" {
+			continue
+		}
+		on = true
+		switch arg := d.GetArg(); {
+		case arg.GetString_() != nil:
+			v := arg.GetString_().GetSval()
+			on = !strings.EqualFold(v, "false") && !strings.EqualFold(v, "off")
+		case arg.GetInteger() != nil:
+			on = arg.GetInteger().GetIval() != 0
+		}
+	}
+	return on
+}
+
+// keepsRows reports whether running n can keep the rows it reads: it
+// creates a table (CREATE TABLE AS, SELECT INTO, CREATE MATERIALIZED VIEW)
+// or writes one, anywhere in its tree.
+func keepsRows(n *pg.Node) bool {
+	found := false
+	walk(n, func(msg proto.Message) bool {
+		switch msg.(type) {
+		case *pg.IntoClause, *pg.InsertStmt, *pg.UpdateStmt, *pg.DeleteStmt, *pg.MergeStmt:
+			found = true
+		}
+		return !found
+	})
+	return found
 }
 
 // with visits the queries of a WITH clause and returns the names in scope
