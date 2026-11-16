@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"regexp"
 	"slices"
@@ -200,8 +201,9 @@ func TestOnlyTheReplacementsOwnErrorIsRewritten(t *testing.T) {
 	t.Run("refused Execute", func(t *testing.T) {
 		g := refusingGate()
 		s := readySession(g)
-		send(s, parseMsg("", ins), bindMsg("", ""), describeMsg('P', ""), execMsg(""), syncMsg)
-		out := relayed(t, s, parseOK, bindOK, &pgproto3.NoData{}, serverErr("34000"), ready)
+		r := sendOne(s, parseMsg("", ins), bindMsg("", ""), describeMsg('P', ""), execMsg(""))
+		send(s, syncMsg)
+		out := relayed(t, s, parseOK, bindOK, &pgproto3.NoData{}, replacementError(t, r), ready)
 		wantGiven(t, out[3])
 		refusedOutcome(t, g.ends[0], false)
 	})
@@ -286,6 +288,72 @@ func TestOnlyTheReplacementsOwnErrorIsRewritten(t *testing.T) {
 			t.Error("the server tap wants NoticeResponse")
 		}
 	})
+}
+
+// An error is taken for a replacement's own only when it is the error the
+// server gives that replacement (spec 6): a syntax error for a Query or
+// Parse; a missing portal or statement named by the replacement's own random
+// name for an Execute or Bind; a missing function, or the failed transaction,
+// for a FunctionCall. Any other error is the server's for some other message:
+// it reaches the client unchanged, and the refusal is not delivered.
+func TestRewriteIsBoundToTheReplacementsOwnError(t *testing.T) {
+	code := func(c string) func([]byte) *pgproto3.ErrorResponse {
+		return func([]byte) *pgproto3.ErrorResponse { return serverErr(c) }
+	}
+	own := func(r []byte) *pgproto3.ErrorResponse { return replacementError(t, r) }
+	recoded := func(c string) func([]byte) *pgproto3.ErrorResponse {
+		return func(r []byte) *pgproto3.ErrorResponse {
+			e := replacementError(t, r)
+			e.Code = c
+			return e
+		}
+	}
+	for _, c := range []struct {
+		name         string
+		kind         byte
+		given, other func(r []byte) *pgproto3.ErrorResponse
+	}{
+		{"Query", 'Q', own, code("22012")},
+		{"Query, in a failed transaction", 'Q', own, code("25P02")},
+		{"Parse", 'P', own, code("42P05")},
+		{"Execute", 'E', own, code("34000")}, // another portal's
+		{"Execute, another code", 'E', own, recoded("57014")},
+		{"Bind", 'B', own, code("26000")}, // another statement's
+		{"FunctionCall", 'F', own, code("22012")},
+		{"FunctionCall, in a failed transaction", 'F', code("25P02"), code("08P01")},
+	} {
+		for _, given := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s, own error %v", c.name, given), func(t *testing.T) {
+				s := readySession(newFakeGate())
+				var u *unit
+				pos := 0
+				if c.kind == 'Q' || c.kind == 'F' {
+					u = s.push(&unit{closed: true, query: c.kind == 'Q'})
+				} else {
+					s.mu.Lock()
+					u, pos = s.count()
+					s.mu.Unlock()
+				}
+				r := s.refuse(u, pos, c.kind, "s1", heldRefusal)
+				if pos > 0 {
+					send(s, syncMsg)
+				}
+				e := c.other(r)
+				if given {
+					e = c.given(r)
+				}
+				out := relayed(t, s, e, ready)
+				if given {
+					wantGiven(t, out[0])
+				} else {
+					wantUnchanged(t, out[0], e)
+				}
+				if o := u.refusedWrite(watchedWrite{refused: true, pos: pos}, false, true); o.Undelivered == given {
+					t.Errorf("outcome %+v, want undelivered %v", o, !given)
+				}
+			})
+		}
+	}
 }
 
 // A refused write is not delivered unless its unit's ReadyForQuery arrived:

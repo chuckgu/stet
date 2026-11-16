@@ -25,8 +25,12 @@ const refusedSQL = ") stet: statement refused"
 // replacement it rejects where the message stood (see refuse), and the client
 // gets r in place of the server's error.
 type refusal struct {
-	pos int // the message's pos in its unit; 0 for a Query or FunctionCall
-	r   Refusal
+	pos  int  // the message's pos in its unit; 0 for a Query or FunctionCall
+	kind byte // the message's type, and its replacement's
+	// name is the random name an Execute's or Bind's replacement runs, which
+	// the server's error for it repeats.
+	name string
+	r    Refusal
 	// given: the server's error for the replacement was rewritten into r. The
 	// client counts as having it once the unit's ReadyForQuery arrived.
 	given bool
@@ -47,10 +51,7 @@ func (rf *refusal) text() string { return "SQLSTATE " + rf.r.Code + ": " + rf.r.
 // cannot exist (freshName), and a FunctionCall the function OID 0. Nothing of
 // the message itself reaches the server.
 func (s *session) refuse(u *unit, pos int, t byte, name string, r Refusal) []byte {
-	s.mu.Lock()
-	u.refused = append(u.refused, refusal{pos: pos, r: r})
-	s.mu.Unlock()
-
+	rf := refusal{pos: pos, kind: t, r: r}
 	var m pgproto3.FrontendMessage
 	switch t {
 	case 'Q':
@@ -58,14 +59,19 @@ func (s *session) refuse(u *unit, pos int, t byte, name string, r Refusal) []byt
 	case 'P':
 		m = &pgproto3.Parse{Name: name, Query: refusedSQL}
 	case 'E':
-		m = &pgproto3.Execute{Portal: freshName()}
+		rf.name = freshName()
+		m = &pgproto3.Execute{Portal: rf.name}
 	case 'B':
-		m = &pgproto3.Bind{PreparedStatement: freshName()}
+		rf.name = freshName()
+		m = &pgproto3.Bind{PreparedStatement: rf.name}
 	case 'F':
 		m = &pgproto3.FunctionCall{Function: 0}
 	default:
 		panic("proxy: no replacement for message type " + string(t))
 	}
+	s.mu.Lock()
+	u.refused = append(u.refused, rf)
+	s.mu.Unlock()
 	b, err := m.Encode(nil)
 	if err != nil {
 		panic("proxy: replacement not encoded: " + err.Error()) // a few fixed fields cannot fail
@@ -89,12 +95,16 @@ func freshName() string {
 // at most one error per unit is rewritten.
 //
 // The error is the replacement's when it is an ERROR (a FATAL ends the
-// session, whatever the message) and it answers the replacement: in a Query
-// or FunctionCall unit it is the unit's error; in an extended unit it came at
-// the refused message's pos (errPos). An error at an earlier message means
-// the server skipped the replacement, and one at the Sync (errPos past msgs:
-// a deferred constraint failing at commit) answers no message; neither is
-// rewritten.
+// session, whatever the message), it answers the replacement, and it is the
+// error the server gives that replacement (answers). It answers the
+// replacement when, in a Query or FunctionCall unit, it is the unit's error,
+// and in an extended unit, it came at the refused message's pos (errPos). An
+// error at an earlier message means the server skipped the replacement, and
+// one at the Sync (errPos past msgs: a deferred constraint failing at commit)
+// answers no message; neither is rewritten. Should the proxy ever match an
+// error to the wrong unit, the last test leaves that error alone and the
+// refusal undelivered, the lesser failure, instead of giving the client the
+// gate's error for another statement.
 func (u *unit) replaced(e []byte) *refusal {
 	for i := range u.refused {
 		rf := &u.refused[i]
@@ -109,12 +119,33 @@ func (u *unit) replaced(e []byte) *refusal {
 		if severity == "" {
 			severity = m.Severity
 		}
-		if severity != "ERROR" {
+		if severity != "ERROR" || !rf.answers(&m) {
 			return nil
 		}
 		return rf
 	}
 	return nil
+}
+
+// answers reports whether e is the error the server gives rf's replacement
+// (checked on PostgreSQL 14.18, outside and inside a failed transaction): a
+// syntax error for a Query or Parse, which the server parses before it looks
+// at the transaction; for an Execute or Bind, the portal or statement it
+// names does not exist, and the server's message repeats that random name;
+// for a FunctionCall, function OID 0 does not exist, or the transaction has
+// failed.
+func (rf *refusal) answers(e *pgproto3.ErrorResponse) bool {
+	switch rf.kind {
+	case 'Q', 'P':
+		return e.Code == "42601"
+	case 'E':
+		return e.Code == "34000" && strings.Contains(e.Message, rf.name)
+	case 'B':
+		return e.Code == "26000" && strings.Contains(e.Message, rf.name)
+	case 'F':
+		return e.Code == "42883" || e.Code == "25P02"
+	}
+	return false
 }
 
 // refusalError is the ErrorResponse a client is given in place of the
