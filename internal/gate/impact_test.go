@@ -784,6 +784,41 @@ func TestImpactCountsThroughAliasOnlyAndSchema(t *testing.T) {
 	wantNoModel(t, d)
 }
 
+// The config key names the table without a schema. The statement names it in
+// a schema that is not on Stet's search_path, and public holds a decoy of the
+// same name: the env's own table. Size and cascades must be the named table's.
+func TestImpactReadsTheCatalogOfTheTableTheStatementNames(t *testing.T) {
+	d := calm()
+	e := setup(t, d, impactYAML)
+	e.seedMany(t) // the decoy: seven rows, no foreign keys
+	// Mixed case, so every reference must quote it.
+	schema := `"Impact_` + strings.TrimPrefix(e.table, "contacts_") + `"`
+	target, child := schema+"."+e.table, schema+"."+e.table+"_child"
+	mustExec(t, e.admin, "create schema "+schema)
+	t.Cleanup(func() { e.admin.Exec(context.Background(), "drop schema "+schema+" cascade") })
+	mustExec(t, e.admin, "create table "+target+" (like "+e.table+" including all)")
+	mustExec(t, e.admin, "create table "+child+" (id int primary key, parent int references "+target+"(id) on delete cascade)")
+	mustExec(t, e.admin, "insert into "+target+" (id, name, company_id) values (1, 'a', 9), (2, 'b', 9)")
+	mustExec(t, e.admin, "analyze "+target)
+	mustExec(t, e.admin, "analyze "+e.table)
+	mustExec(t, e.connect(t, "bulk"), "delete from "+target+" where company_id = 9") // 2 of 2 rows
+
+	r := e.impacts(t, 1)[0]
+	wantVerdict(t, r, "hold", "impact:share")
+	wantImpact(t, r.Impact, map[string]any{
+		"method":      "count",
+		"rows":        2.0,
+		"table_rows":  2.0,
+		"share":       1.0,
+		"cascades":    []any{map[string]any{"table": child, "on_delete": "cascade"}},
+		"actual_rows": 2.0,
+	})
+	if n := e.rowsWhere(t, "true"); n != 7 {
+		t.Errorf("the decoy has %d rows, want its 7 untouched", n)
+	}
+	wantNoModel(t, d)
+}
+
 // The estimate covers shapes counting cannot. A write to another table
 // inside WITH is planned as an InitPlan and not added to the rows.
 func TestImpactEstimatesWhatItCannotCount(t *testing.T) {

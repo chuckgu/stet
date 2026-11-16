@@ -1,6 +1,8 @@
 package sqlparse
 
 import (
+	"strings"
+
 	pg "github.com/pganalyze/pg_query_go/v6"
 	"google.golang.org/protobuf/proto"
 )
@@ -132,24 +134,29 @@ func measure(n *pg.Node) *Measure {
 	switch {
 	case n.GetInsertStmt() != nil:
 		s := n.GetInsertStmt()
-		rows := len(s.SelectStmt.GetSelectStmt().GetValuesLists())
-		if rows > 1 && s.WithClause == nil && !hasSubLink(s) {
-			return &Measure{Method: MethodSyntax, Rows: rows}
+		m := &Measure{Method: MethodEstimate, Relation: relation(s.Relation)}
+		if rows := len(s.SelectStmt.GetSelectStmt().GetValuesLists()); rows > 1 && s.WithClause == nil && !hasSubLink(s) {
+			m.Method, m.Rows = MethodSyntax, rows
 		}
+		return m
 	case n.GetUpdateStmt() != nil:
 		s := n.GetUpdateStmt()
+		m := &Measure{Method: MethodEstimate, Relation: relation(s.Relation)}
 		if s.WithClause == nil && len(s.FromClause) == 0 && !hasSubLink(s) {
 			if sql, ok := countSQL(s.Relation, s.WhereClause); ok {
-				return &Measure{Method: MethodCount, CountSQL: sql}
+				m.Method, m.CountSQL = MethodCount, sql
 			}
 		}
+		return m
 	case n.GetDeleteStmt() != nil:
 		s := n.GetDeleteStmt()
+		m := &Measure{Method: MethodEstimate, Relation: relation(s.Relation)}
 		if s.WithClause == nil && len(s.UsingClause) == 0 && !hasSubLink(s) {
 			if sql, ok := countSQL(s.Relation, s.WhereClause); ok {
-				return &Measure{Method: MethodCount, CountSQL: sql}
+				m.Method, m.CountSQL = MethodCount, sql
 			}
 		}
+		return m
 	}
 	return &Measure{Method: MethodEstimate}
 }
@@ -161,6 +168,31 @@ func countSQL(rel *pg.RangeVar, where *pg.Node) (string, bool) {
 	if where != nil && !countable(where) {
 		return "", false
 	}
+	out, err := selectOne(rel, where)
+	return out, err == nil
+}
+
+// relation renders rel as CountSQL names it, but without ONLY or alias:
+// the deparser quotes each part as SQL needs, and schema and catalog stay
+// only if the statement gave them. "" if it does not deparse, which makes
+// the catalog lookups, and so the measurement, fail.
+func relation(rel *pg.RangeVar) string {
+	bare := &pg.RangeVar{
+		Catalogname:    rel.GetCatalogname(),
+		Schemaname:     rel.GetSchemaname(),
+		Relname:        rel.GetRelname(),
+		Inh:            true,
+		Relpersistence: rel.GetRelpersistence(),
+	}
+	out, err := selectOne(bare, nil)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimPrefix(out, "SELECT 1 FROM ")
+}
+
+// selectOne deparses SELECT 1 FROM rel [WHERE where].
+func selectOne(rel *pg.RangeVar, where *pg.Node) (string, error) {
 	sel := &pg.SelectStmt{
 		TargetList:  []*pg.Node{pg.MakeResTargetNodeWithVal(pg.MakeAConstIntNode(1, 0), 0)},
 		FromClause:  []*pg.Node{{Node: &pg.Node_RangeVar{RangeVar: rel}}},
@@ -168,11 +200,10 @@ func countSQL(rel *pg.RangeVar, where *pg.Node) (string, bool) {
 		Op:          pg.SetOperation_SETOP_NONE,
 		LimitOption: pg.LimitOption_LIMIT_OPTION_DEFAULT,
 	}
-	out, err := pg.Deparse(&pg.ParseResult{
+	return pg.Deparse(&pg.ParseResult{
 		Version: treeVersion,
 		Stmts:   []*pg.RawStmt{{Stmt: &pg.Node{Node: &pg.Node_SelectStmt{SelectStmt: sel}}}},
 	})
-	return out, err == nil
 }
 
 // countable reports whether Stet may run where on its own connection: no

@@ -72,7 +72,12 @@ const (
 
 // Measure says how to learn how many rows a multi-row write touches.
 type Measure struct {
-	Method   Method
+	Method Method
+	// Relation is the written table as the statement names it, quoted for
+	// SQL and schema-qualified when the statement qualifies it, without ONLY
+	// or alias: what CountSQL counts, and what catalog lookups must name.
+	// It is not the config key, which may resolve to another table.
+	Relation string
 	CountSQL string // MethodCount: "SELECT 1 FROM <relation> [WHERE ...]", no LIMIT
 	Rows     int    // MethodSyntax: the number of VALUES lists
 }

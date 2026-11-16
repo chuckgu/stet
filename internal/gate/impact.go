@@ -114,8 +114,10 @@ func (g *Gate) queryImpact(ctx context.Context, p *pending, m *sqlparse.Measure,
 		}
 	}
 
-	rows, err := rowsOf(ctx, pg, "select reltuples::bigint from pg_class where oid = $1::regclass",
-		[][]byte{[]byte(p.res.Table)}, nil)
+	// The table as the statement names it, which the count and EXPLAIN also
+	// read. The config key may resolve to another table on this search_path.
+	rel := [][]byte{[]byte(m.Relation)}
+	rows, err := rowsOf(ctx, pg, "select reltuples::bigint from pg_class where oid = $1::regclass", rel, nil)
 	if err != nil {
 		return fmt.Errorf("table rows: %w", err)
 	}
@@ -130,7 +132,7 @@ func (g *Gate) queryImpact(ctx context.Context, p *pending, m *sqlparse.Measure,
 			select c.conrelid::regclass::text, c.confdeltype
 			from pg_constraint c
 			where c.contype = 'f' and c.confrelid = $1::regclass and c.confdeltype in ('c', 'n', 'd')
-			order by 1`, [][]byte{[]byte(p.res.Table)}, nil)
+			order by 1`, rel, nil)
 		if err != nil {
 			return fmt.Errorf("cascades: %w", err)
 		}
