@@ -1,0 +1,682 @@
+package gate_test
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/stetdb/stet/internal/gate"
+	"github.com/stetdb/stet/internal/proxy"
+)
+
+// readsYAML records reads of the table: each one is counted, and one that
+// sends more than 3 rows is also logged by itself.
+const readsYAML = tableYAML + "    reads: {log_above: 3}\n"
+
+// dealsYAML adds a second gated table, <table>_deals, whose reads are not
+// recorded.
+const dealsYAML = readsYAML + `  %[2]s_deals:
+    pk: id
+    send_fields: [contact_id]
+`
+
+// bothReadYAML records reads of the second table too, aggregated only.
+const bothReadYAML = dealsYAML + "    reads: {}\n"
+
+// setupReads is setup over yamlFormat that also removes what the test left
+// in stet.reads and stet.read_log.
+func setupReads(t *testing.T, yamlFormat string) *env {
+	t.Helper()
+	e := setup(t, calm(), yamlFormat)
+	tables := []string{e.table, e.deals()}
+	t.Cleanup(func() {
+		e.gate.Close() // writes what is still in memory, so it is removed below
+		ctx := context.Background()
+		e.admin.Exec(ctx, "delete from stet.reads where target_table = any($1)", tables)
+		e.admin.Exec(ctx, "delete from stet.read_log where target_tables && $1", tables)
+	})
+	return e
+}
+
+// deals is the second gated table of dealsYAML and bothReadYAML.
+func (e *env) deals() string { return e.table + "_deals" }
+
+// seedDeals creates the second table with four deals: two of contact 1, one
+// each of contacts 2 and 6.
+func (e *env) seedDeals(t *testing.T) {
+	t.Helper()
+	mustExec(t, e.admin, "create table "+e.deals()+" (id int primary key, contact_id int)")
+	t.Cleanup(func() { e.admin.Exec(context.Background(), "drop table "+e.deals()) })
+	mustExec(t, e.admin, "insert into "+e.deals()+" values (1, 1), (2, 1), (3, 2), (4, 6)")
+}
+
+type readRow struct {
+	Bucket     time.Time
+	LoginRole  string
+	Statements int64
+	Rows       int64
+	MaxRows    int64
+}
+
+// reads returns the rows of stet.reads for the env's table, oldest first.
+func (e *env) reads(t *testing.T) []readRow {
+	t.Helper()
+	return e.readsOf(t, e.table)
+}
+
+func (e *env) readsOf(t *testing.T, table string) []readRow {
+	t.Helper()
+	rows, err := e.admin.Query(context.Background(), `
+		select bucket, login_role, statements, rows, max_rows from stet.reads
+		where target_table = $1 order by bucket, login_role`, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowToStructByPos[readRow])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+// count is a role's reads summed over minutes, with the largest max_rows.
+type count struct{ Statements, Rows, MaxRows int64 }
+
+func perRole(rows []readRow) map[string]count {
+	out := map[string]count{}
+	for _, r := range rows {
+		c := out[r.LoginRole]
+		c.Statements += r.Statements
+		c.Rows += r.Rows
+		c.MaxRows = max(c.MaxRows, r.MaxRows)
+		out[r.LoginRole] = c
+	}
+	return out
+}
+
+func wantCounts(t *testing.T, rows []readRow, want map[string]count) {
+	t.Helper()
+	if got := perRole(rows); !reflect.DeepEqual(got, want) {
+		t.Errorf("reads per role = %+v, want %+v", got, want)
+	}
+}
+
+type readLogRow struct {
+	CreatedAt   time.Time
+	LoginRole   *string
+	AgentID     string
+	OnBehalfOf  *string
+	SessionID   *string
+	Statement   string
+	StatementFP string
+	Tables      []string
+	Rows        int64
+	ExecError   *string
+}
+
+// readLog returns the rows of stet.read_log that read the env's table,
+// oldest first.
+func (e *env) readLog(t *testing.T) []readLogRow {
+	t.Helper()
+	rows, err := e.admin.Query(context.Background(), `
+		select created_at, login_role, agent_id, on_behalf_of, session_id, statement,
+		       statement_fp, target_tables, rows, exec_error
+		from stet.read_log where $1 = any(target_tables) order by created_at`, e.table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowToStructByPos[readLogRow])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+// wantNoDecisions checks that nothing was recorded in stet.decisions for
+// the env's table. It closes the gate first, so no judgment is in flight.
+func (e *env) wantNoDecisions(t *testing.T) {
+	t.Helper()
+	e.gate.Close()
+	var n int
+	if err := e.admin.QueryRow(context.Background(),
+		"select count(*) from stet.decisions where target_table = $1", e.table).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("%d decisions recorded for reads, want none", n)
+	}
+}
+
+// collect runs sql on conn and returns the rows the client received.
+func collect(t *testing.T, conn *pgx.Conn, sql string, args ...any) [][]any {
+	t.Helper()
+	rows, err := conn.Query(context.Background(), sql, args...)
+	if err != nil {
+		t.Fatalf("%s: %v", sql, err)
+	}
+	got, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) ([]any, error) { return r.Values() })
+	if err != nil {
+		t.Fatalf("%s: %v", sql, err)
+	}
+	return got
+}
+
+// holdPool takes every connection of the env's pool, so anything that
+// needs one waits. release gives them back; it may be called more than once.
+func (e *env) holdPool(t *testing.T) (release func()) {
+	t.Helper()
+	ctx := context.Background()
+	var held []*pgxpool.Conn
+	for range e.pool.Config().MaxConns {
+		c, err := e.pool.Acquire(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, c)
+	}
+	var once sync.Once
+	release = func() {
+		once.Do(func() {
+			for _, c := range held {
+				c.Release()
+			}
+		})
+	}
+	t.Cleanup(release)
+	return release
+}
+
+func TestReadsAreAggregatedPerRoleAndTable(t *testing.T) {
+	e := setupReads(t, readsYAML)
+	e.seedMany(t)
+	mustExec(t, e.admin, "grant select on "+e.table+" to stet_md5")
+	all := "select * from " + e.table + " order by id"
+	direct := collect(t, e.admin, all)
+	if len(direct) != 7 {
+		t.Fatalf("%d rows seeded, want 7", len(direct))
+	}
+
+	scram := e.connect(t, "reader")
+	for range 2 {
+		if got := collect(t, scram, all); !reflect.DeepEqual(got, direct) {
+			t.Errorf("through the proxy %v, want what a direct connection gets: %v", got, direct)
+		}
+	}
+	if got := collect(t, scram, "select * from "+e.table+" where id <= 2"); len(got) != 2 {
+		t.Errorf("%d rows, want 2", len(got))
+	}
+	if got := collect(t, e.connectAs(t, "stet_md5", "md5-pw", "reader"), all); !reflect.DeepEqual(got, direct) {
+		t.Errorf("through the proxy as stet_md5 %v, want %v", got, direct)
+	}
+
+	e.gate.FlushReads()
+	wantCounts(t, e.reads(t), map[string]count{
+		"stet_scram": {Statements: 3, Rows: 16, MaxRows: 7},
+		"stet_md5":   {Statements: 1, Rows: 7, MaxRows: 7},
+	})
+	e.wantNoDecisions(t)
+}
+
+func TestLargeReadsAreLogged(t *testing.T) {
+	e := setupReads(t, readsYAML)
+	e.seedMany(t)
+	conn := e.connect(t, "exporter")
+	mustExec(t, conn, "set stet.on_behalf_of = 'alice'")
+	collect(t, conn, "select * from "+e.table+" where id <= 2")
+	large := "select * from " + e.table
+	before := time.Now()
+	collect(t, conn, large)
+	after := time.Now()
+
+	e.gate.FlushReads()
+	logs := e.readLog(t)
+	if len(logs) != 1 {
+		t.Fatalf("%d large reads logged, want only the 7-row one: %+v", len(logs), logs)
+	}
+	l := logs[0]
+	if l.Statement != large || l.StatementFP == "" || l.Rows != 7 || !reflect.DeepEqual(l.Tables, []string{e.table}) {
+		t.Errorf("logged %q (fp %q) rows %d tables %v, want %q, a fingerprint, 7 rows, [%s]",
+			l.Statement, l.StatementFP, l.Rows, l.Tables, large, e.table)
+	}
+	if deref(l.LoginRole) != "stet_scram" || l.AgentID != "exporter" || deref(l.OnBehalfOf) != "alice" || l.SessionID == nil {
+		t.Errorf("login_role %v agent %q on_behalf_of %v session %v, want stet_scram, exporter, alice and a session",
+			deref(l.LoginRole), l.AgentID, deref(l.OnBehalfOf), deref(l.SessionID))
+	}
+	if l.ExecError != nil {
+		t.Errorf("exec_error = %q, want NULL", *l.ExecError)
+	}
+	// When the statement arrived, not when the line was written.
+	if l.CreatedAt.Before(before.Add(-time.Millisecond)) || l.CreatedAt.After(after) {
+		t.Errorf("created_at %v, want between %v and %v", l.CreatedAt, before, after)
+	}
+	e.wantNoDecisions(t)
+}
+
+func TestReadsWithoutTheBlockAreNotSeen(t *testing.T) {
+	e := setupReads(t, tableYAML)
+	e.seedMany(t)
+	if st := e.gate.Inspect("select * from " + e.table); st.Observe {
+		t.Error("a read of a table without reads is marked to be observed")
+	}
+	collect(t, e.connect(t, "reader"), "select * from "+e.table)
+	e.gate.FlushReads()
+	if rows := e.reads(t); len(rows) != 0 {
+		t.Errorf("stet.reads has %+v, want nothing", rows)
+	}
+	e.wantNoDecisions(t)
+}
+
+func TestReadOfTwoTablesCountsOnlyTheOneTurnedOn(t *testing.T) {
+	e := setupReads(t, dealsYAML)
+	e.seedMany(t)
+	e.seedDeals(t)
+	if st := e.gate.Inspect("select * from " + e.deals()); st.Observe {
+		t.Error("a read of the table without reads is marked to be observed")
+	}
+	join := "select c.id, d.id from " + e.table + " c join " + e.deals() + " d on d.contact_id = c.id"
+	if got := collect(t, e.connect(t, "reader"), join); len(got) != 4 {
+		t.Fatalf("%d rows, want 4", len(got))
+	}
+
+	e.gate.FlushReads()
+	wantCounts(t, e.reads(t), map[string]count{"stet_scram": {Statements: 1, Rows: 4, MaxRows: 4}})
+	if rows := e.readsOf(t, e.deals()); len(rows) != 0 {
+		t.Errorf("reads of %s counted: %+v", e.deals(), rows)
+	}
+	logs := e.readLog(t)
+	if len(logs) != 1 || !reflect.DeepEqual(logs[0].Tables, []string{e.table}) {
+		t.Errorf("read_log = %+v, want one line naming only %s", logs, e.table)
+	}
+}
+
+// A statement that reads two recorded tables counts its rows for each, and
+// is logged once, naming both, when it passes either table's log_above.
+func TestReadOfTwoRecordedTablesCountsForEach(t *testing.T) {
+	e := setupReads(t, bothReadYAML)
+	e.seedMany(t)
+	e.seedDeals(t)
+	join := "select c.id, d.id from " + e.table + " c join " + e.deals() + " d on d.contact_id = c.id"
+	if got := collect(t, e.connect(t, "reader"), join); len(got) != 4 {
+		t.Fatalf("%d rows, want 4", len(got))
+	}
+
+	e.gate.FlushReads()
+	want := map[string]count{"stet_scram": {Statements: 1, Rows: 4, MaxRows: 4}}
+	wantCounts(t, e.reads(t), want)
+	wantCounts(t, e.readsOf(t, e.deals()), want)
+	logs := e.readLog(t)
+	if len(logs) != 1 || !reflect.DeepEqual(logs[0].Tables, []string{e.table, e.deals()}) || logs[0].Rows != 4 {
+		t.Errorf("read_log = %+v, want one 4-row line naming [%s %s]", logs, e.table, e.deals())
+	}
+}
+
+func TestFailedReadCountsTheRowsItSent(t *testing.T) {
+	e := setupReads(t, readsYAML)
+	e.seedMany(t)
+	conn := e.connect(t, "reader")
+	// The subquery fixes the order, so ids 1 to 4 go out before id 5
+	// divides by zero.
+	rows, err := conn.Query(context.Background(),
+		"select id, 1 / (id - 5) from (select id from "+e.table+" order by id offset 0) s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	received := 0
+	for rows.Next() {
+		received++
+	}
+	if code := sqlstate(rows.Err()); code != "22012" || received != 4 {
+		t.Fatalf("received %d rows, then SQLSTATE %q; want 4, then 22012", received, code)
+	}
+
+	e.gate.FlushReads()
+	wantCounts(t, e.reads(t), map[string]count{"stet_scram": {Statements: 1, Rows: 4, MaxRows: 4}})
+	logs := e.readLog(t)
+	if len(logs) != 1 || logs[0].Rows != 4 || logs[0].ExecError == nil || !strings.Contains(*logs[0].ExecError, "22012") {
+		t.Errorf("read_log = %+v, want one 4-row line whose exec_error names 22012", logs)
+	}
+}
+
+func TestEmptyReadCountsTheStatement(t *testing.T) {
+	e := setupReads(t, readsYAML)
+	e.seedMany(t)
+	if got := collect(t, e.connect(t, "reader"), "select * from "+e.table+" where id < 0"); len(got) != 0 {
+		t.Fatalf("%d rows, want 0", len(got))
+	}
+	e.gate.FlushReads()
+	wantCounts(t, e.reads(t), map[string]count{"stet_scram": {Statements: 1, Rows: 0, MaxRows: 0}})
+	if logs := e.readLog(t); len(logs) != 0 {
+		t.Errorf("read_log = %+v, want nothing", logs)
+	}
+}
+
+func TestCursorReadsAreCounted(t *testing.T) {
+	e := setupReads(t, readsYAML)
+	e.seedMany(t)
+	conn := e.connect(t, "cursor-reader")
+	declare := "declare c cursor for select * from " + e.table
+	mustExec(t, conn, "begin")
+	mustExec(t, conn, declare)
+	first := collect(t, conn, "fetch 5 from c")
+	second := collect(t, conn, "fetch 5 from c")
+	mustExec(t, conn, "commit")
+	if len(first) != 5 || len(second) != 2 {
+		t.Fatalf("fetched %d and %d rows, want 5 and 2", len(first), len(second))
+	}
+
+	e.gate.FlushReads()
+	wantCounts(t, e.reads(t), map[string]count{"stet_scram": {Statements: 2, Rows: 7, MaxRows: 5}})
+	logs := e.readLog(t)
+	if len(logs) != 1 || logs[0].Statement != declare || logs[0].Rows != 5 || !reflect.DeepEqual(logs[0].Tables, []string{e.table}) {
+		t.Errorf("read_log = %+v, want one 5-row line holding %q", logs, declare)
+	}
+}
+
+// DISCARD ALL closes held cursors too, so a FETCH after it is not a read.
+func TestDiscardAllForgetsHeldCursors(t *testing.T) {
+	e := setupReads(t, readsYAML)
+	e.seedMany(t)
+	conn := e.connect(t, "pooled")
+	mustExec(t, conn, "begin")
+	mustExec(t, conn, "declare c cursor with hold for select * from "+e.table)
+	mustExec(t, conn, "commit")
+	if got := collect(t, conn, "fetch 2 from c", pgx.QueryExecModeSimpleProtocol); len(got) != 2 {
+		t.Fatalf("fetched %d rows, want 2", len(got))
+	}
+	mustExec(t, conn, "discard all")
+	rows, err := conn.Query(context.Background(), "fetch 2 from c", pgx.QueryExecModeSimpleProtocol)
+	if err == nil {
+		for rows.Next() {
+		}
+		err = rows.Err()
+	}
+	if code := sqlstate(err); code != "34000" {
+		t.Fatalf("FETCH after DISCARD ALL: SQLSTATE %q, want 34000", code)
+	}
+
+	e.gate.FlushReads()
+	wantCounts(t, e.reads(t), map[string]count{"stet_scram": {Statements: 1, Rows: 2, MaxRows: 2}})
+}
+
+// A session whose startup packet the proxy cannot read has no login role;
+// its reads are counted under the empty role "". Its large reads leave
+// login_role NULL, as stet.decisions does.
+func TestReadsWithoutALoginRoleUseAnEmptyRole(t *testing.T) {
+	e := setupReads(t, readsYAML)
+	e.seedMany(t)
+	mustExec(t, e.admin, "grant select on "+e.table+" to stet_trust")
+	if code := e.rawSimpleQuery(t, 3<<16|1, "stet_trust", "select * from "+e.table); code != "" {
+		t.Fatalf("the read failed with SQLSTATE %s", code)
+	}
+
+	e.gate.FlushReads()
+	wantCounts(t, e.reads(t), map[string]count{"": {Statements: 1, Rows: 7, MaxRows: 7}})
+	logs := e.readLog(t)
+	if len(logs) != 1 || logs[0].LoginRole != nil {
+		t.Errorf("read_log = %+v, want one line with login_role NULL", logs)
+	}
+}
+
+func TestSameMinuteIsSummedAcrossFlushes(t *testing.T) {
+	e := setupReads(t, readsYAML)
+	e.seedMany(t)
+	conn := e.connect(t, "reader")
+	all := "select * from " + e.table
+	before := time.Now()
+	collect(t, conn, all)
+	e.gate.FlushReads()
+	collect(t, conn, all)
+	after := time.Now()
+	e.gate.FlushReads()
+
+	rows := e.reads(t)
+	wantCounts(t, rows, map[string]count{"stet_scram": {Statements: 2, Rows: 14, MaxRows: 7}})
+	if len(rows) > 2 {
+		t.Errorf("%d rows, want at most one per minute: %+v", len(rows), rows)
+	}
+	if before.Truncate(time.Minute).Equal(after.Truncate(time.Minute)) && len(rows) != 1 {
+		t.Errorf("both reads arrived in one minute, but stet.reads has %d rows: %+v", len(rows), rows)
+	}
+}
+
+func TestCloseWritesWhatIsStillInMemory(t *testing.T) {
+	e := setupReads(t, readsYAML)
+	e.seedMany(t)
+	collect(t, e.connect(t, "reader"), "select * from "+e.table)
+	e.gate.Close()
+	wantCounts(t, e.reads(t), map[string]count{"stet_scram": {Statements: 1, Rows: 7, MaxRows: 7}})
+	if logs := e.readLog(t); len(logs) != 1 {
+		t.Errorf("read_log = %+v, want the large read", logs)
+	}
+}
+
+func TestWritesAreNotCountedAsReads(t *testing.T) {
+	e := setupReads(t, readsYAML)
+	e.seedMany(t)
+	conn := e.connect(t, "writer")
+	mustExec(t, conn, "insert into "+e.table+" (id, name) select id + 100, name from "+e.table)
+	if got := collect(t, conn, "update "+e.table+" set title = 'x' where company_id = 9 returning *"); len(got) != 2 {
+		t.Fatalf("%d rows returned, want 2", len(got))
+	}
+	e.gate.FlushReads()
+	if rows := e.reads(t); len(rows) != 0 {
+		t.Errorf("stet.reads has %+v, want nothing for writes", rows)
+	}
+}
+
+// Reads are counted in memory: with every pooled connection taken, a read,
+// a large one included, does not wait.
+func TestReadsDoNotTouchTheDatabaseBeforeTheStatement(t *testing.T) {
+	e := setupReads(t, readsYAML)
+	e.seedMany(t)
+	conn := e.connect(t, "reader")
+	release := e.holdPool(t)
+	start := time.Now()
+	for range 2 {
+		if got := collect(t, conn, "select * from "+e.table); len(got) != 7 {
+			t.Fatalf("%d rows, want 7", len(got))
+		}
+	}
+	elapsed := time.Since(start)
+	release()
+	if elapsed >= 500*time.Millisecond {
+		t.Errorf("two reads took %v with the pool taken, want under 500ms", elapsed)
+	}
+	e.gate.FlushReads()
+	wantCounts(t, e.reads(t), map[string]count{"stet_scram": {Statements: 2, Rows: 14, MaxRows: 7}})
+	if logs := e.readLog(t); len(logs) != 2 {
+		t.Errorf("%d large reads logged, want 2", len(logs))
+	}
+}
+
+// A read whose connection ended before the server answered still counts the
+// rows that went out.
+func TestLostReadCountsTheRowsItSent(t *testing.T) {
+	e := setupReads(t, readsYAML)
+	e.seedMany(t)
+	conn := e.connect(t, "dropped")
+	// Rows far larger than Postgres's send buffer go out as they are made;
+	// the fifth waits a second, and the client hangs up before then.
+	rows, err := conn.Query(context.Background(), "select s.id, repeat('x', 100000), "+
+		"pg_sleep(case when s.id = 5 then 1 else 0 end)::text from (select id from "+e.table+" order by id offset 0) s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rows.Next() {
+		t.Fatalf("no row arrived: %v", rows.Err())
+	}
+	conn.PgConn().Conn().Close()
+
+	// The proxy reports the read once it sees the connection end.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		e.gate.FlushReads()
+		if c := perRole(e.reads(t))["stet_scram"]; c.Statements > 0 {
+			if c.Statements != 1 || c.Rows < 1 {
+				t.Errorf("counted %+v, want one statement with the rows sent", c)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the lost read was never counted")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// The minute comes from when the statement arrived, so a long read lands in
+// the minute it began; created_at is that time too.
+func TestReadsAreBucketedByWhenTheyArrived(t *testing.T) {
+	e := setupReads(t, readsYAML)
+	st := e.gate.Inspect("select * from " + e.table)
+	if !st.Observe {
+		t.Fatal("a read of a table with reads is not marked to be observed")
+	}
+	arrived := time.Now().Add(-5 * time.Minute)
+	e.gate.Observe(proxy.SessionInfo{ID: "s1", User: "slow_role", ApplicationName: "slow"}, st,
+		proxy.Outcome{Executed: true, Sent: 9, Arrived: arrived})
+
+	e.gate.FlushReads()
+	rows := e.reads(t)
+	if len(rows) != 1 || !rows[0].Bucket.Equal(arrived.Truncate(time.Minute)) || rows[0].LoginRole != "slow_role" {
+		t.Errorf("stet.reads = %+v, want one slow_role row in the minute of %v", rows, arrived)
+	}
+	logs := e.readLog(t)
+	if len(logs) != 1 || logs[0].CreatedAt.Sub(arrived).Abs() > time.Microsecond {
+		t.Errorf("read_log = %+v, want one line created at %v", logs, arrived)
+	}
+}
+
+// Every minute the gate writes the minutes that have passed, also one that
+// shows up after a later minute was written (a long read).
+func TestPastMinutesAreWrittenAsTheyAppear(t *testing.T) {
+	defer gate.SetReadFlushInterval(20 * time.Millisecond)()
+	e := setupReads(t, readsYAML)
+	st := e.gate.Inspect("select * from " + e.table)
+	observe := func(ago time.Duration) {
+		e.gate.Observe(proxy.SessionInfo{User: "r"}, st, proxy.Outcome{Executed: true, Sent: 1, Arrived: time.Now().Add(-ago)})
+	}
+	waitFor := func(n int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for len(e.reads(t)) < n {
+			if time.Now().After(deadline) {
+				t.Fatalf("stet.reads has %+v, want %d rows", e.reads(t), n)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	observe(5 * time.Minute)
+	waitFor(1)
+	observe(10 * time.Minute)
+	waitFor(2)
+
+	now := time.Now()
+	observe(0)
+	time.Sleep(200 * time.Millisecond)
+	if rows := e.reads(t); len(rows) != 2 && now.Truncate(time.Minute).Equal(time.Now().Truncate(time.Minute)) {
+		t.Errorf("stet.reads = %+v: the current minute was written before it ended", rows)
+	}
+}
+
+func TestUnwrittenReadsAreWrittenLater(t *testing.T) {
+	e := setupReads(t, readsYAML)
+	gate.FailReadWrites(e.gate, 1)
+	st := e.gate.Inspect("select * from " + e.table)
+	observe := func() {
+		e.gate.Observe(proxy.SessionInfo{User: "r"}, st, proxy.Outcome{Executed: true, Sent: 2, Arrived: time.Now()})
+	}
+	observe()
+	e.gate.FlushReads() // fails
+	if rows := e.reads(t); len(rows) != 0 {
+		t.Fatalf("stet.reads = %+v after a failed write", rows)
+	}
+	observe()
+	e.gate.FlushReads()
+	wantCounts(t, e.reads(t), map[string]count{"r": {Statements: 2, Rows: 4, MaxRows: 2}})
+}
+
+func TestReadsUnwrittenForAnHourAreDropped(t *testing.T) {
+	e := setupReads(t, readsYAML)
+	var logs lockedBuffer
+	gate.SetLogger(e.gate, slog.New(slog.NewTextHandler(&logs, nil)))
+	var mu sync.Mutex
+	clock := time.Now()
+	gate.SetReadClock(e.gate, func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return clock
+	})
+	advance := func(d time.Duration) {
+		mu.Lock()
+		clock = clock.Add(d)
+		mu.Unlock()
+	}
+	gate.FailReadWrites(e.gate, 3)
+	st := e.gate.Inspect("select * from " + e.table)
+	for _, role := range []string{"a", "b"} {
+		e.gate.Observe(proxy.SessionInfo{User: role}, st, proxy.Outcome{Executed: true, Sent: 1, Arrived: time.Now()})
+	}
+
+	e.gate.FlushReads() // fails: kept
+	advance(59 * time.Minute)
+	e.gate.FlushReads() // fails: kept, not yet an hour
+	if strings.Contains(logs.String(), "dropped") {
+		t.Fatalf("reads dropped before an hour passed:\n%s", logs.String())
+	}
+	advance(2 * time.Minute)
+	e.gate.FlushReads() // fails: dropped
+	e.gate.FlushReads() // succeeds, with nothing left to write
+
+	if rows := e.reads(t); len(rows) != 0 {
+		t.Errorf("stet.reads = %+v, want the dropped buckets gone", rows)
+	}
+	var dropped []string
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(line, "dropped") {
+			dropped = append(dropped, line)
+		}
+	}
+	if len(dropped) != 1 || !strings.Contains(dropped[0], "buckets=2") {
+		t.Errorf("want one line dropping 2 buckets, got:\n%s", logs.String())
+	}
+}
+
+// Observe never waits for the store: with every pooled connection taken it
+// still returns at once, and large reads past what the queue holds are
+// dropped and counted.
+func TestObserveDoesNotWaitForASlowStore(t *testing.T) {
+	e := setupReads(t, readsYAML)
+	var logs lockedBuffer
+	gate.SetLogger(e.gate, slog.New(slog.NewTextHandler(&logs, nil)))
+	st := e.gate.Inspect("select * from " + e.table)
+	release := e.holdPool(t)
+	const n = 5000
+	start := time.Now()
+	for range n {
+		e.gate.Observe(proxy.SessionInfo{User: "bulk"}, st, proxy.Outcome{Executed: true, Sent: 10, Arrived: time.Now()})
+	}
+	elapsed := time.Since(start)
+	release()
+	if elapsed >= 500*time.Millisecond {
+		t.Errorf("%d reads took %v to observe with the pool taken, want under 500ms", n, elapsed)
+	}
+
+	e.gate.FlushReads()
+	wantCounts(t, e.reads(t), map[string]count{"bulk": {Statements: n, Rows: 10 * n, MaxRows: 10}})
+	logged := len(e.readLog(t))
+	if logged == 0 || logged == n {
+		t.Fatalf("%d of %d large reads logged, want some dropped", logged, n)
+	}
+	if want := fmt.Sprintf("count=%d", n-logged); !strings.Contains(logs.String(), want) {
+		t.Errorf("want a line counting %d dropped large reads, got:\n%s", n-logged, logs.String())
+	}
+}

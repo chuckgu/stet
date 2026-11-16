@@ -52,6 +52,7 @@ type Gate struct {
 	log     *slog.Logger
 	recent  *recentLog
 	usage   *usage
+	reads   *readStats // nil when no table records reads
 	sem     chan struct{}
 	wg      sync.WaitGroup
 
@@ -77,6 +78,7 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, d decide.Decid
 		usage:   newUsage(st.Usage),
 		sem:     make(chan struct{}, maxModelCalls),
 	}
+	readsOn := map[string]int{}
 	for key, t := range cfg.Tables {
 		g.tables[key] = t.PK
 		if t.CandidateSQL != "" {
@@ -85,23 +87,52 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, d decide.Decid
 		if t.ContextSQL != "" {
 			g.ctxs[key] = compile(t.ContextSQL)
 		}
+		if t.Reads != nil {
+			readsOn[key] = t.Reads.LogAbove
+		}
+	}
+	if g.reads = newReadStats(readsOn, st.AddReads); g.reads != nil {
+		go g.record(readFlushEvery)
 	}
 	return g, nil
 }
 
-// Close waits for decisions still being judged. Close the proxy first so
-// no new writes arrive.
+// Close writes the reads still held in memory and waits for decisions still
+// being judged. Close the proxy first so no new statements arrive.
 func (g *Gate) Close() {
+	g.closeReads()
 	g.wg.Wait()
 }
 
+// Inspect marks gated writes to be watched, and reads of tables that record
+// reads to be observed. A cursor statement always carries its cursor, so the
+// proxy can follow the names a DECLARE it observes binds.
 func (g *Gate) Inspect(sql string) proxy.Statement {
 	r, err := sqlparse.Classify(sql, g.tables)
 	if err != nil {
 		// Postgres will reject it too; nothing to judge.
 		return proxy.Statement{SQL: sql}
 	}
-	return proxy.Statement{SQL: sql, Watch: r.Kind == sqlparse.Gated || r.Kind == sqlparse.Measured || r.Kind == sqlparse.Unsupported, OnBehalfOf: r.OnBehalfOf, Data: r}
+	st := proxy.Statement{SQL: sql, Watch: r.Kind == sqlparse.Gated || r.Kind == sqlparse.Measured || r.Kind == sqlparse.Unsupported, OnBehalfOf: r.OnBehalfOf}
+	if r.Kind == sqlparse.Read {
+		// Narrowed to the tables that record reads: Observe counts these.
+		r.Reads = g.recorded(r.Reads)
+		st.Observe = len(r.Reads) > 0
+	}
+	if c := r.Cursor; c != nil {
+		if op, ok := cursorOps[c.Op]; ok {
+			st.Cursor = &proxy.Cursor{Op: op, Name: c.Name, Hold: c.Hold}
+		}
+	}
+	st.Data = r
+	return st
+}
+
+var cursorOps = map[sqlparse.CursorOp]proxy.CursorOp{
+	sqlparse.CursorDeclare:  proxy.CursorDeclare,
+	sqlparse.CursorFetch:    proxy.CursorFetch,
+	sqlparse.CursorClose:    proxy.CursorClose,
+	sqlparse.CursorCloseAll: proxy.CursorCloseAll,
 }
 
 // pending is one watched write between Begin and its recorded decision.
@@ -229,9 +260,6 @@ func (g *Gate) End(h any, o proxy.Outcome) {
 		g.judge(p, o)
 	}()
 }
-
-// Observe is told about reads the proxy observed. Inspect marks none yet.
-func (g *Gate) Observe(proxy.SessionInfo, proxy.Statement, proxy.Outcome) {}
 
 // judge decides what enforce mode would have done and records it.
 func (g *Gate) judge(p *pending, o proxy.Outcome) {
