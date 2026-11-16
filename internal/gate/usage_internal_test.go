@@ -358,8 +358,10 @@ func TestUsageMergesLoadedAndReservedSeconds(t *testing.T) {
 // The merge runs under the lock every pair shares, so it must be one pass:
 // a full day of loaded seconds against an hour of reserved ones, reserved
 // through a run of failed loads. One pass takes under a millisecond (about
-// 5ms with -race); one insert per loaded second took over 100ms. The fastest
-// of three trials is timed, so a busy machine does not fail the test.
+// 5ms with -race); one insert per loaded second took over 100ms (1.8s with
+// -race). The merge alone is timed, the fastest of three trials, against
+// 30ms, so a busy machine does not fail the test and the old merge still
+// does.
 func TestUsageMergesALoadInOnePass(t *testing.T) {
 	defer func(d time.Duration) { usageRetry = d }(usageRetry)
 	const window = 24 * time.Hour
@@ -378,19 +380,35 @@ func TestUsageMergesALoadInOnePass(t *testing.T) {
 		for i := range reserved {
 			u.reserve(context.Background(), "agent", "t", fmt.Sprint(i), at(time.Duration(i)*time.Second), 1, window)
 		}
+
+		// The merge alone is timed: the load's handoff to the write that
+		// waits for it is scheduling, which an oversubscribed -race run can
+		// stretch past any bound (final fix brief, item 7).
+		u.mu.Lock()
+		p := u.pairs[usageKey{"agent", "t"}]
+		start := time.Now()
+		p.merge(secs)
+		fastest = min(fastest, time.Since(start))
+		total := p.total
+		u.mu.Unlock()
+		if want := int64(len(secs) + reserved); total != want {
+			t.Errorf("total %d after the merge, want %d", total, want)
+		}
+
+		// And a load merged as a write waits for it counts every row once.
 		f.answer(secs, nil)
 		usageRetry = 0
-
-		start := time.Now()
-		used := mustReserve(t, u, "last", last, 1, window)
-		fastest = min(fastest, time.Since(start))
-		if want := int64(len(secs) + reserved); used != want {
+		u2 := testUsage(t, f, usageBase)
+		for i := range reserved {
+			u2.reserve(context.Background(), "agent", "t", fmt.Sprint(i), at(time.Duration(i)*time.Second), 1, window)
+		}
+		if used, want := mustReserve(t, u2, "last", last, 1, window), int64(len(secs)+reserved); used != want {
 			t.Errorf("used %d, want %d", used, want)
 		}
 	}
 	t.Logf("merged %d loaded seconds into %d reserved in %v", len(secs), reserved, fastest)
-	if fastest > 10*time.Millisecond {
-		t.Errorf("merging %d loaded seconds into %d reserved took %v, want well under 10ms", len(secs), reserved, fastest)
+	if fastest > 30*time.Millisecond {
+		t.Errorf("merging %d loaded seconds into %d reserved took %v, want well under 30ms", len(secs), reserved, fastest)
 	}
 }
 

@@ -440,6 +440,31 @@ func TestNamesThatAServerEncodingMayCompareOtherwiseAreRefused(t *testing.T) {
 			} else if m, _ := body2(t, r).(*pgproto3.Parse); m == nil || refuses && !ascii(m.Name) {
 				t.Errorf("a DO block's Parse under %q replaced by %q, want one under an ASCII name", "s"+e, r)
 			}
+
+			// A session that does not enforce does not follow server_encoding
+			// (its taps are not shown ParameterStatus), so only its s.enforce
+			// guards keep it from refusing every name that is not ASCII: it
+			// forwards each of these, and tells the gate of none.
+			sg := byNameGate{newStmtGate()}
+			shadow := newSession(sg, SessionInfo{})
+			serve(shadow, setting("client_encoding", "UTF8"), setting("standard_conforming_strings", "on"), setting("server_encoding", server), ready)
+			send(shadow, parseMsg("s1", "select 1"), bindMsg("p", "s1"), syncMsg)
+			serve(shadow, parseOK, bindOK, ready)
+			for _, m := range []pgproto3.FrontendMessage{
+				parseMsg("s"+e, "select 1"), parseMsg("s2", "execute s"+e), queryMsg("execute s" + e),
+				queryMsg("fetch p" + e), bindMsg("", "s"+e), bindMsg("p"+e, "s1"), execMsg("p" + e),
+			} {
+				if r := sendOne(shadow, m); r != nil {
+					t.Errorf("shadow: %T %+v replaced by %q, want it forwarded", m, m, r)
+				}
+				if _, query := m.(*pgproto3.Query); !query {
+					send(shadow, syncMsg)
+				}
+				serve(shadow, ready)
+			}
+			if len(sg.blocked) != 0 || len(sg.would) != 0 {
+				t.Errorf("shadow: Blocked for %q, WouldBlock for %q; want neither", sg.blocked, sg.would)
+			}
 		})
 	}
 }
