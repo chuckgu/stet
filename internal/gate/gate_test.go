@@ -869,7 +869,7 @@ func TestInspectMarksWhatDefinesCode(t *testing.T) {
 
 // COPY ... FROM STDIN is marked, whatever the table, for the proxy to refuse
 // in a Parse on enforced sessions (copy_extended); a COPY into a gated table
-// is still a watched write, unsupported, for the simple protocol.
+// is still a watched write, which the proxy leaves to Begin (unsupported).
 func TestInspectMarksCopyFromStdin(t *testing.T) {
 	e := setup(t, calm())
 	for sql, want := range map[string]bool{

@@ -744,6 +744,35 @@ func TestEnforcedSessionAsksToLogAReasonOnce(t *testing.T) {
 	}
 }
 
+// copyGate marks SQL holding "from stdin" as a COPY FROM STDIN, and watches
+// it when it names the table "gated".
+type copyGate struct{ *fakeGate }
+
+func (g copyGate) Inspect(sql string) Statement {
+	return Statement{SQL: sql, CopyIn: strings.Contains(sql, "from stdin"), Watch: strings.Contains(sql, "gated")}
+}
+
+// An enforced session refuses the Parse of a COPY FROM STDIN as
+// copy_extended, but not one into a gated table: that stays a watched write,
+// which Begin judges at its Execute. A Query of either goes to the server.
+func TestOnlyAnUnwatchedCopyIsRefusedInItsParse(t *testing.T) {
+	g := copyGate{newFakeGate()}
+	s := enforcedSession(g)
+	if r := sendOne(s, parseMsg("", "copy other from stdin")); r == nil || !slices.Equal(g.blocked, []string{BlockCopyExtended}) {
+		t.Errorf("Parse of a COPY into another table: replaced %v, Blocked for %q; want refused as copy_extended", r != nil, g.blocked)
+	}
+	send(s, syncMsg)
+	serve(s, syntaxError(), ready)
+	g.blocked = nil
+	send(s, parseMsg("", "copy gated from stdin"), bindMsg("", ""))
+	if r := sendOne(s, execMsg("")); r != nil || len(g.blocked) != 0 || g.n != 1 {
+		t.Errorf("COPY into the gated table: replaced %v, Blocked for %q, %d begun; want it begun at its Execute", r != nil, g.blocked, g.n)
+	}
+	if r := sendOne(s, queryMsg("copy other from stdin")); r != nil {
+		t.Errorf("a Query of COPY FROM STDIN was replaced by %q", r)
+	}
+}
+
 // A refused closed point did not run: it leaves the statement and portal
 // tables, on_behalf_of and the cursor table as they were, also when the
 // proxy could not read it.

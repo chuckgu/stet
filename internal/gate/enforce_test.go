@@ -1469,7 +1469,9 @@ func TestClosedPointsAreLoggedOncePerSessionAndReason(t *testing.T) {
 
 // An agent's COPY FROM STDIN through the extended protocol is refused in its
 // Parse with an ordinary ST002, and the session goes on; through the simple
-// protocol, into a table that is not gated, it runs.
+// protocol, into a table that is not gated, it runs. A COPY into the gated
+// table stays what it was: a watched write the gate finds unsupported, here
+// refused at its Execute, with its decision.
 func TestEnforceRefusesAnExtendedCopyFromStdin(t *testing.T) {
 	e := setupEnforce(t, calm())
 	ctx := context.Background()
@@ -1480,6 +1482,11 @@ func TestEnforceRefusesAnExtendedCopyFromStdin(t *testing.T) {
 	if pgErr := wantRefused(t, err, "ST002", ""); pgErr.Message != decide.Blocked(proxy.BlockCopyExtended).Message {
 		t.Errorf("message %q, want %q", pgErr.Message, decide.Blocked(proxy.BlockCopyExtended).Message)
 	}
+	err = conn.PgConn().ExecParams(ctx, "copy "+e.table+" from stdin", nil, nil, nil, nil).Read().Err
+	wantRefused(t, err, "ST002", "write refused by stet: COPY into "+e.table+" cannot be judged")
+	r := e.enforced(t, 1)[0]
+	wantEnforced(t, 0, r, "unsupported", "copy")
+	wantRefusedRecord(t, 0, r, "ST002")
 	tag, err := conn.PgConn().CopyFrom(ctx, strings.NewReader("1\n2\n"), "copy copied from stdin")
 	if err != nil || tag.RowsAffected() != 2 {
 		t.Errorf("simple-protocol COPY: %v, %v; want 2 rows", tag, err)
@@ -1488,7 +1495,9 @@ func TestEnforceRefusesAnExtendedCopyFromStdin(t *testing.T) {
 	if err := conn.QueryRow(ctx, "select count(*) from copied").Scan(&n); err != nil || n != 2 {
 		t.Errorf("%d rows copied (%v), want 2", n, err)
 	}
-	e.wantNoDecisions(t)
+	if rs := e.enforced(t, 1); len(rs) != 1 {
+		t.Errorf("%d decisions, want the gated COPY's alone", len(rs))
+	}
 }
 
 // A SQL PREPARE of a gated write would let each EXECUTE of it, and each

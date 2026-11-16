@@ -114,8 +114,9 @@ type Statement struct {
 	Block string
 	// CopyIn marks SQL holding COPY ... FROM STDIN. The server ignores the
 	// Sync after such a copy sent through the extended protocol, so an
-	// enforced session refuses it in a Parse (BlockCopyExtended); a Query
-	// may hold it.
+	// enforced session refuses it in a Parse (BlockCopyExtended), unless it
+	// is a watched write, which Begin judges (see copyFromStdin); a Query may hold
+	// it.
 	CopyIn bool
 	// Executes and Portals name what the SQL runs by name, as the server
 	// compares names: prepared statements it runs with EXECUTE, and portals
@@ -585,7 +586,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 				s.wouldBlock(unreadable(body))
 			case p.st.Block != "":
 				s.wouldBlock(p.st.Block)
-			case p.st.CopyIn:
+			case copyFromStdin(p.st):
 				s.wouldBlock(BlockCopyExtended)
 			}
 		}
@@ -593,7 +594,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		u, pos := s.count()
 		misread := read && s.enforce && s.misread(m.Query)
 		foreign := read && s.enforce && (s.foreign(m.Name) || s.foreignNames(p.st))
-		if s.enforce && (!read || misread || p.st.Block != "" || p.st.CopyIn || foreign) {
+		if s.enforce && (!read || misread || p.st.Block != "" || copyFromStdin(p.st) || foreign) {
 			s.mu.Unlock()
 			// The table is left as it was. The server keeps a named
 			// statement it holds when the replacement fails, as for any
@@ -618,7 +619,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 				return s.block(u, pos, 'P', name, BlockSessionSetting), nil
 			case p.st.Block != "":
 				return s.block(u, pos, 'P', name, p.st.Block), nil
-			case p.st.CopyIn:
+			case copyFromStdin(p.st):
 				// The server would ignore the Sync during the copy, and its
 				// answers would no longer match the units (spec correction
 				// B6 ②); refused here it is an ordinary error.
@@ -771,6 +772,14 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 	}
 	return nil, nil
 }
+
+// copyFromStdin reports whether a Parse of st is refused as copy_extended on
+// an enforced session: its SQL holds COPY ... FROM STDIN, and it is not a
+// watched write. A COPY into a gated table stays the watched write it was:
+// Begin judges it at its Execute (unsupported), and refuses it under the
+// table's unsupported: reject; one let through ends the session when the
+// copy starts (session.copyIn), as one the classifier did not see does.
+func copyFromStdin(st Statement) bool { return st.CopyIn && !st.Watch }
 
 // unreadable is why a message whose body is body could not be inspected: nil
 // is a body past maxInspect, which was not read; any other could not be
