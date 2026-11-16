@@ -41,9 +41,15 @@ func (s *session) ended() []byte {
 // ignores leaves a unit the server never answers, so the session is ended
 // when one of those messages arrives in that stretch (protocol_order), and
 // it is not forwarded. A Flush is let through: the units follow it either
-// way. A message the client sends after a Query before CopyDone or CopyFail,
-// which only matters if the Query turns out to start a copy, marks that
-// Query (stray) for copyIn, since the server may not have answered it yet.
+// way.
+//
+// A Query may hold several copies, each ended by the client's next CopyDone
+// or CopyFail, so the server splits what the client sends after the Query at
+// each of them: what comes after the n-th is read during copy n+1, if the
+// Query starts one. Until the client sends something else after the Query,
+// its CopyDones and CopyFails are counted on it (copyEnds); that message
+// marks the Query stray at that count, for copyIn, since the server may not
+// have started the copy that will read it yet.
 func (s *session) admit(t byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -53,8 +59,7 @@ func (s *session) admit(t byte) error {
 	switch t {
 	case 'c', 'f': // CopyDone, CopyFail
 		if s.lastQuery != nil {
-			s.lastQuery.copyEnded = true
-			s.lastQuery = nil
+			s.lastQuery.copyEnds++ // the Query may start another copy
 		}
 		s.copying = nil
 	case 'H':
@@ -62,8 +67,8 @@ func (s *session) admit(t byte) error {
 		if s.copying != nil {
 			return s.endWith(BlockProtocolOrder)
 		}
-		if s.lastQuery != nil {
-			s.lastQuery.stray = true
+		if q := s.lastQuery; q != nil {
+			q.stray, q.strayAt = true, q.copyEnds
 			s.lastQuery = nil
 		}
 	}
@@ -73,17 +78,21 @@ func (s *session) admit(t byte) error {
 // copyIn follows a CopyInResponse or CopyBothResponse from the server of an
 // enforced session, answering head (see admit). The server ignores a Sync
 // during an extended-protocol copy, so that ends the session at once
-// (copy_extended), as does a Query copy behind which the client already sent
-// a message the server will read during the copy (protocol_order). It runs
-// on the server side with s.mu held.
+// (copy_extended), as does a Query copy that will read a message the client
+// already sent other than copy messages (protocol_order). A copy the client
+// has not ended yet is in progress. It runs on the server side with s.mu
+// held.
 func (s *session) copyIn(head *unit) error {
+	if head == nil {
+		return nil
+	}
+	head.copies++
 	switch {
-	case head == nil:
 	case !head.query:
 		return s.endWith(BlockCopyExtended)
-	case head.stray:
+	case head.stray && head.copies > head.strayAt:
 		return s.endWith(BlockProtocolOrder)
-	case !head.copyEnded:
+	case head.copies > head.copyEnds:
 		s.copying = head
 	}
 	return nil

@@ -275,6 +275,15 @@ func TestCopyRuleHoldsOnlyDuringTheCopy(t *testing.T) {
 			msgs2(copyIn, serverErr("22P02"), ready), syncMsg, ""},
 		{"an extended-protocol copy", msgs(parseMsg("", "copy"), bindMsg("", ""), execMsg(""), syncMsg),
 			msgs2(parseOK, bindOK, copyIn), nil, BlockCopyExtended},
+		// A Query of two copies: the client's first CopyDone ends the first.
+		{"a Sync during a second copy", msgs(queryMsg("copy; copy")),
+			msgs2(copyIn), nil, BlockProtocolOrder},
+		{"a Sync between the copies, before the second starts", msgs(queryMsg("copy; copy")),
+			msgs2(copyIn), nil, BlockProtocolOrder},
+		{"both CopyDones before either copy starts", msgs(queryMsg("copy; copy"), copyDone, copyDone),
+			msgs2(copyIn, tag("COPY 0"), copyIn), syncMsg, ""},
+		{"CopyDone, Query, then a second copy", msgs(queryMsg("copy; copy"), copyDone, queryMsg("select 1")),
+			msgs2(copyIn, tag("COPY 0"), copyIn), nil, BlockProtocolOrder},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			s := enforcedSession(newFakeGate())
@@ -297,6 +306,15 @@ func TestCopyRuleHoldsOnlyDuringTheCopy(t *testing.T) {
 			if err == nil && c.name == "a Sync after CopyDone" {
 				send(s, copyDone)
 				_, err = s.fromClient('S', nil, func() error { return nil })
+			}
+			if err == nil && c.name == "a Sync during a second copy" {
+				send(s, copyDone)
+				serve(s, tag("COPY 0"), copyIn)
+				_, err = s.fromClient('S', nil, func() error { return nil })
+			}
+			if err == nil && c.name == "a Sync between the copies, before the second starts" {
+				send(s, copyDone, syncMsg)
+				_, err = s.serverTap().see('G', body(copyIn), nil)
 			}
 			if c.ends == "" && err != nil || c.ends != "" && !errors.Is(err, errEnded) || s.end != c.ends {
 				t.Errorf("%v, ending for %q; want ending for %q", err, s.end, c.ends)

@@ -179,8 +179,9 @@ type session struct {
 	// reported client_encoding UTF8 and standard_conforming_strings on (see
 	// readable). end: why the proxy is ending the session, "" while it is
 	// not (see endWith). lastQuery: the newest Query unit, until the client
-	// sends anything but a Flush after it; copying: the Query unit whose COPY
-	// FROM STDIN the client has not ended yet (see admit, copyIn).
+	// sends anything after it but a Flush, CopyDone or CopyFail; copying: the
+	// Query unit whose current COPY FROM STDIN the client has not ended yet
+	// (see admit, copyIn).
 	utf8, standard     bool
 	end                string
 	lastQuery, copying *unit
@@ -235,20 +236,24 @@ type unit struct {
 	// of the unit, so the server may read it after that Execute changed a
 	// setting (see sentAfter).
 	late bool
-	// Of a Query unit on an enforced session (see admit): stray, a message
-	// other than a Flush came after it before a CopyDone or CopyFail;
-	// copyEnded, a CopyDone or CopyFail came after it first.
-	stray, copyEnded bool
-	query            bool
-	dirty            bool // it holds a statement that is not clean (see Statement.Clean)
-	executes         int  // Execute messages so far
-	completions      int  // CommandComplete, EmptyQueryResponse, PortalSuspended
-	err              string
-	errAt            int // the Execute the error belongs to (1-based)
-	writes           []watchedWrite
-	reads            []observedRead
-	rows             map[int]int64 // row counts by completion (1-based); kept only once a watched write or observed read joined
-	sent             map[int]int64 // row messages sent by Execute (1-based), or 0 for a Query; kept only once an observed read joined
+	// Of a Query unit on an enforced session (see admit, copyIn): copies,
+	// the CopyInResponses (or CopyBothResponses) the server answered it with
+	// so far; copyEnds, the CopyDones and CopyFails the client sent after it;
+	// stray, a message other than those and Flush came after it, when
+	// copyEnds was strayAt: the server reads it during copy strayAt+1, if the
+	// Query starts that many copies.
+	stray                     bool
+	copies, copyEnds, strayAt int
+	query                     bool
+	dirty                     bool // it holds a statement that is not clean (see Statement.Clean)
+	executes                  int  // Execute messages so far
+	completions               int  // CommandComplete, EmptyQueryResponse, PortalSuspended
+	err                       string
+	errAt                     int // the Execute the error belongs to (1-based)
+	writes                    []watchedWrite
+	reads                     []observedRead
+	rows                      map[int]int64 // row counts by completion (1-based); kept only once a watched write or observed read joined
+	sent                      map[int]int64 // row messages sent by Execute (1-based), or 0 for a Query; kept only once an observed read joined
 
 	// The server answers each Parse, Bind, Describe, Close and Execute it
 	// completes with one message: ParseComplete, BindComplete, RowDescription

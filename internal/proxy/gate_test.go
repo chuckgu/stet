@@ -2965,3 +2965,157 @@ func TestSyncDuringCopyEndsTheSession(t *testing.T) {
 		wantReplies(t, fe, "C Z")
 	})
 }
+
+// readyOrEnd reads up to the next ReadyForQuery, or until the connection
+// ends; it returns the replies (as replies writes them, a FATAL left out)
+// and the FATAL that ended the connection, nil when it was not ended.
+func readyOrEnd(t *testing.T, fe *pgproto3.Frontend) (string, *pgproto3.ErrorResponse) {
+	t.Helper()
+	var got []string
+	var fatal *pgproto3.ErrorResponse
+	for {
+		msg, err := fe.Receive()
+		if err != nil {
+			if fatal == nil {
+				t.Fatalf("the connection ended without a FATAL after %q: %v", got, err)
+			}
+			return strings.Join(got, " "), fatal
+		}
+		switch m := msg.(type) {
+		case *pgproto3.ErrorResponse:
+			if m.Severity == "FATAL" {
+				c := *m
+				fatal = &c
+				continue
+			}
+			got = append(got, "E:"+m.Code)
+		default:
+			b, _ := msg.Encode(nil)
+			got = append(got, string(b[0]))
+		}
+		if _, ok := msg.(*pgproto3.ReadyForQuery); ok && fatal == nil {
+			return strings.Join(got, " "), nil
+		}
+	}
+}
+
+// wantFatal fails the test unless fatal is the proxy's FATAL ST002 for reason.
+func wantFatal(t *testing.T, fatal *pgproto3.ErrorResponse, reason string) {
+	t.Helper()
+	if fatal == nil || fatal.Code != "ST002" || fatal.SeverityUnlocalized != "FATAL" || fatal.Message != "blocked "+reason {
+		t.Errorf("the session ended with %+v, want a FATAL ST002 blocked %s", fatal, reason)
+	}
+}
+
+// A Query of two COPY FROM STDIN statements starts its second copy after the
+// client's first CopyDone. The server ignores a Sync during the second copy
+// as during the first, so an enforced session is ended there. Were it kept,
+// the proxy's units would lag behind the server's answers, and a watched
+// write sent later would run unjudged.
+func TestSyncDuringASecondCopyEndsTheSession(t *testing.T) {
+	table := watchedTable(t)
+	mustExec(t, connect(t, upstream(t), "stet_scram", nil), "grant insert on "+table+" to stet_trust")
+	g := closedPointGate(watches(table))
+	addr, _ := startProxyWith(t, upstream(t), g, proxy.Policy{Enforce: true})
+	fe, pid := rawSessionWith(t, addr, "stet_trust", nil)
+	sendAll(t, fe, &pgproto3.Query{String: "create temp table copied (i int)"})
+	wantReplies(t, fe, "C Z")
+	data := &pgproto3.CopyData{Data: []byte("1\n")}
+
+	sendAll(t, fe, &pgproto3.Query{String: "copy copied from stdin; copy copied from stdin"})
+	if got := nextReplies(t, fe, 1); got != "G" {
+		t.Fatalf("replies %q, want G", got)
+	}
+	sendAll(t, fe, data, &pgproto3.CopyDone{})
+	if got := nextReplies(t, fe, 2); got != "C G" {
+		t.Fatalf("replies %q, want C G", got)
+	}
+	sendAll(t, fe, &pgproto3.Sync{}, data, &pgproto3.CopyDone{})
+	got, fatal := readyOrEnd(t, fe)
+	if fatal == nil {
+		// Kept: follow the probe to what that costs.
+		sendAll(t, fe, &pgproto3.Parse{Name: "s1", Query: "insert into " + table + " values (1, 'x')"}, &pgproto3.Sync{})
+		replies(t, fe)
+		sendAll(t, fe, &pgproto3.Sync{})
+		replies(t, fe)
+		sendAll(t, fe, &pgproto3.Bind{PreparedStatement: "s1"}, &pgproto3.Execute{}, &pgproto3.Sync{})
+		replies(t, fe)
+		t.Fatalf("the session was kept (replies %q); a watched write sent after it began %d times and inserted %d rows",
+			got, g.beginCount(), rowCount(t, table))
+	}
+	if got != "" {
+		t.Errorf("before the end the client got %q, want nothing", got)
+	}
+	wantFatal(t, fatal, proxy.BlockProtocolOrder)
+	waitForBackendGone(t, pid)
+	g.wantBlocked(t, "stet_trust", proxy.BlockProtocolOrder)
+}
+
+// A Sync sent after the first CopyDone, before the second copy starts, is
+// read by the server during the second copy and ignored: the session ends
+// when that copy starts.
+func TestSyncBeforeASecondCopyEndsTheSession(t *testing.T) {
+	g := closedPointGate(isWrite)
+	addr, _ := startProxyWith(t, upstream(t), g, proxy.Policy{Enforce: true})
+	fe, pid := rawSessionWith(t, addr, "stet_trust", nil)
+	sendAll(t, fe, &pgproto3.Query{String: "create temp table copied (i int)"})
+	wantReplies(t, fe, "C Z")
+
+	sendAll(t, fe, &pgproto3.Query{String: "copy copied from stdin; copy copied from stdin"})
+	if got := nextReplies(t, fe, 1); got != "G" {
+		t.Fatalf("replies %q, want G", got)
+	}
+	sendAll(t, fe, &pgproto3.CopyData{Data: []byte("1\n")}, &pgproto3.CopyDone{}, &pgproto3.Sync{})
+	got, fatal := readyOrEnd(t, fe)
+	// The proxy reads the Sync long before the second CopyInResponse
+	// arrives; were it the other way round, that G would reach the client.
+	if got != "C" && got != "C G" {
+		t.Errorf("before the end the client got %q, want C", got)
+	}
+	wantFatal(t, fatal, proxy.BlockProtocolOrder)
+	waitForBackendGone(t, pid)
+	g.wantBlocked(t, "stet_trust", proxy.BlockProtocolOrder)
+}
+
+// Two COPY FROM STDIN statements in one Query, each ended by its own
+// CopyDone with nothing else sent during either copy, run on an enforced
+// session, whether the copy data waits for each CopyInResponse or not; the
+// session goes on, and a watched write after it is judged.
+func TestTwoCopiesInOneQueryKeepTheSession(t *testing.T) {
+	table := watchedTable(t)
+	mustExec(t, connect(t, upstream(t), "stet_scram", nil), "grant insert on "+table+" to stet_trust")
+	g := closedPointGate(watches(table))
+	addr, _ := startProxyWith(t, upstream(t), g, proxy.Policy{Enforce: true})
+	fe, _ := rawSessionWith(t, addr, "stet_trust", nil)
+	sendAll(t, fe, &pgproto3.Query{String: "create temp table copied (i int)"})
+	wantReplies(t, fe, "C Z")
+	twoCopies := &pgproto3.Query{String: "copy copied from stdin; copy copied from stdin"}
+	data := &pgproto3.CopyData{Data: []byte("1\n")}
+
+	sendAll(t, fe, twoCopies)
+	if got := nextReplies(t, fe, 1); got != "G" {
+		t.Fatalf("replies %q, want G", got)
+	}
+	sendAll(t, fe, data, &pgproto3.CopyDone{})
+	if got := nextReplies(t, fe, 2); got != "C G" {
+		t.Fatalf("replies %q, want C G", got)
+	}
+	sendAll(t, fe, data, &pgproto3.CopyDone{})
+	wantReplies(t, fe, "C Z")
+
+	sendAll(t, fe, twoCopies, data, &pgproto3.CopyDone{}, data, &pgproto3.CopyDone{})
+	wantReplies(t, fe, "G C G C Z")
+
+	sendAll(t, fe, &pgproto3.Query{String: "select count(*) from copied"})
+	wantReplies(t, fe, "T D C Z")
+	sendAll(t, fe, &pgproto3.Parse{Name: "s1", Query: "insert into " + table + " values (1, 'x')"},
+		&pgproto3.Bind{PreparedStatement: "s1"}, &pgproto3.Execute{}, &pgproto3.Sync{})
+	wantReplies(t, fe, "1 2 C Z")
+	if n := g.beginCount(); n != 1 {
+		t.Errorf("%d writes begun, want the insert judged", n)
+	}
+	if n := rowCount(t, table); n != 1 {
+		t.Errorf("%d rows, want 1", n)
+	}
+	g.wantBlocked(t, "stet_trust")
+}
