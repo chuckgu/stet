@@ -173,13 +173,16 @@ func countSQL(rel *pg.RangeVar, where *pg.Node) (string, bool) {
 }
 
 // countable reports whether Stet may run where on its own connection: no
-// WHERE CURRENT OF, every function call on countFuncs, and no
+// WHERE CURRENT OF, no query, every function call on countFuncs, and no
 // schema-qualified operator (OPERATOR(schema.op)).
+//
+// A query can sit outside a SubLink, where hasSubLink does not see it:
+// JSON_ARRAY(SELECT ...) holds a bare SelectStmt. Any SelectStmt refuses.
 func countable(where *pg.Node) bool {
 	ok := true
 	walk(where, func(msg proto.Message) bool {
 		switch e := msg.(type) {
-		case *pg.CurrentOfExpr:
+		case *pg.CurrentOfExpr, *pg.SelectStmt:
 			ok = false
 		case *pg.FuncCall:
 			ok = countFunc(e.Funcname)

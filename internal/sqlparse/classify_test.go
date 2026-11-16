@@ -117,6 +117,11 @@ func TestClassifyMeasured(t *testing.T) {
 			Measure{Method: MethodEstimate}},
 		{"where current of", "update contacts set title = 'x' where current of c", "not_single_row",
 			Measure{Method: MethodEstimate}},
+		// JSON_ARRAY(query) holds a bare SelectStmt, not a SubLink.
+		{"query outside a sublink", "delete from contacts where json_array(select 1) is not null", "not_single_row",
+			Measure{Method: MethodEstimate}},
+		{"query reading another table outside a sublink", "delete from contacts where json_array(select email from secrets) is not null", "not_single_row",
+			Measure{Method: MethodEstimate}},
 		{"join", "update contacts set title = l.title from leads l where contacts.company_id = l.id", "join",
 			Measure{Method: MethodEstimate}},
 		{"subquery", "update contacts set title = 'x' where company_id in (select id from companies)", "subquery",
