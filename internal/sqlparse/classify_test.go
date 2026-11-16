@@ -758,6 +758,49 @@ func TestClassifyRunsByName(t *testing.T) {
 	}
 }
 
+// A statement that defines code, or a view over a gated table, makes a way
+// to write that table that no later statement shows (ruling 29): a function
+// or procedure, a rule, a trigger, or a view whose query reads a gated table.
+// A view over other tables does not. CREATE SCHEMA's elements count, and so
+// does any statement of several.
+func TestClassifyDefinesCode(t *testing.T) {
+	for sql, want := range map[string]bool{
+		"create function f() returns void language sql as 'update contacts set title = ''x'''":       true,
+		"create or replace function pg_temp.f() returns int language sql as 'select 1'":              true,
+		"create function f() returns int begin atomic select 1; end":                                 true,
+		"create procedure p() language sql as 'delete from contacts'":                                true,
+		"create rule r as on insert to log do instead insert into contacts (name) values (new.name)": true,
+		"create or replace rule r as on update to log do instead nothing":                            true,
+		"create trigger t before insert on log for each row execute function f()":                    true,
+		"create or replace trigger t before update on log for each row execute function f()":         true,
+		"create constraint trigger t after insert on log for each row execute function f()":          true,
+		"create temp view v as select * from contacts":                                               true,
+		"create or replace temporary view v as select id from public.contacts where id > 3":          true,
+		"create view v as select * from leads where id in (select id from contacts)":                 true,
+		"create view v as select l.* from leads l join contacts c on c.id = l.id":                    true,
+		"create schema s create view v as select * from contacts":                                    true,
+		"select 1; create function f() returns int language sql as 'select 1'":                       true,
+
+		"create view v as select * from leads":                                              false,
+		"create view v as with contacts as (select 1) select * from contacts":               false,
+		"create recursive view v (n) as select 1 union all select n + 1 from v where n < 3": false,
+		"create materialized view m as select * from contacts":                              false,
+		"create schema s create table x (i int)":                                            false,
+		"create table x (i int)":                                                            false,
+		"do $$ begin end $$":                                                                false,
+		"select * from contacts":                                                            false,
+		"update contacts set title = 'x' where id = 1":                                      false,
+	} {
+		r, err := Classify(sql, gated)
+		if err != nil {
+			t.Fatalf("%q: %v", sql, err)
+		}
+		if r.DefinesCode != want {
+			t.Errorf("%q: DefinesCode = %v, want %v", sql, r.DefinesCode, want)
+		}
+	}
+}
+
 // Postgres reads t.f as column f of t or, when t has none, as the call f(t).
 // The count runs the WHERE clause, so it lists such names for the gate to
 // look up; no other method runs it.

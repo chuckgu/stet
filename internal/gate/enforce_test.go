@@ -1340,6 +1340,74 @@ func TestEnforceClosedPointsAnswerThroughTheGate(t *testing.T) {
 	e.wantNoDecisions(t)
 }
 
+// An agent that may create objects (TEMPORARY on the database and CREATE on
+// schema public are PUBLIC's by default on the test server, PostgreSQL 14)
+// could otherwise write a gated table through a view or a function it
+// creates, with no decision (ruling 29). An enforced session refuses the
+// statement that defines it, as a closed point; a view over a table that is
+// not gated is made. The shadow proxy lets both probes run as before.
+func TestStatementsThatDefineCodeAreRefused(t *testing.T) {
+	for _, mode := range []string{"enforce", "shadow"} {
+		t.Run(mode, func(t *testing.T) {
+			format := enforceYAML
+			if mode == "shadow" {
+				format = "agents: {roles: [stet_md5]}\n" + tableYAML
+			}
+			e := setupEnforce(t, calm(), format)
+			e.seed(t)
+			ctx := context.Background()
+			conn := e.agent(t, mode)
+			fn := fmt.Sprintf("public.rv_g_%d", time.Now().UnixNano())
+			t.Cleanup(func() { superuser(t).Exec(context.Background(), "drop function if exists "+fn+"()") })
+			defines := []string{
+				"create temp view rv_v as select * from " + e.table,
+				"create function pg_temp.rv_f() returns void language sql as 'update " + e.table + " set title = ''f'''",
+				"create function " + fn + "() returns void language sql as 'update " + e.table + " set title = ''g'''",
+			}
+			uses := []string{"update rv_v set title = 'v'", "select pg_temp.rv_f()", "select " + fn + "()"}
+			want := decide.Blocked(proxy.BlockDefinesCode).Message
+			for i, sql := range defines {
+				_, err := conn.Exec(ctx, sql)
+				if mode == "shadow" {
+					if err != nil {
+						t.Fatalf("shadow: %s: %v", sql, err)
+					}
+					mustExec(t, conn, uses[i])
+					continue
+				}
+				if pgErr := wantRefused(t, err, "ST002", ""); pgErr.Message != want {
+					t.Errorf("%s: message %q, want %q", sql, pgErr.Message, want)
+				}
+				// The server's own answer: no such view, function, or (before
+				// any temporary object) schema pg_temp.
+				_, err = conn.Exec(ctx, uses[i])
+				if code := sqlstate(err); code != "42P01" && code != "42883" && code != "3F000" {
+					t.Errorf("%s after the refusal: %v, want the server's: it does not exist", uses[i], err)
+				}
+			}
+			// One Query, as psql -c sends it, and a Parse.
+			_, err := conn.Exec(ctx, "create temp view rv_w as select * from "+e.table+"; update rv_w set title = 'w'")
+			_, perr := conn.PgConn().Prepare(ctx, "", defines[1], nil)
+			if mode == "enforce" {
+				wantRefused(t, err, "ST002", want)
+				wantRefused(t, perr, "ST002", want)
+			} else if err != nil || perr != nil {
+				t.Errorf("shadow: %v, %v", err, perr)
+			}
+
+			mustExec(t, conn, "create temp table rv_other (i int)")
+			mustExec(t, conn, "create temp view rv_ok as select * from rv_other")
+			mustExec(t, conn, "insert into rv_ok values (1)")
+
+			written := e.rowsWhere(t, "title in ('v', 'f', 'g', 'w')")
+			if want := map[string]int{"enforce": 0, "shadow": 2}[mode]; written != want {
+				t.Errorf("%d rows written through what the agent defined, want %d", written, want)
+			}
+			e.wantNoDecisions(t)
+		})
+	}
+}
+
 // churnDecider says a write breaks policy rule 1 when it sets status to
 // churned, and answers every other question calmly.
 type churnDecider struct{}

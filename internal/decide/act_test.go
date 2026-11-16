@@ -426,6 +426,8 @@ func TestBlocked(t *testing.T) {
 			"call the function with SELECT"},
 		{"do_block", "DO block refused by stet: what it writes cannot be seen",
 			"send its statements one by one"},
+		{"defines_code", "statement refused by stet: it defines a function, rule, trigger or view through which writes to a watched table could not be seen",
+			"ask an operator to create it, or send the writes as plain statements"},
 		{"prepared_write", "statement refused by stet: it runs a prepared write by name, which cannot be judged",
 			"run the write with Bind and Execute, or send it as SQL"},
 		{"unsettled_name", "statement refused by stet: the name it runs was changed by a message the server has not answered yet",

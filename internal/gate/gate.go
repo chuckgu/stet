@@ -141,8 +141,10 @@ func (g *Gate) Close() {
 // reads to be observed. A cursor statement always carries its cursor, so the
 // proxy can follow the names a DECLARE it observes binds.
 //
-// SQL the classifier cannot read, and SQL holding a DO block, whose writes
-// cannot be seen, are marked with Block whatever the mode: the proxy refuses
+// SQL the classifier cannot read, SQL holding a DO block, whose writes cannot
+// be seen, and SQL that defines a function, procedure, rule or trigger, or a
+// view over a gated table, through which later writes could not be seen
+// (ruling 29), are marked with Block whatever the mode: the proxy refuses
 // them on enforced sessions only. The names SQL runs (EXECUTE, FETCH, MOVE)
 // are passed on for the proxy to look up in the session's tables.
 func (g *Gate) Inspect(sql string) proxy.Statement {
@@ -153,8 +155,11 @@ func (g *Gate) Inspect(sql string) proxy.Statement {
 		return proxy.Statement{SQL: sql, Block: proxy.BlockUnparsed}
 	}
 	st := proxy.Statement{SQL: sql, Watch: r.Kind == sqlparse.Gated || r.Kind == sqlparse.Measured || r.Kind == sqlparse.Unsupported, OnBehalfOf: r.OnBehalfOf, Clean: r.Clean}
-	if r.Do {
+	switch {
+	case r.Do:
 		st.Block = proxy.BlockDo
+	case r.DefinesCode:
+		st.Block = proxy.BlockDefinesCode
 	}
 	if r.Kind == sqlparse.Read {
 		st.Observe = g.recordsAny(r.Reads)
@@ -172,8 +177,9 @@ func (g *Gate) Inspect(sql string) proxy.Statement {
 
 // Blocked answers what the proxy refuses on a watched session without
 // asking the gate to judge it, and logs it. That is a message it refuses: a
-// closed point of spec 7 (SQL the classifier cannot read, a DO block, a
-// message too large to read, a FunctionCall), a statement that runs a
+// closed point of spec 7 (SQL the classifier cannot read, a DO block, SQL
+// that defines code or a view over a gated table, a message too large to
+// read, a FunctionCall), a statement that runs a
 // watched write by name or a name whose meaning is not settled, a
 // statement the server may read otherwise than the classifier under the
 // session's settings, or a name it may compare otherwise under its

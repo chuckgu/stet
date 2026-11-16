@@ -35,10 +35,14 @@ type Gate interface {
 
 // Reasons a message is refused without a decision, or the session is ended.
 const (
-	BlockUnparsed      = "unparsed"
-	BlockTooLarge      = "too_large"
-	BlockFunctionCall  = "function_call"
-	BlockDo            = "do_block"
+	BlockUnparsed     = "unparsed"
+	BlockTooLarge     = "too_large"
+	BlockFunctionCall = "function_call"
+	BlockDo           = "do_block"
+	// BlockDefinesCode: the SQL defines a function, procedure, rule or
+	// trigger, or a view over a gated table, through which writes to a
+	// watched table could not be seen (ruling 29).
+	BlockDefinesCode   = "defines_code"
 	BlockPreparedWrite = "prepared_write" // SQL EXECUTE, FETCH or MOVE of a name the session prepared or bound as a watched statement
 	BlockUnsettledName = "unsettled_name" // the name may mean a watched statement, and the server has not said which meaning holds
 	BlockProtocolOrder = "protocol_order" // the session is ended: answers can no longer be matched to messages

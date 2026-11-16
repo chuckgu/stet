@@ -7,6 +7,7 @@
 package sqlparse
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 
@@ -143,10 +144,14 @@ type Result struct {
 	// "" means reset.
 	OnBehalfOf *string
 
-	Clean    bool     // every statement is BEGIN, START TRANSACTION, SET or SHOW; true for SQL with no statement
-	Do       bool     // some statement is a DO block
-	Executes []string // prepared statements run by SQL EXECUTE, wherever it sits (EXPLAIN EXECUTE, CREATE TABLE AS EXECUTE), in order
-	Portals  []string // portals read by FETCH or MOVE, in order
+	Clean bool // every statement is BEGIN, START TRANSACTION, SET or SHOW; true for SQL with no statement
+	Do    bool // some statement is a DO block
+	// DefinesCode: some statement defines a function, procedure, rule or
+	// trigger, or a view whose query reads a gated table (see definesCode):
+	// writes through it would reach a gated table unseen.
+	DefinesCode bool
+	Executes    []string // prepared statements run by SQL EXECUTE, wherever it sits (EXPLAIN EXECUTE, CREATE TABLE AS EXECUTE), in order
+	Portals     []string // portals read by FETCH or MOVE, in order
 }
 
 const onBehalfOfSetting = "stet.on_behalf_of"
@@ -185,6 +190,7 @@ func Classify(sql string, tables Tables) (Result, error) {
 		portals  []string
 		clean    = true
 		do       bool
+		defines  bool
 	)
 	for _, raw := range tree.Stmts {
 		if w, ok := firstGatedWrite(raw.Stmt, m); ok {
@@ -205,6 +211,7 @@ func Classify(sql string, tables Tables) (Result, error) {
 		executes = appendExecutes(executes, raw.Stmt)
 		clean = clean && leavesClean(raw.Stmt)
 		do = do || raw.Stmt.GetDoStmt() != nil
+		defines = defines || definesCode(raw.Stmt, m)
 	}
 
 	var r Result
@@ -228,7 +235,30 @@ func Classify(sql string, tables Tables) (Result, error) {
 	r.Table, r.Op = target.table, target.op // empty when nothing gated is written
 	r.OnBehalfOf, r.Cursors, r.Statements = obo, cursors, len(tree.Stmts)
 	r.Clean, r.Do, r.Executes, r.Portals = clean, do, executes, portals
+	r.DefinesCode = defines
 	return r, nil
+}
+
+// definesCode reports whether n, a top-level statement, defines code or an
+// alias through which a write to a gated table would pass where no statement
+// shows it (ruling 29): CREATE [OR REPLACE] FUNCTION or PROCEDURE, CREATE [OR
+// REPLACE] RULE, CREATE [OR REPLACE] [CONSTRAINT] TRIGGER, or CREATE [OR
+// REPLACE] [TEMP] [RECURSIVE] VIEW whose query reads a gated table (an
+// updatable view writes its table). The elements of CREATE SCHEMA are
+// top-level statements too; no other statement can hold these, so nothing
+// else is walked.
+func definesCode(n *pg.Node, m matchFunc) bool {
+	switch s := n.Node.(type) {
+	case *pg.Node_CreateFunctionStmt, *pg.Node_RuleStmt, *pg.Node_CreateTrigStmt:
+		return true
+	case *pg.Node_ViewStmt:
+		r := reader{m: m}
+		r.visit(s.ViewStmt.Query, nil, false)
+		return len(r.tables) > 0
+	case *pg.Node_CreateSchemaStmt:
+		return slices.ContainsFunc(s.CreateSchemaStmt.SchemaElts, func(e *pg.Node) bool { return definesCode(e, m) })
+	}
+	return false
 }
 
 // leavesClean reports whether n leaves a transaction clean: it is BEGIN,

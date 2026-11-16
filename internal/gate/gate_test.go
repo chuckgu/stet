@@ -846,6 +846,27 @@ func TestInspectMarksWhatCannotBeInspected(t *testing.T) {
 	}
 }
 
+// What defines code, or a view over a gated table, is marked whatever the
+// mode (ruling 29); a DO block keeps its own reason. A view over another
+// table is not marked.
+func TestInspectMarksWhatDefinesCode(t *testing.T) {
+	e := setup(t, calm())
+	for sql, want := range map[string]string{
+		"create temp view v as select * from " + e.table:                    proxy.BlockDefinesCode,
+		"create function f() returns int language sql as 'select 1'":        proxy.BlockDefinesCode,
+		"create procedure p() language sql as 'select 1'":                   proxy.BlockDefinesCode,
+		"create rule r as on insert to v do instead nothing":                proxy.BlockDefinesCode,
+		"create trigger tr before insert on v execute function f()":         proxy.BlockDefinesCode,
+		"select 1; create view v as select * from " + e.table:               proxy.BlockDefinesCode,
+		"do $$ begin end $$; create function f() returns int as 'select 1'": proxy.BlockDo,
+		"create view v as select * from pg_class":                           "",
+	} {
+		if got := e.gate.Inspect(sql).Block; got != want {
+			t.Errorf("Inspect(%q).Block = %q, want %q", sql, got, want)
+		}
+	}
+}
+
 // A session the proxy ends gets decide.Blocked's error too, and its warning
 // says the session was ended; a refused message's says it was refused.
 func TestBlockedSaysWhatItEnded(t *testing.T) {
