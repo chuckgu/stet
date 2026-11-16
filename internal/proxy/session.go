@@ -45,10 +45,23 @@ const (
 	BlockCopyExtended  = "copy_extended"  // the session is ended: COPY FROM STDIN through the extended protocol
 	// BlockSessionSetting: the session's client_encoding or
 	// standard_conforming_strings makes the server read statements otherwise
-	// than the classifier (see readable); the session is ended when that
-	// happened under statements already sent.
+	// than the classifier (see readable).
 	BlockSessionSetting = "session_setting"
+	// BlockSettingChanged: the session is ended: one of those settings
+	// changed to such a value while statements read under the old one were
+	// already sent (see parameter).
+	BlockSettingChanged = "setting_changed"
 )
+
+// EndsSession reports whether reason is one the proxy ends the session for,
+// rather than refusing one message.
+func EndsSession(reason string) bool {
+	switch reason {
+	case BlockProtocolOrder, BlockCopyExtended, BlockSettingChanged:
+		return true
+	}
+	return false
+}
 
 type Statement struct {
 	SQL   string

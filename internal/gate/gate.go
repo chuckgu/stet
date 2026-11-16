@@ -150,14 +150,24 @@ func (g *Gate) Inspect(sql string) proxy.Statement {
 	return st
 }
 
-// Blocked answers a message the proxy refuses on a watched session because it
-// cannot be inspected (spec 7): SQL the classifier cannot read, a DO block, a
-// message too large to read, a FunctionCall. No decision records it, since
-// no table can be named for it, so it is logged: the session and the reason,
-// never the statement, which may hold data.
+// Blocked answers what the proxy refuses on a watched session without
+// asking the gate to judge it, and logs it. That is a message it refuses: a
+// closed point of spec 7 (SQL the classifier cannot read, a DO block, a
+// message too large to read, a FunctionCall), a statement that runs a
+// watched write by name or a name whose meaning is not settled, or a
+// statement the server may read otherwise than the classifier under the
+// session's settings. Or it is a session the proxy ends (proxy.EndsSession),
+// whose client gets the answer as a FATAL: a COPY or a change of setting
+// after which the server's answers no longer match what the proxy follows.
+// No decision records either, so the log line names the session and the
+// reason, never the statement, which may hold data.
 func (g *Gate) Blocked(s proxy.SessionInfo, reason string) proxy.Refusal {
 	a := decide.Blocked(reason)
-	g.log.Warn("message refused without a decision", "reason", reason,
+	msg := "message refused without a decision"
+	if proxy.EndsSession(reason) {
+		msg = "session ended without a decision"
+	}
+	g.log.Warn(msg, "reason", reason,
 		"session", s.ID, "login_role", s.User, "database", s.Database, "agent", s.ApplicationName)
 	return proxy.Refusal{Code: a.Code, Message: a.Message, Hint: a.Hint("")}
 }

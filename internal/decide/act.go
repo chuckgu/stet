@@ -149,7 +149,8 @@ func Blocked(reason string) Action {
 // phrase is the sentence after the message's prefix, and the hint.
 type phrase struct{ msg, hint string }
 
-// blocked are the closed points of spec 7; their messages are whole.
+// blocked are the closed points of spec 7, and the reasons the proxy ends a
+// session; their messages are whole.
 var blocked = map[string]phrase{
 	"unparsed": {"statement refused by stet: it could not be parsed, so it cannot be checked",
 		"send standard PostgreSQL syntax, up to version 17"},
@@ -169,6 +170,8 @@ var blocked = map[string]phrase{
 		"send COPY ... FROM STDIN as a simple query"},
 	"session_setting": {"statement refused by stet: this session's client_encoding or standard_conforming_strings makes its statements unreadable to stet",
 		"use client_encoding UTF8 and standard_conforming_strings on"},
+	"setting_changed": {"connection closed by stet: client_encoding or standard_conforming_strings changed to a value stet cannot read while later statements were already sent",
+		"keep client_encoding UTF8 and standard_conforming_strings on, and change them only when nothing else waits for an answer"},
 }
 
 // fixed are the reasons whose sentence needs no fact.

@@ -209,8 +209,8 @@ func TestSettingChangedAheadOfSentStatementsEndsTheSession(t *testing.T) {
 				t.Errorf("session ended %v, want %v", ended, c.ends)
 			}
 			if want := []string(nil); c.ends {
-				if !slices.Equal(g.blocked, []string{BlockSessionSetting}) {
-					t.Errorf("Blocked for %q, want session_setting", g.blocked)
+				if !slices.Equal(g.blocked, []string{BlockSettingChanged}) {
+					t.Errorf("Blocked for %q, want setting_changed", g.blocked)
 				}
 			} else if !slices.Equal(g.blocked, want) {
 				t.Errorf("Blocked for %q, want never", g.blocked)
@@ -366,8 +366,8 @@ func TestSettingReportedWhileAMessageIsInspected(t *testing.T) {
 			if r := sendOne(s, c.m); r == nil {
 				t.Error("forwarded, want it refused")
 			}
-			if (s.end != "") != c.ends {
-				t.Errorf("session ending for %q, want ended %v", s.end, c.ends)
+			if want := map[bool]string{true: BlockSettingChanged}[c.ends]; s.end != want {
+				t.Errorf("session ending for %q, want %q", s.end, want)
 			}
 			if len(g.blocked) == 0 || g.blocked[0] != BlockSessionSetting {
 				t.Errorf("Blocked for %q, want session_setting first", g.blocked)

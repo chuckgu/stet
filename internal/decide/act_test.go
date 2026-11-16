@@ -436,6 +436,8 @@ func TestBlocked(t *testing.T) {
 			"send COPY ... FROM STDIN as a simple query"},
 		{"session_setting", "statement refused by stet: this session's client_encoding or standard_conforming_strings makes its statements unreadable to stet",
 			"use client_encoding UTF8 and standard_conforming_strings on"},
+		{"setting_changed", "connection closed by stet: client_encoding or standard_conforming_strings changed to a value stet cannot read while later statements were already sent",
+			"keep client_encoding UTF8 and standard_conforming_strings on, and change them only when nothing else waits for an answer"},
 		{"something_new", "refused by stet (something_new)", ""},
 		{"", "refused by stet", ""},
 	}

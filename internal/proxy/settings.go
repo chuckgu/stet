@@ -65,7 +65,7 @@ func (s *session) parameter(head *unit, body []byte) error {
 		return nil
 	}
 	if was && !s.readable() && s.sentAfter(head) {
-		return s.endWith(BlockSessionSetting)
+		return s.endWith(BlockSettingChanged)
 	}
 	return nil
 }

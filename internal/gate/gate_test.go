@@ -781,6 +781,37 @@ func TestInspectMarksWhatCannotBeInspected(t *testing.T) {
 	}
 }
 
+// A session the proxy ends gets decide.Blocked's error too, and its warning
+// says the session was ended; a refused message's says it was refused.
+func TestBlockedSaysWhatItEnded(t *testing.T) {
+	e := setup(t, calm())
+	var logs lockedBuffer
+	gate.SetLogger(e.gate, slog.New(slog.NewJSONHandler(&logs, nil)))
+	info := proxy.SessionInfo{ID: "f00d", User: "agent_a"}
+	reasons := map[string]string{
+		proxy.BlockDo:             "message refused without a decision",
+		proxy.BlockSessionSetting: "message refused without a decision",
+		proxy.BlockCopyExtended:   "session ended without a decision",
+		proxy.BlockProtocolOrder:  "session ended without a decision",
+		proxy.BlockSettingChanged: "session ended without a decision",
+	}
+	for reason := range reasons {
+		got := e.gate.Blocked(info, reason)
+		if ends := strings.HasPrefix(got.Message, "connection closed by stet: "); ends != proxy.EndsSession(reason) {
+			t.Errorf("Blocked(%s).Message = %q; it ends the session: %v", reason, got.Message, proxy.EndsSession(reason))
+		}
+	}
+	for line := range strings.Lines(logs.String()) {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatal(err)
+		}
+		if reason, _ := rec["reason"].(string); rec["level"] == "WARN" && rec["msg"] != reasons[reason] {
+			t.Errorf("warning %q for %s, want %q", rec["msg"], reason, reasons[reason])
+		}
+	}
+}
+
 // Inspect passes on what SQL runs by name, as the server compares names, so
 // the proxy can look the names up in the session's tables (spec correction
 // B5).

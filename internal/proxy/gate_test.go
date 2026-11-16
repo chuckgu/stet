@@ -2838,9 +2838,9 @@ func TestSettingChangedAheadOfAStatementEndsTheSession(t *testing.T) {
 				wantReplies(t, fe, "T D C Z")
 				return
 			}
-			wantEnded(t, fe, "C", proxy.BlockSessionSetting)
+			wantEnded(t, fe, "C", proxy.BlockSettingChanged)
 			waitForBackendGone(t, pid)
-			g.wantBlocked(t, "stet_trust", proxy.BlockSessionSetting)
+			g.wantBlocked(t, "stet_trust", proxy.BlockSettingChanged)
 		})
 	}
 }
