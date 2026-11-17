@@ -2,6 +2,7 @@ package bench
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,20 +25,40 @@ var fakeRef = "hoophq/hoopsidecar@sha256:" + strings.Repeat("ab", 32)
 // hoopTestKey is the key the test's env file holds. It must reach the key file and nothing else.
 const hoopTestKey = "sk-test-KEY"
 
-// stubDocker records each call as a line "== docker" and then one argument per line. For inspect it
-// prints $STUB_REF; for a container that runs date, the host's time shifted by $STUB_SKEW seconds;
-// for run -d, a container id.
+// stubDocker records each call as a line "== docker" and then one argument per line, and plays the
+// container bench-hoop: run -d creates it, rm removes it.
+//   - inspect -f {{.State.Running}}: fails while there is no container; otherwise "true" for the
+//     first $STUB_UP_FOR answers (always, when unset) and "false" after, as when hoop exits.
+//   - any other inspect: $STUB_REF.
+//   - date, in a new container (run --entrypoint date) or the running one (exec): the host's time
+//     shifted by $STUB_SKEW seconds, read after a $STUB_DATE_DELAY seconds' wait for the first
+//     $STUB_SLOW_READS reads (all, when unset), as a slow container start widens the window.
+//   - logs: one line.
 const stubDocker = `#!/bin/sh
 { echo '== docker'; for a in "$@"; do printf '%s\n' "$a"; done; } >> "$STUB_LOG"
+up="$STUB_LOG.up"
+clock() {
+	n=$(cat "$STUB_LOG.reads" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$STUB_LOG.reads"
+	if [ -n "$STUB_DATE_DELAY" ] && [ "$n" -le "${STUB_SLOW_READS:-1000}" ]; then sleep "$STUB_DATE_DELAY"; fi
+	exec perl -MTime::HiRes=time -e 'printf "%.9f\n", time + ($ENV{STUB_SKEW} || 0)'
+}
 case "$1" in
-inspect) echo "$STUB_REF" ;;
+inspect)
+	case "$*" in
+	*State.Running*)
+		[ -f "$up" ] || { echo "Error: No such object: bench-hoop" >&2; exit 1; }
+		n=$(cat "$STUB_LOG.n" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$STUB_LOG.n"
+		if [ -n "$STUB_UP_FOR" ] && [ "$n" -gt "$STUB_UP_FOR" ]; then echo false; else echo true; fi ;;
+	*) echo "$STUB_REF" ;;
+	esac ;;
 run)
-	for a in "$@"; do
-		if [ "$a" = date ]; then
-			exec perl -MTime::HiRes=time -e 'printf "%.9f\n", time + ($ENV{STUB_SKEW} || 0)'
-		fi
-	done
-	case " $* " in *" -d "*) echo 0f1e2d3c4b5a ;; esac ;;
+	for a in "$@"; do if [ "$a" = date ]; then clock; fi; done
+	case " $* " in *" -d "*) : > "$up"; rm -f "$STUB_LOG.n"; echo 0f1e2d3c4b5a ;; esac ;;
+exec)
+	[ -f "$up" ] || { echo "Error: No such container: bench-hoop" >&2; exit 1; }
+	clock ;;
+rm) rm -f "$up" "$STUB_LOG.n" ;;
+logs) echo "hoop: the fake sidecar's last words" ;;
 esac
 exit 0
 `
@@ -61,11 +82,53 @@ listeners:
 `
 
 // hoopRig is one test's environment for the script: the stub, a bench directory, a key file to
-// read, and a working directory holding cfg.yaml (containerConfig).
+// read, a working directory holding cfg.yaml (containerConfig), and a TCP listener standing in for
+// the port the container publishes (HOOP_PORT).
 type hoopRig struct {
 	bench, work, log string
+	port             int
 	env              []string
 	outputs          []string // every run's combined output, in order
+}
+
+// listen starts a listener on a free port of 127.0.0.1 that accepts and closes every connection
+// until the test ends.
+func listen(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+// closedPort returns a port of 127.0.0.1 nothing listens on.
+func closedPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+	return port
+}
+
+// without returns env less the variables named.
+func without(env []string, names ...string) []string {
+	return slices.DeleteFunc(slices.Clone(env), func(s string) bool {
+		return slices.ContainsFunc(names, func(n string) bool { return strings.HasPrefix(s, n+"=") })
+	})
 }
 
 func newHoopRig(t *testing.T) *hoopRig {
@@ -88,17 +151,33 @@ func newHoopRig(t *testing.T) *hoopRig {
 	if err := os.WriteFile(filepath.Join(r.work, "cfg.yaml"), []byte(containerConfig), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	r.port = listen(t)
 	// Built from nothing, so neither DOCKER nor HOOP_USER comes from the caller's environment.
+	// HOOP_SETTLE=0: the stub's hoop does not need time to fail.
 	r.env = []string{
 		"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"),
 		"HOME=" + dir,
 		"BENCH_DIR=" + r.bench,
 		"ANTHROPIC_ENV=" + envFile,
 		"HOOP_DIGEST=" + fakeRef[strings.Index(fakeRef, "@")+1:],
+		"HOOP_PORT=" + fmt.Sprint(r.port),
+		"HOOP_SETTLE=0",
 		"STUB_LOG=" + r.log,
 		"STUB_REF=" + fakeRef,
 	}
 	return r
+}
+
+// named returns the stub's calls whose first argument is cmd.
+func (r *hoopRig) named(t *testing.T, cmd string) [][]string {
+	t.Helper()
+	var out [][]string
+	for _, c := range r.calls(t) {
+		if len(c) > 0 && c[0] == cmd {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // run runs the script in the working directory with extra environment, returning its combined
@@ -244,8 +323,11 @@ func TestHoopScriptStartsTheImageByDigestWithThreeMounts(t *testing.T) {
 	if got := values(args, "-e"); !slices.Equal(got, []string{"HOOP_SIDECAR_FREE_STANDALONE=true", "HOOP_SIDECAR_ANALYTICS=off"}) {
 		t.Errorf("-e %q", got)
 	}
-	if got := values(args, "-p"); !slices.Equal(got, []string{"127.0.0.1:15432:15432"}) {
-		t.Errorf("-p %q", got)
+	if got, want := values(args, "-p"), fmt.Sprintf("127.0.0.1:%d:15432", r.port); !slices.Equal(got, []string{want}) {
+		t.Errorf("-p %q, want %s", got, want)
+	}
+	if !strings.Contains(out, fmt.Sprintf("bench-hoop runs %s on 127.0.0.1:%d", fakeRef, r.port)) {
+		t.Errorf("start does not say hoop runs: %q", out)
 	}
 	if got, want := values(args, "--user"), fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()); !slices.Equal(got, []string{want}) {
 		t.Errorf("--user %q, want %s", got, want)
@@ -273,6 +355,16 @@ func TestHoopScriptStartsTheImageByDigestWithThreeMounts(t *testing.T) {
 	starts = r.starts(t)
 	if len(starts) != 2 || slices.Contains(starts[1], "--user") {
 		t.Errorf("with HOOP_USER empty the start is %q, want no --user", starts[len(starts)-1])
+	}
+
+	// By default the container publishes 15432 on 127.0.0.1. Whether something answers there on
+	// this machine does not matter: only the argument is looked at.
+	r.run(t, nil, "stop")
+	r.env = without(r.env, "HOOP_PORT")
+	r.run(t, []string{"HOOP_WAIT=1"}, "start", "cfg.yaml", "run3")
+	starts = r.starts(t)
+	if got := values(starts[len(starts)-1], "-p"); !slices.Equal(got, []string{"127.0.0.1:15432:15432"}) {
+		t.Errorf("-p %q by default, want 127.0.0.1:15432:15432", got)
 	}
 
 	// Nothing ever passes the key, or runs the container with more than it needs.
@@ -321,6 +413,79 @@ func TestHoopScriptGivesEachRunItsOwnAuditLog(t *testing.T) {
 	if n := len(r.starts(t)); n != 1 {
 		t.Errorf("%d containers started, want the first only", n)
 	}
+
+	// Any file with something in it makes the directory a used run's, whatever its name.
+	dir := filepath.Join(r.bench, "hoop", "audit-practice-b")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "other.jsonl"), []byte("{}\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if out, ok := r.run(t, nil, "start", "cfg.yaml", "practice-b"); ok || !strings.Contains(out, "other.jsonl") {
+		t.Errorf("start into a directory holding other.jsonl: ok %v, output %q; want a refusal naming it", ok, out)
+	}
+	// Empty files are what a start that failed leaves: the name may be used again.
+	if err := os.WriteFile(filepath.Join(dir, "other.jsonl"), nil, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "audit.jsonl"), nil, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if out, ok := r.run(t, nil, "start", "cfg.yaml", "practice-b"); !ok {
+		t.Errorf("start into a directory of empty files: %s", out)
+	}
+}
+
+func TestHoopScriptStartWaitsForHoopToServe(t *testing.T) {
+	r := newHoopRig(t)
+	if out, ok := r.run(t, nil, "pull"); !ok {
+		t.Fatal(out)
+	}
+	for _, c := range []struct {
+		name  string
+		extra []string
+		want  string // in the output
+	}{
+		// hoop refuses its config and exits before anything looks.
+		{"exited at once", []string{"STUB_UP_FOR=0"}, "not running"},
+		// hoop exits after the published port first answered (Docker's proxy answers for it).
+		{"exited after the port answered", []string{"STUB_UP_FOR=1"}, "not running"},
+		{"nothing answers on the port", []string{"HOOP_PORT=" + fmt.Sprint(closedPort(t)), "HOOP_WAIT=1"}, "127.0.0.1:"},
+	} {
+		r.run(t, nil, "stop")
+		before := len(r.named(t, "logs"))
+		out, ok := r.run(t, c.extra, "start", "cfg.yaml", "fail")
+		if ok || !strings.Contains(out, c.want) || strings.Contains(out, "bench-hoop runs") {
+			t.Errorf("%s: ok %v, output %q; want a failure saying %q", c.name, ok, out, c.want)
+		}
+		// The last log lines say why.
+		logs := r.named(t, "logs")
+		if len(logs) != before+1 || !slices.Equal(logs[len(logs)-1], []string{"logs", "--tail", "20", "bench-hoop"}) ||
+			!strings.Contains(out, "the fake sidecar's last words") {
+			t.Errorf("%s: the log was not shown (calls %q, output %q)", c.name, logs, out)
+		}
+	}
+
+	r.run(t, nil, "stop")
+	out, ok := r.run(t, nil, "start", "cfg.yaml", "ok")
+	if !ok || !strings.Contains(out, "bench-hoop runs") {
+		t.Fatalf("start with hoop serving: ok %v, output %q", ok, out)
+	}
+	// Running is asked after the start.
+	calls := r.calls(t)
+	last := -1
+	for i := len(calls) - 1; i >= 0; i-- {
+		if len(calls[i]) > 1 && calls[i][0] == "run" && calls[i][1] == "-d" {
+			last = i
+			break
+		}
+	}
+	if !slices.ContainsFunc(calls[last+1:], func(c []string) bool {
+		return slices.Equal(c, []string{"inspect", "-f", "{{.State.Running}}", "bench-hoop"})
+	}) {
+		t.Errorf("start did not ask whether bench-hoop runs: %q", calls[last+1:])
+	}
 }
 
 func TestHoopScriptChecksTheContainerClock(t *testing.T) {
@@ -328,16 +493,29 @@ func TestHoopScriptChecksTheContainerClock(t *testing.T) {
 	if out, ok := r.run(t, nil, "pull"); !ok {
 		t.Fatal(out)
 	}
+	dateRuns := func() int {
+		n := 0
+		for _, c := range r.named(t, "run") {
+			if slices.Equal(c, []string{"run", "--rm", "--entrypoint", "date", fakeRef, "-u", "+%s.%N"}) {
+				n++
+			}
+		}
+		return n
+	}
 	out, ok := r.run(t, nil, "clock")
-	if !ok || !strings.Contains(out, "container") || !strings.Contains(out, "host") {
+	if !ok || !strings.Contains(out, "container") || !strings.Contains(out, "host") || !strings.Contains(out, "at most") {
 		t.Errorf("clock with the clocks together: ok %v, output %q", ok, out)
 	}
-	date := r.calls(t)[len(r.calls(t))-1]
-	if !slices.Contains(date, "date") || date[len(date)-3] != fakeRef {
-		t.Errorf("clock ran %q, want date in a container of the pinned image", date)
+	if n := dateRuns(); n != 1 {
+		t.Errorf("clock ran date in %d containers of the pinned image, want 1", n)
 	}
-	// bench collect joins hoop's lines within 2 s of the sender's clock.
-	for _, skew := range []string{"1.6", "-1.6", "120"} {
+
+	// bench collect joins hoop's lines within 2 s of the sender's clock; the check allows 1.5 s for
+	// the worst case, the container's reading against either end of the host's window.
+	if out, ok := r.run(t, []string{"STUB_SKEW=1.2"}, "clock"); !ok {
+		t.Errorf("clock with the container 1.2 s off: %s", out)
+	}
+	for _, skew := range []string{"1.8", "-1.8", "120"} {
 		out, ok := r.run(t, []string{"STUB_SKEW=" + skew}, "clock")
 		if ok {
 			t.Errorf("clock with the container %s s off: ok (%s)", skew, out)
@@ -347,8 +525,41 @@ func TestHoopScriptChecksTheContainerClock(t *testing.T) {
 			t.Errorf("start with the container %s s off: ok %v, output %q", skew, ok, out)
 		}
 	}
+	// A slow container start widens the host's window until the reading proves nothing: the clocks
+	// agree, but nothing shows they agree within 1.5 s.
+	before := dateRuns()
+	if out, ok := r.run(t, []string{"STUB_DATE_DELAY=1.7"}, "clock"); ok {
+		t.Errorf("clock read 1.7 s into a window: ok (%s)", out)
+	}
+	if n := dateRuns() - before; n != 3 {
+		t.Errorf("a slow read was tried %d times, want 3", n)
+	}
+	// One slow read, then fast ones: the smallest bound counts.
+	if err := os.Remove(r.log + ".reads"); err != nil {
+		t.Fatal(err)
+	}
+	before = dateRuns()
+	if out, ok := r.run(t, []string{"STUB_DATE_DELAY=1.7", "STUB_SLOW_READS=1"}, "clock"); !ok {
+		t.Errorf("clock with one slow read: %s", out)
+	}
+	if n := dateRuns() - before; n != 2 {
+		t.Errorf("one slow read, then a fast one: %d reads, want 2", n)
+	}
 	if n := len(r.starts(t)); n != 0 {
 		t.Errorf("%d containers started with the clock off", n)
+	}
+
+	// With bench-hoop running, its own clock is read: no container start widens the window.
+	if out, ok := r.run(t, nil, "start", "cfg.yaml", "up"); !ok {
+		t.Fatal(out)
+	}
+	before = dateRuns()
+	if out, ok := r.run(t, nil, "clock"); !ok || !strings.Contains(out, "exec") {
+		t.Errorf("clock with bench-hoop running: ok %v, output %q", ok, out)
+	}
+	execs := r.named(t, "exec")
+	if dateRuns() != before || len(execs) != 1 || !slices.Equal(execs[0], []string{"exec", "bench-hoop", "date", "-u", "+%s.%N"}) {
+		t.Errorf("clock with bench-hoop running ran %q and %d new containers", execs, dateRuns()-before)
 	}
 }
 
@@ -406,10 +617,23 @@ func TestHoopScriptValidatesStopsAndShowsLogs(t *testing.T) {
 	if n < 6 || v[0] != "run" || v[1] != "--rm" || !slices.Equal(v[n-5:], []string{fakeRef, "hoop", "start", "sidecar", "--validate"}) {
 		t.Fatalf("validate ran %q", v)
 	}
+	// The same three mounts as start, the audit directory a throwaway one: a validation never
+	// creates or touches a run's.
 	mounts := values(v, "-v")
-	if len(mounts) != 2 || !strings.HasSuffix(mounts[0], ":/etc/hoop-inspect/config.yaml:ro") ||
-		!strings.HasSuffix(mounts[1], ":/run/hoop/anthropic.key:ro") || !filepath.IsAbs(mounts[0]) {
-		t.Errorf("validate mounts %q", mounts)
+	if len(mounts) != 3 || !strings.HasSuffix(mounts[0], ":/etc/hoop-inspect/config.yaml:ro") ||
+		!strings.HasSuffix(mounts[1], ":/run/hoop/anthropic.key:ro") || !strings.HasSuffix(mounts[2], ":/var/log/hoop") ||
+		!filepath.IsAbs(mounts[0]) || !filepath.IsAbs(mounts[2]) {
+		t.Fatalf("validate mounts %q", mounts)
+	}
+	scratch := strings.TrimSuffix(mounts[2], ":/var/log/hoop")
+	if strings.HasPrefix(filepath.Base(scratch), "audit-") {
+		t.Errorf("validate mounted %s, a run's audit directory", scratch)
+	}
+	if _, err := os.Stat(scratch); !os.IsNotExist(err) {
+		t.Errorf("validate left its audit directory %s (%v)", scratch, err)
+	}
+	if runs, _ := filepath.Glob(filepath.Join(r.bench, "hoop", "audit-*")); len(runs) != 0 {
+		t.Errorf("validate created %q", runs)
 	}
 	if got := values(v, "-e"); !slices.Equal(got, []string{"HOOP_SIDECAR_FREE_STANDALONE=true", "HOOP_SIDECAR_ANALYTICS=off"}) {
 		t.Errorf("validate -e %q", got)
@@ -443,20 +667,30 @@ func TestHoopScriptRefusesAConfigTheMountsDoNotFit(t *testing.T) {
 	if out, ok := r.run(t, nil, "pull"); !ok {
 		t.Fatal(out)
 	}
+	// Each edit replaces its first string with its second; an empty first string appends.
 	for name, edit := range map[string][2]string{
 		// The audit log would stay inside the container and go with it.
 		"audit outside the mount": {"file: /var/log/hoop/audit.jsonl", "file: /tmp/audit.jsonl"},
+		// The reuse guard and the runbook read audit.jsonl.
+		"another audit file name": {"file: /var/log/hoop/audit.jsonl", "file: /var/log/hoop/other.jsonl"},
+		"a second file key":       {"", "pii:\n  file: /tmp/pii.jsonl\n"},
 		// The runbook's fallback 1 lays the config out for the host.
 		"audit on the host":     {"file: /var/log/hoop/audit.jsonl", "file: /Users/x/bench/hoop/audit/audit.jsonl"},
 		"key outside the mount": {"credentials_file: /run/hoop/anthropic.key", "credentials_file: /cfg/anthropic.key"},
+		"a second key file":     {"", "other:\n  credentials_file: /run/hoop/anthropic.key\n"},
 		"another port":          {"listen: 0.0.0.0:15432", "listen: 0.0.0.0:6432"},
 		"loopback only":         {"listen: 0.0.0.0:15432", "listen: 127.0.0.1:15432"},
+		"a second listener":     {"", "  - name: other\n    listen: 0.0.0.0:6432\n"},
 	} {
-		if !strings.Contains(containerConfig, edit[0]) {
-			t.Fatalf("containerConfig has no %q", edit[0])
+		cfg := containerConfig + edit[1]
+		if edit[0] != "" {
+			if !strings.Contains(containerConfig, edit[0]) {
+				t.Fatalf("containerConfig has no %q", edit[0])
+			}
+			cfg = strings.Replace(containerConfig, edit[0], edit[1], 1)
 		}
 		path := filepath.Join(r.work, "bad.yaml")
-		if err := os.WriteFile(path, []byte(strings.Replace(containerConfig, edit[0], edit[1], 1)), 0o644); err != nil {
+		if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		for _, args := range [][]string{{"start", "bad.yaml", "bad"}, {"validate", "bad.yaml"}} {

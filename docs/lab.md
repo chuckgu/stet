@@ -486,7 +486,7 @@ hard negative 유형별 막은 건수:
 | `hoop` | hoop, `claude-haiku-5-5`, 연습에서 고른 설정, 캐시 끔, 단순 질의 | V, I, X | 판독 |
 | `hoop-cache` | `hoop`과 같고 캐시만 켬 | V, I | 참고: 모양 재사용 |
 | `hoop-bind`, `stet-bind` | `hoop`, `stet`과 같고 값을 바인딩으로 | V·I의 정해진 부분 | 참고: 확장 프로토콜 |
-| `hoop-opus` | `hoop`과 같고 모델만 `claude-opus-5-5` | V·I의 정해진 부분 | 참고. hoop 1.310.0의 요청을 Opus가 거절하면 돌리지 않는다(스펙 3장) |
+| `hoop-opus` | `hoop`과 같고 모델만 `claude-opus-5-5` | V·I의 정해진 부분 | 참고. 스펙 3장: 돌릴 수 없음; 런북 3.5에서 다시 확인 |
 | 연습 `none`, `stet`, `hoop-a`, `hoop-b`, `hoop-c` | 연습 스트림. `hoop-a`~`c`는 프롬프트 (가)·(나)·(다), `medium: allow` | V, I | hoop 설정 고르기(스펙 6장) |
 
 **이름.** 데이터베이스와 역할에 프로젝트 이름을 넣지 않는다(hoop이 데이터베이스 이름을 LLM에 보낸다).
@@ -519,20 +519,21 @@ hard negative 유형별 막은 건수:
 - 실행에 쓰는 설정은 두 파일을 고치지 않고 `bench hoop-config -prompt a|b|c -medium allow|block [-cache] [-model <모델>] [-no-endpoint] -out <파일>`과 `bench stet-config -database <데이터베이스> -out <파일>`로 실행마다 새 파일로 만든다. 두 명령은 있는 파일에 쓰지 않는다. 돌고 있는 hoop은 자기 설정 파일이 바뀌면 다시 읽기 때문이다.
 - 동결할 때 고른 hoop 설정(`hoop.yaml`, `hoop-cache.yaml`, 되면 `hoop-opus.yaml`)을 `lab/bench/run/`에 커밋한다.
 
-**`scripts/hoop.sh`** (hoop 컨테이너. 환경 변수 `BENCH_DIR`, `DOCKER`, `HOOP_IMAGE`, `HOOP_DIGEST`, `ANTHROPIC_ENV`, `HOOP_USER`)
+**`scripts/hoop.sh`** (hoop 컨테이너. 환경 변수 `BENCH_DIR`, `DOCKER`, `HOOP_IMAGE`, `HOOP_DIGEST`, `ANTHROPIC_ENV`, `HOOP_USER`, `HOOP_PORT`(기본 15432), `HOOP_WAIT`(기본 10초), `HOOP_SETTLE`(기본 2초))
 
 | 명령 | 하는 일 |
 |---|---|
 | `pull` | `hoophq/hoopsidecar:1.310.0`을 받아 다이제스트가 고정값(`sha256:737e87b7…`)인지 보고 `$BENCH_DIR/hoop.digest`에 적는다. 다른 명령은 이 다이제스트로만 이미지를 부른다 |
-| `start <설정> <실행 이름>` | 컨테이너 `bench-hoop`을 띄워 `127.0.0.1:15432`로 낸다. 붙이는 것은 설정과 키 파일(둘 다 읽기 전용), 그 실행의 감사 로그 디렉터리 `$BENCH_DIR/hoop/audit-<실행 이름>/` 셋뿐이다. 이미 로그가 든 실행 이름, 경로가 이 마운트와 맞지 않는 설정(`audit.file`, `credentials_file`, `listen`), 시계가 호스트와 1초 넘게 어긋난 컨테이너는 거부한다 |
-| `validate <설정>` | 같은 이미지·설정·키로 `hoop start sidecar --validate` |
-| `clock` | 컨테이너와 호스트의 UTC 시각과 차이를 찍고, 1초를 넘으면 실패한다(`collect`는 2초까지 받는다) |
+| `start <설정> <실행 이름>` | 시계를 확인하고 컨테이너 `bench-hoop`을 띄워 `127.0.0.1:$HOOP_PORT`로 낸다. 붙이는 것은 설정과 키 파일(둘 다 읽기 전용), 그 실행의 감사 로그 디렉터리 `$BENCH_DIR/hoop/audit-<실행 이름>/` 셋뿐이다. 그 포트가 `HOOP_WAIT`초 안에 받고 hoop이 그 뒤 `HOOP_SETTLE`초 동안 살아 있어야 "runs" 줄을 찍고 성공한다. 아니면 로그의 마지막 20줄을 찍고 실패한다(컨테이너는 남으므로 `stop`으로 지운다). 거부하는 것: 내용이 있는 파일이 든 감사 로그 디렉터리, 경로가 마운트와 맞지 않는 설정(`file: /var/log/hoop/audit.jsonl`, `credentials_file: /run/hoop/anthropic.key`, `listen: 0.0.0.0:15432`가 각각 정확히 한 번), 시계가 어긋난 컨테이너 |
+| `validate <설정>` | 같은 이미지·환경·마운트로 `hoop start sidecar --validate`. 감사 로그 디렉터리만 쓰고 버리는 것(`$BENCH_DIR/hoop/validate.*`, 끝나면 지운다)이라 실행의 디렉터리를 만들거나 건드리지 않는다 |
+| `clock` | 호스트 시각 두 번 사이에 컨테이너 시각을 읽어 UTC로 찍고, 컨테이너 시각과 호스트 창의 먼 끝 사이의 거리(실제 차이의 최댓값)를 낸다. 1.5초를 넘으면 실패한다(`collect`는 2초까지 받는다). `bench-hoop`이 돌고 있으면 그 안에서(`docker exec`), 아니면 새 컨테이너로 읽고, 넘으면 세 번까지 다시 읽어 가장 작은 값을 쓴다. `start`는 띄우기 전에 새 컨테이너로 같은 확인을 한다 |
 | `stop`, `logs` | 컨테이너를 지운다, 그 로그를 찍는다 |
 
 - 키 파일 `$BENCH_DIR/hoop/anthropic.key`가 없으면 `ANTHROPIC_ENV`(기본 `~/.config/stet/anthropic.env`)에서 키만 0600으로 쓴다. 키는 화면과 인자에 나오지 않는다. 벤치마크가 끝나면 지운다.
 - 로그인하지 않고(`HOOP_SIDECAR_FREE_STANDALONE=true`) 사용 통계를 끈다(`HOOP_SIDECAR_ANALYTICS=off`). 컨테이너는 내 uid로 돈다(`HOOP_USER=`로 비우면 이미지의 사용자).
 - 컨테이너는 `host.docker.internal`로 호스트의 DB(55432)와 기록기(18080)에 닿는다.
-- 실행마다 감사 로그 디렉터리와 기록기 파일을 따로 둔다. hoop은 감사 로그에 덧붙여 쓰고 `collect`는 시간 창으로 잇기 때문이다. 로그가 든 실행 이름은 다시 쓸 수 없다. 다시 띄우려면 `stop` 뒤에 새 이름을 준다(로그가 비어 있으면 같은 이름도 된다).
+- 스크립트는 Docker Desktop을 가정한다. 거기서는 `host.docker.internal`이 `--add-host` 없이 호스트로 풀린다. Linux의 Docker Engine에서는 `start`와 `validate`에 `--add-host host.docker.internal:host-gateway`를 더해야 한다.
+- 실행마다 감사 로그 디렉터리와 기록기 파일을 따로 둔다. hoop은 감사 로그에 덧붙여 쓰고 `collect`는 시간 창으로 잇기 때문이다. 내용이 있는 파일이 든 실행 이름은 다시 쓸 수 없다. 다시 띄우려면 `stop` 뒤에 새 이름을 준다(파일이 모두 비어 있으면 같은 이름도 된다).
 
 **한 실행의 모양** (연습의 `hoop-a`와 `stet`. 전체 순서와 확인할 것은 계획의 Part B)
 
