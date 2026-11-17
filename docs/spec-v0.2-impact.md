@@ -199,7 +199,7 @@ tables:
 - `rows`는 판정에 쓴 값이다. `capped`가 참이면 `rows`는 `cap`과 같다. `estimate`는 추정을 실행했을 때의 추정값이다.
 - `share`는 `UPDATE`·`DELETE`에서 `table_rows`가 있고 `capped`가 아닐 때만 있다(4장).
 - `actual_rows`는 실행되지 않은 쓰기에서는 비어 있다.
-- 스키마는 `internal/store/schema.sql`에 `ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS impact jsonb`로 더한다. 이 파일은 시작할 때마다 실행되므로 여러 번 실행해도 안전해야 한다.
+- 스키마는 `internal/store/schema.sql`에 `ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS impact jsonb`로 더한다. Stet은 시작할 때 이 파일이 데이터베이스가 마지막으로 실행한 것과 다를 때만 실행한다. 같은지는 파일의 SHA-256을 `stet.schema_version`에 적힌 값과 비교해 안다(2b에서 바뀜: spec-v0.2-approve 4·11장). 실행은 advisory lock으로 직렬화하고, 여러 번 실행해도 안전하다.
 - 측정 대상 쓰기의 다른 컬럼: `target_pk`, `proposed`, `state`, `questions`, `answers`는 NULL이다. `latency_ms`는 측정 시간을 포함한다. 클라이언트가 실제로 기다린 시간이기 때문이다.
 - 모델에 보내는 상태(`gate.State`)는 바꾸지 않는다. 필드 순서가 답을 바꾸므로(D19), 기존 녹화의 재생이 달라지면 안 된다.
 

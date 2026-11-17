@@ -118,7 +118,7 @@ CREATE INDEX IF NOT EXISTS held_writes_approved ON stet.held_writes (resolved_at
   - 그 Parse나 Bind가 왔을 때 첫째 경우였다.
 - 그런 쓰기와, 셋 가운데 서버가 알린 적 없는 것이 있는 쓰기는 "보낸 그대로 저장할 수 없는" 것이다. 줄을 넣지 않고 `held_write` 없이 막는다(enforce 스펙 7장). 에러 로그 `held write not stored`가 남는다.
 - `SET`은 깨끗한 문장이어서(enforce 스펙 4장) 답을 기다리지 않고 그 뒤에 이어 보낸 쓰기도 판단받는다. 보류되면 위의 규칙으로 저장되지 않는다. `RESET`은 깨끗하지 않아서, 답을 받기 전에 이어 보낸 쓰기는 보류되기 전에 `in_transaction`으로 막힌다.
-- 바인딩 값은 텍스트 형식으로 온 것은 온 바이트 그대로, 바이너리 형식으로 온 것은 Stet의 연결에서 서버가 텍스트로 푼 글자로 저장한다. NULL은 NULL이다. 한 Bind에 둘이 섞여 와도 같다(JDBC는 정수를 바이너리로, 날짜를 타입 없는 텍스트로 한 Bind에 보낸다고 알려져 있다). 텍스트 값을 Stet의 연결에서 다시 읽어 저장하면 `'01/02/2026'`이 Stet의 `DateStyle`로 읽힌 글자가 된다. 판단 기록의 `params`도 같은 값이다(enforce 스펙 9장).
+- 바인딩 값은 텍스트 형식으로 온 것은 온 바이트 그대로, 바이너리 형식으로 온 것은 Stet의 연결에서 서버가 텍스트로 푼 글자로 저장한다. NULL은 NULL이다. 한 Bind에 둘이 섞여 와도 같다(JDBC는 정수를 바이너리로, 날짜를 타입 없는 텍스트로 한 Bind에 보낸다고 알려져 있다). 텍스트 값을 Stet의 연결에서 다시 읽어 저장하면 `'01/02/2026'`이 Stet의 `DateStyle`로 읽힌 글자가 된다. 섞여 오면 바이너리 값만 Stet의 연결에서 푼다. 텍스트 값은 그 질의에 보내지 않는다. 보내면 에이전트 세션의 설정으로만 읽히는 값(`DateStyle`이 `DMY`인 세션의 `'13/02/2026'`)이 Stet 연결의 설정으로 읽혀 실패하고, 그 쓰기는 바인딩 값을 읽지 못한 것이 된다. 그 자리에 NULL을 보내도 안 된다. `NOT NULL` 도메인 타입의 값이면 NULL로도 실패한다. 판단 기록의 `params`도 같은 값이다(enforce 스펙 9장).
 - `row_absent`는 단일 행 `UPDATE`·`DELETE`의 상태를 읽었는데 대상 행이 없었다는 표시다. 그때는 `row_version`이 없다. 상태를 읽지 못했으면 둘 다 없다. 검토자가 본 것은 "그런 행이 없다"이다(7장).
 - `planned_rows`와 `rows_exact`는 승인이 허락하는 크기의 기준이다(6장).
 
@@ -129,13 +129,15 @@ CREATE INDEX IF NOT EXISTS held_writes_approved ON stet.held_writes (resolved_at
 | 잰 다중 행 쓰기, 상한에 닿은 `count`나 `estimate` | 잰 값 | false |
 | 재지 못한 쓰기 | NULL | false |
 
-- Stet의 풀 연결은 `DateStyle`을 `ISO`로, `IntervalStyle`을 `postgres`로 고정한다. 바이너리 값을 텍스트로 풀 때 어느 설정에서나 같은 뜻으로 읽히는 글자가 나오게 하려는 것이다.
+- Stet의 풀 연결은 `DateStyle`을 `ISO`로, `IntervalStyle`을 `postgres`로, `extra_float_digits`를 `1`로 고정한다. 바이너리 값을 텍스트로 풀 때 어느 설정에서나 같은 뜻으로 읽히는 글자가 나오게 하려는 것이다. 데이터베이스나 계정이 `extra_float_digits`를 0 이하로 두면 바이너리로 온 실수가 반올림된 글자로 풀린다(`1/3`이 `0.333333333333333`).
 
 **줄의 내용은 바뀌지 않는다.** `BEFORE UPDATE` 트리거(`stet.held_writes_guard`)가 셋을 강제한다. 어기면 `ST004`다. 누가 고치든 같고, Stet의 계정도 마찬가지다.
 
 - 바뀔 수 있는 컬럼은 아홉이다. `status`, `in_transaction`, `resolved_by`, `resolved_at`, `note`, `max_rows`, `applied_at`, `rows_affected`, `error`. 나머지는 한 번 들어가면 바뀌지 않는다. 문장, 값, 값의 타입(`param_types`), 계정, 데이터베이스, 테이블, 대상 키, 행 버전, `row_absent`, 판정, 이유, `expires_at`, `settings`, `planned_rows`, `rows_exact`, `id`, `decision_id`, `created_at`이다. 나중에 더해지는 컬럼도 기본이 고정이다.
 - `status`는 3장의 그림에 있는 화살표로만 바뀐다. 끝 상태에서는 바뀌지 않는다. `status`를 그대로 두는 갱신은 이 확인을 지난다.
 - 아홉도 저마다 바뀌는 갱신이 정해져 있다. `in_transaction`은 `unconfirmed`에서 `pending`이 되는 갱신에서만 바뀐다. `resolved_by`, `resolved_at`, `note`, `max_rows`는 `pending`에서 `approved`나 `rejected`가 되는 갱신에서만, `applied_at`, `rows_affected`, `error`는 `approved`에서 `applied`나 `failed`가 되는 갱신에서만 바뀐다. 그래서 승인된 줄의 `max_rows`를 넓히거나 `resolved_at`을 늦춰 10분(8장)을 다시 세게 할 수 없다.
+
+트리거 함수는 `search_path`를 `pg_catalog, pg_temp`로 고정한다(`stet.decisions`의 append-only 트리거도 같다). 고정하지 않으면 트리거를 일으킨 세션의 `search_path`로 함수를 찾는다. 그 경로의 스키마에 행 타입에 꼭 맞는 `to_jsonb(stet.held_writes)`가 있으면 `pg_catalog`의 `to_jsonb(anyelement)` 대신 그것이 불리고, 그것이 늘 같은 값을 돌려주면 어떤 변경이든 지난다.
 
 승인된 뒤에 문장이 바뀌면 사람이 보지 않은 쓰기가 실행된다. 함수와 Stet의 코드가 지키는 것과 별개로 DB가 직접 막는다(규칙 5와 같은 생각이다). `DELETE`는 막지 않는다. 보존 기간은 이 단계에서 다루지 않는다. 줄을 SQL로 직접 넣는 것도 막지 않는다. 그런 줄 때문에 실행부가 상한과 설정을 다시 확인한다(7장의 `no_row_limit`, `settings_missing`).
 
@@ -154,10 +156,12 @@ SELECT h.id,
        h.verdict, h.reasons, h.planned_rows, h.rows_exact,
        d.impact, d.cumulative, d.proposed, d.state, d.answers,
        h.resolved_by, h.resolved_at, h.note, h.max_rows,
-       h.applied_at, h.rows_affected, h.error
+       h.applied_at, h.rows_affected, h.error,
+       h.settings
 FROM stet.held_writes h LEFT JOIN stet.decisions d ON d.id = h.decision_id;
 ```
 
+- `settings`는 그 줄이 실행될 세션 설정(4장)이다. 검토자는 이것으로 텍스트 값이 어떻게 읽힐지 안다. `'01/02/2026'`은 `DateStyle`이 `DMY`면 2월 1일, `MDY`면 1월 2일이다. 마지막 컬럼인 것은 `CREATE OR REPLACE VIEW`가 컬럼을 끝에 더하는 것만 받기 때문이다.
 - 근거는 판단 기록에서 온다. 모델에 보낸 상태(`state`), 모델의 답(`answers`), 영향 측정(`impact`), 누적 값(`cumulative`)이다. 판단 기록의 삽입이 실패했으면 그 칸들이 비어 있다. 그 줄도 승인할 수 있다. 문장과 값과 이유는 줄 자체에 있다.
 - `in_transaction`이 참인 줄은 명시적 트랜잭션 안에서 왔거나, 한 Sync 아래 다른 문장과 함께 온 쓰기다. 에이전트가 `BEGIN` 뒤에 보낸 첫 쓰기가 대표적이다. 어느 쪽이든 거부로 그 트랜잭션은 실패했고, 에이전트가 그 트랜잭션에서 함께 하려던 다른 문장은 실행되지 않았다. 승인하면 이 쓰기 하나만 따로 실행되고 바로 커밋된다. 드라이버가 문장마다 `BEGIN`을 붙이는 클라이언트(psycopg, 자동 커밋을 끈 JDBC)의 쓰기는 모두 이렇게 보인다. 그래서 막지 않고 검토자에게 보여 준다.
 - `expired`는 뷰를 읽는 트랜잭션이 시작한 시각(`now()`)으로 가린다. 승인할 수 있는지는 `stet.approve`가 그때의 시각(`clock_timestamp()`)으로 다시 본다(6장).
@@ -210,13 +214,13 @@ GRANT EXECUTE ON FUNCTION stet.approve(uuid, text, bigint), stet.reject(uuid, te
 
 **언제 도는가.** `mode: enforce`이고 게이트 대상 테이블이 있을 때만 돈다. 섀도에서는 Stet이 어떤 쓰기도 실행하지 않는다(규칙 6). 섀도에서 `stet.approve`를 부르면 줄은 `approved`가 되지만 아무도 집지 않고, 아래의 10분이 지나면 실행되지 않는다.
 
-**집는 방법.** Stet은 1초마다 `approved`인 줄을 풀 연결로 읽는다. 첫 읽기는 시작하자마자다. 승인된 순서(`resolved_at`, 같으면 `id`)로 100줄까지 읽고, 그 순서로 한 번에 하나씩 처리한다. 읽기 하나는 5초를 넘기지 않는다. 줄마다 Stet의 계정으로 새 연결을 열고, 처리가 끝나면 그 연결을 닫는다. 풀의 연결을 쓰지 않는다. 에이전트가 쓴 문장이 그 연결의 설정을 바꿨을 수 있기 때문이다. 새 연결의 시작 설정은 풀과 같다(`lock_timeout` 200ms, `DateStyle` `ISO`, `IntervalStyle` `postgres`).
+**집는 방법.** Stet은 1초마다 `approved`인 줄을 풀 연결로 읽는다. 첫 읽기는 시작하자마자다. 승인된 순서(`resolved_at`, 같으면 `id`)로 100줄까지 읽고, 그 순서로 한 번에 하나씩 처리한다. 읽기 하나는 5초를 넘기지 않는다. 줄마다 Stet의 계정으로 새 연결을 열고, 처리가 끝나면 그 연결을 닫는다. 풀의 연결을 쓰지 않는다. 에이전트가 쓴 문장이 그 연결의 설정을 바꿨을 수 있기 때문이다. 새 연결의 시작 설정은 풀과 같다(`lock_timeout` 200ms, `DateStyle` `ISO`, `IntervalStyle` `postgres`, `extra_float_digits` `1`). 풀의 연결 설정을 복사해 연다.
 
 **한 줄의 처리.** 모두 한 트랜잭션이다. 줄의 상태 변경과 쓰기가 함께 커밋되거나 함께 버려진다. 줄 하나의 처리는 `held.apply_timeout`에 5초를 더한 시간을 넘기지 않는다. 넘으면 연결을 닫는다. 그것은 Stet 자신의 실패다(아래).
 
 1. 트랜잭션을 연다. 줄에 `row_version`이 있거나 `row_absent`이면 `REPEATABLE READ`로, 아니면 `READ COMMITTED`로 연다. 격리 수준은 줄을 읽기 전에 정해야 하므로, 목록 질의가 줄마다 그 둘이 있는지를 함께 돌려준다. 고정 컬럼(4장)이어서 트랜잭션 밖에서 읽어도 같다. 목록은 그 둘이 없다고 했는데 잠근 줄에 있으면 Stet 자신의 실패로 보고 그만둔다.
 2. 줄을 잠그고 읽는다(`WHERE id = $1 AND status = 'approved' FOR UPDATE SKIP LOCKED`). 없으면 다른 Stet이 처리 중이거나 이미 끝난 것이다. 그만둔다. `REPEATABLE READ`에서는 다른 Stet이 그 줄을 끝내고 커밋한 직후에 이 질의가 빈 결과 대신 `40001`로 실패한다(2장). 그것도 같은 뜻으로 보고 조용히 그만둔다. 승인한 지 10분이 지났는지도 이 질의에서 `clock_timestamp()`로 잰다.
-3. 실행 전 확인. Stet의 계정으로 표의 순서대로 확인한다. 하나라도 걸리면 실행하지 않고 처음 걸린 것을 `failed`로 적는다.
+3. 실행 전 확인. 먼저 저장점을 둔다. Stet의 계정으로 표의 순서대로 확인한다. 하나라도 걸리면 실행하지 않고 저장점까지 되돌린 뒤 처음 걸린 것을 `failed`로 적는다.
 
 | 확인 | `error` |
 |---|---|
@@ -231,9 +235,10 @@ GRANT EXECUTE ON FUNCTION stet.approve(uuid, text, bigint), stet.reject(uuid, te
 | 그 계정의 역할 수준 `search_path`(이 데이터베이스용이 있으면 그것, 없으면 전체용)가 이 연결의 `search_path`와 다르다 | `search_path_differs` |
 
 - `no_row_limit`과 `settings_missing`은 함수와 게이트를 거친 줄에는 생기지 않는다. 줄을 SQL로 직접 넣거나 고친 경우다. 상한 없이 실행하지 않고, 빠진 설정을 Stet의 것으로 채워 실행하지 않는다. 키가 없는 행 버전은 확인할 수 없으므로 바뀐 것으로 본다.
+- 확인에 필요한 것(행 버전, 역할 수준 `search_path`)을 읽다가 서버 에러가 나면 그 줄의 문제로 본다. 대상 테이블이 지워졌으면 `42P01`, 대상 키가 키 컬럼의 타입에 맞지 않으면 `22P02` 같은 것이다. 실행하지 않고 그 에러를 `failed`(`SQLSTATE <코드>: <서버의 메시지>`)로 적는다. 에러로 실패한 트랜잭션은 저장점까지 되돌려 적을 수 있다. Stet 자신의 실패(아래)로 다시 집으면 원인이 승인이 만료될 때까지 숨었다가 `approval_lapsed`로 남기 때문이다. 다만 Stet의 `lock_timeout`을 넘긴 것(`55P03`)과 연결이 끊긴 것(클래스 `08`의 에러, 심각도가 `FATAL`이나 `PANIC`인 에러)은 Stet 자신의 실패다.
 
-4. 저장점을 두고, `SET LOCAL ROLE`로 줄의 `login_role`이 된다. 줄의 `settings` 셋을 `set_config(<이름>, <값>, true)`로 맞춘다. `statement_timeout`과 `lock_timeout`을 `held.apply_timeout`으로 둔다. 이 단계가 서버 에러로 실패하면 문장의 실패처럼 저장점까지 되돌리고 `failed`(`SQLSTATE <코드>: <서버의 메시지>`)로 적는다. Stet의 계정이 그 역할의 구성원이 아니면 `42501`, 역할이 지워졌으면 `22023`이다(2장).
-5. 줄의 문장을 확장 프로토콜로 보낸다. 값은 저장된 텍스트 그대로(NULL은 NULL, 빈 글자는 빈 글자), 타입은 `param_types` 그대로다. 결과 행은 버린다. 이어서 같은 역할로 `SET CONSTRAINTS ALL IMMEDIATE`를 보낸다. 지연된 제약이 여기서 검사되고, 어기면 문장의 실패로 적힌다. 커밋에서 실패하면 Stet 자신의 실패가 되어 줄이 `approved`로 남기 때문이다.
+4. `SET LOCAL ROLE`로 줄의 `login_role`이 된다. 줄의 `settings` 셋을 `set_config(<이름>, <값>, true)`로 맞춘다. `statement_timeout`과 `lock_timeout`을 `held.apply_timeout`으로 둔다. 이 단계가 서버 에러로 실패하면 문장의 실패처럼 저장점까지 되돌리고 `failed`(`SQLSTATE <코드>: <서버의 메시지>`)로 적는다. Stet의 계정이 그 역할의 구성원이 아니면 `42501`, 역할이 지워졌으면 `22023`이다(2장).
+5. 줄의 문장을 확장 프로토콜로 보낸다. 값은 저장된 텍스트 그대로(NULL은 NULL, 빈 글자는 빈 글자), 타입은 `param_types` 그대로다. 결과 행은 버린다. 이어서 같은 역할로 `SET CONSTRAINTS ALL IMMEDIATE`를 보낸다. 지연된 제약이 여기서 검사되고, 어기면 문장의 실패로 적힌다. 커밋에서 실패하면 Stet 자신의 실패가 되어 줄이 `approved`로 남기 때문이다. 둘이 성공하면 `SET LOCAL search_path = pg_catalog, pg_temp`를 보낸다. 문장이 `set_config('search_path', ..., true)`로 이 트랜잭션의 `search_path`를 바꿨을 수 있다. 그 뒤의 Stet 자신의 질의(`current_user` 읽기, 줄을 `applied`로 바꾸기)가 에이전트가 고른 스키마의 함수와 연산자(예: 그 스키마의 `clock_timestamp()`)를 쓰지 않게 하려는 것이다. `SET CONSTRAINTS`는 그 전이므로 에이전트의 역할과 `search_path`로 돈다. 6단계에서 걸려 저장점까지 되돌리면 문장이 바꾼 `search_path`도 함께 되돌려진다.
 6. 실행 뒤 확인. 걸리면 저장점까지 되돌리고 `failed`로 적는다.
 
 | 확인 | `error` |
@@ -249,7 +254,7 @@ GRANT EXECUTE ON FUNCTION stet.approve(uuid, text, bigint), stet.reject(uuid, te
 - `row_version`도 `row_absent`도 없는 줄(`INSERT`, 다중 행 쓰기, 상태를 읽지 못해 보류된 쓰기)은 이 확인을 하지 않는다. 행 수의 상한만 본다.
 - **바뀐 행 수**는 서버가 답한 그 문장의 행 수다. 판단 기록의 `rows_affected`와 같은 뜻이다. 연쇄 삭제로 지워진 다른 테이블의 행은 세지 않는다.
 - **`failed`는 끝이다.** 다시 시도하지 않는다. 시간 초과(`57014`)도 같다. 잠금을 기다리다 넘긴 것도 `statement_timeout`과 `lock_timeout`이 같은 값이어서 `57014`로 끝난다(2장). 사람이 본 때와 상황이 달라졌을 수 있기 때문이다.
-- **Stet 자신의 실패.** 처리하다가 Stet 자신의 질의가 실패하면(연결이 끊겼다, 행 버전을 읽다가 Stet의 `lock_timeout`을 넘겼다, 줄을 고치지 못했다, 커밋이 실패했다, 줄 하나의 상한을 넘겼다) 트랜잭션을 버린다. 줄은 `approved`로 남는다. 쓰기와 상태 변경이 한 트랜잭션이므로 반영된 것이 없고, 두 번 실행되지 않는다. 그 Stet은 그 줄을 30초 동안 다시 집지 않고 다음 줄로 간다. 1초마다 다시 집으면 상한을 넘긴 문장이 승인이 만료될 때까지 되풀이해 돌고, 트랜잭션과 함께 되돌려지지 않는 일(시퀀스 등)이 그때마다 남기 때문이다.
+- **Stet 자신의 실패.** 처리하다가 Stet 자신의 질의가 실패하면(연결이 끊겼다, 행 버전을 읽다가 Stet의 `lock_timeout`을 넘겼다, 줄을 고치지 못했다, 커밋이 실패했다, 줄 하나의 상한을 넘겼다) 트랜잭션을 버린다. 줄은 `approved`로 남는다. 쓰기와 상태 변경이 한 트랜잭션이므로 반영된 것이 없고, 두 번 실행되지 않는다. 그 Stet은 그 줄을 30초 동안 다시 집지 않고 다음 줄로 간다. 1초마다 다시 집으면 상한을 넘긴 문장이 승인이 만료될 때까지 되풀이해 돌고, 트랜잭션과 함께 되돌려지지 않는 일(시퀀스 등)이 그때마다 남기 때문이다. 줄 하나를 처리하다 panic이 나도 같다. 실행부가 그것을 받아 스택과 함께 에러 로그로 남기고, 그 줄은 Stet 자신의 실패처럼 30초 동안 다시 집지 않는다. 처리하던 연결은 닫혀 트랜잭션이 버려진다. 프로세스는 끝나지 않는다.
 - Stet이 끝날 때는 처리 중인 줄 하나가 끝나기를 기다린다. 상한은 줄 하나의 상한(`held.apply_timeout`에 5초를 더한 값)이다. 넘으면 연결을 닫는다. 서버가 그 트랜잭션을 버리고, 줄은 `approved`로 남는다. 끄기 시작한 뒤에는 새 줄을 집지 않는다. 실행부는 프록시와 게이트 다음, 풀을 닫기 전에 멈춘다.
 - Stet이 여럿이어도 한 줄은 한 번만 실행된다(2단계의 잠금).
 - 모델을 부르지 않는다. 이 트랜잭션은 모델을 기다리지 않는다(규칙 1).
@@ -258,7 +263,7 @@ GRANT EXECUTE ON FUNCTION stet.approve(uuid, text, bigint), stet.reject(uuid, te
 
 - 실행 결과는 그 줄에 남는다. `stet.decisions`에는 새 줄을 넣지 않고, 원래의 판단 기록도 고치지 않는다(규칙 3). 원래 기록은 "막았다"(`executed = false`, `refused = ST001`)는 사실 그대로다.
 - 승인으로 실행된 행은 그 계정의 누적 한도에 세지 않는다. 누적 한도는 "사람이 보지 않고 바꿀 수 있는 양"이다. 세면, 한도를 넘어 보류된 큰 쓰기 하나를 승인한 뒤 그 계정의 쓰기가 창이 지날 때까지 전부 보류된다.
-- 로그 한 줄을 남긴다. 실행하면 info(`held write applied`), `failed`로 적으면 warn(`held write failed`)이다. id, 계정, 테이블, 행 수나 이유가 들어간다. Stet 자신의 실패는 warn(`held write not applied; it stays approved`)이고 에러와 다시 집을 때까지의 시간이 들어간다. 목록을 읽지 못하면 그때마다 warn(`approved held writes not listed`)이다.
+- 로그 한 줄을 남긴다. 실행하면 info(`held write applied`), `failed`로 적으면 warn(`held write failed`)이다. id, 계정, 테이블, 행 수나 이유가 들어간다. Stet 자신의 실패는 warn(`held write not applied; it stays approved`)이고 에러와 다시 집을 때까지의 시간이 들어간다. panic이면 그 앞에 error(`panic while applying a held write`)가 하나 더 남고 panic의 값과 스택이 들어간다. 목록을 읽지 못하면 그때마다 warn(`approved held writes not listed`)이다.
 
 ## 8. 만료
 
@@ -294,7 +299,6 @@ enforce에서 게이트 대상 테이블이 있으면 둘을 더 경고한다. �
 - 세션 설정은 셋만 옮긴다. 에이전트가 세션 안에서 바꾼 `search_path`, `SET ROLE`, 그 밖의 설정(`lc_monetary` 등)은 옮기지 않는다. enforce 스펙 13장의 한계와 같다.
 - `SET`으로 세 설정 가운데 하나를 바꾸기 전에 준비한 문장(Parse)이나 묶은 포털(Bind)로 보낸 쓰기는, 보류되면 `held_write` 없이 막힌다(4장). 클라이언트가 그 문장을 다시 준비할 때까지 그렇다. `SET`에 답이 오기 전에 준비한 문장도 같다. 문장을 한 번 준비해 두고 오래 쓰는 드라이버가 세션 중간에 `SET TimeZone`을 보내면, 그 뒤로 그 문장으로 보낸 쓰기의 보류 건은 승인할 수 없다.
 - 서버 설정을 다시 읽게 하면(`ALTER SYSTEM`과 `pg_reload_conf()`) 세 설정 가운데 하나가 ReadyForQuery와 다음 쓰기 사이에 바뀔 수 있다. 프록시는 그 단위의 ReadyForQuery에서야 그것을 안다. 그 사이에 보류된 쓰기는 옛 값으로 저장된다.
-- 바이너리 값과 텍스트 값이 한 Bind에 섞인 쓰기는, 바이너리 값을 풀려고 모든 값을 Stet의 연결에서 한 번 읽는다. 저장하는 것은 텍스트 값의 온 바이트지만(4장), 이 읽기에서 텍스트 값도 Stet 연결의 설정으로 읽힌다. 에이전트 세션에서는 읽히지만 Stet 연결의 설정으로는 읽히지 않는 값(`DateStyle`이 `DMY`인 세션의 `'13/01/2026'`)이 있으면 바인딩 값을 읽지 못한 것이 된다. 그 쓰기는 보류되면 `held_write` 없이 막힌다.
 - 실행하는 동안 `session_user`는 Stet의 계정이다. 권한 확인과 행 수준 보안은 에이전트 계정(`current_user`)으로 되지만, `session_user`를 읽는 기본값, 트리거, 정책은 Stet을 본다.
 - 명시적 트랜잭션 안에서나 한 Sync 아래 다른 문장과 함께 보류된 줄을 승인하면 그 쓰기 하나만 실행된다. 에이전트가 같은 트랜잭션에서 하려던 나머지는 실행되지 않았다. 검토자에게는 `in_transaction`으로 보인다.
 - 에이전트는 결과를 모른다. `ST001`을 받은 뒤 승인됐는지, 실행됐는지 알 길이 없다. 승인되어 실행된 쓰기를 에이전트가 다시 보내면 새로 판단받는다.
@@ -303,9 +307,12 @@ enforce에서 게이트 대상 테이블이 있으면 둘을 더 경고한다. �
 - Stet이 죽은 사이에 보류된 줄은 `unconfirmed`로 남아 승인할 수 없다. 에이전트는 id를 들었을 수 있다.
 - 한 번에 하나씩 실행한다. 오래 걸리는 쓰기 하나가 뒤의 승인을 `held.apply_timeout`까지 세워 둔다.
 - 한 번에 읽는 것은 승인된 순서로 100줄이다. 그 100줄이 모두 Stet 자신의 실패로 30초를 기다리는 줄이면, 그 뒤의 승인은 그동안 실행되지 않는다. 그 상태가 이어지면 10분이 지나 `approval_lapsed`가 된다.
-- 실행부 안에서 panic이 나면 Stet 프로세스가 끝난다. 처리하던 트랜잭션은 서버가 버리고 줄은 `approved`로 남는다. 다시 시작한 Stet은 그 줄을 먼저 집는다.
+- **`not_gated`는 끝이다.** 줄의 `target_table`이 그 Stet의 설정에서 게이트 대상이 아니면 `failed`(`not_gated`)로 적고 다시 보지 않는다(7장). 한 데이터베이스에 enforce로 도는 Stet이 여럿이고 `tables`가 다르면, 한 Stet이 다른 Stet만 게이트하는 테이블의 승인된 줄을 먼저 집어 `failed`로 만든다. 한 데이터베이스의 Stet은 모두 같은 테이블을 게이트해야 한다.
+- `expires_at`은 Stet 프로세스의 시계로 정한다(문장이 들어온 시각에 `held.expire_after`를 더한다). `stet.approve`와 뷰는 그것을 데이터베이스의 시계와 비교한다. 두 시계가 어긋난 만큼 만료가 당겨지거나 밀린다. 승인 뒤 10분(8장)은 양쪽 다 데이터베이스의 시계여서 어긋나지 않는다.
+- `target_pk`는 클라이언트가 쓴 글자 그대로다(판단 기록에도 보류 줄에도). 같은 행이어도 `'07'`과 `'7'`은 최근 변경을 찾을 때 다른 키다. 그 행을 다른 글자로 가리킨 변경은 모델에 보내는 최근 변경에 들지 않는다.
 - `stet.held_writes`의 보존 기간이 없다. 줄은 지우기 전까지 남는다.
 - **스키마는 바뀌었을 때만 올린다(4장).** 스키마의 DDL은 Stet의 표에 강한 잠금을 잡고, 시작하는 Stet은 잠금을 200ms만 기다린다(`lock_timeout`). 파일을 실행할 때마다 올리면 검토자의 열린 트랜잭션(커밋하지 않은 `stet.approve`, `stet.review`의 읽기)이나 쓰기를 실행하고 있는 다른 Stet 때문에 Stet이 시작하지 못한다. 대가는 둘이다. `stet.schema_version`이 지금 파일의 값인 동안에는 누가 손으로 고친 스키마를 Stet이 되돌리지 않는다. 지운 인덱스나 트리거도, 손으로 PUBLIC에 준 두 함수의 `EXECUTE`도 그대로 남는다. 또 파일이 바뀐 뒤 처음 시작하는 Stet은 여전히 잠금을 잡는다. 그때 그런 트랜잭션이 열려 있으면 시작하지 못하고, 다시 시작해야 한다.
+- **표지는 같은지만 본다.** `schema.sql`이 다른 두 바이너리가 한 데이터베이스를 쓰면, 시작할 때마다 표지가 자기 파일의 값과 달라 저마다 자기 파일을 다시 실행한다(그때마다 잠금도 잡는다). 스키마는 마지막에 시작한 쪽의 것이 된다. 뷰에 컬럼을 더한 파일 뒤에 그 전의 파일을 실행하면 `CREATE OR REPLACE VIEW`가 컬럼을 지울 수 없어(`cannot drop columns from view`) 그 바이너리는 시작하지 못한다. 이 단계 전의 바이너리는 표지를 모른다. 시작할 때마다 자기 파일을 실행하고 표지를 적지 않는다. 그 파일은 `stet.decisions_append_only`를 `search_path` 고정 없이 다시 만든다(4장). 표지는 그대로이므로 이 단계의 바이너리는 그것을 되돌리지 않는다. 올리는 사이에 그 바이너리가 보류한 쓰기의 줄은 `status`를 적지 않고 들어가 기본값인 `unconfirmed`가 되고, 그 바이너리는 `pending`인 줄만 `undelivered`로 바꾸므로 `unconfirmed`로 남는다. `expires_at`과 `settings`도 없다. 승인할 수 없고 거부할 수도 없다. 이 단계의 스키마가 실행되기 전에 들어간 줄은 4장대로 `pending`이지만 `expires_at`이 없어 승인할 수 없다.
 
 ## 12. 패키지별 변경
 
@@ -317,31 +324,31 @@ enforce에서 게이트 대상 테이블이 있으면 둘을 더 경고한다. �
 | `internal/gate` | 보류할 때 `expires_at`, `settings`, `row_absent`, `planned_rows`, `rows_exact`를 채운다. 설정을 모르는 쓰기는 저장하지 않는다. 결과를 받을 때 줄을 `pending`이나 `undelivered`로 바꾼다(4장의 표). 텍스트 바인딩 값을 온 바이트 그대로 둔다 |
 | `internal/apply` (새 패키지) | 7장. 한 줄의 처리(`Apply`), 1초마다 집는 루프와 멈추기(`Start`, `Close`), 역할 수준 `search_path` 읽기(`RoleSearchPath`, `SchemaNames`. 시작할 때의 확인도 쓴다) |
 | `internal/config` | `held.expire_after`, `held.apply_timeout` |
-| `cmd/stet` | enforce에서 게이트 대상 테이블이 있으면 실행부를 켜고, 끌 때 프록시와 게이트 다음, 풀을 닫기 전에 멈춘다. 풀 연결의 `DateStyle`·`IntervalStyle` 고정. 10장의 두 경고 |
+| `cmd/stet` | enforce에서 게이트 대상 테이블이 있으면 실행부를 켜고, 끌 때 프록시와 게이트 다음, 풀을 닫기 전에 멈춘다. 풀 연결의 `DateStyle`·`IntervalStyle`·`extra_float_digits` 고정. 10장의 두 경고 |
 | 문서 | `stet.example.yaml`, spec-v0.2-enforce 7·8·9·13·17장과 spec-v0.1 8장의 해당 문장 |
 
 판정 규칙과 모델 인터페이스는 바뀌지 않는다(규칙 7). 프록시의 지연 예산(2ms)을 그대로 확인한다.
 
 ## 13. 수용 기준
 
-- [x] 보류된 쓰기의 줄은 `unconfirmed`로 들어가고, 거부가 전달되면 `pending`이 된다. 전달되지 않았거나 삽입이 실패로 보고됐거나 프록시가 실행됐다고 보고했으면 `undelivered`가 된다. (`TestInsertHeldWrite`, `TestMarkDelivered`, `TestMarkUndelivered`, `TestHeldWriteCarriesWhatApprovalNeeds`, `TestEnforceMarksAHiddenHoldUndelivered`, `TestEnforceMarksAnUnconfirmedHeldWriteUndelivered`, `TestHeldWriteTheProxyReportsAsSentIsUndelivered`)
-- [x] `stet.review`가 줄과 판단 기록의 근거를 함께 보여 준다. 판단 기록이 없는 줄도 나온다. `expires_at`이 지난 `pending`은 `expired`로 보인다. (`TestReviewShowsAHeldWriteWithItsDecision`, `TestRowsHeldBeforeThisStageCannotBeApproved`)
+- [x] 보류된 쓰기의 줄은 `unconfirmed`로 들어가고, 거부가 전달되면 `pending`이 된다. 전달되지 않았거나 삽입이 실패로 보고됐거나 프록시가 실행됐다고 보고했으면 `undelivered`가 된다. 판단 기록을 넣지 못해도 `pending`이 된다. (`TestInsertHeldWrite`, `TestMarkDelivered`, `TestMarkUndelivered`, `TestHeldWriteCarriesWhatApprovalNeeds`, `TestEnforceMarksAHiddenHoldUndelivered`, `TestEnforceMarksAnUnconfirmedHeldWriteUndelivered`, `TestHeldWriteTheProxyReportsAsSentIsUndelivered`, `TestHeldWriteIsPendingWhenItsDecisionIsNotRecorded`)
+- [x] `stet.review`가 줄과 판단 기록의 근거를 함께 보여 준다. 판단 기록이 없는 줄도 나온다. `expires_at`이 지난 `pending`은 `expired`로 보인다. 줄이 실행될 세션 설정도 보인다. (`TestReviewShowsAHeldWriteWithItsDecision`, `TestRowsHeldBeforeThisStageCannotBeApproved`, `TestReviewShowsTheSettingsAHeldWriteRunsUnder`)
 - [x] 권한을 받은 검토자가 `stet.approve`를 부르면 줄이 `approved`가 되고 `resolved_by`가 그 접속 계정이다. 권한을 받지 않은 계정은 뷰도 함수도 쓰지 못한다. 스키마를 다시 올려도 검토자의 권한이 남고 PUBLIC에는 없다. (`TestApproveMarksTheRow`, `TestOnlyGrantedRolesReview`. 스키마를 다시 올리는 것은 `stet.schema_version`의 값을 바꿔 `schema.sql`이 다시 돌게 해서 확인했다. PUBLIC이 쓸 수 없는 것은 `stet` 스키마의 `USAGE`만 받은 계정이 두 함수에서 `42501`을 받는 것으로 확인했다)
 - [x] 6장의 표의 줄마다 `ST005`로 거절된다. (`TestApproveAndRejectRefusals`. 표의 순서도 확인한다. 트랜잭션이 시작한 뒤 만료된 줄은 `TestApproveAndRejectReadTheClock`)
 - [x] 한 Sync 아래에서 `SET TimeZone` 뒤에 온 쓰기가 보류되면 줄이 생기지 않고, 에러에 `held_write`가 없다. (`TestSetPendingUntilReadyForQuery`, `TestGateSeesSessionSettings`, `TestHeldWriteBehindASetUnderOneSyncIsNotStored`)
 - [x] `BEGIN` 뒤의 첫 쓰기로 보류된 줄은 `in_transaction`이 참이고, 승인하면 그 쓰기만 실행된다. (`TestFirstWriteAfterBeginIsHeldInTransaction`, `TestApprovingTheFirstWriteOfATransactionRunsOnlyIt`)
-- [x] 승인된 단일 행 `UPDATE`가 실행되고 줄이 `applied`가 된다. 값은 에이전트가 보낸 그대로다. 텍스트 값과 바이너리로 온 값, NULL, 타입을 준 값과 주지 않은 값 모두에서 확인한다. (`TestHeldWriteKeepsTextValuesAsSentAmongBinaryOnes`, `TestHeldWriteKeepsBinaryAndNullParamsAsText`, `TestApplyRunsAnApprovedUpdate`, `TestApplySendsValuesAsStored`, `TestApplySendsAnEmptyValueAsEmpty`, `TestApprovedWriteRunsAsTheAgentSentIt`. 마지막 것은 프록시, 게이트, 함수, 실행부를 모두 거친다. 한 Bind에 타입 없는 텍스트 날짜, 타입 없는 NULL, 타입을 준 바이너리 정수를 보낸다)
+- [x] 승인된 단일 행 `UPDATE`가 실행되고 줄이 `applied`가 된다. 값은 에이전트가 보낸 그대로다. 텍스트 값과 바이너리로 온 값, NULL, 타입을 준 값과 주지 않은 값 모두에서 확인한다. 바이너리 값과 함께 온 텍스트 값이 에이전트 세션의 설정으로만 읽혀도 그 쓰기는 판단받고 보낸 그대로 저장된다. 바이너리로 온 실수는 반올림되지 않은 글자로 풀린다. (`TestHeldWriteKeepsTextValuesAsSentAmongBinaryOnes`, `TestHeldWriteKeepsBinaryAndNullParamsAsText`, `TestHeldWriteKeepsATextValueOnlyItsSessionReads`, `TestPoolPinsDateStyleIntervalStyleAndFloatDigits`, `TestApplyRunsAnApprovedUpdate`, `TestApplySendsValuesAsStored`, `TestApplySendsAnEmptyValueAsEmpty`, `TestApprovedWriteRunsAsTheAgentSentIt`. 마지막 것은 프록시, 게이트, 함수, 실행부를 모두 거친다. 한 Bind에 타입 없는 텍스트 날짜, 타입 없는 NULL, 타입을 준 바이너리 정수를 보낸다)
 - [x] 실행은 에이전트 계정의 권한으로 된다. 그 계정에 권한이 없는 테이블에 쓰는 줄은 `failed`(`42501`)가 되고, 행 수준 보안이 그 계정에 적용된다. (`TestApplyRunsWithTheAgentsRights`. Stet이 그 계정이 될 수 없을 때는 `TestApplyFailsWhenStetCannotBecomeTheRole`)
 - [x] 에이전트 세션의 `TimeZone`과 `DateStyle`이 Stet의 것과 다를 때, 승인된 쓰기가 에이전트 세션에서 실행했을 때와 같은 값을 넣는다. (`TestApplyReadsValuesUnderTheAgentsSettings`, `TestApprovedWriteRunsAsTheAgentSentIt`. 둘 다 `Asia/Seoul`과 `ISO, DMY`에서 `'01/02/2026 10:00'`이 2월 1일 01:00 UTC로 들어가는 것을 본다)
 - [x] 보류된 뒤 대상 행이 바뀌었으면 `failed`(`row_changed`)이고 행은 그대로다. 실행 트랜잭션이 연 뒤 문장을 보내기 전에 다른 연결이 그 행을 바꿔도 같다. 행이 사라졌으면 `applied`이고 0행이다. 보류될 때 없던 행이 생겼으면 `failed`(`row_changed`)다. 에이전트 계정의 역할 수준 `search_path`가 다르면 `failed`(`search_path_differs`)다. (`TestApplyChecksTheRowVersion`, `TestApplyRefusesAnotherSearchPath`, `TestApplyRefusesARowVersionWithoutItsKey`)
 - [x] 바뀐 행 수가 상한을 넘으면 `failed`(`rows_exceeded`)이고 테이블은 그대로다. `max_rows`를 준 승인은 그 값까지 실행된다. (`TestApplyKeepsToTheApprovedRows`. 상한이 없는 줄의 `no_row_limit`도 본다)
-- [x] 문장이 역할을 바꾸면 `failed`(`role_changed`)이고 바뀐 것이 없다. 그 뒤의 줄은 정상으로 실행된다(연결을 버렸다). (`TestApplyUndoesAWriteThatChangesRole`)
-- [x] 문장이 서버에서 실패하면 `failed`이고 `error`에 SQLSTATE와 메시지가 있다. 시간 상한을 넘어도 같다. (`TestApplyRecordsTheServersError`. 잠금 대기가 `57014`로 끝나는 것과 지연된 제약도 본다)
+- [x] 문장이 역할을 바꾸면 `failed`(`role_changed`)이고 바뀐 것이 없다. 그 뒤의 줄은 정상으로 실행된다(연결을 버렸다). 문장이 `search_path`를 바꿔도 그 뒤의 Stet 자신의 질의는 그것으로 이름을 찾지 않는다. (`TestApplyUndoesAWriteThatChangesRole`, `TestApplyIgnoresTheSearchPathItsStatementSets`)
+- [x] 문장이 서버에서 실패하면 `failed`이고 `error`에 SQLSTATE와 메시지가 있다. 시간 상한을 넘어도 같다. 실행 전 확인이 읽다가 서버 에러가 나도(대상 테이블이 지워졌다) 같다. (`TestApplyRecordsTheServersError`, `TestApplyRecordsAServerErrorInTheChecks`. 잠금 대기가 `57014`로 끝나는 것과 지연된 제약도 본다)
 - [x] 거부된 줄, 만료된 줄, `undelivered`와 `unconfirmed`인 줄은 실행되지 않는다. 승인하고 10분이 지난 줄은 `failed`(`approval_lapsed`)다. (`TestApplyLeavesOtherStatusesAlone`, `TestLoopPicksUpApprovalsMadeWhileItWasDown`)
-- [x] 두 실행부가 같은 줄을 동시에 집어도 쓰기는 한 번만 실행된다. 실행부의 질의가 중간에 실패하면 줄은 `approved`로 남고 쓰기는 반영되지 않는다. (`TestTwoAppliersRunAWriteOnce`, `TestApplyLeavesTheRowApprovedWhenItsOwnStepFails`, `TestApplyLeavesTheRowApprovedWhenItsBoundPasses`, `TestLoopGoesOnAfterAFailure`. 7장 2단계에서 다른 Stet이 막 끝낸 줄을 `40001`로 받는 경로는 한 문장 안의 경주라 테스트가 없다)
+- [x] 두 실행부가 같은 줄을 동시에 집어도 쓰기는 한 번만 실행된다. 실행부의 질의가 중간에 실패하면 줄은 `approved`로 남고 쓰기는 반영되지 않는다. 줄 하나의 처리에서 panic이 나도 같고, 실행부는 다른 줄로 간다. (`TestTwoAppliersRunAWriteOnce`, `TestApplyLeavesTheRowApprovedWhenItsOwnStepFails`, `TestApplyLeavesTheRowApprovedWhenItsBoundPasses`, `TestLoopGoesOnAfterAFailure`, `TestLoopGoesOnAfterAPanic`. 7장 2단계에서 다른 Stet이 막 끝낸 줄을 `40001`로 받는 경로는 한 문장 안의 경주라 테스트가 없다)
 - [x] 섀도 모드에서는 `approved`인 줄이 있어도 아무것도 실행되지 않는다. (`TestShadowModeRunsNoApprovedWrite`)
 - [x] 승인으로 실행된 행은 누적 한도에 들지 않는다. (`TestAppliedRowsDoNotCountTowardTheCumulativeLimit`)
-- [x] `stet.held_writes`의 문장이나 값을 고치는 `UPDATE`, 그림에 없는 상태 변경은 `ST004`로 거부된다. (`TestHeldWritesContentIsFixed`, `TestHeldWritesStatusFollowsTheArrows`, `TestHeldWritesResultsMoveWithTheirArrow`)
+- [x] `stet.held_writes`의 문장이나 값을 고치는 `UPDATE`, 그림에 없는 상태 변경은 `ST004`로 거부된다. 고친 사람의 `search_path`에 트리거가 부르는 함수를 가로채는 함수가 있어도 같다. (`TestHeldWritesContentIsFixed`, `TestHeldWritesStatusFollowsTheArrows`, `TestHeldWritesResultsMoveWithTheirArrow`, `TestGuardTriggersIgnoreTheCallersSearchPath`)
 - [x] Stet을 끌 때 처리 중인 줄이 끝나거나 버려지고, 반쯤 반영된 것이 없다. (`TestCloseWaitsForTheWriteBeingApplied`, `TestCloseAbandonsAWritePastItsBound`, `TestRunStopsTheApplierBeforeThePool`. 마지막 것은 끌 때 처리 중이던 줄이 `applied`로 끝나고 에러 로그가 없는 것을 본다. 실행부와 풀을 닫는 순서는 밖에서 보이지 않아 코드로만 확인했다)
 - [x] 10장의 두 경고가 나온다. (`TestCheckWarnsWhenStetIsASuperuser`, `TestCheckWarnsWhenStetIsNotAMemberOfAnAgentRole`, `TestCheckInShadowSaysNothingOfApprovals`)
 - [x] 프록시의 2ms 지연 예산을 지킨다. `go test -race ./...`가 통과한다. (`TestPassthroughLatencyBudget`, `TestObservedReadLatencyBudget`, `TestUnwatchedSessionLatencyBudget`, `TestEnforcedSessionLatencyBudget`, `TestEnforcedSessionSettingsLatencyBudget`. 마지막 확인에서 프록시가 더한 p95는 차례로 33.9µs, 41.8µs, 28.5µs, 28.1µs, 29.7µs였다. `STET_TEST_PG=127.0.0.1:55432 go test -race -count=1 ./...`가 모든 패키지에서 `ok`)
