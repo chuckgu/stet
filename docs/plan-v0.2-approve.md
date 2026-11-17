@@ -152,6 +152,11 @@ func (s *Store) MarkUndelivered(ctx context.Context, id string) error
 - [ ] **Step 4:** `internal/gate/enforce_test.go`의 `TestEnforceHoldsWhatTheModelFlags`에서 `h.Status != "pending"`을 `"unconfirmed"`로 바꾼다(Task 5가 `pending`을 기다리도록 되돌린다. 그 사이의 줄은 승인할 수 없는 쪽으로 틀린다). `STET_TEST_PG=127.0.0.1:55432 go test -race ./...` → 모든 패키지 `ok`.
 - [ ] **Step 5:** 커밋 `Store: held writes start unconfirmed, keep what was held, and move only along the spec's arrows`.
 
+**실행 전 점검의 판정.** 이 Task의 본문과 다르면 이것을 따른다.
+
+- (P2) `stet.held_writes`의 DDL은 스키마가 이미 맞으면 잠금을 잡지 않게 쓴다. `Migrate`는 Stet이 시작할 때마다 돌고, `ALTER TABLE`과 `DROP TRIGGER`는 아무것도 바꾸지 않아도 `AccessExclusiveLock`을 잡는다. 실행부의 트랜잭션이 줄을 잠그고 있는 동안 다른 Stet이 시작하면 `lock_timeout`(200ms)으로 시작에 실패한다. 그래서 컬럼 추가와 기본값 변경은 빠진 것이 있을 때만 도는 `DO` 블록 안에 두고(`information_schema.columns`나 `pg_attribute`, `pg_attrdef`로 확인), 트리거는 없을 때만 만든다(`pg_trigger`로 확인. 트리거 함수는 `CREATE OR REPLACE FUNCTION`이 본문을 새로 한다). 인덱스는 `CREATE INDEX IF NOT EXISTS` 그대로다. 테스트 하나를 더한다: 다른 연결이 `stet.held_writes`의 한 줄을 `FOR UPDATE`로 잠근 채로 있어도 `Migrate`가 `lock_timeout` 200ms인 풀에서 성공한다(`TestMigrateDoesNotWaitForAHeldRowLock`).
+- (P7) 트리거의 두 확인은 따로다. 상태 화살표 확인은 `status`가 같으면 통과다. `in_transaction` 확인은 그와 별개이고, 값이 바뀌는 것은 `unconfirmed`에서 `pending`으로 가는 그 갱신에서만 허락한다.
+
 ---
 
 ### Task 3: 저장소 2 — 뷰, 승인·거부 함수, 승인된 줄 집기
@@ -234,6 +239,12 @@ func MarkFailed(ctx context.Context, q Querier, id, reason string) error
 - [ ] **Step 4:** `STET_TEST_PG=127.0.0.1:55432 go test -race ./...` → 모든 패키지 `ok`.
 - [ ] **Step 5:** 커밋 `Store: the review view, approve and reject, and claiming approved held writes`.
 
+**실행 전 점검의 판정.** 이 Task의 본문과 다르면 이것을 따른다.
+
+- (P1) `TestApprovedWrites`는 순서와 `limit`을 자기가 넣은 id들 안에서만 확인한다. 공유 데이터베이스 `stet_test`에는 다른 테스트의 줄이 있을 수 있다.
+- (P3) 검토자 역할을 만드는 테스트 헬퍼는 `GRANT`와, 나중의 `DROP OWNED BY`를 `Migrate`가 잡는 것과 같은 advisory lock(`pg_advisory_xact_lock`, 같은 키)을 먼저 잡은 트랜잭션에서 한다. 다른 패키지의 `Migrate`가 같은 때에 두 함수와 뷰의 카탈로그 줄을 고쳐 쓰면 `tuple concurrently updated`로 실패하기 때문이다.
+- (P5, B9에 더함) `MarkApplied`와 `MarkFailed`는 `applied_at`에 `clock_timestamp()`를 쓴다. 스펙 4장의 뜻은 실행을 끝낸 시각이다.
+
 ---
 
 ### Task 4: 프록시 — 세션 설정과 `SET` 깃발
@@ -280,6 +291,10 @@ SetPending bool
 - [ ] **Step 4:** `STET_TEST_PG=127.0.0.1:55432 go test -race ./...` → 모든 패키지 `ok`. `STET_TEST_PG=127.0.0.1:55432 go test ./internal/proxy/ -run LatencyBudget -count=1 -v`의 다섯 테스트가 PASS이고, 찍힌 p95를 보고에 적는다.
 - [ ] **Step 5:** 커밋 `Proxy: follow TimeZone, DateStyle and IntervalStyle on enforced sessions, and tell the gate of a SET not yet answered`.
 
+**실행 전 점검의 판정.** 이 Task의 본문과 다르면 이것을 따른다.
+
+- (P6) 테스트용 `recordingGate`는 `set`이나 `reset`으로 시작하는 SQL에 `Sets`만 세운다. `Clean`은 지금의 `cleanRE`가 정하는 대로 둔다. 실제 분류기와 B2에서 `RESET`은 깨끗한 문장이 아니다.
+
 ---
 
 ### Task 5: 게이트 — 보류 줄의 내용과 전달 확인
@@ -322,6 +337,10 @@ SetPending bool
   - 손으로 만든 `SessionInfo`로 보류 줄을 기대하는 기존 테스트가 있으면 세 설정을 채운다.
 - [ ] **Step 4:** `STET_TEST_PG=127.0.0.1:55432 go test -race ./...` → 모든 패키지 `ok`.
 - [ ] **Step 5:** 커밋 `Gate: store what an approval needs with a held write, and make it pending only once its refusal was delivered`.
+
+**실행 전 점검의 판정.** 이 Task의 본문과 다르면 이것을 따른다.
+
+- (P8) `settings`의 키는 서버가 알리는 ParameterStatus 이름 그대로 `TimeZone`, `DateStyle`, `IntervalStyle`이다. Task 2와 Task 6의 테스트와 실행부가 이 이름으로 읽는다.
 
 ---
 
@@ -387,6 +406,11 @@ var applyGrace = 5 * time.Second // a var so tests can shorten it
 - [ ] **Step 4:** `STET_TEST_PG=127.0.0.1:55432 go test -race ./...` → 모든 패키지 `ok`(`cmd/stet`의 `search_path` 경고 테스트 포함).
 - [ ] **Step 5:** 커밋 `Apply: run one approved held write in one transaction, as its role and only as far as it was approved`.
 
+**실행 전 점검의 판정.** 이 Task의 본문과 다르면 이것을 따른다.
+
+- (P1) `internal/apply`의 테스트는 공유 데이터베이스 `stet_test`가 아니라 테스트가 만들고 지우는 자기 데이터베이스에서 돈다(`cmd/stet`의 `cleanDatabase`와 같은 방식. 헬퍼는 이 패키지에 새로 둔다). 실행부는 그 데이터베이스의 `approved` 줄을 모두 집으므로, 공유 데이터베이스에서 돌면 다른 패키지의 줄을 `not_gated`로 끝내 버린다.
+- (P9) 역할 수준 `search_path`를 읽는 질의는 한 곳에만 둔다. `internal/apply`가 읽는 함수 하나를 내보내고(예: `RoleSearchPath`), `cmd/stet/check.go`의 `searchPath`도 그것을 부르게 고친다. 질의와 우선순위(이 데이터베이스용 설정이 전체용보다 먼저)가 두 벌이 되지 않게 한다. `ident`와 행 버전을 읽는 짧은 질의를 이 패키지에 한 벌 더 두는 것은 받아들인다(게이트의 것은 내보내지 않은 메서드다).
+
 ---
 
 ### Task 7: 실행부의 루프와 `cmd/stet` 배선
@@ -422,6 +446,11 @@ func (a *Applier) Close()
 - [ ] **Step 3: 구현.** 루프는 1초 간격(`pollEvery`)으로 `ApprovedWrites(ctx, 100)`을 풀로 읽고, 나온 순서대로 `Apply`한다. 줄 사이마다 멈춤을 확인하고, `Apply`의 에러는 warn 로그로 남기고 다음 줄로 간다(그 줄은 다음 차례에 다시 나온다). `openGate`: `cfg.Mode == config.ModeEnforce`일 때만 `apply.New(...).Start()`(게이트가 없는 설정에서는 풀도 실행부도 없다). `closeGate`는 `g.Close()`, 실행부의 `Close()`, `pool.Close()` 순서다. `openPool`의 `RuntimeParams`에 `DateStyle = ISO`, `IntervalStyle = postgres`를 더한다.
 - [ ] **Step 4:** `STET_TEST_PG=127.0.0.1:55432 go test -race ./...` → 모든 패키지 `ok`.
 - [ ] **Step 5:** 커밋 `Stet: apply approved held writes in enforce mode, stop the applier before the pool, and pin the pool's DateStyle and IntervalStyle`.
+
+**실행 전 점검의 판정.** 이 Task의 본문과 다르면 이것을 따른다.
+
+- (P1) 이 Task의 `internal/apply` 테스트와, `cmd/stet`에서 줄을 승인하거나 게이트 대상 테이블을 두고 enforce로 `run`을 띄우는 테스트는 모두 자기 데이터베이스에서 돈다. 이미 있는 `TestRunServesInEnforceMode`도 준비 단계만 그렇게 바꾼다(단언은 그대로다). 실행부가 켜진 뒤로는 공유 데이터베이스에서 enforce로 도는 Stet이 다른 패키지의 `approved` 줄을 집기 때문이다.
+- (P10) Consumes에 Task 6의 `export_test.go`가 내보내는 `apply.FailMarks`가 더 있다. `TestLoopGoesOnAfterAFailure`가 쓴다.
 
 ---
 
@@ -492,3 +521,8 @@ func (a *Applier) Close()
 | 19 | 끌 때 끝나거나 버려진다 | 7: `TestCloseWaitsForTheWriteBeingApplied`, `TestCloseAbandonsAWritePastItsBound`, `TestRunStopsTheApplierBeforeThePool` |
 | 20 | 10장의 두 경고 | 8: `TestCheckWarnsWhenStetIsASuperuser`, `TestCheckWarnsWhenStetIsNotAMemberOfAnAgentRole` |
 | 21 | 2ms 예산, `go test -race ./...` | 4: Step 4. 9: Step 4 |
+
+**실행 전 점검의 판정.** 이 Task의 본문과 다르면 이것을 따른다.
+
+- (P4) Step 3은 B1~B9 전부를 스펙의 해당 장(2·4·5·6·7장)에 옮긴다. B3의 5장 설명과 B9의 `clock_timestamp()`(6·7장, `applied_at` 포함)가 빠지지 않게 한다. 실행 전 점검의 판정 가운데 스펙의 문장을 바꾸는 것(P2: 스키마가 맞으면 `Migrate`가 `stet.held_writes`를 잠그지 않는다)도 4장에 한 줄로 적는다.
+
