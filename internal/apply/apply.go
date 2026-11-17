@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -36,12 +37,14 @@ var applyGrace = 5 * time.Second
 const closeTimeout = time.Second
 
 // The reasons a held write is recorded as failed without being kept, besides
-// the server's errors (spec 7; no_row_limit is correction B5).
+// the server's errors (spec 7; no_row_limit is correction B5, settings_missing
+// ruling 16).
 const (
 	approvalLapsed    = "approval_lapsed"
 	otherDatabase     = "other_database"
 	notGated          = "not_gated"
 	noRowLimit        = "no_row_limit"
+	settingsMissing   = "settings_missing"
 	rowChanged        = "row_changed"
 	searchPathDiffers = "search_path_differs"
 	roleChanged       = "role_changed"
@@ -63,13 +66,27 @@ type Applier struct {
 	store *store.Store
 	log   *slog.Logger
 
+	// The loop (loop.go).
+	ctx       context.Context // done once Close is called
+	stop      context.CancelFunc
+	startOnce sync.Once
+	stopped   chan struct{} // closed once the loop has returned, or at Close when it never started
+
 	// Test seams.
 	markApplied     func(ctx context.Context, q store.Querier, id string, rows int64) error
-	beforeStatement func() // called once the checks pass, before the savepoint
+	beforeStatement func()                       // called once the checks pass, before the savepoint
+	applyOne        func(w store.Approved) error // what the loop calls for each write: Apply
 }
 
 func New(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, log *slog.Logger) *Applier {
-	return &Applier{cfg: cfg, pool: pool, store: st, log: log, markApplied: store.MarkApplied}
+	ctx, stop := context.WithCancel(context.Background())
+	a := &Applier{
+		cfg: cfg, pool: pool, store: st, log: log,
+		ctx: ctx, stop: stop, stopped: make(chan struct{}),
+		markApplied: store.MarkApplied,
+	}
+	a.applyOne = a.Apply
+	return a
 }
 
 // Apply processes one approved held write on a connection of its own, in one
@@ -185,7 +202,17 @@ func (a *Applier) check(ctx context.Context, tx pgx.Tx, c *store.Claimed) (strin
 	if c.Limit == nil {
 		return noRowLimit, nil
 	}
+	// The gate stores no row without all three; one put there by SQL is not
+	// run under Stet's settings in their place.
+	for _, name := range sessionSettings {
+		if c.Settings[name] == "" {
+			return settingsMissing, nil
+		}
+	}
 	if c.RowVersion != nil || c.RowAbsent {
+		if c.TargetPK == nil {
+			return rowChanged, nil // the version cannot be checked without the row's key
+		}
 		changed, err := rowChangedSince(ctx, tx.Conn().PgConn(), c, t.PK)
 		if err != nil {
 			return "", fmt.Errorf("read the row version: %w", err)
@@ -208,14 +235,10 @@ func (a *Applier) check(ctx context.Context, tx pgx.Tx, c *store.Claimed) (strin
 // reports whether it differs from what was held. A row that is gone has not
 // changed: the statement runs and touches no row. A row that was absent and
 // is there now has. Under REPEATABLE READ, a change committed after this read
-// fails the statement with 40001 (spec 7).
+// fails the statement with 40001 (spec 7). c.TargetPK is not nil.
 func rowChangedSince(ctx context.Context, pg *pgconn.PgConn, c *store.Claimed, pk string) (bool, error) {
 	q := fmt.Sprintf("select t.xmin::text from %s as t where t.%s = $1", ident(c.TargetTable), pgx.Identifier{pk}.Sanitize())
-	key := [][]byte{nil}
-	if c.TargetPK != nil {
-		key[0] = []byte(*c.TargetPK)
-	}
-	res := pg.ExecParams(ctx, q, key, nil, nil, nil).Read()
+	res := pg.ExecParams(ctx, q, [][]byte{[]byte(*c.TargetPK)}, nil, nil, nil).Read()
 	switch {
 	case res.Err != nil:
 		return false, res.Err
@@ -232,11 +255,14 @@ func rowChangedSince(ctx context.Context, pg *pgconn.PgConn, c *store.Claimed, p
 // 5) and checks what it did (step 6). It returns the rows the statement
 // changed, or the reason not to keep what it did. A server error at any of
 // these steps is such a reason (correction B6); any other failure is an
-// error.
+// error, labelled with its step.
 func (a *Applier) run(ctx context.Context, tx pgx.Tx, c *store.Claimed) (int64, string, error) {
 	if err := a.become(ctx, tx, c); err != nil {
 		reason, err := failure(err)
-		return 0, reason, err
+		if err != nil {
+			return 0, "", fmt.Errorf("role and settings: %w", err)
+		}
+		return 0, reason, nil
 	}
 
 	// The values as stored, in text, with the client's types; the result
@@ -251,7 +277,10 @@ func (a *Applier) run(ctx context.Context, tx pgx.Tx, c *store.Claimed) (int64, 
 	}
 	if err != nil {
 		reason, err := failure(err)
-		return 0, reason, err
+		if err != nil {
+			return 0, "", fmt.Errorf("statement: %w", err)
+		}
+		return 0, reason, nil
 	}
 
 	var user string
@@ -267,17 +296,16 @@ func (a *Applier) run(ctx context.Context, tx pgx.Tx, c *store.Claimed) (int64, 
 	return tag.RowsAffected(), "", nil
 }
 
-// become takes the row's role and its session's settings, and the bounds
-// of held.apply_timeout, for the rest of the transaction (step 4).
+// become takes the row's role and its session's settings, which check found
+// all there, and the bounds of held.apply_timeout, for the rest of the
+// transaction (step 4).
 func (a *Applier) become(ctx context.Context, tx pgx.Tx, c *store.Claimed) error {
 	if _, err := tx.Exec(ctx, "set local role "+pgx.Identifier{c.LoginRole}.Sanitize()); err != nil {
 		return err
 	}
 	for _, name := range sessionSettings {
-		if v, ok := c.Settings[name]; ok {
-			if _, err := tx.Exec(ctx, "select set_config($1, $2, true)", name, v); err != nil {
-				return err
-			}
+		if _, err := tx.Exec(ctx, "select set_config($1, $2, true)", name, c.Settings[name]); err != nil {
+			return err
 		}
 	}
 	// Also over the start's lock_timeout, which is for Stet's own queries.

@@ -97,7 +97,11 @@ func setup(t *testing.T) *env {
 	if _, err := root.Exec(ctx, "create database "+db+" template template0 owner stet_scram"); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { root.Exec(context.Background(), "drop database if exists "+db+" with (force)") })
+	t.Cleanup(func() {
+		if _, err := root.Exec(context.Background(), "drop database if exists "+db+" with (force)"); err != nil {
+			t.Errorf("drop database %s: %v", db, err)
+		}
+	})
 	// So Stet can become the agent's role (already so on the test server; never revoked).
 	if _, err := root.Exec(ctx, "grant stet_md5 to stet_scram"); err != nil {
 		t.Fatal(err)
@@ -174,8 +178,11 @@ func (e *env) role(name string) string {
 	e.suExec("create role " + id + " nologin")
 	e.t.Cleanup(func() {
 		ctx := context.Background()
-		e.su.Exec(ctx, "drop owned by "+id)
-		e.su.Exec(ctx, "drop role "+id)
+		for _, sql := range []string{"drop owned by " + id, "drop role " + id} {
+			if _, err := e.su.Exec(ctx, sql); err != nil {
+				e.t.Errorf("%s: %v", sql, err)
+			}
+		}
 	})
 	e.suExec("grant " + id + " to stet_scram")
 	return name
@@ -304,6 +311,11 @@ func deref[T any](p *T) any {
 	return *p
 }
 
+func (r heldRow) String() string {
+	return fmt.Sprintf("{status %s, applied_at %v, rows_affected %v, error %v}",
+		r.Status, deref(r.AppliedAt), deref(r.RowsAffected), deref(r.Error))
+}
+
 func (e *env) wantApplied(id string, rows int64) {
 	e.t.Helper()
 	r := e.row(id)
@@ -379,6 +391,27 @@ func (e *env) logged(parts ...string) bool {
 	return false
 }
 
+// gone waits until no session of the test's database runs statement, so
+// that what an abandoned transaction did can no longer be committed.
+func (e *env) gone(statement string) {
+	e.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var n int
+		if err := e.su.QueryRow(context.Background(), `select count(*) from pg_stat_activity
+			where datname = current_database() and query = $1 and pid <> pg_backend_pid()`, statement).Scan(&n); err != nil {
+			e.t.Fatal(err)
+		}
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			e.t.Fatalf("a session still runs %q", statement)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func TestApplyRunsAnApprovedUpdate(t *testing.T) {
 	e := setup(t)
 	ctx := context.Background()
@@ -440,6 +473,114 @@ func TestApplySendsValuesAsStored(t *testing.T) {
 			t.Errorf("param_types %v: name %v, owner %v; want CTO and NULL", types, deref(name), deref(owner))
 		}
 	}
+}
+
+// An empty text value is sent as the empty string, not as NULL, with and
+// without a type.
+func TestApplySendsAnEmptyValueAsEmpty(t *testing.T) {
+	e := setup(t)
+	for _, types := range [][]uint32{{25, 23}, nil} {
+		e.exec("update contacts set name = 'before' where id = 2")
+		h := e.update("update contacts set name = $1 where id = $2", 2)
+		h.Params, h.ParamTypes = []*string{ptr(""), ptr("2")}, types
+		e.apply(e.approved(h, nil))
+		e.wantApplied(h.ID, 1)
+		if got := e.name(2); got == nil || *got != "" {
+			t.Errorf("param_types %v: name %v, want ''", types, deref(got))
+		}
+	}
+}
+
+// Addendum A: a row whose settings are NULL, lack one of the three, or hold
+// an empty one is not run under Stet's own settings in their place.
+func TestApplyRefusesARowWithoutItsSettings(t *testing.T) {
+	e := setup(t)
+	before := e.contents(table)
+	for what, settings := range map[string]map[string]string{
+		"NULL":               nil,
+		"no IntervalStyle":   {"TimeZone": "UTC", "DateStyle": "ISO, MDY"},
+		"an empty DateStyle": {"TimeZone": "UTC", "DateStyle": "", "IntervalStyle": "postgres"},
+		"an empty TimeZone":  {"TimeZone": "", "DateStyle": "ISO, MDY", "IntervalStyle": "postgres"},
+	} {
+		h := e.update("update contacts set name = 'x' where id = 1", 1)
+		h.Settings = settings
+		e.apply(e.approved(h, nil))
+		if r := e.row(h.ID); r.Status != "failed" || r.Error == nil || *r.Error != "settings_missing" {
+			t.Errorf("settings %s: status %s, error %v; want failed with settings_missing", what, r.Status, deref(r.Error))
+		}
+	}
+	e.wantUnchanged(table, before)
+}
+
+// Addendum B: a row version, or row_absent, without the key of the row it
+// was read from cannot be checked, so the row is taken to have changed.
+func TestApplyRefusesARowVersionWithoutItsKey(t *testing.T) {
+	e := setup(t)
+	before := e.contents(table)
+
+	versioned := e.update("update contacts set name = 'x' where id = 1", 1)
+	versioned.TargetPK = nil
+	e.apply(e.approved(versioned, nil))
+	e.wantFailed(versioned.ID, "row_changed", true)
+
+	absent := e.update("update contacts set name = 'x' where id = 9", 9)
+	if !absent.RowAbsent {
+		t.Fatal("row 9 exists")
+	}
+	absent.TargetPK = nil
+	e.apply(e.approved(absent, nil))
+	e.wantFailed(absent.ID, "row_changed", true)
+
+	e.wantUnchanged(table, before)
+}
+
+// A row with a row version needs the REPEATABLE READ transaction the
+// listing announces; told otherwise, Apply runs nothing.
+func TestApplyNeedsTheSnapshotItsRowVersionDoes(t *testing.T) {
+	e := setup(t)
+	before := e.contents(table)
+	h := e.update("update contacts set name = 'x' where id = 1", 1)
+	w := e.approved(h, nil)
+	if !w.Snapshot {
+		t.Fatal("a row with a row version is listed as needing no snapshot")
+	}
+	if err := e.a.Apply(store.Approved{ID: w.ID, Snapshot: false}); err == nil {
+		t.Error("Apply without the snapshot = nil, want an error")
+	}
+	if r := e.row(h.ID); r.Status != "approved" || r.AppliedAt != nil || r.Error != nil {
+		t.Errorf("row is now %+v, want it still approved", r)
+	}
+	e.wantUnchanged(table, before)
+}
+
+// Apply's bound passes while the statement runs: a failure that is not the
+// server's, so the row stays approved and nothing it did is kept. The error
+// names the step it came from (addendum D).
+func TestApplyLeavesTheRowApprovedWhenItsBoundPasses(t *testing.T) {
+	e := setup(t)
+	e.cfg.Held.ApplyTimeout = time.Second
+	t.Cleanup(apply.SetGrace(-500 * time.Millisecond)) // a bound of 500ms, before the server's 1s
+	before := e.contents(table)
+	h := e.update("update contacts set name = (select 'slept' from pg_sleep(2)) where id = 1", 1)
+	w := e.approved(h, nil)
+
+	start := time.Now()
+	err := e.a.Apply(w)
+	if d := time.Since(start); d > 1500*time.Millisecond {
+		t.Errorf("Apply took %s, want about its bound of 500ms", d)
+	}
+	var pgErr *pgconn.PgError
+	if err == nil || errors.As(err, &pgErr) {
+		t.Fatalf("Apply = %v, want an error that is not the server's", err)
+	}
+	if want := "apply held write " + w.ID + ": statement: "; !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("Apply = %q, want it to start with %q", err, want)
+	}
+	e.gone(h.Statement)
+	if r := e.row(h.ID); r.Status != "approved" || r.AppliedAt != nil || r.Error != nil {
+		t.Errorf("row is now %+v, want it still approved", r)
+	}
+	e.wantUnchanged(table, before)
 }
 
 func TestApplyRunsWithTheAgentsRights(t *testing.T) {

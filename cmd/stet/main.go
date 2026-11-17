@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/stetdb/stet/internal/apply"
 	"github.com/stetdb/stet/internal/config"
 	"github.com/stetdb/stet/internal/decide"
 	"github.com/stetdb/stet/internal/decide/jev"
@@ -78,7 +79,9 @@ func runProxy(args []string) error {
 
 // run serves cfg on ln until ctx is done, then stops in order: the proxy
 // first, waiting for its sessions to report their last statements; then the
-// gate, which records what it still holds; then Stet's own pool.
+// gate, which records what it still holds; then, in enforce mode, the
+// executor of approved held writes, waiting for the one it is applying; then
+// Stet's own pool.
 func run(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog.Logger) error {
 	g, closeGate, err := openGate(ctx, cfg, log)
 	if err != nil {
@@ -115,10 +118,12 @@ func run(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog.Log
 }
 
 // openGate opens Stet's pool, brings the stet schema up to date, checks the
-// database (check), and builds the gate over cfg's tables. closeGate closes
-// the gate and then the pool. With no table there is no gate, no pool and no
-// check: the proxy passes every session through, in enforce mode too (spec
-// correction B10), which is logged.
+// database (check), and builds the gate over cfg's tables. In enforce mode it
+// also starts the executor of approved held writes (spec-v0.2-approve 7); in
+// shadow mode there is none, and no write is executed (rule 6). closeGate
+// closes the gate, then the executor, then the pool. With no table there is
+// no gate, no executor, no pool and no check: the proxy passes every session
+// through, in enforce mode too (spec correction B10), which is logged.
 func openGate(ctx context.Context, cfg *config.Config, log *slog.Logger) (g *gate.Gate, closeGate func(), err error) {
 	if len(cfg.Tables) == 0 {
 		if cfg.Mode == config.ModeEnforce {
@@ -153,15 +158,27 @@ func openGate(ctx context.Context, cfg *config.Config, log *slog.Logger) (g *gat
 	if g, err = gate.New(cfg, pool, st, d, log); err != nil {
 		return fail(err)
 	}
+	var applier *apply.Applier
+	if cfg.Mode == config.ModeEnforce {
+		applier = apply.New(cfg, pool, st, log)
+		applier.Start()
+	}
 	return g, func() {
 		g.Close()
+		if applier != nil {
+			applier.Close()
+		}
 		pool.Close()
 	}, nil
 }
 
 // openPool connects Stet's own sessions: state reads and decision writes.
 // They wait briefly for locks so a client's open transaction cannot stall
-// its own write's state assembly for long.
+// its own write's state assembly for long. DateStyle and IntervalStyle are
+// pinned, whatever the database or role sets, so that a binary value Stet
+// turns into text reads the same under any session's settings
+// (spec-v0.2-approve 4). The executor's connections start with these
+// settings too.
 func openPool(ctx context.Context, upstream string) (*pgxpool.Pool, error) {
 	pc, err := pgxpool.ParseConfig(upstream)
 	if err != nil {
@@ -169,6 +186,8 @@ func openPool(ctx context.Context, upstream string) (*pgxpool.Pool, error) {
 	}
 	pc.ConnConfig.RuntimeParams["application_name"] = "stet"
 	pc.ConnConfig.RuntimeParams["lock_timeout"] = "200ms"
+	pc.ConnConfig.RuntimeParams["DateStyle"] = "ISO"
+	pc.ConnConfig.RuntimeParams["IntervalStyle"] = "postgres"
 	pool, err := pgxpool.NewWithConfig(ctx, pc)
 	if err != nil {
 		return nil, err

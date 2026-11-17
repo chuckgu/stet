@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -118,6 +119,110 @@ func stetPoolIn(t *testing.T, pg, db string) *pgxpool.Pool {
 		t.Fatal(err)
 	}
 	return pool
+}
+
+// agentTable makes a database of the test's own (cleanDatabase) holding a
+// table with rows ids 1..n that stet_md5 may read and change, and makes Stet's
+// account a member of stet_md5, so that it can measure and apply as it. It
+// returns the database's name, the table's, and a connection to the database
+// as Stet's account. A run in enforce mode with gated tables applies every
+// approved held write of its database, so such a run, and a test that
+// approves held writes, keeps out of the shared stet_test (plan ruling P1).
+func agentTable(t *testing.T, pg string, n int) (db, table string, admin *pgx.Conn) {
+	t.Helper()
+	db = cleanDatabase(t, pg)
+	admin = connectTo(t, pg, db, "stet_scram", "scram-pw")
+	table = freshTable(t, admin, n)
+	mustExec(t, admin, "grant all on "+table+" to stet_md5")
+	mustExec(t, superuser(t, pg), "grant stet_md5 to stet_scram") // already so on the test server; never revoked
+	return db, table, admin
+}
+
+// reviewerPassword is the password of the reviewers the tests create.
+const reviewerPassword = "reviewer-pw"
+
+// newReviewer creates a login role for a reviewer. Create it before the
+// database it reviews in: see cleanDatabase.
+func newReviewer(t *testing.T, pg string) string {
+	t.Helper()
+	return createRole(t, superuser(t, pg), "reviewer", "login password '"+reviewerPassword+"'")
+}
+
+// review gives reviewer the grants of spec 6 in database db, whose stet
+// schema is in place, and connects as it.
+func review(t *testing.T, pg, db, reviewer string) *pgx.Conn {
+	t.Helper()
+	in := connectTo(t, pg, db, "postgres", "postgres-pw")
+	mustExec(t, in, "grant usage on schema stet to "+reviewer)
+	mustExec(t, in, "grant select on stet.review to "+reviewer)
+	mustExec(t, in, "grant execute on function stet.approve(uuid, text, bigint), stet.reject(uuid, text) to "+reviewer)
+	return connectTo(t, pg, db, reviewer, reviewerPassword)
+}
+
+// heldWriteOf is the held write a refusal names, failing the test unless err
+// is one (ST001 with a held_write in its detail).
+func heldWriteOf(t *testing.T, err error, log fmt.Stringer) string {
+	t.Helper()
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "ST001" {
+		t.Fatalf("got %v, want a refusal with ST001; log:\n%s", err, log)
+	}
+	for f := range strings.FieldsSeq(pgErr.Detail) {
+		if id, ok := strings.CutPrefix(f, "held_write="); ok {
+			return id
+		}
+	}
+	t.Fatalf("refusal detail %q names no held write; log:\n%s", pgErr.Detail, log)
+	return ""
+}
+
+// waitStatus waits up to d for held write id to show status in stet.review
+// as conn reads it.
+func waitStatus(t *testing.T, conn *pgx.Conn, id, status string, d time.Duration, log fmt.Stringer) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for {
+		var got string
+		err := conn.QueryRow(context.Background(), "select status from stet.review where id = $1", id).Scan(&got)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatal(err)
+		}
+		if got == status {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("held write %s is %q after %s, want %s; log:\n%s", id, got, d, status, log)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// approvedWrite stores statement as a held write by stet_md5 to table in
+// database db, of one row planned exactly and with the settings of a
+// session at the server's defaults, and approves it as Stet's account; it
+// returns its id.
+func approvedWrite(t *testing.T, pool *pgxpool.Pool, db, table, statement string) string {
+	t.Helper()
+	ctx := context.Background()
+	st := store.New(pool)
+	one := int64(1)
+	h := &store.HeldWrite{
+		ID: store.NewID(), DecisionID: store.NewID(), CreatedAt: time.Now(),
+		LoginRole: "stet_md5", Database: db, Statement: statement, TargetTable: table,
+		Verdict: "hold", Reasons: []string{"model:conflict"}, ExpiresAt: time.Now().Add(time.Hour),
+		Settings:    map[string]string{"TimeZone": "UTC", "DateStyle": "ISO, MDY", "IntervalStyle": "postgres"},
+		PlannedRows: &one, RowsExact: true,
+	}
+	if err := st.InsertHeldWrite(ctx, h); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkDelivered(ctx, h.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "select stet.approve($1)", h.ID); err != nil {
+		t.Fatal(err)
+	}
+	return h.ID
 }
 
 func parseConfig(t *testing.T, format string, args ...any) *config.Config {
@@ -256,24 +361,20 @@ func TestRunWithoutTablesWarnsThatEnforceOnlyPassesThrough(t *testing.T) {
 func TestRunServesInEnforceMode(t *testing.T) {
 	pg := testPG(t)
 	ctx := context.Background()
-	admin := connect(t, pg, "stet_scram", "scram-pw")
-	table := freshTable(t, admin, 5)
-	mustExec(t, superuser(t, pg), "grant stet_md5 to stet_scram") // so Stet can measure as stet_md5
-	mustExec(t, admin, "grant all on "+table+" to stet_md5")
-	t.Cleanup(func() { admin.Exec(ctx, "delete from stet.held_writes where target_table = $1", table) })
+	db, table, admin := agentTable(t, pg, 5)
 
 	r := start(t, parseConfig(t, `mode: enforce
 agents: {roles: [stet_md5]}
 listen: 127.0.0.1:0
-upstream: postgres://stet_scram:scram-pw@%[1]s/stet_test?sslmode=disable
+upstream: postgres://stet_scram:scram-pw@%[1]s/%[3]s?sslmode=disable
 model: {adapter: none, on_failure: pass}
 tables:
   %[2]s:
     pk: id
     send_fields: [name]
     impact: {max_rows: 3}
-`, pg, table))
-	agent := connect(t, r.addr, "stet_md5", "md5-pw")
+`, pg, table, db))
+	agent := connectTo(t, r.addr, db, "stet_md5", "md5-pw")
 
 	if _, err := agent.Exec(ctx, "update "+table+" set name = 'one' where id = 1"); err != nil {
 		t.Fatalf("single-row update: %v; log:\n%s", err, r.log)
@@ -403,6 +504,307 @@ tables:
 	}
 	if strings.Contains(r.log.String(), "scram-pw") {
 		t.Errorf("the log shows Stet's password:\n%s", r.log)
+	}
+}
+
+// enforceYAML is an enforce config for stet_md5, with no model, over table
+// %[3]s of database %[2]s on the test server %[1]s. A test adds the table's
+// further keys after it.
+const enforceYAML = `mode: enforce
+agents: {roles: [stet_md5]}
+listen: 127.0.0.1:0
+upstream: postgres://stet_scram:scram-pw@%[1]s/%[2]s?sslmode=disable
+model: {adapter: none, on_failure: pass}
+tables:
+  %[3]s:
+    pk: id
+    send_fields: [name]
+`
+
+// holdingConfig is enforceYAML with a policy rule, which makes every
+// single-row write a question; with no model to ask, on_failure: hold holds
+// it (no_model). config.Parse refuses on_failure: hold with no model, so it
+// is set after.
+func holdingConfig(t *testing.T, pg, db, table string) *config.Config {
+	t.Helper()
+	cfg := parseConfig(t, enforceYAML+"    policy: Do not clear a name.\n", pg, db, table)
+	cfg.Model.OnFailure = "hold"
+	return cfg
+}
+
+func TestPoolPinsDateStyleAndIntervalStyle(t *testing.T) {
+	pg := testPG(t)
+	ctx := context.Background()
+	db := cleanDatabase(t, pg)
+	// The database's defaults are not the ones Stet's connections keep.
+	in := connectTo(t, pg, db, "postgres", "postgres-pw")
+	mustExec(t, in, "alter database "+db+" set datestyle = 'German, DMY'")
+	mustExec(t, in, "alter database "+db+" set intervalstyle = 'sql_standard'")
+
+	pool, err := openPool(ctx, "postgres://stet_scram:scram-pw@"+pg+"/"+db+"?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	var dateStyle, intervalStyle string
+	if err := pool.QueryRow(ctx, "show datestyle").Scan(&dateStyle); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, "show intervalstyle").Scan(&intervalStyle); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(dateStyle, "ISO") || intervalStyle != "postgres" {
+		t.Errorf("DateStyle %q, IntervalStyle %q; want ISO first and postgres", dateStyle, intervalStyle)
+	}
+}
+
+// Review Focus 1: in one Bind, an integer in binary and an untyped date in
+// text, from a session whose TimeZone and DateStyle are not Stet's. The
+// approved write puts in what the agent's session would have.
+func TestApprovedWriteRunsAsTheAgentSentIt(t *testing.T) {
+	pg := testPG(t)
+	ctx := context.Background()
+	reviewer := newReviewer(t, pg)
+	db, table, admin := agentTable(t, pg, 1)
+	mustExec(t, admin, "alter table "+table+" add column at timestamptz")
+	r := start(t, holdingConfig(t, pg, db, table))
+	agent := connectTo(t, r.addr, db, "stet_md5", "md5-pw")
+
+	for _, set := range []string{"set timezone = 'Asia/Seoul'", "set datestyle = 'ISO, DMY'"} {
+		if _, err := agent.Exec(ctx, set); err != nil {
+			t.Fatalf("%s: %v", set, err)
+		}
+	}
+	res := agent.PgConn().ExecParams(ctx, "update "+table+" set at = $1, name = $2 where id = $3",
+		[][]byte{[]byte("01/02/2026 10:00"), nil, {0, 0, 0, 1}}, []uint32{0, 0, 23}, []int16{0, 0, 1}, nil).Read()
+	id := heldWriteOf(t, res.Err, r.log)
+
+	rv := review(t, pg, db, reviewer)
+	waitStatus(t, rv, id, "pending", 3*time.Second, r.log)
+	var inTransaction *bool
+	if err := rv.QueryRow(ctx, "select in_transaction from stet.review where id = $1", id).Scan(&inTransaction); err != nil {
+		t.Fatal(err)
+	}
+	if inTransaction == nil || *inTransaction {
+		t.Errorf("in_transaction is %s, want false", orNull(inTransaction))
+	}
+	var approved string
+	if err := rv.QueryRow(ctx, "select stet.approve($1)", id).Scan(&approved); err != nil || approved != "approved" {
+		t.Fatalf("stet.approve = %q, %v; want approved", approved, err)
+	}
+	waitStatus(t, rv, id, "applied", 3*time.Second, r.log)
+	var rows *int64
+	if err := rv.QueryRow(ctx, "select rows_affected from stet.review where id = $1", id).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows == nil || *rows != 1 {
+		t.Errorf("rows_affected is %s, want 1", orNull(rows))
+	}
+
+	var at *time.Time
+	var name *string
+	if err := admin.QueryRow(ctx, "select at, name from "+table+" where id = 1").Scan(&at, &name); err != nil {
+		t.Fatal(err)
+	}
+	if want := time.Date(2026, 2, 1, 1, 0, 0, 0, time.UTC); at == nil || !at.Equal(want) || name != nil {
+		t.Errorf("row 1 has at %s and name %s, want %s and NULL", orNull(at), orNull(name), want)
+	}
+}
+
+// Spec 5: the first write after BEGIN is held, the rest of its transaction
+// fails, and approving the write runs only it.
+func TestApprovingTheFirstWriteOfATransactionRunsOnlyIt(t *testing.T) {
+	pg := testPG(t)
+	ctx := context.Background()
+	reviewer := newReviewer(t, pg)
+	db, table, admin := agentTable(t, pg, 2)
+	r := start(t, holdingConfig(t, pg, db, table))
+	agent := connectTo(t, r.addr, db, "stet_md5", "md5-pw")
+
+	if _, err := agent.Exec(ctx, "begin"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := agent.Exec(ctx, "update "+table+" set name = 'one' where id = 1")
+	id := heldWriteOf(t, err, r.log)
+	if _, err := agent.Exec(ctx, "update "+table+" set name = 'two' where id = 2"); err == nil {
+		t.Error("the write after the refused one, in its transaction, succeeded")
+	}
+	if _, err := agent.Exec(ctx, "rollback"); err != nil {
+		t.Fatal(err)
+	}
+
+	rv := review(t, pg, db, reviewer)
+	waitStatus(t, rv, id, "pending", 3*time.Second, r.log)
+	var n int
+	var inTransaction *bool
+	if err := rv.QueryRow(ctx, "select count(*), bool_and(in_transaction) from stet.review").Scan(&n, &inTransaction); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || inTransaction == nil || !*inTransaction {
+		t.Errorf("stet.review has %d rows, in_transaction %s; want one, true", n, orNull(inTransaction))
+	}
+	if _, err := rv.Exec(ctx, "select stet.approve($1)", id); err != nil {
+		t.Fatal(err)
+	}
+	waitStatus(t, rv, id, "applied", 3*time.Second, r.log)
+	var names string
+	if err := admin.QueryRow(ctx, "select string_agg(name, ',' order by id) from "+table).Scan(&names); err != nil {
+		t.Fatal(err)
+	}
+	if names != "one,n2" {
+		t.Errorf("names are %s, want one,n2: only the held write ran", names)
+	}
+}
+
+// waitListening waits until r is serving.
+func waitListening(t *testing.T, r *running) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(r.log.String(), "listening") {
+		if time.Now().After(deadline) {
+			t.Fatalf("run never served; log:\n%s", r.log)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// orNull is *p as text, or NULL.
+func orNull[T any](p *T) string {
+	if p == nil {
+		return "NULL"
+	}
+	return fmt.Sprint(*p)
+}
+
+// statusOf is held write id's status as stored.
+func statusOf(t *testing.T, conn *pgx.Conn, id string) string {
+	t.Helper()
+	var status string
+	if err := conn.QueryRow(context.Background(), "select status from stet.held_writes where id = $1", id).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	return status
+}
+
+// Rule 6: in shadow mode Stet executes no write, an approved one included.
+func TestShadowModeRunsNoApprovedWrite(t *testing.T) {
+	pg := testPG(t)
+	db, table, admin := agentTable(t, pg, 1)
+	id := approvedWrite(t, stetPoolIn(t, pg, db), db, table, "update "+table+" set name = 'applied' where id = 1")
+	r := start(t, parseConfig(t, `mode: shadow
+listen: 127.0.0.1:0
+upstream: postgres://stet_scram:scram-pw@%[1]s/%[2]s?sslmode=disable
+model: {adapter: none, on_failure: pass}
+tables:
+  %[3]s: {pk: id, send_fields: [name]}
+`, pg, db, table))
+	waitListening(t, r)
+	time.Sleep(2500 * time.Millisecond)
+
+	if got := statusOf(t, admin, id); got != "approved" {
+		t.Errorf("the approved held write is %s in shadow mode, want approved; log:\n%s", got, r.log)
+	}
+	var name string
+	if err := admin.QueryRow(context.Background(), "select name from "+table+" where id = 1").Scan(&name); err != nil {
+		t.Fatal(err)
+	}
+	if name != "n1" {
+		t.Errorf("row 1's name is %q, want n1: shadow mode ran the approved write", name)
+	}
+	if err := r.stop(t); err != nil {
+		t.Fatalf("run = %v, want nil", err)
+	}
+}
+
+// Spec 7: what an approval runs is not what the agent changed unseen.
+func TestAppliedRowsDoNotCountTowardTheCumulativeLimit(t *testing.T) {
+	pg := testPG(t)
+	ctx := context.Background()
+	db, table, admin := agentTable(t, pg, 7)
+	r := start(t, parseConfig(t, enforceYAML+"    impact: {max_rows: 3, cumulative: {max_rows: 4, window: 10m}}\n", pg, db, table))
+	agent := connectTo(t, r.addr, db, "stet_md5", "md5-pw")
+
+	_, err := agent.Exec(ctx, "update "+table+" set name = 'five' where id <= 5")
+	id := heldWriteOf(t, err, r.log)
+	waitStatus(t, admin, id, "pending", 3*time.Second, r.log)
+	var reasons []string
+	if err := admin.QueryRow(ctx, "select reasons from stet.held_writes where id = $1", id).Scan(&reasons); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(reasons, "impact:rows") {
+		t.Fatalf("held for %v, want impact:rows", reasons)
+	}
+	if _, err := admin.Exec(ctx, "select stet.approve($1, null, 5)", id); err != nil {
+		t.Fatal(err)
+	}
+	waitStatus(t, admin, id, "applied", 3*time.Second, r.log)
+	var five int
+	if err := admin.QueryRow(ctx, "select count(*) from "+table+" where name = 'five'").Scan(&five); err != nil {
+		t.Fatal(err)
+	}
+	if five != 5 {
+		t.Fatalf("%d rows say five, want 5", five)
+	}
+
+	small := "update " + table + " set name = 'two' where id in (6, 7)"
+	if _, err := agent.Exec(ctx, small); err != nil {
+		t.Fatalf("a 2-row update after the approved one: %v, want it to pass; log:\n%s", err, r.log)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var used *string
+		err := admin.QueryRow(ctx, "select cumulative->>'used' from stet.decisions where statement = $1", small).Scan(&used)
+		if err == nil {
+			if used == nil || *used != "0" {
+				t.Errorf("the 2-row update's cumulative.used is %s, want 0", orNull(used))
+			}
+			break
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the 2-row update's decision was not recorded; log:\n%s", r.log)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// Spec 7: on shutdown the write being applied is finished, after the proxy
+// and the gate and before Stet's pool is closed.
+func TestRunStopsTheApplierBeforeThePool(t *testing.T) {
+	pg := testPG(t)
+	ctx := context.Background()
+	db, table, admin := agentTable(t, pg, 1)
+	pool := stetPoolIn(t, pg, db)
+	r := start(t, parseConfig(t, enforceYAML, pg, db, table))
+	statement := "update " + table + " set name = (select 'slept' from pg_sleep(1)) where id = 1"
+	id := approvedWrite(t, pool, db, table, statement)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var running bool
+		if err := admin.QueryRow(ctx, `select exists (select from pg_stat_activity
+			where state = 'active' and query = $1)`, statement).Scan(&running); err != nil {
+			t.Fatal(err)
+		}
+		if running {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the approved write is not running; log:\n%s", r.log)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if err := r.stop(t); err != nil {
+		t.Fatalf("run = %v, want nil", err)
+	}
+	if got := statusOf(t, admin, id); got != "applied" {
+		t.Errorf("the held write being applied at shutdown is %s, want applied; log:\n%s", got, r.log)
+	}
+	if strings.Contains(r.log.String(), "level=ERROR") {
+		t.Errorf("the log has an error:\n%s", r.log)
 	}
 }
 
