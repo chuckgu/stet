@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -46,6 +47,11 @@ commands:
            arm's stet.decisions of its database and of each -db (this run's X clones); a hoop arm's audit logs
            and recorder files, after which its denials the log does not confirm are unknown
            (-arm <arm> [-practice] [-rerun N] [-db <db>]... [-audit <file>]... [-llm <file>]... [-join tag|text])
+  score    score the collected runs and write the report of spec 8 and 9 as Korean markdown, from the
+           databases alone; an arm may be given more than once with its reruns, and none is read even when
+           it is not listed (-arms none,stet,hoop[:rerun],... [-practice] [-out <file>])
+  choose   choose hoop's configuration by spec 6 from the practice runs of hoop-a, hoop-b, hoop-c and
+           none (always the practice databases) and print the six candidates' J and blocked passes
 `
 
 // benchEpoch is the date the benchmark's data is generated relative to.
@@ -75,6 +81,10 @@ func runBench(args []string) error {
 		return benchLLMRecorder(args[1:])
 	case "collect":
 		return benchCollect(args[1:])
+	case "score":
+		return benchScore(args[1:])
+	case "choose":
+		return benchChoose(args[1:])
 	}
 	fmt.Fprint(os.Stderr, benchUsage)
 	os.Exit(2)
@@ -637,5 +647,139 @@ func benchCollect(args []string) error {
 	}
 	fmt.Printf("%s, arm %s: %d writes in lab.proxy, %d blocked (%s); %d records of its writes outside their time "+
 		"window left out; collect:%s %s\n", db, *arm, len(rows), blocked, strings.Join(by, ", "), c.OutOfWindow, *arm, meta)
+	return nil
+}
+
+// armRun is one entry of bench score -arms.
+type armRun struct {
+	arm   string
+	rerun int
+}
+
+// parseArms reads -arms: runs separated by commas, each an arm of the stream (practice: of the practice
+// stream) or arm:rerun with rerun 1 or more; a run given twice is refused.
+func parseArms(list string, practice bool) ([]armRun, error) {
+	if strings.TrimSpace(list) == "" {
+		return nil, errors.New("bench score: -arms is required, such as none,stet,hoop")
+	}
+	var out []armRun
+	for _, item := range strings.Split(list, ",") {
+		arm, n, hasRerun := strings.Cut(strings.TrimSpace(item), ":")
+		rerun := 1
+		if hasRerun {
+			v, err := strconv.Atoi(n)
+			if err != nil || v < 1 {
+				return nil, fmt.Errorf("bench score: -arms: %q: want arm or arm:rerun with rerun 1 or more", item)
+			}
+			rerun = v
+		}
+		if _, _, _, err := bench.ArmPlan(arm, practice); err != nil {
+			return nil, fmt.Errorf("bench score: -arms: %w", err)
+		}
+		if slices.Contains(out, armRun{arm, rerun}) {
+			return nil, fmt.Errorf("bench score: -arms: %s:%d is given twice", arm, rerun)
+		}
+		out = append(out, armRun{arm, rerun})
+	}
+	return out, nil
+}
+
+// loadBenchRun reads one run of an arm from its own database, as the owner.
+func loadBenchRun(ctx context.Context, f benchFlags, cmd, arm string, practice bool, rerun int) (bench.Run, error) {
+	db := bench.DBName(arm, practice, 0, rerun)
+	conn, err := pgx.Connect(ctx, bench.OwnerURL(*f.pg, bench.Names{}, db))
+	if err != nil {
+		return bench.Run{}, fmt.Errorf("%s: %s: %w", cmd, db, err)
+	}
+	defer conn.Close(context.Background())
+	r, err := bench.LoadRun(ctx, conn, arm, rerun)
+	if err != nil {
+		return bench.Run{}, fmt.Errorf("%s: %s: %w", cmd, db, err)
+	}
+	fmt.Fprintf(os.Stderr, "%s: read arm %s (run %d) from %s: %d outcomes, %d proxy rows, %d attack results\n", cmd,
+		arm, rerun, db, len(r.Outcomes), len(r.Proxy), len(r.Attacks))
+	return r, nil
+}
+
+// benchScore reads each run of -arms from its own database (bench.LoadRun) and writes bench.Report: the
+// tables of spec 8 and the reading of spec 9, which takes the stet and hoop runs with the highest rerun. The
+// none arm confirms the I labels: the latest none run listed, else none's first run. Nothing is written when
+// a run cannot be read.
+func benchScore(args []string) error {
+	fs := flag.NewFlagSet("bench score", flag.ExitOnError)
+	f := newBenchFlags(fs)
+	armList := fs.String("arms", "", "the runs to score, comma-separated: arm or arm:rerun, such as none,stet,hoop,hoop:2")
+	out := fs.String("out", "", "the markdown file to write (default: standard output)")
+	fs.Parse(args)
+	list, err := parseArms(*armList, *f.practice)
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	var runs []bench.Run
+	none := -1
+	for _, a := range list {
+		r, err := loadBenchRun(ctx, f, "bench score", a.arm, *f.practice, a.rerun)
+		if err != nil {
+			return err
+		}
+		if a.arm == "none" && (none < 0 || r.Rerun > runs[none].Rerun) {
+			none = len(runs)
+		}
+		runs = append(runs, r)
+	}
+	var baseline bench.Run
+	if none >= 0 {
+		baseline = runs[none]
+	} else if baseline, err = loadBenchRun(ctx, f, "bench score", "none", *f.practice, 1); err != nil {
+		return err
+	}
+	var b bytes.Buffer
+	if err := bench.Report(&b, runs, baseline); err != nil {
+		return fmt.Errorf("bench score: %w", err)
+	}
+	if *out == "" {
+		_, err := os.Stdout.Write(b.Bytes())
+		return err
+	}
+	if err := os.WriteFile(*out, b.Bytes(), 0o644); err != nil {
+		return fmt.Errorf("bench score: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "bench score: wrote %s\n", *out)
+	return nil
+}
+
+// benchChoose applies spec 6 ("고르는 규칙") to the practice runs: hoop-a, hoop-b and hoop-c, the prompts
+// (가), (나), (다) each sent once with medium: allow, and none, which confirms the I labels. It always reads
+// the practice databases. It prints the six candidates in the registered order and the one chosen.
+func benchChoose(args []string) error {
+	fs := flag.NewFlagSet("bench choose", flag.ExitOnError)
+	f := newBenchFlags(fs) // -practice is accepted and implied: the configuration is chosen on the practice stream
+	fs.Parse(args)
+	ctx := context.Background()
+	runs := map[string]bench.Run{}
+	for _, p := range []string{"a", "b", "c"} {
+		r, err := loadBenchRun(ctx, f, "bench choose", "hoop-"+p, true, 1)
+		if err != nil {
+			return err
+		}
+		runs[p] = r
+	}
+	none, err := loadBenchRun(ctx, f, "bench choose", "none", true, 1)
+	if err != nil {
+		return err
+	}
+	best, all := bench.Choose(runs, none)
+	name := map[string]string{"a": "a (가)", "b": "b (나)", "c": "c (다)"}
+	fmt.Printf("%-8s  %-6s  %9s  %s\n", "prompt", "medium", "J", "blocked passes (normal, H1-H4, small sides)")
+	for _, c := range all {
+		mark := ""
+		if c == best {
+			mark = "  <- chosen"
+		}
+		fmt.Printf("%-8s  %-6s  %+9.4f  %d%s\n", name[c.Prompt], c.Medium, c.J, c.FalseBlocks, mark)
+	}
+	fmt.Printf("chosen: prompt %s, medium: %s (J %.4f, %d blocked passes)\n", name[best.Prompt], best.Medium, best.J,
+		best.FalseBlocks)
 	return nil
 }
