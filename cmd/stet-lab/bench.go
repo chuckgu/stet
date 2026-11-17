@@ -29,7 +29,10 @@ commands:
   drop     drop one of the benchmark's databases (-name <db>)
   list     list the benchmark's databases and roles
   send     send an arm's stream to -addr and record the outcomes in its database
-           (-arm <arm> [-practice] [-rerun N] -addr <host:port> [-sets V,I])
+           (-arm <arm> [-practice] [-rerun N] -addr <host:port> [-sets V,I]);
+           -sets X sends the attacks into the arm's X clone (-x N) from attack -from K on and exits
+           with status 3 when an executed attack needs a fresh clone
+           (-arm <arm> [-rerun N] -addr <host:port> -sets X [-x N] [-from K])
   exec     send one statement the way send does and print its outcome; records nothing
            (-addr <host:port> -db <db> -role <role> [-app import-job] [-mode simple|bind]
             [-tag <12 digits>] -sql <statement> [-args a,b])
@@ -201,14 +204,17 @@ func benchList(args []string) error {
 
 // benchSend sends an arm's stream to -addr (spec 4, "보내는 방식") and
 // records every write's outcome in lab.outcomes of the arm's database. A set
-// the arm already has outcomes of is not sent again.
+// the arm already has outcomes of is not sent again. -sets X goes its own
+// way (benchSendX).
 func benchSend(args []string) error {
 	fs := flag.NewFlagSet("bench send", flag.ExitOnError)
 	f := newBenchFlags(fs)
 	arm := fs.String("arm", "", "the arm, such as none, stet, stet-bind, hoop-a")
 	rerun := fs.Int("rerun", 1, "2 or more: a rerun of the arm")
 	addr := fs.String("addr", "", "host:port the statements go to: the arm's proxy, or the server for none")
-	setList := fs.String("sets", "", "the sets to send, such as V,I (default: the arm's sets but X)")
+	setList := fs.String("sets", "", "the sets to send, such as V,I (default: the arm's sets but X); X is sent alone")
+	x := fs.Int("x", 0, "-sets X: the arm's X clone the attacks go to, as bench clone -x names it (0 is 1)")
+	from := fs.Int("from", 0, "-sets X: the first attack to send, after a fresh clone")
 	fs.Parse(args)
 	if *addr == "" {
 		return errors.New("bench send: -addr is required")
@@ -222,12 +228,25 @@ func benchSend(args []string) error {
 		sets = strings.Split(*setList, ",")
 		for _, s := range sets {
 			switch {
-			case s == tasks.SetX:
-				return errors.New("bench send: -sets: the X set is not sent by bench send")
 			case !slices.Contains(planned, s):
 				return fmt.Errorf("bench send: -sets: arm %s does not send set %q (it sends %s)", *arm, s, strings.Join(planned, ","))
+			case s == tasks.SetX && len(sets) > 1:
+				return errors.New("bench send: -sets: X is sent alone")
 			}
 		}
+	}
+	if slices.Equal(sets, []string{tasks.SetX}) {
+		reclone, err := benchSendX(f, *arm, *rerun, *x, *from, *addr, bind)
+		if err != nil {
+			return err
+		}
+		if reclone {
+			os.Exit(3)
+		}
+		return nil
+	}
+	if *x != 0 || *from != 0 {
+		return errors.New("bench send: -x and -from go with -sets X")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -282,6 +301,106 @@ func benchSend(args []string) error {
 	})
 	fmt.Printf("%s, arm %s, sets %s: %d of %d sent; %s\n", db, *arm, strings.Join(sets, ","), done, total, outcomeCounts(count))
 	return err
+}
+
+// benchSendX sends the arm's attacks from attack from on into its X clone x
+// (spec 4, "X"), probing that clone as the owner, and records the steps'
+// outcomes and the attacks' results in the arm's own database. Attacks the
+// arm already has results of are not sent again. When an executed attack
+// needs a fresh clone it prints how to go on and returns reclone.
+func benchSendX(f benchFlags, arm string, rerun, x, from int, addr string, bind bool) (reclone bool, err error) {
+	switch {
+	case x < 0:
+		return false, fmt.Errorf("bench send: -x %d: want 1 or more (0 is 1)", x)
+	case from < 0:
+		return false, fmt.Errorf("bench send: -from %d: want 0 or more", from)
+	case rerun < 1:
+		return false, fmt.Errorf("bench send: -rerun %d: want 1 (the first run) or more", rerun)
+	}
+	x = max(x, 1)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	db, xdb := bench.DBName(arm, false, 0, rerun), bench.DBName(arm, false, x, rerun)
+	conn, err := pgx.Connect(ctx, bench.OwnerURL(*f.pg, bench.Names{}, db))
+	if err != nil {
+		return false, err
+	}
+	defer conn.Close(context.Background())
+	var sent bool
+	if err := conn.QueryRow(ctx, "select exists (select 1 from lab.attacks where arm = $1 and idx >= $2)", arm, from).Scan(&sent); err != nil {
+		return false, err
+	}
+	if sent {
+		return false, fmt.Errorf("bench send: %s already holds results of arm %s's attacks from %d on; nothing was sent "+
+			"(the attacks are sent once: clone a fresh database with -rerun)", db, arm, from)
+	}
+	stream, attacks, err := bench.LoadStream(ctx, conn)
+	if err != nil {
+		return false, err
+	}
+	if from > len(attacks) {
+		return false, fmt.Errorf("bench send: -from %d: there are %d attacks", from, len(attacks))
+	}
+	stmts := map[string]tasks.Stmt{}
+	for _, s := range stream {
+		if s.Set == tasks.SetX {
+			stmts[s.ID] = s
+		}
+	}
+	owner, err := pgx.Connect(ctx, bench.OwnerURL(*f.pg, bench.Names{}, xdb))
+	if err != nil {
+		return false, err
+	}
+	defer owner.Close(context.Background())
+
+	o := bench.DefaultOptions(arm)
+	o.Bind = bind
+	o.Sleep = func(d time.Duration) { // the pause before a split bundle ends early on an interrupt
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+		case <-timer.C:
+		}
+	}
+	count := map[string]int{}
+	executed, done := 0, 0
+	// A result is saved even after an interrupt: its statements were sent.
+	save := context.WithoutCancel(ctx)
+	next, reclone, err := bench.RunAttacks(ctx, bench.Target{Addr: addr, Database: xdb, Names: bench.Names{}}, owner,
+		attacks, stmts, from, o,
+		func(out bench.Outcome) error {
+			if err := bench.SaveOutcome(save, conn, out); err != nil {
+				return err
+			}
+			count[out.Result]++
+			return nil
+		},
+		func(r bench.AttackResult) error {
+			if err := bench.SaveAttack(save, conn, r); err != nil {
+				return err
+			}
+			verdict := "not executed"
+			switch {
+			case r.Undetermined:
+				verdict = "undetermined (a probe failed)"
+			case r.Executed:
+				verdict = "executed"
+				executed++
+			}
+			done++
+			fmt.Fprintf(os.Stderr, "%d/%d %s %s: %s\n", r.Index+1, len(attacks), r.Path, r.Payload, verdict)
+			return nil
+		})
+	fmt.Printf("%s via %s, arm %s, set X: %d attacks from %d on, %d executed; steps: %s\n", db, xdb, arm, done, from,
+		executed, outcomeCounts(count))
+	if err != nil {
+		return false, err
+	}
+	if reclone {
+		fmt.Printf("RECLONE after %s: clone -x %d, then send -sets X -x %d -from %d\n", attacks[next-1].Path, x+1, x+1, next)
+	}
+	return reclone, nil
 }
 
 func outcomeCounts(count map[string]int) string {
