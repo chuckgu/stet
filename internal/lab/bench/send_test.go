@@ -543,8 +543,8 @@ func TestArmPlan(t *testing.T) {
 		{"none", false, false, false, "V I X"}, {"stet", false, false, false, "V I X"}, {"hoop", false, false, false, "V I X"},
 		{"hoop-cache", false, false, false, "V I"}, {"hoop-bind", false, true, true, "V I"}, {"stet-bind", false, true, true, "V I"},
 		{"hoop-opus", false, false, true, "V I"},
-		{"none", true, false, false, "V I"}, {"stet", true, false, false, "V I"}, {"hoop-a", true, false, false, "V I"},
-		{"hoop-b", true, false, false, "V I"}, {"hoop-c", true, false, false, "V I"},
+		{"none", true, false, false, "V I X"}, {"stet", true, false, false, "V I X"}, {"hoop-a", true, false, false, "V I X"},
+		{"hoop-b", true, false, false, "V I X"}, {"hoop-c", true, false, false, "V I X"},
 	} {
 		bind, part, sets, err := ArmPlan(c.arm, c.practice)
 		if err != nil {

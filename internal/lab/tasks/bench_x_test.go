@@ -580,6 +580,52 @@ func TestWholeStreamIsDeterministic(t *testing.T) {
 	}
 }
 
+// TestPracticeStreamHasTheXSet: the practice stream carries the X set as a tool check, built from the practice
+// seed: the same paths, attacks and steps as the scored one, with other statements.
+func TestPracticeStreamHasTheXSet(t *testing.T) {
+	c, o := BenchPreset(true, now)
+	p, err := BuildBench(crm.Generate(c), o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, s := withX(t)
+	count := map[string]int{}
+	for _, x := range p.Stream {
+		count[x.Set]++
+	}
+	if want := map[string]int{SetPrep: 80, SetV: 360, SetI: 40, SetX: 442}; !reflect.DeepEqual(count, want) {
+		t.Errorf("practice counts %v, want %v", count, want)
+	}
+	if len(p.Attacks) != len(s.Attacks) || len(p.Attacks) != 113 || len(p.Fixtures) != len(s.Fixtures) {
+		t.Fatalf("practice: %d attacks and %d fixtures, scored %d and %d; want 113 attacks in both",
+			len(p.Attacks), len(p.Fixtures), len(s.Attacks), len(s.Fixtures))
+	}
+	same := 0
+	for i, a := range p.Attacks {
+		b := s.Attacks[i]
+		if a.Path != b.Path || a.Code != b.Code || a.Payload != b.Payload || len(a.Steps) != len(b.Steps) ||
+			a.Conns != b.Conns || a.PauseBefore != b.PauseBefore || a.Limit != b.Limit || a.Breaks != b.Breaks ||
+			(a.LockSQL == "") != (b.LockSQL == "") || a.LockFor != b.LockFor {
+			t.Errorf("attack %d: practice %s %s, %d steps; scored %s %s, %d steps", i, a.Path, a.Payload, len(a.Steps),
+				b.Path, b.Payload, len(b.Steps))
+		}
+		if a.Probe == b.Probe {
+			same++
+		}
+	}
+	if same > len(p.Attacks)/2 {
+		t.Errorf("%d of %d practice probes are the scored ones: the practice seed should give other rows", same, len(p.Attacks))
+	}
+	for _, x := range p.Stream {
+		if x.Set == SetX && x.Tag == "" && x.Path != "s5.function_call_message" {
+			t.Errorf("practice %s has no tag", x.ID)
+		}
+		if strings.Contains(strings.ToLower(x.Inline+x.SQL), "stet") {
+			t.Errorf("practice %s mentions the product", x.ID)
+		}
+	}
+}
+
 func TestWholeStreamNeverSaysStet(t *testing.T) {
 	_, b := withX(t)
 	for _, s := range b.Stream {

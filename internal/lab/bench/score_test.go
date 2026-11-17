@@ -984,6 +984,31 @@ func TestReportHasEverySection(t *testing.T) {
 	}
 }
 
+// TestPracticeReportHasTheXSet: the practice arms send X as a tool check; score -practice reports it like any
+// set, and the comparison of stet with hoop says its arms are not here.
+func TestPracticeReportHasTheXSet(t *testing.T) {
+	none := reportRun("none", 0, true)
+	runs := []Run{none, reportRun("stet", 50, true), reportRun("hoop-a", 18, false)}
+	var b bytes.Buffer
+	if err := Report(&b, runs, none); err != nil {
+		t.Fatal(err)
+	}
+	out := b.String()
+	for _, name := range []string{"none", "stet", "hoop-a"} {
+		if l := lineStarting(section(t, out, "## 1. 유효성"), "| "+name+" |"); !strings.Contains(l, "유효 (") ||
+			strings.Count(l, "보내지 않음") != 0 {
+			t.Errorf("validity of %s: %q, want its three sets, X included", name, l)
+		}
+	}
+	x := section(t, out, "## 5. X: 공격")
+	if head := lineStarting(x, "| 경로 |"); !strings.Contains(head, "hoop-a") {
+		t.Errorf("the X table's head %q does not have hoop-a", head)
+	}
+	if !strings.Contains(x, "`stet`과 `hoop`의 X 세트가 모두 있어야 한다") {
+		t.Errorf("the comparison of stet with hoop does not say hoop is absent:\n%s", x)
+	}
+}
+
 // cmpRows are the X attacks of TestReportStatesOnlyWhatWasMeasured for one arm: stet's or hoop's results.
 func cmpRows(arm string) []row {
 	pick := func(stet, hoop string) string {

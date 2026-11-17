@@ -37,7 +37,8 @@ commands:
            (-arm <arm> [-practice] [-rerun N] -addr <host:port> [-sets V,I]);
            -sets X sends the attacks into the arm's X clone (-x N) from attack -from K on and exits
            with status 3 when an executed attack needs a fresh clone
-           (-arm <arm> [-rerun N] -addr <host:port> -sets X [-x N] [-from K])
+           (-arm <arm> [-practice] [-rerun N] -addr <host:port> -sets X [-x N] [-from K]);
+           -addr is the arm's proxy, never -pg, and for none it is -pg
   exec     send one statement the way send does and print its outcome; records nothing
            (-addr <host:port> -db <db> -role <role> [-app import-job] [-mode simple|bind]
             [-tag <12 digits>] -sql <statement> [-args a,b])
@@ -275,7 +276,7 @@ func benchSend(args []string) error {
 		return fmt.Errorf("bench send: %w", err)
 	}
 	if slices.Equal(sets, []string{tasks.SetX}) {
-		reclone, err := benchSendX(f, *arm, *rerun, *x, *from, *addr, bind)
+		reclone, err := benchSendX(f, *arm, *f.practice, *rerun, *x, *from, *addr, bind)
 		if err != nil {
 			return err
 		}
@@ -378,8 +379,9 @@ func sameServer(a, b string) bool {
 // when from is exactly where the recorded run stopped (bench.CheckResume),
 // and nothing when -addr does not answer. When a destructive attack ran, or
 // may have, it prints how to go on with a fresh clone and returns reclone; on
-// an error it prints the attack the run stopped at.
-func benchSendX(f benchFlags, arm string, rerun, x, from int, addr string, bind bool) (reclone bool, err error) {
+// an error it prints the attack the run stopped at. The practice stream's attacks go into the practice arm's X
+// clone, paced as the scored ones are.
+func benchSendX(f benchFlags, arm string, practice bool, rerun, x, from int, addr string, bind bool) (reclone bool, err error) {
 	switch {
 	case x < 0:
 		return false, fmt.Errorf("bench send: -x %d: want 1 or more (0 is 1)", x)
@@ -391,7 +393,7 @@ func benchSendX(f benchFlags, arm string, rerun, x, from int, addr string, bind 
 	x = max(x, 1)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	db, xdb := bench.DBName(arm, false, 0, rerun), bench.DBName(arm, false, x, rerun)
+	db, xdb := bench.DBName(arm, practice, 0, rerun), bench.DBName(arm, practice, x, rerun)
 	conn, err := pgx.Connect(ctx, bench.OwnerURL(*f.pg, bench.Names{}, db))
 	if err != nil {
 		return false, err
@@ -471,7 +473,12 @@ func benchSendX(f benchFlags, arm string, rerun, x, from int, addr string, bind 
 		return false, err
 	}
 	if reclone {
-		fmt.Printf("RECLONE after %s: clone -x %d, then send -sets X -x %d -from %d\n", attacks[next-1].Path, x+1, x+1, next)
+		p := ""
+		if practice {
+			p = "-practice "
+		}
+		fmt.Printf("RECLONE after %s: clone %s-x %d, then send %s-sets X -x %d -from %d\n", attacks[next-1].Path, p, x+1,
+			p, x+1, next)
 	}
 	return reclone, nil
 }

@@ -2,8 +2,12 @@ package bench
 
 import (
 	"fmt"
+	"maps"
 	"math"
+	"slices"
 	"testing"
+
+	"github.com/stetdb/stet/internal/lab/tasks"
 )
 
 // medRun is a practice run sent with medium: allow, of 100 F1 writes and 100 normal writes: caught faults
@@ -78,6 +82,36 @@ func TestChoose(t *testing.T) {
 		}
 		return rows
 	}
+	// X results in the practice runs (the tool check) change nothing: the rule reads V and I only.
+	withX := func(r Run, result, level string) Run {
+		r.Writes, r.Outcomes, r.Proxy = slices.Clone(r.Writes), maps.Clone(r.Outcomes), maps.Clone(r.Proxy)
+		for i := range 20 {
+			id := fmt.Sprintf("x-%d", i)
+			r.Writes = append(r.Writes, tasks.Stmt{ID: id, Set: tasks.SetX, Code: "S5", Kind: "F4", Expected: tasks.Block,
+				Path: "s5.x"})
+			r.Outcomes[id] = Outcome{Arm: r.Arm, ID: id, Set: tasks.SetX, Result: result}
+			r.Proxy[id] = Proxy{Arm: r.Arm, ID: id, Level: level, Layer: "judgment", Blocked: result == Blocked}
+			r.Specs = append(r.Specs, tasks.Attack{Path: "s5.x", Code: "S5", Payload: "F4", Steps: []string{id}})
+			r.Attacks = append(r.Attacks, AttackResult{Arm: r.Arm, Index: i, Path: "s5.x", Code: "S5",
+				Executed: result == Executed})
+		}
+		return r
+	}
+	plain := map[string]Run{
+		"a": medRun("hoop-a", 20, 10, 0, 5), "b": medRun("hoop-b", 52, 12, 18, 18), "c": medRun("hoop-c", 40, 10, 0, 10),
+	}
+	best0, all0 := Choose(plain, none)
+	for _, x := range []struct{ result, level string }{{Blocked, "high"}, {Executed, "medium"}, {Executed, "low"}} {
+		with := map[string]Run{}
+		for k, r := range plain {
+			with[k] = withX(r, x.result, x.level)
+		}
+		if best, all := Choose(with, none); best != best0 || !slices.Equal(all, all0) {
+			t.Errorf("with X steps %s graded %s: chose %+v of %+v, want %+v of %+v as without X", x.result, x.level, best,
+				all, best0, all0)
+		}
+	}
+
 	nonePairs := mkRun("none", pairs(Executed, Executed)...)
 	runs = map[string]Run{
 		"a": mkRun("hoop-a", append(vRows(100, 50, 100, 0), pairs(Executed, Blocked)...)...),

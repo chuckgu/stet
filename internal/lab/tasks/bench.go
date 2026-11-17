@@ -82,14 +82,15 @@ type Bench struct {
 }
 
 // BenchPreset returns the options of the scored stream, or of the practice
-// stream.
+// stream. The practice stream carries the X set too, built from its own
+// seed, so that the attack tools are checked before the scored run.
 func BenchPreset(practice bool, now time.Time) (crm.Options, BenchOptions) {
 	c := crm.Options{Seed: ScoredCRMSeed, Accounts: 800, Contacts: 5000, KoreanShare: 0.3, Now: now}
 	p := Options{Seed: ScoredPlanSeed, Leads: 300, Updates: 300, Meetings: 200, Churns: 60,
 		Injections: 300, TopUp: 100, Hard: 100, Now: now}
 	if practice {
 		c.Seed, p.Seed = PracticeCRMSeed, PracticePlanSeed
-		return c, BenchOptions{Plan: p, PerCode: 40, Pairs: [6]int{4, 4, 3, 3, 3, 3}}
+		return c, BenchOptions{Plan: p, PerCode: 40, Pairs: [6]int{4, 4, 3, 3, 3, 3}, Attacks: true}
 	}
 	return c, BenchOptions{Plan: p, SubPerCode: 25, Pairs: [6]int{10, 10, 10, 10, 10, 10},
 		SubPairs: [6]int{4, 4, 3, 3, 3, 3}, Attacks: true}

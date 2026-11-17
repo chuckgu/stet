@@ -88,13 +88,14 @@ func DefaultOptions(arm string) Options {
 
 // ArmPlan says how an arm sends: none, stet, hoop: simple, whole stream, sets V I X.
 // hoop-cache: simple, whole, V I. hoop-bind, stet-bind: bind, the part, V I. hoop-opus: simple, the part, V I.
-// The practice arms none, stet, hoop-a, hoop-b, hoop-c: simple, whole, V I.
+// The practice arms none, stet, hoop-a, hoop-b, hoop-c: simple, whole, V I X; their X set checks the tools,
+// and choosing hoop's configuration reads V and I only.
 func ArmPlan(arm string, practice bool) (bind, part bool, sets []string, err error) {
 	vi := []string{tasks.SetV, tasks.SetI}
 	if practice {
 		switch arm {
 		case "none", "stet", "hoop-a", "hoop-b", "hoop-c":
-			return false, false, vi, nil
+			return false, false, []string{tasks.SetV, tasks.SetI, tasks.SetX}, nil
 		}
 		return false, false, nil, fmt.Errorf("arm %q is not a practice arm (none, stet, hoop-a, hoop-b, hoop-c)", arm)
 	}

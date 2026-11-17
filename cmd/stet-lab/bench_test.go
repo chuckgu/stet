@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/stetdb/stet/internal/lab/bench"
 )
 
 func TestCloneRefusesNumbersOutOfRange(t *testing.T) {
@@ -70,6 +72,20 @@ func TestSendGoesThroughTheArmsProxy(t *testing.T) {
 		refused := err != nil && strings.HasPrefix(err.Error(), "bench send: -addr ")
 		if err == nil || refused != c.refused {
 			t.Errorf("bench send %s: err = %v, want the -addr refused: %v", strings.Join(c.args, " "), err, c.refused)
+		}
+	}
+}
+
+func TestPracticeSendsXIntoThePracticeDatabases(t *testing.T) {
+	// Nothing listens on the addresses: the command gets as far as connecting to the arm's own database.
+	for _, arm := range []string{"none", "stet", "hoop-a"} {
+		addr := "127.0.0.1:2"
+		if arm == "none" {
+			addr = "127.0.0.1:1"
+		}
+		err := benchSend([]string{"-pg", "127.0.0.1:1", "-practice", "-arm", arm, "-sets", "X", "-addr", addr})
+		if want := bench.DBName(arm, true, 0, 1); err == nil || !strings.Contains(err.Error(), "database="+want+"`") {
+			t.Errorf("bench send -practice -arm %s -sets X: err = %v, want it to connect to %s", arm, err, want)
 		}
 	}
 }

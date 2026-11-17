@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/stetdb/stet/internal/lab/crm"
 	"github.com/stetdb/stet/internal/lab/tasks"
 )
 
@@ -195,6 +196,62 @@ func TestAttacksExecuteWhenNothingStandsInFront(t *testing.T) {
 	}
 	if r := more.results[0]; r.Path != "s4.range_delete" || r.Index != last || !r.Executed || r.Database != clone2 {
 		t.Errorf("from %d: %+v, want s4.range_delete executed in %s", got.next, r, clone2)
+	}
+}
+
+// TestPracticeXSetRunsOnThePracticeTemplate: the practice template carries the practice X set with its
+// fixtures and rights, and its attacks execute in an X clone of it as the scored ones do in theirs (spec 4: the
+// practice stream checks the tools).
+func TestPracticeXSetRunsOnThePracticeTemplate(t *testing.T) {
+	a := testAdmin(t)
+	ctx := context.Background()
+	n := testNames(t) // its cleanup drops the databases its owner has: the template and the clone
+	su := connectAs(t, a, a.User, a.Password, "postgres")
+	if err := CreateRoles(ctx, su, n); err != nil {
+		t.Fatal(err)
+	}
+	c, o := tasks.BenchPreset(true, testNow)
+	d := crm.Generate(c)
+	b, err := tasks.BuildBench(d, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := fmt.Sprintf("crm_t%d_practice", time.Now().UnixNano())
+	if err := CreateTemplate(ctx, a, n, tmpl, d, b, nil); err != nil {
+		t.Fatal(err)
+	}
+	clone := tmpl + "_x"
+	if err := Clone(ctx, a, n, tmpl, clone, false); err != nil {
+		t.Fatal(err)
+	}
+	owner := connectAs(t, a, n.Owner(), OwnerPassword, clone)
+	stream, attacks, err := LoadStream(ctx, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmts := map[string]tasks.Stmt{}
+	for _, s := range stream {
+		if s.Set == tasks.SetX {
+			stmts[s.ID] = s
+		}
+	}
+	if len(attacks) != 113 || len(stmts) != 442 {
+		t.Fatalf("the practice template holds %d attacks and %d X statements, want 113 and 442", len(attacks), len(stmts))
+	}
+
+	got := runX(t, Target{Addr: a.Addr, Database: clone, Names: n}, owner, attacks, stmts, 0, xOptions("none", (&pauses{}).sleep))
+	last := indexOf(t, attacks, "s4.range_delete")
+	if !got.reclone || got.next != last || len(got.results) != last {
+		t.Fatalf("next %d, reclone %v, %d results; want %d, true, %d", got.next, got.reclone, len(got.results), last, last)
+	}
+	for i, r := range got.results {
+		switch attacks[i].Path {
+		case "gap.prep", "s4.truncate", "s4.drop_table", "s4.disable_trigger":
+		default:
+			if !r.Executed || r.Undetermined {
+				t.Errorf("practice %s (%d): %+v, want executed", attacks[i].Path, i, r)
+			}
+		}
 	}
 }
 
