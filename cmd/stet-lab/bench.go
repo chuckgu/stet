@@ -40,6 +40,11 @@ commands:
             [-tag <12 digits>] -sql <statement> [-args a,b])
   llm-recorder  forward a proxy's calls to the Anthropic API, log level, tokens and cost, and stop at a dollar cap
            ([-listen 127.0.0.1:18080] -out <file> [-cap-usd 10] [-upstream https://api.anthropic.com])
+  collect  join what an arm's proxy recorded about each write to it by tag, store it in lab.proxy of the
+           arm's database and the totals in lab.meta (collect:<arm>): a stet arm's stet.decisions of its
+           database and of each -db (its X clones); a hoop arm's audit logs and recorder files, after which
+           its denials the log does not confirm are unknown
+           (-arm <arm> [-practice] [-rerun N] [-db <db>]... [-audit <file>]... [-llm <file>]... [-join tag|text])
 `
 
 // benchEpoch is the date the benchmark's data is generated relative to.
@@ -67,6 +72,8 @@ func runBench(args []string) error {
 		return benchExec(args[1:])
 	case "llm-recorder":
 		return benchLLMRecorder(args[1:])
+	case "collect":
+		return benchCollect(args[1:])
 	}
 	fmt.Fprint(os.Stderr, benchUsage)
 	os.Exit(2)
@@ -493,4 +500,111 @@ func benchLLMRecorder(args []string) error {
 	defer f.Close()
 	fmt.Printf("llm-recorder: listening on %s, writing %s, spent so far $%.4f, cap $%.2f\n", *listen, *out, spent, *capUSD)
 	return http.ListenAndServe(*listen, bench.NewRecorder(*upstream, f, *capUSD, spent))
+}
+
+// repeated is a flag that may be given more than once.
+type repeated []string
+
+func (r *repeated) String() string     { return strings.Join(*r, ",") }
+func (r *repeated) Set(v string) error { *r = append(*r, v); return nil }
+
+// benchCollect reads what the arm's proxy recorded about each write (spec 7, "프록시가 남긴 것"), joins it to
+// the writes by tag and stores one row per write in lab.proxy of the arm's database, replacing the arm's
+// earlier rows. A stet arm's decisions are read, as Stet's account, from its database and from each -db (its
+// X clones). A hoop arm's come from its audit logs and the recorder's files, and its blocked outcomes whose
+// write has no violation line in the logs become unknown (bench.Unconfirm). What it found is kept in
+// lab.meta as collect:<arm> and printed on one line.
+func benchCollect(args []string) error {
+	fs := flag.NewFlagSet("bench collect", flag.ExitOnError)
+	f := newBenchFlags(fs)
+	arm := fs.String("arm", "", "the arm, such as stet, stet-bind, hoop, hoop-a")
+	rerun := fs.Int("rerun", 1, "2 or more: a rerun of the arm")
+	var dbs, audits, llms repeated
+	fs.Var(&dbs, "db", "stet arms: another database whose stet.decisions to read, such as an X clone (repeatable)")
+	fs.Var(&audits, "audit", "hoop arms: hoop's JSON-lines audit log (repeatable)")
+	fs.Var(&llms, "llm", "hoop arms: a file of the LLM recorder (repeatable)")
+	join := fs.String("join", "tag", "hoop arms: tag, or text to join by statement text and order")
+	fs.Parse(args)
+	bind, _, _, err := bench.ArmPlan(*arm, *f.practice)
+	if err != nil {
+		return fmt.Errorf("bench collect: %w", err)
+	}
+	stet, hoop := strings.HasPrefix(*arm, "stet"), strings.HasPrefix(*arm, "hoop")
+	switch {
+	case *rerun < 1:
+		return fmt.Errorf("bench collect: -rerun %d: want 1 (the first run) or more", *rerun)
+	case *join != "tag" && *join != "text":
+		return fmt.Errorf("bench collect: -join %q: want tag or text", *join)
+	case !stet && !hoop:
+		return fmt.Errorf("bench collect: arm %s has no proxy whose records to collect", *arm)
+	case stet && (len(audits) > 0 || len(llms) > 0 || *join != "tag"):
+		return errors.New("bench collect: -audit, -llm and -join go with a hoop arm")
+	case hoop && len(dbs) > 0:
+		return errors.New("bench collect: -db goes with a stet arm")
+	case hoop && len(audits) == 0:
+		return errors.New("bench collect: -audit is required for a hoop arm: without hoop's log no denial is confirmed")
+	}
+
+	var events []bench.AuditEvent
+	for _, path := range audits {
+		e, err := bench.ReadAudit(path)
+		if err != nil {
+			return fmt.Errorf("bench collect: %w", err)
+		}
+		events = append(events, e...)
+	}
+	var calls []bench.Call
+	for _, path := range llms {
+		cs, err := bench.ReadCalls(path)
+		if err != nil {
+			return fmt.Errorf("bench collect: %w", err)
+		}
+		calls = append(calls, cs...)
+	}
+
+	ctx := context.Background()
+	db := bench.DBName(*arm, *f.practice, 0, *rerun)
+	conn, err := pgx.Connect(ctx, bench.OwnerURL(*f.pg, bench.Names{}, db))
+	if err != nil {
+		return err
+	}
+	defer conn.Close(context.Background())
+	var rows []bench.Proxy
+	var c bench.Collected
+	if stet {
+		var decisions []*pgx.Conn
+		for _, name := range append([]string{db}, dbs...) {
+			d, err := pgx.Connect(ctx, bench.GateURL(*f.pg, bench.Names{}, name))
+			if err != nil {
+				return fmt.Errorf("bench collect: %s: %w", name, err)
+			}
+			defer d.Close(context.Background())
+			decisions = append(decisions, d)
+		}
+		rows, c, err = bench.CollectStet(ctx, conn, *arm, decisions)
+	} else {
+		rows, c, err = bench.CollectHoop(ctx, conn, *arm, bind, events, calls, *join == "text")
+	}
+	if err != nil {
+		return fmt.Errorf("bench collect: %s: nothing was stored: %w", db, err)
+	}
+
+	blocked, layers := 0, map[string]int{}
+	for _, p := range rows {
+		if p.Blocked {
+			blocked++
+			layers[p.Layer]++
+		}
+	}
+	var by []string
+	for _, l := range []string{"deterministic", "judgment", "limit", "failure"} {
+		by = append(by, fmt.Sprintf("%s %d", l, layers[l]))
+	}
+	meta, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s, arm %s: %d writes in lab.proxy, %d blocked (%s); collect:%s %s\n", db, *arm, len(rows), blocked,
+		strings.Join(by, ", "), *arm, meta)
+	return nil
 }
