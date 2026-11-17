@@ -182,6 +182,9 @@ func Send(ctx context.Context, t Target, phases [][][]tasks.Stmt, o Options, sav
 		defer saving.Unlock()
 		return save(out)
 	}
+	exec := func(ctx context.Context, c *pgconn.PgConn, s tasks.Stmt) (pgconn.CommandTag, error) {
+		return sendOne(ctx, c, s, o.Bind, o)
+	}
 
 	for _, units := range phases {
 		var (
@@ -203,7 +206,7 @@ func Send(ctx context.Context, t Target, phases [][][]tasks.Stmt, o Options, sav
 			wg.Go(func() {
 				for unit, ok := take(); ok && ctx.Err() == nil; unit, ok = take() {
 					for _, s := range unit {
-						out, err := w.send(ctx, t, s, o, lim)
+						out, err := w.send(ctx, t, s, o, lim, exec)
 						if err == nil {
 							err = report(out)
 						}
@@ -229,10 +232,15 @@ type worker struct {
 	role, app string
 }
 
-// send sends one statement over the worker's connection, connecting first
-// when it has none or one of another role or application. It returns an
-// error only when ctx ended before the statement was sent.
-func (w *worker) send(ctx context.Context, t Target, s tasks.Stmt, o Options, lim *limiter) (Outcome, error) {
+// execFunc sends s over c and returns the tag of its last result. ctx is not
+// cancelled by the tool; any bound on the statement is the function's own.
+type execFunc func(ctx context.Context, c *pgconn.PgConn, s tasks.Stmt) (pgconn.CommandTag, error)
+
+// send sends one statement over the worker's connection with exec,
+// connecting first when it has none or one of another role or application,
+// and then waiting for lim unless it is nil. It returns an error only when
+// ctx ended before the statement was sent.
+func (w *worker) send(ctx context.Context, t Target, s tasks.Stmt, o Options, lim *limiter, exec execFunc) (Outcome, error) {
 	if w.conn == nil || w.conn.IsClosed() || w.role != s.Role || w.app != s.App {
 		w.hangUp()
 		c, err := connect(ctx, t, s.Role, s.App)
@@ -247,14 +255,16 @@ func (w *worker) send(ctx context.Context, t Target, s tasks.Stmt, o Options, li
 		}
 		w.conn, w.role, w.app = c, s.Role, s.App
 	}
-	if err := lim.wait(ctx); err != nil {
-		return Outcome{}, err
+	if lim != nil {
+		if err := lim.wait(ctx); err != nil {
+			return Outcome{}, err
+		}
 	}
 	start := time.Now()
 	// A statement that has gone out finishes, within o.Timeout, even when the
 	// tool cancels: an interrupt, or another worker's failed save, is not the
 	// far side's silence, and unknown is kept for that.
-	tag, err := sendOne(context.WithoutCancel(ctx), w.conn, s, o.Bind, o)
+	tag, err := exec(context.WithoutCancel(ctx), w.conn, s)
 	latency := time.Since(start)
 	out := Classify(tag, err)
 	out.Arm, out.ID, out.Tag, out.Set = o.Arm, s.ID, s.Tag, s.Set
@@ -321,14 +331,16 @@ func tagged(tag, sql string) string {
 
 // sendOne sends s over c, within o.Timeout: SQL with Args bound as text when
 // bind, otherwise Inline as a simple query; s.Wire, when simple or bind,
-// overrides bind. It returns the tag of the last result.
+// overrides bind, and a copy wire sends SQL followed by CopyData. A text with
+// Pad > 0 has its @PAD@ written out first (at most o.MaxPad x's when that is
+// set). It returns the tag of the last result.
 func sendOne(ctx context.Context, c *pgconn.PgConn, s tasks.Stmt, bind bool, o Options) (pgconn.CommandTag, error) {
 	switch s.Wire {
 	case tasks.WireSimple:
 		bind = false
 	case tasks.WireBind:
 		bind = true
-	case "":
+	case "", tasks.WireCopy:
 	default:
 		return pgconn.CommandTag{}, fmt.Errorf("statement %s: wire %q is not sent this way", s.ID, s.Wire)
 	}
@@ -337,15 +349,31 @@ func sendOne(ctx context.Context, c *pgconn.PgConn, s tasks.Stmt, bind bool, o O
 		ctx, cancel = context.WithTimeout(ctx, o.Timeout)
 		defer cancel()
 	}
+	if s.Wire == tasks.WireCopy {
+		return c.CopyFrom(ctx, strings.NewReader(s.CopyData), tagged(s.Tag, s.SQL))
+	}
+	text := s.Inline
+	if bind {
+		text = s.SQL
+	}
+	if s.Pad > 0 {
+		n := s.Pad
+		if o.MaxPad > 0 {
+			n = min(n, o.MaxPad)
+		}
+		text = padded(s.Tag, text, n)
+	} else {
+		text = tagged(s.Tag, text)
+	}
 	if bind {
 		params := make([][]byte, len(s.Args))
 		for i, a := range s.Args {
 			params[i] = []byte(a)
 		}
-		r := c.ExecParams(ctx, tagged(s.Tag, s.SQL), params, nil, nil, nil).Read()
+		r := c.ExecParams(ctx, text, params, nil, nil, nil).Read()
 		return r.CommandTag, r.Err
 	}
-	results, err := c.Exec(ctx, tagged(s.Tag, s.Inline)).ReadAll()
+	results, err := c.Exec(ctx, text).ReadAll()
 	if err != nil {
 		return pgconn.CommandTag{}, err
 	}
@@ -354,6 +382,32 @@ func sendOne(ctx context.Context, c *pgconn.PgConn, s tasks.Stmt, bind bool, o O
 	}
 	last := results[len(results)-1]
 	return last.CommandTag, last.Err
+}
+
+const padToken = "@PAD@"
+
+// padded returns sql with its tag in front and every @PAD@ written as n x's.
+// The text is built in one piece, so that a 64 MiB message is held once
+// rather than once per step of its making.
+func padded(tag, sql string, n int) string {
+	prefix := tagged(tag, "")
+	var b strings.Builder
+	b.Grow(len(prefix) + len(sql) + strings.Count(sql, padToken)*(n-len(padToken)))
+	b.WriteString(prefix)
+	chunk := strings.Repeat("x", min(n, 64<<10))
+	for {
+		i := strings.Index(sql, padToken)
+		if i < 0 {
+			break
+		}
+		b.WriteString(sql[:i])
+		for left := n; left > 0; left -= len(chunk) {
+			b.WriteString(chunk[:min(left, len(chunk))])
+		}
+		sql = sql[i+len(padToken):]
+	}
+	b.WriteString(sql)
+	return b.String()
 }
 
 // limiter spaces statements across all connections.
@@ -414,8 +468,26 @@ func AlreadySent(ctx context.Context, conn *pgx.Conn, arm, set string) (bool, er
 	return sent, err
 }
 
-// reachWithin bounds Record's one attempt to reach the target.
+// reachWithin bounds the one attempt to reach the target before anything is sent.
 const reachWithin = 5 * time.Second
+
+// reach connects once to t as role with application app, within
+// reachWithin, and hangs up. Its error says that nothing was sent or
+// recorded: a wrong address would otherwise make every statement wait out
+// the connect window and be recorded as unknown.
+func reach(ctx context.Context, t Target, role, app string) error {
+	rctx, cancel := context.WithTimeout(ctx, reachWithin)
+	c, err := dial(rctx, t, role, app)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("cannot reach %s as %s (database %s); nothing was sent or recorded: %w",
+			t.Addr, t.Names.Role(role), t.Database, err)
+	}
+	closing, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+	c.Close(closing)
+	cancel()
+	return nil
+}
 
 // Record sends phases to t and saves every outcome in lab.outcomes through conn, calling saved (if not nil)
 // after each. An outcome is saved even after ctx ends: its statement was sent.
@@ -425,16 +497,9 @@ const reachWithin = 5 * time.Second
 // statement wait out the connect window and be recorded as unknown, and those rows would refuse a retry.
 func Record(ctx context.Context, conn *pgx.Conn, t Target, phases [][][]tasks.Stmt, o Options, saved func(Outcome)) error {
 	if s, ok := firstStmt(phases); ok {
-		rctx, cancel := context.WithTimeout(ctx, reachWithin)
-		c, err := dial(rctx, t, s.Role, s.App)
-		cancel()
-		if err != nil {
-			return fmt.Errorf("cannot reach %s as %s (database %s); nothing was sent or recorded: %w",
-				t.Addr, t.Names.Role(s.Role), t.Database, err)
+		if err := reach(ctx, t, s.Role, s.App); err != nil {
+			return err
 		}
-		closing, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
-		c.Close(closing)
-		cancel()
 	}
 	save := context.WithoutCancel(ctx)
 	return Send(ctx, t, phases, o, func(out Outcome) error {

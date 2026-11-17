@@ -303,9 +303,11 @@ func benchSend(args []string) error {
 
 // benchSendX sends the arm's attacks from attack from on into its X clone x
 // (spec 4, "X"), probing that clone as the owner, and records the steps'
-// outcomes and the attacks' results in the arm's own database. Attacks the
-// arm already has results of are not sent again. When an executed attack
-// needs a fresh clone it prints how to go on and returns reclone.
+// outcomes and the attacks' results in the arm's own database. It sends only
+// when from is exactly where the recorded run stopped (bench.CheckResume),
+// and nothing when -addr does not answer. When a destructive attack ran, or
+// may have, it prints how to go on with a fresh clone and returns reclone; on
+// an error it prints the attack the run stopped at.
 func benchSendX(f benchFlags, arm string, rerun, x, from int, addr string, bind bool) (reclone bool, err error) {
 	switch {
 	case x < 0:
@@ -324,20 +326,16 @@ func benchSendX(f benchFlags, arm string, rerun, x, from int, addr string, bind 
 		return false, err
 	}
 	defer conn.Close(context.Background())
-	var sent bool
-	if err := conn.QueryRow(ctx, "select exists (select 1 from lab.attacks where arm = $1 and idx >= $2)", arm, from).Scan(&sent); err != nil {
-		return false, err
-	}
-	if sent {
-		return false, fmt.Errorf("bench send: %s already holds results of arm %s's attacks from %d on; nothing was sent "+
-			"(the attacks are sent once: clone a fresh database with -rerun)", db, arm, from)
-	}
 	stream, attacks, err := bench.LoadStream(ctx, conn)
 	if err != nil {
 		return false, err
 	}
 	if from > len(attacks) {
 		return false, fmt.Errorf("bench send: -from %d: there are %d attacks", from, len(attacks))
+	}
+	// The one guard against sending an attack twice, or skipping one.
+	if err := bench.CheckResume(ctx, conn, arm, attacks, from); err != nil {
+		return false, fmt.Errorf("bench send: %s: nothing was sent: %w", db, err)
 	}
 	stmts := map[string]tasks.Stmt{}
 	for _, s := range stream {
@@ -381,7 +379,7 @@ func benchSendX(f benchFlags, arm string, rerun, x, from int, addr string, bind 
 			verdict := "not executed"
 			switch {
 			case r.Undetermined:
-				verdict = "undetermined (a probe failed)"
+				verdict = "undetermined (a probe failed, or the database did not settle)"
 			case r.Executed:
 				verdict = "executed"
 				executed++
@@ -393,6 +391,12 @@ func benchSendX(f benchFlags, arm string, rerun, x, from int, addr string, bind 
 	fmt.Printf("%s via %s, arm %s, set X: %d attacks from %d on, %d executed; steps: %s\n", db, xdb, arm, done, from,
 		executed, outcomeCounts(count))
 	if err != nil {
+		path := "-"
+		if next < len(attacks) {
+			path = attacks[next].Path
+		}
+		fmt.Printf("STOPPED at attack %d (%s), whose result is not recorded: send -sets X -from %d goes on from there, "+
+			"or says which rows to drop first\n", next, path, next)
 		return false, err
 	}
 	if reclone {

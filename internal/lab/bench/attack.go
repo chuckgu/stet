@@ -30,25 +30,43 @@ type AttackResult struct {
 	Database            string
 	Before, After       int64 // the probe before the first step and after the last
 	Executed            bool  // After-Before > Limit; false when the attack has no probe
-	Undetermined        bool  // a probe query failed: Before and After are NULL in lab.attacks, Executed is false
+	// A probe query failed, or the database did not settle before the after probe: Before and After are NULL
+	// in lab.attacks, Executed is false.
+	Undetermined bool
 }
 
-// RunAttacks runs attacks[from:] in order. It stops after an attack that Breaks and was executed, unless it was
-// the last one, and then returns the index to go on from and reclone == true.
+// RunAttacks runs attacks[from:] in order. It stops after an attack that Breaks and was executed or is
+// undetermined, unless it was the last one, and then returns the index to go on from and reclone == true: an
+// undetermined destructive path may have run and voided the paths after it.
 //
-// owner is the owner's connection to t.Database, not through the arm's proxy: it runs the probes, resolves the
-// OIDs of FunctionCall steps and opens the connection that holds an attack's lock. stmts holds the steps by ID.
-// Every step's outcome goes to save and every attack's result to saveAttack, one call at a time. On an error,
-// next is the attack that was not finished; its result was not saved.
+// owner is the owner's connection to t.Database itself, not through the arm's proxy: it runs the probes,
+// resolves the OIDs of FunctionCall steps, opens the connection that holds an attack's lock, and waits for the
+// database to settle before each after probe. stmts holds the steps by ID. Before the first attack RunAttacks
+// connects once to t as that attack's first step would, and when that fails it returns an error having sent and
+// recorded nothing. Every step's outcome goes to save and every attack's result to saveAttack, one call at a
+// time. On an error, next is the attack that was not finished: its result was not saved, though some of its
+// steps' outcomes may have been.
 func RunAttacks(ctx context.Context, t Target, owner *pgx.Conn, attacks []tasks.Attack, stmts map[string]tasks.Stmt,
 	from int, o Options, save func(Outcome) error, saveAttack func(AttackResult) error) (next int, reclone bool, err error) {
 	if from < 0 || from > len(attacks) {
 		return from, false, fmt.Errorf("run attacks: from %d is outside the %d attacks", from, len(attacks))
 	}
+	if db := owner.Config().Database; db != t.Database {
+		return from, false, fmt.Errorf("run attacks: the owner's connection is to %s and the attacks go to %s: "+
+			"the probes must read the database the attacks change", db, t.Database)
+	}
 	if o.Sleep == nil {
 		o.Sleep = time.Sleep
 	}
-	x := &attackRun{t: t, owner: owner, stmts: stmts, o: o, lim: newLimiter(o.PerSecond), save: save}
+	if from < len(attacks) && len(attacks[from].Steps) > 0 {
+		if s, ok := stmts[attacks[from].Steps[0]]; ok {
+			if err := reach(ctx, t, s.Role, s.App); err != nil {
+				return from, false, fmt.Errorf("run attacks: %w", err)
+			}
+		}
+	}
+	x := &attackRun{t: t, owner: owner, stmts: stmts, o: o, lim: newLimiter(o.PerSecond), oids: map[string]uint32{},
+		save: save}
 	for i := from; i < len(attacks); i++ {
 		a := attacks[i]
 		r, err := x.run(ctx, i, a)
@@ -58,7 +76,7 @@ func RunAttacks(ctx context.Context, t Target, owner *pgx.Conn, attacks []tasks.
 		if err != nil {
 			return i, false, fmt.Errorf("attack %d (%s): %w", i, a.Path, err)
 		}
-		if a.Breaks && r.Executed && i < len(attacks)-1 {
+		if a.Breaks && (r.Executed || r.Undetermined) && i < len(attacks)-1 {
 			return i + 1, true, nil
 		}
 	}
@@ -80,18 +98,89 @@ func SaveAttack(ctx context.Context, conn *pgx.Conn, r AttackResult) error {
 	return nil
 }
 
+// CheckResume refuses to send attacks[from:] for arm, as recorded through conn, unless the run goes on exactly
+// where the recorded one stopped: lab.attacks holds the results of the arm's attacks 0 to from-1 and of none
+// after, and lab.outcomes holds no step of attacks[from:]. Its error says how to go on.
+func CheckResume(ctx context.Context, conn *pgx.Conn, arm string, attacks []tasks.Attack, from int) error {
+	rows, err := conn.Query(ctx, "select idx from lab.attacks where arm = $1 order by idx", arm)
+	if err != nil {
+		return err
+	}
+	done, err := pgx.CollectRows(rows, pgx.RowTo[int])
+	if err != nil {
+		return fmt.Errorf("read lab.attacks: %w", err)
+	}
+	stop := 0 // the first attack without a result
+	for stop < len(done) && done[stop] == stop {
+		stop++
+	}
+	path := func(i int) string {
+		if i < len(attacks) {
+			return attacks[i].Path
+		}
+		return "?"
+	}
+	switch {
+	case stop < len(done):
+		return fmt.Errorf("lab.attacks holds no result of arm %s's attack %d (%s) but holds results of later ones: "+
+			"the run stopped at attack %d. Drop the arm's rows of attacks %d on (lab.attacks with idx >= %d, and "+
+			"their steps in lab.outcomes), re-clone the X database and send -from %d", arm, stop, path(stop), stop,
+			stop, stop, stop)
+	case from != stop && stop == len(attacks):
+		return fmt.Errorf("all %d attacks of arm %s have results; nothing is left to send", len(attacks), arm)
+	case from != stop && stop == 0:
+		return fmt.Errorf("lab.attacks holds no result of arm %s yet: send -from 0", arm)
+	case from != stop:
+		return fmt.Errorf("lab.attacks holds the results of arm %s's attacks 0 to %d: send -from %d", arm, stop-1, stop)
+	}
+
+	of := map[string]int{} // step -> its attack
+	var ids []string
+	for i := from; i < len(attacks); i++ {
+		for _, id := range attacks[i].Steps {
+			of[id] = i
+			ids = append(ids, id)
+		}
+	}
+	rows, err = conn.Query(ctx, "select id from lab.outcomes where arm = $1 and id = any($2) order by id", arm, ids)
+	if err != nil {
+		return err
+	}
+	sent, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return fmt.Errorf("read lab.outcomes: %w", err)
+	}
+	if len(sent) == 0 {
+		return nil
+	}
+	cut := len(attacks)
+	for _, id := range sent {
+		cut = min(cut, of[id])
+	}
+	quoted := make([]string, len(sent))
+	for i, id := range sent {
+		quoted[i] = "'" + strings.ReplaceAll(id, "'", "''") + "'"
+	}
+	return fmt.Errorf("attack %d (%s) of arm %s was cut off: lab.outcomes holds steps of it (%s) but lab.attacks no "+
+		"result. Drop those rows (delete from lab.outcomes where arm = '%s' and id in (%s)), re-clone the X database "+
+		"and send -from %d", cut, path(cut), arm, strings.Join(sent, ", "), strings.ReplaceAll(arm, "'", "''"),
+		strings.Join(quoted, ", "), cut)
+}
+
 // attackRun is one RunAttacks call.
 type attackRun struct {
 	t      Target
 	owner  *pgx.Conn
 	stmts  map[string]tasks.Stmt
 	o      Options
-	lim    *limiter // shared by the steps sent one after another
+	lim    *limiter          // shared by the steps sent one after another
+	oids   map[string]uint32 // the function of each FunctionCall step, by step ID
 	saving sync.Mutex
 	save   func(Outcome) error
 }
 
-// run runs attack i: the pause, the probe, the connections, the lock, the steps, the lock's release, the probe.
+// run runs attack i: the pause, the probe, the connections, the lock, the steps, the lock's release, the
+// database settling, the probe.
 func (x *attackRun) run(ctx context.Context, i int, a tasks.Attack) (AttackResult, error) {
 	r := AttackResult{Arm: x.o.Arm, Index: i, Path: a.Path, Code: a.Code, Payload: a.Payload, Database: x.t.Database}
 	steps := make([]tasks.Stmt, len(a.Steps))
@@ -112,8 +201,7 @@ func (x *attackRun) run(ctx context.Context, i int, a tasks.Attack) (AttackResul
 	if err != nil {
 		return r, err
 	}
-	oids, err := x.functionOIDs(ctx, steps)
-	if err != nil {
+	if err := x.resolve(ctx, steps); err != nil {
 		return r, err
 	}
 
@@ -130,20 +218,24 @@ func (x *attackRun) run(ctx context.Context, i int, a tasks.Attack) (AttackResul
 			return r, err
 		}
 	}
-	err = x.send(ctx, rt, steps, oids)
+	err = x.send(ctx, rt, steps)
 	if released != nil {
-		err = errors.Join(err, <-released) // the after probe must not read a write still waiting for the lock
+		err = errors.Join(err, <-released)
 	}
 	if err != nil {
 		return r, err
 	}
 
+	settled, err := x.settle(ctx)
+	if err != nil {
+		return r, err
+	}
 	after, okAfter, err := x.probe(ctx, a.Probe)
 	if err != nil {
 		return r, err
 	}
 	r.Before, r.After = before, after
-	r.Undetermined = !okBefore || !okAfter
+	r.Undetermined = !okBefore || !settled || !okAfter
 	r.Executed = a.Probe != "" && !r.Undetermined && after-before > a.Limit
 	return r, nil
 }
@@ -166,24 +258,77 @@ func (x *attackRun) probe(ctx context.Context, sql string) (v int64, ok bool, er
 	return 0, false, nil
 }
 
-// functionOIDs resolves the function of each FunctionCall step, such as set_consent(integer), to its OID, by ID.
-func (x *attackRun) functionOIDs(ctx context.Context, steps []tasks.Stmt) (map[string]uint32, error) {
-	oids := map[string]uint32{}
+// How often settle looks; tests may shorten it. Without o.Timeout it waits at most settleDefault.
+var (
+	settleEvery   = 25 * time.Millisecond
+	settleDefault = 2 * time.Minute
+)
+
+// busySQL counts the other sessions on the owner's database that are inside a transaction. Every transaction
+// holds the lock on its own virtual transaction ID until it ends, and an idle session holds no lock; a statement
+// waiting for a row lock is inside its transaction too. pg_locks is read because pg_stat_activity shows the
+// owner no other role's state (it is no member of pg_read_all_stats, and the benchmark leaves existing roles
+// alone); a session's database and user are shown to everyone. A NULL usesysid is a background process, such
+// as autovacuum.
+const busySQL = `select count(distinct l.pid) from pg_locks l join pg_stat_activity a on a.pid = l.pid
+	where a.datname = current_database() and a.usesysid is not null and a.pid <> pg_backend_pid()`
+
+// settle waits until no other session on the owner's database is inside a transaction, looking every
+// settleEvery for at most o.Timeout; ok is false when it never saw that, or when its query failed. A
+// statement whose client stopped waiting (an arm that hung up after forwarding it, the timeout, an interrupt)
+// still runs in the database, and an after probe read before it commits would count an executed payload as
+// caught. A proxy's own sessions may be busy for a moment (Stet looks for approved writes every second), so one
+// reading of none is enough.
+//
+// Known limit: a statement still queued inside a proxy, which has not reached the database, is not seen.
+func (x *attackRun) settle(ctx context.Context) (ok bool, err error) {
+	within := x.o.Timeout
+	if within <= 0 {
+		within = settleDefault
+	}
+	deadline := time.Now().Add(within)
+	for {
+		var busy int64
+		qerr := x.owner.QueryRow(ctx, busySQL).Scan(&busy)
+		switch {
+		case qerr == nil && busy == 0:
+			return true, nil
+		case qerr != nil && ctx.Err() != nil:
+			return false, ctx.Err()
+		case qerr != nil && x.owner.IsClosed():
+			return false, fmt.Errorf("settle: %w", qerr)
+		case qerr != nil:
+			return false, nil
+		}
+		if time.Now().After(deadline) {
+			return false, nil
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(settleEvery):
+		}
+	}
+}
+
+// resolve finds the function of each FunctionCall step, such as set_consent(integer), and keeps its OID.
+func (x *attackRun) resolve(ctx context.Context, steps []tasks.Stmt) error {
 	for _, s := range steps {
 		if s.Wire != tasks.WireFunctionCall {
 			continue
 		}
 		var oid uint32
 		if err := x.owner.QueryRow(ctx, "select $1::text::regprocedure::oid", s.SQL).Scan(&oid); err != nil {
-			return nil, fmt.Errorf("step %s: the OID of %s: %w", s.ID, s.SQL, err)
+			return fmt.Errorf("step %s: the OID of %s: %w", s.ID, s.SQL, err)
 		}
-		oids[s.ID] = oid
+		x.oids[s.ID] = oid
 	}
-	return oids, nil
+	return nil
 }
 
 // lock runs sql in a transaction on a connection of the owner's own and returns once it holds the lock. The
-// transaction is committed after d, or as soon as ctx ends; the channel then reports how that went.
+// transaction is committed after d, or as soon as ctx ends, and the connection closed; the channel then reports
+// how that went.
 func (x *attackRun) lock(ctx context.Context, sql string, d time.Duration) (<-chan error, error) {
 	c, err := pgx.ConnectConfig(ctx, x.owner.Config())
 	if err != nil {
@@ -274,11 +419,11 @@ func (rt *route) hangUp() {
 
 // send sends the steps and reports each outcome. One after another, each step waits for the shared rate; at
 // once, the workers send their steps in parallel without it. It stops at the first error save returns, or when
-// ctx ends.
-func (x *attackRun) send(ctx context.Context, rt *route, steps []tasks.Stmt, oids map[string]uint32) error {
+// ctx ends: no step starts after that, and one already sent finishes and is reported as the far side answered.
+func (x *attackRun) send(ctx context.Context, rt *route, steps []tasks.Stmt) error {
 	if !rt.atOnce {
 		for i, s := range steps {
-			out, err := x.step(ctx, rt.via[i], s, oids[s.ID], x.lim)
+			out, err := x.step(ctx, rt.via[i], s, x.lim)
 			if err == nil {
 				err = x.report(out)
 			}
@@ -294,7 +439,7 @@ func (x *attackRun) send(ctx context.Context, rt *route, steps []tasks.Stmt, oid
 	for k, w := range rt.workers {
 		wg.Go(func() {
 			for i := k; i < len(steps) && ctx.Err() == nil; i += len(rt.workers) {
-				out, err := x.step(ctx, w, steps[i], oids[steps[i].ID], nil)
+				out, err := x.step(ctx, w, steps[i], nil)
 				if err == nil {
 					err = x.report(out)
 				}
@@ -315,115 +460,32 @@ func (x *attackRun) report(out Outcome) error {
 	return x.save(out)
 }
 
-// step sends s over w, connecting first when w has no connection or one of another role or application; a
-// FunctionCall goes over a connection of its own, closed after it. With lim, it waits for the rate after
-// connecting. A step that did not execute leaves w without a connection: hoop hangs up on every denial. It
-// returns an error only when ctx ended before s was sent.
-func (x *attackRun) step(ctx context.Context, w *worker, s tasks.Stmt, oid uint32, lim *limiter) (Outcome, error) {
+// step sends s as Send sends a statement, over w; a FunctionCall goes over a connection of its own, closed
+// after it.
+func (x *attackRun) step(ctx context.Context, w *worker, s tasks.Stmt, lim *limiter) (Outcome, error) {
 	if s.Wire == tasks.WireFunctionCall {
 		w = &worker{}
 		defer w.hangUp()
 	}
-	if w.conn == nil || w.conn.IsClosed() || w.role != s.Role || w.app != s.App {
-		w.hangUp()
-		c, err := connect(ctx, x.t, s.Role, s.App)
-		if err != nil {
-			if ctx.Err() != nil {
-				return Outcome{}, ctx.Err()
-			}
-			// Not classified: a server that refuses the session refused no statement.
-			return x.outcome(s, time.Now(), 0, Outcome{Result: Unknown, Message: err.Error()}), nil
-		}
-		w.conn, w.role, w.app = c, s.Role, s.App
-	}
-	if lim != nil {
-		if err := lim.wait(ctx); err != nil {
-			return Outcome{}, err
-		}
-	}
-	start := time.Now()
-	tag, err := x.exec(ctx, w.conn, s, oid)
-	out := x.outcome(s, start, time.Since(start), Classify(tag, err))
-	if out.Result != Executed {
-		w.hangUp()
-	}
-	return out, nil
+	return w.send(ctx, x.t, s, x.o, lim, x.exec)
 }
 
-func (x *attackRun) outcome(s tasks.Stmt, start time.Time, took time.Duration, out Outcome) Outcome {
-	out.Arm, out.ID, out.Tag, out.Set = x.o.Arm, s.ID, s.Tag, s.Set
-	out.SentAt, out.LatencyMS = start, float64(took.Nanoseconds())/1e6
-	return out
-}
-
-// exec sends s over c within o.Timeout, the way its Wire says: a FunctionCall message of the function oid, a
-// COPY with its data, or else as sendOne does, with any @PAD@ written out first.
-func (x *attackRun) exec(ctx context.Context, c *pgconn.PgConn, s tasks.Stmt, oid uint32) (pgconn.CommandTag, error) {
-	switch {
-	case s.Wire == tasks.WireFunctionCall:
-		return callFunction(ctx, c, oid, s.Args, x.o.Timeout)
-	case s.Wire == tasks.WireCopy:
-		ctx, cancel := withTimeout(ctx, x.o.Timeout)
-		defer cancel()
-		return c.CopyFrom(ctx, strings.NewReader(s.CopyData), tagged(s.Tag, s.SQL))
-	case s.Pad > 0:
-		n := s.Pad
-		if x.o.MaxPad > 0 {
-			n = min(n, x.o.MaxPad)
-		}
-		// Only the text that is sent is padded, with its tag, and then
-		// sent as it is.
-		if binds(s, x.o.Bind) {
-			s.SQL = padded(s.Tag, s.SQL, n)
-		} else {
-			s.Inline = padded(s.Tag, s.Inline, n)
-		}
-		s.Tag = ""
+// exec sends s over c: a FunctionCall message of its function, within o.Timeout, or else as sendOne does.
+func (x *attackRun) exec(ctx context.Context, c *pgconn.PgConn, s tasks.Stmt) (pgconn.CommandTag, error) {
+	if s.Wire == tasks.WireFunctionCall {
+		return callFunction(ctx, c, x.oids[s.ID], s.Args, x.o.Timeout)
 	}
 	return sendOne(ctx, c, s, x.o.Bind, x.o)
-}
-
-// binds says whether sendOne sends s with its values bound.
-func binds(s tasks.Stmt, bind bool) bool {
-	switch s.Wire {
-	case tasks.WireSimple:
-		return false
-	case tasks.WireBind:
-		return true
-	}
-	return bind
-}
-
-const padToken = "@PAD@"
-
-// padded returns sql with its tag in front and every @PAD@ written as n x's. The text is built in one piece, so
-// that a 64 MiB message is held once rather than once per step of its making.
-func padded(tag, sql string, n int) string {
-	prefix := tagged(tag, "")
-	var b strings.Builder
-	b.Grow(len(prefix) + len(sql) + strings.Count(sql, padToken)*(n-len(padToken)))
-	b.WriteString(prefix)
-	chunk := strings.Repeat("x", min(n, 64<<10))
-	for {
-		i := strings.Index(sql, padToken)
-		if i < 0 {
-			break
-		}
-		b.WriteString(sql[:i])
-		for left := n; left > 0; left -= len(chunk) {
-			b.WriteString(chunk[:min(left, len(chunk))])
-		}
-		sql = sql[i+len(padToken):]
-	}
-	b.WriteString(sql)
-	return b.String()
 }
 
 // callFunction sends a FunctionCall message for the function oid with args as text and reads until the server is
 // ready for the next message or reports an error.
 func callFunction(ctx context.Context, c *pgconn.PgConn, oid uint32, args []string, timeout time.Duration) (pgconn.CommandTag, error) {
-	ctx, cancel := withTimeout(ctx, timeout)
-	defer cancel()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 	values := make([][]byte, len(args))
 	for i, a := range args {
 		values[i] = []byte(a)
@@ -445,11 +507,4 @@ func callFunction(ctx context.Context, c *pgconn.PgConn, oid uint32, args []stri
 			return pgconn.CommandTag{}, nil
 		}
 	}
-}
-
-func withTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
-	if d > 0 {
-		return context.WithTimeout(ctx, d)
-	}
-	return ctx, func() {}
 }

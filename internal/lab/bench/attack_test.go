@@ -2,6 +2,7 @@ package bench
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -541,8 +542,11 @@ func TestBurstOpensItsConnectionsFirstAndIgnoresTheRate(t *testing.T) {
 	if d > 5*time.Second {
 		t.Errorf("s8.burst's 200 steps took %v, want them at once (20s at the rate)", d)
 	}
-	if f.MaxOpen() != 32 || len(f.Seen()) != 200 {
-		t.Errorf("s8.burst: %d connections open at once, %d statements; want 32 and 200", f.MaxOpen(), len(f.Seen()))
+	// RunAttacks's first connection, which only checks that the address
+	// answers, may still count at the fake: the client hung up on it.
+	if m := f.MaxOpen(); m < 32 || m > 33 || len(f.Seen()) != 200 {
+		t.Errorf("s8.burst: %d connections open at once, %d statements; want 32 (33 with the address check) and 200",
+			m, len(f.Seen()))
 	}
 }
 
@@ -562,5 +566,258 @@ func TestPadIsWrittenOutOnce(t *testing.T) {
 	}
 	if got := padded("", "'@PAD@'", 200000); len(got) != 200002 || strings.Count(got, "x") != 200000 {
 		t.Errorf("padded with 200000: %d bytes, want 200002", len(got))
+	}
+}
+
+// execLeftRunning returns a fake's Exec that sends each statement to db as
+// the owner, after pause seconds of pg_sleep in the same transaction, and
+// returns once the database has started it, without waiting for it to end:
+// the fake then hangs up on a client whose statement is still running.
+func execLeftRunning(t *testing.T, a Admin, n Names, db string, pause float64) func(string) {
+	t.Helper()
+	var wg sync.WaitGroup
+	t.Cleanup(wg.Wait)
+	return func(sql string) {
+		ctx := context.Background()
+		conn, err := pgx.Connect(ctx, OwnerURL(a.Addr, n, db))
+		if err != nil {
+			t.Errorf("connect to run %.80q: %v", sql, err)
+			return
+		}
+		if pause > 0 {
+			sql = fmt.Sprintf("select pg_sleep(%g); %s", pause, sql)
+		}
+		running := conn.PgConn().Exec(ctx, sql) // sent here, read below
+		time.Sleep(50 * time.Millisecond)
+		wg.Go(func() {
+			if err := running.Close(); err != nil {
+				t.Errorf("run %.80q on the database: %v", sql, err)
+			}
+			conn.Close(ctx)
+		})
+	}
+}
+
+func TestAfterProbeWaitsForAStatementTheArmLeftRunning(t *testing.T) {
+	a, n, _, b := testTemplate(t)
+	stmts := xStmts(b)
+	clone := testClone(t, false)
+	owner := connectAs(t, a, n.Owner(), OwnerPassword, clone)
+	f := startFakeHoop(t)
+	f.Mode = "drop"
+	f.Exec = execLeftRunning(t, a, n, clone, 0.5)
+
+	attack := b.Attacks[indexOf(t, b.Attacks, "s5.do")]
+	got := runX(t, Target{Addr: f.Addr, Database: clone, Names: n}, owner, []tasks.Attack{attack}, stmts, 0,
+		xOptions("hoop", (&pauses{}).sleep))
+	if o := got.out[attack.Steps[0]]; o.Result != Unknown {
+		t.Errorf("s5.do's step: %s, want unknown", o.Result)
+	}
+	if r := got.results[0]; !r.Executed || r.Undetermined {
+		t.Errorf("s5.do: %+v, want executed: the statement committed half a second after the fake hung up", r)
+	}
+}
+
+func TestLockedRowWhoseAnswerIsLostIsJudgedAfterItCommits(t *testing.T) {
+	a, n, _, b := testTemplate(t)
+	stmts := xStmts(b)
+	clone := testClone(t, false)
+	owner := connectAs(t, a, n.Owner(), OwnerPassword, clone)
+	f := startFakeHoop(t)
+	f.Mode = "drop"
+	f.Exec = execLeftRunning(t, a, n, clone, 0) // the write waits for the lock after the fake has hung up
+
+	attack := b.Attacks[indexOf(t, b.Attacks, "s8.locked_row")]
+	got := runX(t, Target{Addr: f.Addr, Database: clone, Names: n}, owner, []tasks.Attack{attack}, stmts, 0,
+		xOptions("hoop", (&pauses{}).sleep))
+	if o := got.out[attack.Steps[0]]; o.Result != Unknown || o.LatencyMS > 1000 {
+		t.Errorf("s8.locked_row's step: %s after %.0fms, want unknown at once", o.Result, o.LatencyMS)
+	}
+	if r := got.results[0]; !r.Executed || r.Undetermined {
+		t.Errorf("s8.locked_row: %+v, want executed: the write ran once the lock was released", r)
+	}
+}
+
+func TestDatabaseThatNeverSettlesIsUndetermined(t *testing.T) {
+	a, n, _, b := testTemplate(t)
+	stmts := xStmts(b)
+	clone := testClone(t, false)
+	owner := connectAs(t, a, n.Owner(), OwnerPassword, clone)
+	ctx := context.Background()
+	busy := connectAs(t, a, n.Owner(), OwnerPassword, clone)
+	tx, err := busy.Begin(ctx) // a session that stays inside a transaction
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "select 1"); err != nil {
+		t.Fatal(err)
+	}
+
+	attack := b.Attacks[indexOf(t, b.Attacks, "s5.call")]
+	o := xOptions("none", (&pauses{}).sleep)
+	o.Timeout = 500 * time.Millisecond
+	start := time.Now()
+	got := runX(t, Target{Addr: a.Addr, Database: clone, Names: n}, owner, []tasks.Attack{attack}, stmts, 0, o)
+	if r := got.results[0]; !r.Undetermined || r.Executed {
+		t.Errorf("s5.call beside a session that never settles: %+v, want undetermined", r)
+	}
+	if took := time.Since(start); took > 10*time.Second {
+		t.Errorf("gave up after %v, want about the 500ms timeout", took)
+	}
+}
+
+func TestBurstWhoseSaveFailsKeepsInFlightStepsOutOfUnknown(t *testing.T) {
+	a, n, _, b := testTemplate(t)
+	stmts := xStmts(b)
+	clone := testClone(t, false)
+	owner := connectAs(t, a, n.Owner(), OwnerPassword, clone)
+	burst := b.Attacks[indexOf(t, b.Attacks, "s8.burst")]
+	denied := stmts[burst.Steps[0]]
+
+	// The failing save is the denied step's: a denial never reaches Exec,
+	// which the fake runs one at a time, so the other connections' steps
+	// wait behind the slow one, in flight.
+	f := startFakeHoop(t)
+	f.Deny = func(sql string) bool { return tagOf(sql) == denied.Tag }
+	inflight := make(chan struct{})
+	var once sync.Once
+	f.Exec = func(string) {
+		once.Do(func() {
+			close(inflight)
+			time.Sleep(300 * time.Millisecond)
+		})
+	}
+	full := errors.New("disk full")
+	var got []Outcome
+	save := func(o Outcome) error {
+		got = append(got, o)
+		if o.ID != denied.ID {
+			return nil
+		}
+		select {
+		case <-inflight:
+		case <-time.After(5 * time.Second):
+		}
+		return full
+	}
+	_, _, err := RunAttacks(context.Background(), Target{Addr: f.Addr, Database: clone, Names: n}, owner,
+		[]tasks.Attack{burst}, stmts, 0, xOptions("hoop", (&pauses{}).sleep), save, func(AttackResult) error { return nil })
+	if !errors.Is(err, full) {
+		t.Errorf("RunAttacks = %v, want the save's error", err)
+	}
+	for _, o := range got {
+		if o.Result == Unknown {
+			t.Errorf("%s recorded as unknown (%s): the far side answered it", o.ID, o.Message)
+		}
+	}
+	if seen := len(f.Seen()); seen != len(got) || seen >= len(burst.Steps) {
+		t.Errorf("the fake saw %d statements, %d were recorded; want every one sent recorded, and fewer than %d",
+			seen, len(got), len(burst.Steps))
+	}
+}
+
+func TestResumeGoesOnExactlyWhereTheResultsStop(t *testing.T) {
+	a, n, _, b := testTemplate(t)
+	ctx := context.Background()
+	conn := connectAs(t, a, n.Owner(), OwnerPassword, testClone(t, false))
+	at := b.Attacks
+	result := func(arm string, i int) {
+		t.Helper()
+		if err := SaveAttack(ctx, conn, AttackResult{Arm: arm, Index: i, Path: at[i].Path, Code: at[i].Code,
+			Payload: at[i].Payload, Database: "crm_x"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	outcome := func(arm, id string) {
+		t.Helper()
+		if err := SaveOutcome(ctx, conn, Outcome{Arm: arm, ID: id, Set: tasks.SetX, SentAt: time.Now(), Result: Executed}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(arm string, from int, want ...string) {
+		t.Helper()
+		err := CheckResume(ctx, conn, arm, at, from)
+		switch {
+		case len(want) == 0 && err != nil:
+			t.Errorf("%s -from %d: %v, want no error", arm, from, err)
+		case len(want) > 0 && err == nil:
+			t.Errorf("%s -from %d: no error, want one saying %q", arm, from, want)
+		case len(want) > 0:
+			for _, w := range want {
+				if !strings.Contains(err.Error(), w) {
+					t.Errorf("%s -from %d: %q does not say %q", arm, from, err, w)
+				}
+			}
+		}
+	}
+
+	check("a", 0)
+	check("a", 3, "-from 0")
+	for i := range 3 {
+		result("a", i)
+		for _, id := range at[i].Steps {
+			outcome("a", id)
+		}
+	}
+	check("a", 3)
+	check("a", 2, "-from 3")
+	check("a", 4, "-from 3")
+	check("b", 0) // another arm's rows are not this arm's
+
+	// Attack 3 was cut off: one of its steps is recorded, its result is not.
+	outcome("a", at[3].Steps[0])
+	check("a", 3, "attack 3", at[3].Steps[0], "re-clone")
+	check("a", 4, "-from 3")
+
+	// A gap: attack 1 has no result, attack 2 has one.
+	result("c", 0)
+	result("c", 2)
+	check("c", 3, "attack 1", "-from 1")
+}
+
+func TestUndeterminedDestructiveAttackStopsForAFreshClone(t *testing.T) {
+	a, n, _, b := testTemplate(t)
+	stmts := xStmts(b)
+	clone := testClone(t, false)
+	owner := connectAs(t, a, n.Owner(), OwnerPassword, clone)
+	truncate := b.Attacks[indexOf(t, b.Attacks, "s4.truncate")]
+	truncate.Probe = "select nope"
+	call := b.Attacks[indexOf(t, b.Attacks, "s5.call")]
+	target := Target{Addr: a.Addr, Database: clone, Names: n}
+
+	got := runX(t, target, owner, []tasks.Attack{truncate, call}, stmts, 0, xOptions("none", (&pauses{}).sleep))
+	if !got.reclone || got.next != 1 || len(got.results) != 1 || !got.results[0].Undetermined {
+		t.Errorf("an undetermined s4.truncate before s5.call: next %d, reclone %v, results %+v; want 1, true, "+
+			"one undetermined", got.next, got.reclone, got.results)
+	}
+	last := runX(t, target, owner, []tasks.Attack{call, truncate}, stmts, 0, xOptions("none", (&pauses{}).sleep))
+	if last.reclone || last.next != 2 {
+		t.Errorf("an undetermined s4.truncate last: next %d, reclone %v; want 2, false", last.next, last.reclone)
+	}
+}
+
+func TestAttacksToADeadAddressRecordNothing(t *testing.T) {
+	a, n, _, b := testTemplate(t)
+	stmts := xStmts(b)
+	clone := testClone(t, false)
+	owner := connectAs(t, a, n.Owner(), OwnerPassword, clone)
+	window, every := connectWindow, connectEvery
+	connectWindow, connectEvery = 300*time.Millisecond, 50*time.Millisecond
+	t.Cleanup(func() { connectWindow, connectEvery = window, every })
+	f := startFakeHoop(t)
+	dead := f.Addr
+	f.ln.Close() // nothing listens there now
+
+	saved := 0
+	start := time.Now()
+	next, _, err := RunAttacks(context.Background(), Target{Addr: dead, Database: clone, Names: n}, owner, b.Attacks[:3], stmts, 0,
+		xOptions("hoop", (&pauses{}).sleep), func(Outcome) error { saved++; return nil },
+		func(AttackResult) error { saved++; return nil })
+	if err == nil || !strings.Contains(err.Error(), dead) || next != 0 || saved != 0 {
+		t.Errorf("attacks to a dead address: next %d, %d saves, err %v; want 0, 0 and an error naming %s", next, saved, err, dead)
+	}
+	if took := time.Since(start); took > 10*time.Second {
+		t.Errorf("took %v to find the address dead; want one short attempt, not the connect window", took)
 	}
 }
