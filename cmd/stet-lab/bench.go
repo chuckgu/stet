@@ -6,8 +6,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -36,6 +38,8 @@ commands:
   exec     send one statement the way send does and print its outcome; records nothing
            (-addr <host:port> -db <db> -role <role> [-app import-job] [-mode simple|bind]
             [-tag <12 digits>] -sql <statement> [-args a,b])
+  llm-recorder  forward a proxy's calls to the Anthropic API, log level, tokens and cost, and stop at a dollar cap
+           ([-listen 127.0.0.1:18080] -out <file> [-cap-usd 10] [-upstream https://api.anthropic.com])
 `
 
 // benchEpoch is the date the benchmark's data is generated relative to.
@@ -61,6 +65,8 @@ func runBench(args []string) error {
 		return benchSend(args[1:])
 	case "exec":
 		return benchExec(args[1:])
+	case "llm-recorder":
+		return benchLLMRecorder(args[1:])
 	}
 	fmt.Fprint(os.Stderr, benchUsage)
 	os.Exit(2)
@@ -461,4 +467,30 @@ func benchExec(args []string) error {
 			fmt.Println(string(line))
 			return nil
 		})
+}
+
+// benchLLMRecorder runs the recorder between a third-party proxy and the
+// Anthropic API (spec 5). The key travels in the proxy's request headers and
+// is never stored or printed here.
+func benchLLMRecorder(args []string) error {
+	fs := flag.NewFlagSet("bench llm-recorder", flag.ExitOnError)
+	listen := fs.String("listen", "127.0.0.1:18080", "address the recorder listens on")
+	out := fs.String("out", "", "the file one JSON line per call is appended to")
+	capUSD := fs.Float64("cap-usd", 10, "stop forwarding once this much is spent, the files beside -out included")
+	upstream := fs.String("upstream", "https://api.anthropic.com", "the API the calls are forwarded to")
+	fs.Parse(args)
+	if *out == "" {
+		return errors.New("bench llm-recorder: -out is required")
+	}
+	spent, err := bench.SpentIn(filepath.Dir(*out))
+	if err != nil {
+		return fmt.Errorf("bench llm-recorder: %w", err)
+	}
+	f, err := os.OpenFile(*out, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fmt.Printf("llm-recorder: listening on %s, writing %s, spent so far $%.4f, cap $%.2f\n", *listen, *out, spent, *capUSD)
+	return http.ListenAndServe(*listen, bench.NewRecorder(*upstream, f, *capUSD, spent))
 }
