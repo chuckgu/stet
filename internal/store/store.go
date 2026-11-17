@@ -4,8 +4,11 @@ package store
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -15,6 +18,13 @@ import (
 
 //go:embed schema.sql
 var schemaSQL string
+
+// schemaHash is the SHA-256 (hex) of schemaSQL, recorded in
+// stet.schema_version once the database has run it.
+var schemaHash = func() string {
+	sum := sha256.Sum256([]byte(schemaSQL))
+	return hex.EncodeToString(sum[:])
+}()
 
 // Arbitrary key serializing concurrent migrations ("Stet").
 const migrateLock = 0x53746574
@@ -28,16 +38,51 @@ func New(pool *pgxpool.Pool) *Store {
 }
 
 // Migrate creates or updates the stet schema. Safe to run concurrently.
+//
+// It runs schema.sql only when the file differs from the one the database
+// last ran, as stet.schema_version records. On a current schema it runs no
+// DDL and takes no lock on Stet's tables, so a Stet starting while others
+// hold open transactions on them (a reviewer around stet.approve, the
+// executor applying a held write) does not wait for them. The flip side: an
+// object dropped by hand is not recreated until schema.sql changes.
 func (s *Store) Migrate(ctx context.Context) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, "select pg_advisory_xact_lock($1)", migrateLock); err != nil {
 			return err
 		}
+		current, err := schemaCurrent(ctx, tx)
+		if err != nil {
+			return fmt.Errorf("read stet schema version: %w", err)
+		}
+		if current {
+			return nil
+		}
 		if err := tx.Conn().PgConn().Exec(ctx, schemaSQL).Close(); err != nil {
 			return fmt.Errorf("migrate stet schema: %w", err)
 		}
+		if _, err := tx.Exec(ctx, `
+			insert into stet.schema_version (sha256) values ($1)
+			on conflict (one) do update set sha256 = excluded.sha256`, schemaHash); err != nil {
+			return fmt.Errorf("record stet schema version: %w", err)
+		}
 		return nil
 	})
+}
+
+// schemaCurrent reports whether the database last ran this schemaSQL. A
+// database without stet.schema_version has not; looking the table up by
+// name first (to_regclass takes no lock) keeps that from being an error.
+func schemaCurrent(ctx context.Context, tx pgx.Tx) (bool, error) {
+	var exists bool
+	if err := tx.QueryRow(ctx, `select to_regclass('stet.schema_version') is not null`).Scan(&exists); err != nil || !exists {
+		return false, err
+	}
+	var hash string
+	err := tx.QueryRow(ctx, `select sha256 from stet.schema_version`).Scan(&hash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return hash == schemaHash, err
 }
 
 // Decision is one row of stet.decisions. Nil fields are stored as NULL.

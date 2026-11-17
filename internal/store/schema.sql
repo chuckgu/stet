@@ -1,6 +1,16 @@
--- 판단 기록. docs/spec-v0.1.md 8장. Stet이 시작할 때 매번 실행하므로 여러 번 실행해도 안전해야 한다.
+-- Stet의 스키마. 판단 기록은 docs/spec-v0.1.md 8장.
+-- Store.Migrate는 이 파일이 데이터베이스가 마지막으로 실행한 것과 다를 때만 실행한다. 같은지는 파일의 SHA-256을
+-- stet.schema_version과 비교해 안다. 같으면 DDL을 하나도 돌리지 않으므로, Stet의 테이블에 열린 트랜잭션이 있어도
+-- Stet의 시작이 잠금을 기다리지 않는다. 손으로 지운 객체는 이 파일이 바뀌기 전에는 다시 만들어지지 않는다.
+-- 이미 있는 스키마 위에서도 돌므로 여러 번 실행해도 안전해야 한다.
 
 CREATE SCHEMA IF NOT EXISTS stet;
+
+-- Store.Migrate가 마지막으로 실행한 이 파일의 SHA-256 (hex). 한 줄뿐이다.
+CREATE TABLE IF NOT EXISTS stet.schema_version (
+  one     boolean PRIMARY KEY DEFAULT true CHECK (one),
+  sha256  text NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS stet.decisions (
   id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -134,37 +144,21 @@ CREATE TABLE IF NOT EXISTS stet.held_writes (
 );
 CREATE INDEX IF NOT EXISTS held_writes_pending ON stet.held_writes (created_at) WHERE status = 'pending';
 
--- 승인과 거부 (docs/spec-v0.2-approve.md 4장).
--- Stet이 시작할 때마다 돌므로, 스키마가 이미 맞으면 stet.held_writes를 잠그지 않는다. ALTER TABLE과 DROP TRIGGER는
--- 아무것도 바꾸지 않아도 AccessExclusiveLock을 잡아서, 실행부가 줄을 잠근 동안 다른 Stet이 시작하지 못한다.
--- 그래서 ALTER는 빠진 것이 있을 때만 돌고, 트리거는 없을 때만 만든다. 컬럼을 더하면 아래의 이름 목록에도 더한다.
-DO $$
-BEGIN
-  IF EXISTS (SELECT FROM unnest('{expires_at,settings,row_absent,in_transaction,planned_rows,rows_exact,
-                                  resolved_by,resolved_at,note,max_rows,applied_at,rows_affected,error}'::name[]) AS c(name)
-             WHERE NOT EXISTS (SELECT FROM pg_attribute
-                               WHERE attrelid = 'stet.held_writes'::regclass AND attname = c.name AND NOT attisdropped))
-     OR (SELECT pg_get_expr(d.adbin, d.adrelid)
-         FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
-         WHERE d.adrelid = 'stet.held_writes'::regclass AND a.attname = 'status') IS DISTINCT FROM '''unconfirmed''::text'
-  THEN
-    ALTER TABLE stet.held_writes ALTER COLUMN status SET DEFAULT 'unconfirmed';
-    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS expires_at    timestamptz;  -- 이때까지 승인할 수 있다
-    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS settings      jsonb;        -- 보류될 때 그 세션의 TimeZone, DateStyle, IntervalStyle
-    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS row_absent    boolean;      -- 상태를 읽었을 때 대상 행이 없었다
-    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS in_transaction boolean;     -- 명시적 트랜잭션이거나 한 Sync 아래 다른 문장과 함께 온 쓰기였다. pending이 될 때 적는다
-    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS planned_rows  bigint;       -- 보류될 때 잰 행 수
-    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS rows_exact    boolean;      -- planned_rows가 정확한 값인가
-    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS resolved_by   text;         -- 승인·거부한 접속 계정(session_user)
-    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS resolved_at   timestamptz;
-    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS note          text;         -- 검토자가 적은 말
-    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS max_rows      bigint;       -- 승인이 허락한 행 수의 상한
-    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS applied_at    timestamptz;  -- 실행을 끝냈거나 실패로 적은 시각
-    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS rows_affected bigint;
-    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS error         text;         -- failed의 이유
-  END IF;
-END
-$$;
+-- 승인과 거부 (docs/spec-v0.2-approve.md 4장)
+ALTER TABLE stet.held_writes ALTER COLUMN status SET DEFAULT 'unconfirmed';
+ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS expires_at    timestamptz;  -- 이때까지 승인할 수 있다
+ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS settings      jsonb;        -- 보류될 때 그 세션의 TimeZone, DateStyle, IntervalStyle
+ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS row_absent    boolean;      -- 상태를 읽었을 때 대상 행이 없었다
+ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS in_transaction boolean;     -- 명시적 트랜잭션이거나 한 Sync 아래 다른 문장과 함께 온 쓰기였다. pending이 될 때 적는다
+ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS planned_rows  bigint;       -- 보류될 때 잰 행 수
+ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS rows_exact    boolean;      -- planned_rows가 정확한 값인가
+ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS resolved_by   text;         -- 승인·거부한 접속 계정(session_user)
+ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS resolved_at   timestamptz;
+ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS note          text;         -- 검토자가 적은 말
+ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS max_rows      bigint;       -- 승인이 허락한 행 수의 상한
+ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS applied_at    timestamptz;  -- 실행을 끝냈거나 실패로 적은 시각
+ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS rows_affected bigint;
+ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS error         text;         -- failed의 이유
 CREATE INDEX IF NOT EXISTS held_writes_approved ON stet.held_writes (resolved_at) WHERE status = 'approved';
 
 -- 보류된 것은 바뀌지 않는다 (docs/spec-v0.2-approve.md 4장, 계획의 보정 B4). 역할 권한과 별개로 DB가 직접 막는다.
@@ -193,14 +187,7 @@ BEGIN
 END
 $$;
 
--- 트리거는 없을 때만 만든다. 그래서 트리거의 정의(언제, 무엇에)를 바꾸려면 따로 옮겨야 한다.
--- 함수의 본문은 위의 CREATE OR REPLACE가 매번 새로 한다.
-DO $$
-BEGIN
-  IF NOT EXISTS (SELECT FROM pg_trigger WHERE tgrelid = 'stet.held_writes'::regclass AND tgname = 'held_writes_guard') THEN
-    CREATE TRIGGER held_writes_guard
-      BEFORE UPDATE ON stet.held_writes
-      FOR EACH ROW EXECUTE FUNCTION stet.held_writes_guard();
-  END IF;
-END
-$$;
+DROP TRIGGER IF EXISTS held_writes_guard ON stet.held_writes;
+CREATE TRIGGER held_writes_guard
+  BEFORE UPDATE ON stet.held_writes
+  FOR EACH ROW EXECUTE FUNCTION stet.held_writes_guard();

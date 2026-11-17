@@ -2,6 +2,8 @@ package store_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,14 +19,110 @@ import (
 	"github.com/stetdb/stet/internal/store"
 )
 
-// testDSN connects as Stet's own account to the test database.
-func testDSN(t *testing.T) string {
+// testAddr is the test server's address. Without one the test is skipped.
+func testAddr(t *testing.T) string {
 	t.Helper()
 	addr := os.Getenv("STET_TEST_PG")
 	if addr == "" {
 		t.Skip("STET_TEST_PG not set; start a test database with scripts/testdb.sh")
 	}
-	return "postgres://stet_scram:scram-pw@" + addr + "/stet_test?sslmode=disable"
+	return addr
+}
+
+// testDSN connects as Stet's own account to the test database.
+func testDSN(t *testing.T) string {
+	t.Helper()
+	return "postgres://stet_scram:scram-pw@" + testAddr(t) + "/stet_test?sslmode=disable"
+}
+
+// newPool connects to dsn and is closed when the test ends.
+func newPool(t *testing.T, dsn string) *pgxpool.Pool {
+	t.Helper()
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+// ownDatabase creates an empty database owned by Stet's account, dropped
+// when the test ends, and returns how Stet connects to it. Tests that change
+// the stet schema use one, so that other packages sharing stet_test do not
+// see the change.
+func ownDatabase(t *testing.T) string {
+	t.Helper()
+	addr := testAddr(t)
+	ctx := context.Background()
+	su, err := pgx.Connect(ctx, "postgres://postgres:postgres-pw@"+addr+"/stet_test?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { su.Close(context.Background()) })
+	name := fmt.Sprintf("stet_store_db_%d", time.Now().UnixNano())
+	if _, err := su.Exec(ctx, "create database "+name+" template template0 owner stet_scram"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { su.Exec(context.Background(), "drop database if exists "+name+" with (force)") })
+	return "postgres://stet_scram:scram-pw@" + addr + "/" + name + "?sslmode=disable"
+}
+
+// schemaHash is the SHA-256 (hex) of schema.sql, which Migrate records once
+// it has run the file.
+func schemaHash(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile("schema.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// schemaMarker is the hash the database records for the schema it last ran.
+func schemaMarker(t *testing.T, pool *pgxpool.Pool) string {
+	t.Helper()
+	var hash string
+	if err := pool.QueryRow(context.Background(), `select sha256 from stet.schema_version`).Scan(&hash); err != nil {
+		t.Fatal(err)
+	}
+	return hash
+}
+
+// migrateWithLockTimeout runs Migrate in a pool that, like Stet's own, waits
+// at most 200ms for a lock.
+func migrateWithLockTimeout(t *testing.T) error {
+	t.Helper()
+	ctx := context.Background()
+	cfg, err := pgxpool.ParseConfig(testDSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.RuntimeParams["lock_timeout"] = "200ms"
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	return store.New(pool).Migrate(ctx)
+}
+
+// openTx begins a transaction on a connection of its own. It is rolled back
+// when the test ends.
+func openTx(t *testing.T) pgx.Tx {
+	t.Helper()
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, testDSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close(context.Background()) })
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { tx.Rollback(context.Background()) })
+	return tx
 }
 
 func testStore(t *testing.T) (*store.Store, *pgxpool.Pool) {
@@ -49,6 +147,14 @@ func uniqueTable(t *testing.T) string {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// deref is *p for messages, or "NULL".
+func deref[T any](p *T) any {
+	if p == nil {
+		return "NULL"
+	}
+	return *p
+}
 
 func sample(table string) *store.Decision {
 	return &store.Decision{
@@ -102,33 +208,124 @@ func TestMigrateDoesNotWaitForAHeldRowLock(t *testing.T) {
 	ctx := context.Background()
 	h := insertHeld(t, s, pool)
 
-	locker, err := pgx.Connect(ctx, testDSN(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer locker.Close(ctx)
-	tx, err := locker.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tx.Rollback(ctx)
+	tx := openTx(t)
 	var id string
 	if err := tx.QueryRow(ctx, `select id::text from stet.held_writes where id = $1 for update`, h.ID).Scan(&id); err != nil {
 		t.Fatal(err)
 	}
-
-	cfg, err := pgxpool.ParseConfig(testDSN(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg.ConnConfig.RuntimeParams["lock_timeout"] = "200ms"
-	stetPool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stetPool.Close()
-	if err := store.New(stetPool).Migrate(ctx); err != nil {
+	if err := migrateWithLockTimeout(t); err != nil {
 		t.Errorf("migrate while a held write is locked: %v", err)
+	}
+}
+
+// Reviewers keep transactions open around stet.approve, which updates a held
+// write, and around reads of Stet's tables. On a current schema Migrate runs
+// no DDL, so none of them keeps a Stet from starting. Each transaction stays
+// open only while Migrate runs.
+func TestMigrateDoesNotWaitForOpenTransactions(t *testing.T) {
+	s, pool := testStore(t)
+	ctx := context.Background()
+	h := insertHeld(t, s, pool)
+	for _, c := range []struct{ name, sql string }{
+		{"an uncommitted update of stet.held_writes", `update stet.held_writes set note = 'reviewing' where id = $1`},
+		{"an uncommitted insert into stet.held_writes", `
+			insert into stet.held_writes (id, decision_id, created_at, login_role, database, statement,
+			                              target_table, verdict, reasons)
+			values (gen_random_uuid(), $1, now(), 'agent_a', 'stet_test', 'delete from contacts',
+			        'contacts', 'hold', '{}')`},
+		{"a read of stet.decisions", `select count(*) from stet.decisions where id = $1`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			tx := openTx(t)
+			if _, err := tx.Exec(ctx, c.sql, h.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := migrateWithLockTimeout(t); err != nil {
+				t.Errorf("migrate during %s: %v", c.name, err)
+			}
+		})
+	}
+}
+
+// A database without the stet schema gets all of it, and records the hash
+// of the schema it ran.
+func TestMigrateFromNothing(t *testing.T) {
+	pool := newPool(t, ownDatabase(t))
+	ctx := context.Background()
+	if err := store.New(pool).Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var missing []string
+	if err := pool.QueryRow(ctx, `
+		select coalesce(array_agg(name), '{}') from unnest('{stet.decisions,stet.reads,stet.read_log,stet.held_writes,
+		       stet.held_writes_approved,stet.schema_version}'::text[]) as name
+		where to_regclass(name) is null`).Scan(&missing); err != nil {
+		t.Fatal(err)
+	}
+	if len(missing) != 0 {
+		t.Errorf("missing after migrating: %v", missing)
+	}
+	var guarded bool
+	if err := pool.QueryRow(ctx, `select exists (select from pg_trigger
+		where tgrelid = 'stet.held_writes'::regclass and tgname = 'held_writes_guard')`).Scan(&guarded); err != nil {
+		t.Fatal(err)
+	}
+	if !guarded {
+		t.Error("stet.held_writes has no guard trigger")
+	}
+	if got, want := schemaMarker(t, pool), schemaHash(t); got != want {
+		t.Errorf("schema marker = %q, want %q", got, want)
+	}
+}
+
+// Migrate runs schema.sql only when it differs from what the database last
+// ran. On a current schema an object dropped by hand stays dropped; once the
+// marker differs, Migrate runs the file again and records it.
+func TestMigrateRunsTheSchemaOnlyWhenItDiffers(t *testing.T) {
+	pool := newPool(t, ownDatabase(t))
+	ctx := context.Background()
+	s := store.New(pool)
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, sql := range []string{
+		`drop index stet.held_writes_approved`,
+		`alter table stet.held_writes alter column status drop default`,
+	} {
+		if _, err := pool.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	restored := func() (index bool, statusDefault *string) {
+		t.Helper()
+		if err := pool.QueryRow(ctx, `
+			select to_regclass('stet.held_writes_approved') is not null,
+			       (select pg_get_expr(d.adbin, d.adrelid)
+			        from pg_attrdef d join pg_attribute a on a.attrelid = d.adrelid and a.attnum = d.adnum
+			        where d.adrelid = 'stet.held_writes'::regclass and a.attname = 'status')`).Scan(&index, &statusDefault); err != nil {
+			t.Fatal(err)
+		}
+		return index, statusDefault
+	}
+
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if index, statusDefault := restored(); index || statusDefault != nil {
+		t.Errorf("a current schema ran again: index %v, status default %v", index, deref(statusDefault))
+	}
+
+	if _, err := pool.Exec(ctx, `update stet.schema_version set sha256 = 'an older schema'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if index, statusDefault := restored(); !index || statusDefault == nil || *statusDefault != "'unconfirmed'::text" {
+		t.Errorf("after a changed schema: index %v, status default %v, want the index and 'unconfirmed'::text", index, deref(statusDefault))
+	}
+	if got, want := schemaMarker(t, pool), schemaHash(t); got != want {
+		t.Errorf("schema marker = %q, want %q", got, want)
 	}
 }
 
