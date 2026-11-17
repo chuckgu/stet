@@ -287,18 +287,16 @@ func benchSend(args []string) error {
 	o.Bind = bind
 	count := map[string]int{}
 	done := 0
-	// An outcome is saved even after an interrupt: its statement was sent.
-	save := context.WithoutCancel(ctx)
-	err = bench.Send(ctx, bench.Target{Addr: *addr, Database: db, Names: bench.Names{}}, phases, o, func(out bench.Outcome) error {
-		if err := bench.SaveOutcome(save, conn, out); err != nil {
-			return err
-		}
+	// Record first checks that -addr answers, and records nothing if not.
+	err = bench.Record(ctx, conn, bench.Target{Addr: *addr, Database: db, Names: bench.Names{}}, phases, o, func(out bench.Outcome) {
 		count[out.Result]++
 		if done++; done%100 == 0 {
 			fmt.Fprintf(os.Stderr, "%d/%d sent\n", done, total)
 		}
-		return nil
 	})
+	if err != nil && done == 0 {
+		return fmt.Errorf("bench send: %w", err)
+	}
 	fmt.Printf("%s, arm %s, sets %s: %d of %d sent; %s\n", db, *arm, strings.Join(sets, ","), done, total, outcomeCounts(count))
 	return err
 }

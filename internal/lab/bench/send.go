@@ -161,7 +161,8 @@ func Phases(stream []tasks.Stmt, sets []string, part bool) [][][]tasks.Stmt {
 // The connections' workers take a phase's units in order; before each statement a worker waits for the
 // shared rate, and after any statement that did not execute it closes its connection and connects anew for
 // the next. save is called by one worker at a time. Send stops at the first error save returns, or when ctx
-// ends; a statement already sent is still reported.
+// ends: no statement starts after that, and one already sent finishes, within o.Timeout, and is reported as
+// the far side answered it.
 func Send(ctx context.Context, t Target, phases [][][]tasks.Stmt, o Options, save func(Outcome) error) error {
 	if o.Conns < 1 {
 		return fmt.Errorf("send: %d connections; want at least 1", o.Conns)
@@ -250,7 +251,10 @@ func (w *worker) send(ctx context.Context, t Target, s tasks.Stmt, o Options, li
 		return Outcome{}, err
 	}
 	start := time.Now()
-	tag, err := sendOne(ctx, w.conn, s, o.Bind, o)
+	// A statement that has gone out finishes, within o.Timeout, even when the
+	// tool cancels: an interrupt, or another worker's failed save, is not the
+	// far side's silence, and unknown is kept for that.
+	tag, err := sendOne(context.WithoutCancel(ctx), w.conn, s, o.Bind, o)
 	latency := time.Since(start)
 	out := Classify(tag, err)
 	out.Arm, out.ID, out.Tag, out.Set = o.Arm, s.ID, s.Tag, s.Set
@@ -281,13 +285,11 @@ var (
 // application_name app, trying again every connectEvery for connectWindow.
 // Its error starts with "connect: ".
 func connect(ctx context.Context, t Target, role, app string) (*pgconn.PgConn, error) {
-	u := url.URL{Scheme: "postgres", User: url.UserPassword(t.Names.Role(role), AgentPassword), Host: t.Addr,
-		Path: "/" + t.Database, RawQuery: url.Values{"sslmode": {"disable"}, "application_name": {app}}.Encode()}
 	ctx, cancel := context.WithTimeout(ctx, connectWindow)
 	defer cancel()
 	var last error
 	for {
-		c, err := pgconn.Connect(ctx, u.String())
+		c, err := dial(ctx, t, role, app)
 		if err == nil {
 			return c, nil
 		}
@@ -300,6 +302,13 @@ func connect(ctx context.Context, t Target, role, app string) (*pgconn.PgConn, e
 		case <-time.After(connectEvery):
 		}
 	}
+}
+
+// dial is one attempt of connect.
+func dial(ctx context.Context, t Target, role, app string) (*pgconn.PgConn, error) {
+	u := url.URL{Scheme: "postgres", User: url.UserPassword(t.Names.Role(role), AgentPassword), Host: t.Addr,
+		Path: "/" + t.Database, RawQuery: url.Values{"sslmode": {"disable"}, "application_name": {app}}.Encode()}
+	return pgconn.Connect(ctx, u.String())
 }
 
 // tagged puts the statement's tag in front of sql; no tag, no comment.
@@ -403,4 +412,50 @@ func AlreadySent(ctx context.Context, conn *pgx.Conn, arm, set string) (bool, er
 	var sent bool
 	err := conn.QueryRow(ctx, "select exists (select 1 from lab.outcomes where arm = $1 and set = $2)", arm, set).Scan(&sent)
 	return sent, err
+}
+
+// reachWithin bounds Record's one attempt to reach the target.
+const reachWithin = 5 * time.Second
+
+// Record sends phases to t and saves every outcome in lab.outcomes through conn, calling saved (if not nil)
+// after each. An outcome is saved even after ctx ends: its statement was sent.
+//
+// First it connects once to t as the first statement's role and application, within reachWithin, and when
+// that fails it returns an error having sent and recorded nothing. Otherwise a wrong address would make every
+// statement wait out the connect window and be recorded as unknown, and those rows would refuse a retry.
+func Record(ctx context.Context, conn *pgx.Conn, t Target, phases [][][]tasks.Stmt, o Options, saved func(Outcome)) error {
+	if s, ok := firstStmt(phases); ok {
+		rctx, cancel := context.WithTimeout(ctx, reachWithin)
+		c, err := dial(rctx, t, s.Role, s.App)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("cannot reach %s as %s (database %s); nothing was sent or recorded: %w",
+				t.Addr, t.Names.Role(s.Role), t.Database, err)
+		}
+		closing, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+		c.Close(closing)
+		cancel()
+	}
+	save := context.WithoutCancel(ctx)
+	return Send(ctx, t, phases, o, func(out Outcome) error {
+		if err := SaveOutcome(save, conn, out); err != nil {
+			return err
+		}
+		if saved != nil {
+			saved(out)
+		}
+		return nil
+	})
+}
+
+// firstStmt is the statement phases would send first.
+func firstStmt(phases [][][]tasks.Stmt) (tasks.Stmt, bool) {
+	for _, p := range phases {
+		for _, u := range p {
+			if len(u) > 0 {
+				return u[0], true
+			}
+		}
+	}
+	return tasks.Stmt{}, false
 }

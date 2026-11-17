@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"regexp"
 	"slices"
 	"sort"
@@ -564,5 +565,164 @@ func TestArmPlan(t *testing.T) {
 	}
 	if o := DefaultOptions("stet-bind"); !o.Bind || o.Arm != "stet-bind" || o.Timeout != 120*time.Second || o.Sleep == nil {
 		t.Errorf("DefaultOptions(stet-bind) = %+v, want Bind, the arm, 120s and a Sleep", o)
+	}
+}
+
+func TestRecordChecksTheAddressBeforeRecordingAnything(t *testing.T) {
+	a, n, _, _ := testTemplate(t)
+	ctx := context.Background()
+	clone := testClone(t, false)
+	conn := connectAs(t, a, n.Owner(), OwnerPassword, clone)
+	stream, _, err := LoadStream(ctx, conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := Phases(stream, []string{tasks.SetV, tasks.SetI}, false)[0]
+	phases := [][][]tasks.Stmt{first[:3]}
+	rows := func() int {
+		t.Helper()
+		var k int
+		if err := conn.QueryRow(ctx, "select count(*) from lab.outcomes").Scan(&k); err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+
+	f := startFakeHoop(t)
+	dead := f.Addr
+	f.ln.Close() // nothing listens there now
+	start := time.Now()
+	err = Record(ctx, conn, Target{Addr: dead, Database: clone, Names: n}, phases, DefaultOptions("none"), nil)
+	if err == nil || !strings.Contains(err.Error(), dead) {
+		t.Errorf("Record to a dead address = %v, want an error naming %s", err, dead)
+	}
+	if took := time.Since(start); took > 10*time.Second {
+		t.Errorf("Record took %v to find the address dead; want one short attempt, not the connect window", took)
+	}
+	if k := rows(); k != 0 {
+		t.Errorf("lab.outcomes holds %d rows after a send to a dead address, want 0", k)
+	}
+	if sent, err := AlreadySent(ctx, conn, "none", tasks.SetPrep); err != nil || sent {
+		t.Errorf("AlreadySent(none, P) = %v, %v; want false: a retry must be possible", sent, err)
+	}
+
+	live := startFakeHoop(t)
+	var saved []string
+	err = Record(ctx, conn, Target{Addr: live.Addr, Database: clone, Names: n}, phases, fastOptions(2),
+		func(out Outcome) { saved = append(saved, out.ID) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k := rows(); k != 3 || len(saved) != 3 {
+		t.Errorf("through a live address: %d rows, %d reported; want 3 of each", k, len(saved))
+	}
+	if s := live.Seen(); len(s) != 3 || s[0].User != n.Role(first[0][0].Role) {
+		t.Errorf("the fake saw %+v, want the three statements as %s", s, n.Role(first[0][0].Role))
+	}
+}
+
+func TestCancelledStatementIsNotRecordedAsUnknown(t *testing.T) {
+	fast1 := testStmt(1, "update contacts set notes = 'a' where id = 1")
+	slow := testStmt(2, "update contacts set notes = 'slow' where id = 2")
+	fast3 := testStmt(3, "update contacts set notes = 'c' where id = 3")
+	fast4 := testStmt(4, "update contacts set notes = 'd' where id = 4")
+	// check wants the reported outcomes to be want, none unknown, and the
+	// fake to have seen only those statements: none starts after the
+	// cancellation.
+	check := func(t *testing.T, f *fakeHoop, got []Outcome, want map[string]string) {
+		t.Helper()
+		for _, o := range got {
+			if o.Result == Unknown {
+				t.Errorf("%s recorded as unknown (%s): the far side answered it", o.ID, o.Message)
+			}
+		}
+		results := map[string]string{}
+		for _, o := range got {
+			results[o.ID] = o.Result
+		}
+		if !maps.Equal(results, want) {
+			t.Errorf("reported %v, want %v", results, want)
+		}
+		if n := len(f.Seen()); n != len(want) {
+			t.Errorf("the fake saw %d statements, want %d: none starts after the cancellation", n, len(want))
+		}
+	}
+
+	t.Run("interrupt", func(t *testing.T) {
+		f := startFakeHoop(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		f.Exec = func(sql string) {
+			if strings.Contains(sql, "slow") {
+				cancel() // as SIGINT would, while the statement is at the server
+				time.Sleep(300 * time.Millisecond)
+			}
+		}
+		var got []Outcome
+		err := Send(ctx, Target{Addr: f.Addr, Database: "crm_fake", Names: freshNames()}, singles(fast1, slow, fast3, fast4),
+			fastOptions(1), func(o Outcome) error { got = append(got, o); return nil })
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Send = %v, want context.Canceled", err)
+		}
+		check(t, f, got, map[string]string{"w-1": Executed, "w-2": Executed})
+	})
+
+	t.Run("another worker's save fails", func(t *testing.T) {
+		// The save that fails is a denied statement's: a denial never
+		// reaches Exec, which the fake runs one at a time, so nothing waits
+		// behind the slow statement held there.
+		f := startFakeHoop(t)
+		f.Deny = func(sql string) bool { return strings.Contains(sql, "deny") }
+		inflight := make(chan struct{})
+		f.Exec = func(sql string) {
+			if strings.Contains(sql, "slow") {
+				close(inflight)
+				time.Sleep(300 * time.Millisecond)
+			}
+		}
+		denied := testStmt(1, "update contacts set notes = 'deny' where id = 1")
+		full := errors.New("disk full")
+		var got []Outcome
+		save := func(o Outcome) error {
+			got = append(got, o)
+			if o.ID != denied.ID {
+				return nil
+			}
+			select { // fail while the slow statement is at the server
+			case <-inflight:
+			case <-time.After(5 * time.Second):
+			}
+			return full
+		}
+		err := Send(context.Background(), Target{Addr: f.Addr, Database: "crm_fake", Names: freshNames()},
+			singles(slow, denied, fast3, fast4), fastOptions(2), save)
+		if !errors.Is(err, full) {
+			t.Errorf("Send = %v, want the save's error", err)
+		}
+		check(t, f, got, map[string]string{"w-1": Blocked, "w-2": Executed})
+	})
+}
+
+func TestBindModeDenialIsBlockedAndTheNextStatementGetsANewConnection(t *testing.T) {
+	f := startFakeHoop(t)
+	f.Deny = func(sql string) bool { return strings.Contains(sql, "deny_log") }
+	denied := testStmt(1, "update deny_log set notes = $1 where id = $2")
+	denied.Args = []string{"x", "1"}
+	next := testStmt(2, "update contacts set notes = $1 where id = $2")
+	next.Args = []string{"y", "2"}
+	o := fastOptions(1)
+	o.Bind = true
+	got := sendAll(t, Target{Addr: f.Addr, Database: "crm_fake", Names: freshNames()}, singles(denied, next), o)
+
+	if x := got[denied.ID]; x.Result != Blocked || x.Severity != "FATAL" || x.SQLState != "42501" {
+		t.Errorf("denied at Parse: %+v, want blocked FATAL 42501", x)
+	}
+	if x := got[next.ID]; x.Result != Executed || x.Rows == nil || *x.Rows != 1 {
+		t.Errorf("the next statement: %+v, want executed, rows 1", x)
+	}
+	s := f.Seen()
+	if len(s) != 2 || s[0].Kind != "Parse" || s[1].Kind != "Parse" || s[0].Conn == s[1].Conn ||
+		!slices.Equal(s[1].Params, next.Args) {
+		t.Errorf("seen %+v, want two Parses on two connections, the second with its values", s)
 	}
 }
