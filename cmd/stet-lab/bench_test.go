@@ -1,6 +1,7 @@
 package main
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -42,6 +43,24 @@ func TestSendKeepsTheXFlagsToTheXSet(t *testing.T) {
 		err := benchSend(args)
 		if err == nil || !strings.HasPrefix(err.Error(), c.want) {
 			t.Errorf("bench send %s: err = %v, want one starting %q", strings.Join(c.args, " "), err, c.want)
+		}
+	}
+}
+
+func TestLLMRecorderOutMustBeAJSONLFile(t *testing.T) {
+	// Only *.jsonl files in the directory count against the cap: any other
+	// name would let a restart forget what it spent.
+	for _, out := range []string{"", "run.log", "calls.json", "calls.jsonl.bak"} {
+		args := []string{"-listen", "127.0.0.1:0"}
+		if out != "" {
+			args = append(args, "-out", filepath.Join(t.TempDir(), out))
+		}
+		err := benchLLMRecorder(args)
+		if err == nil || !strings.Contains(err.Error(), "bench llm-recorder: -out") {
+			t.Errorf("-out %q: err = %v", out, err)
+		}
+		if out != "" && !strings.Contains(err.Error(), ".jsonl") {
+			t.Errorf("-out %q: err = %v, want it to name .jsonl", out, err)
 		}
 	}
 }

@@ -4,15 +4,19 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,9 +57,11 @@ type Recorder struct {
 	client   *http.Client
 	capUSD   float64
 
-	mu    sync.Mutex // guards out and spent
-	out   io.Writer
-	spent float64
+	mu      sync.Mutex // guards the fields below
+	out     io.Writer
+	spent   float64
+	capSaid bool // the cap has been announced on stderr
+	broken  bool // a line could not be written: nothing is forwarded any more
 }
 
 // NewRecorder forwards to upstream (https://api.anthropic.com) and appends a Call per request to out.
@@ -77,7 +83,6 @@ func NewRecorder(upstream string, out io.Writer, capUSD, spent float64) *Recorde
 func price(model string, in, out int) float64 {
 	p, ok := Prices[model]
 	if !ok {
-		p = Prices["claude-opus-5-5"]
 		for _, q := range Prices {
 			p[0], p[1] = max(p[0], q[0]), max(p[1], q[1])
 		}
@@ -85,36 +90,81 @@ func price(model string, in, out int) float64 {
 	return float64(in)/1e6*p[0] + float64(out)/1e6*p[1]
 }
 
-// write appends c to the output with the running total; costs are added to spent.
-func (r *Recorder) write(c Call) {
+// worstCase prices a call whose usage is unknown: the request's bytes as input
+// tokens (a token is never shorter than a byte) and the request's max_tokens
+// as output (8192 when it names none).
+func worstCase(model string, requestBytes, maxTokens int) float64 {
+	if maxTokens <= 0 {
+		maxTokens = 8192
+	}
+	return price(model, requestBytes, maxTokens)
+}
+
+// write appends c to the output with the running total, after adding its cost
+// to spent. When the line cannot be written the recorder stops forwarding.
+func (r *Recorder) write(c Call) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.spent += c.CostUSD
 	c.TotalUSD = r.spent
 	line, err := json.Marshal(c)
-	if err != nil {
-		return
+	if err == nil {
+		_, err = r.out.Write(append(line, '\n'))
 	}
-	r.out.Write(append(line, '\n'))
+	if err != nil {
+		if !r.broken {
+			fmt.Fprintf(os.Stderr, "llm-recorder: the call log cannot be written (%v): no more calls are forwarded\n", err)
+		}
+		r.broken = true
+	}
+	return err
 }
 
-func (r *Recorder) overCap() bool {
+// state reports whether the recorder has stopped and whether the cap is
+// reached; it announces the cap on stderr the first time.
+func (r *Recorder) state() (broken, capped bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.spent >= r.capUSD
+	capped = r.spent >= r.capUSD
+	if capped && !r.capSaid {
+		r.capSaid = true
+		fmt.Fprintf(os.Stderr, "llm-recorder: the cost cap of $%.2f is reached ($%.4f spent): no more calls are forwarded\n", r.capUSD, r.spent)
+	}
+	return r.broken, capped
+}
+
+func jsonError(w http.ResponseWriter, status int, typ, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	fmt.Fprintf(w, `{"type":"error","error":{"type":%q,"message":%q}}`, typ, msg)
 }
 
 func (r *Recorder) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.URL.Path != "/v1/messages" {
+		jsonError(w, http.StatusNotFound, "not_found", "the recorder forwards only POST /v1/messages")
+		return
+	}
+	if req.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		jsonError(w, http.StatusMethodNotAllowed, "method_not_allowed", "the recorder forwards only POST /v1/messages")
+		return
+	}
+	broken, capped := r.state()
+	if broken {
+		jsonError(w, http.StatusServiceUnavailable, "recorder_stopped", "the recorder cannot write its log and forwards nothing")
+		return
+	}
 	start := time.Now()
 	body, err := io.ReadAll(req.Body)
 	if err != nil {
-		http.Error(w, "the request body could not be read", http.StatusBadRequest)
+		jsonError(w, http.StatusBadRequest, "bad_request", "the request body could not be read")
 		return
 	}
 	c := Call{Time: start.UTC()}
 	var rq struct {
-		Model    string `json:"model"`
-		Messages []struct {
+		Model     string `json:"model"`
+		MaxTokens int    `json:"max_tokens"`
+		Messages  []struct {
 			Content json.RawMessage `json:"content"`
 		} `json:"messages"`
 	}
@@ -131,47 +181,79 @@ func (r *Recorder) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		c.Tag = m[1]
 	}
 
-	if r.overCap() {
-		const refusal = `{"type":"error","error":{"type":"cost_cap","message":"the benchmark's cost cap is reached"}}`
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusForbidden)
-		io.WriteString(w, refusal)
+	if capped {
 		c.Status, c.Event = http.StatusForbidden, "cap_reached"
 		c.LatencyMS = ms(time.Since(start))
-		r.write(c)
+		if r.write(c) != nil {
+			jsonError(w, http.StatusServiceUnavailable, "recorder_stopped", "the recorder cannot write its log and forwards nothing")
+			return
+		}
+		jsonError(w, http.StatusForbidden, "cost_cap", "the benchmark's cost cap is reached")
 		return
 	}
 
-	out, err := http.NewRequestWithContext(req.Context(), req.Method, r.upstream+req.URL.RequestURI(), bytes.NewReader(body))
+	// The call is not tied to the client's context: once sent it may be billed,
+	// so it is read to the end and logged even if the client gave up.
+	var sent atomic.Bool
+	ctx := httptrace.WithClientTrace(context.WithoutCancel(req.Context()),
+		&httptrace.ClientTrace{WroteRequest: func(httptrace.WroteRequestInfo) { sent.Store(true) }})
+	out, err := http.NewRequestWithContext(ctx, req.Method, r.upstream+req.URL.RequestURI(), bytes.NewReader(body))
 	if err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+		jsonError(w, http.StatusBadRequest, "bad_request", "the request could not be forwarded")
 		return
 	}
 	out.Header = req.Header.Clone()
 	stripHop(out.Header)
+	// Ask for an encoding the recorder can read: gzip when the client takes it
+	// (relayed as is), identity otherwise.
+	clientGzip := slices.ContainsFunc(strings.Split(strings.Join(req.Header.Values("Accept-Encoding"), ","), ","), func(e string) bool {
+		name, q, _ := strings.Cut(strings.TrimSpace(e), ";")
+		return strings.EqualFold(name, "gzip") && !strings.Contains(q, "q=0")
+	})
+	if clientGzip {
+		out.Header.Set("Accept-Encoding", "gzip")
+	} else {
+		out.Header.Set("Accept-Encoding", "identity")
+	}
+
 	resp, err := r.client.Do(out)
 	var respBody []byte
 	if err == nil {
 		respBody, err = io.ReadAll(resp.Body)
 		resp.Body.Close()
 	}
+	c.LatencyMS = ms(time.Since(start))
 	if err != nil {
 		// The error text is not passed on: it is the transport's, not the API's.
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadGateway)
-		io.WriteString(w, `{"type":"error","error":{"type":"recorder_upstream","message":"the upstream call failed"}}`)
-		c.Status = http.StatusBadGateway
-		c.LatencyMS = ms(time.Since(start))
-		r.write(c)
+		// A request that was sent may have been billed.
+		c.Status, c.Event = http.StatusBadGateway, "upstream_error"
+		if sent.Load() {
+			c.CostUSD = worstCase(c.Model, len(body), rq.MaxTokens)
+		}
+		if r.write(c) != nil {
+			jsonError(w, http.StatusServiceUnavailable, "recorder_stopped", "the recorder cannot write its log and forwards nothing")
+			return
+		}
+		jsonError(w, http.StatusBadGateway, "recorder_upstream", "the upstream call failed")
 		return
 	}
 	c.Status = resp.StatusCode
-	c.LatencyMS = ms(time.Since(start))
-	parseReply(&c, resp.Header.Get("Content-Encoding"), respBody)
 	if c.Status/100 == 2 {
-		c.CostUSD = price(c.Model, c.InputTokens, c.OutputTokens)
+		if parseReply(&c, resp.Header.Get("Content-Encoding"), respBody) {
+			c.CostUSD = price(c.Model, c.InputTokens, c.OutputTokens)
+		} else {
+			c.Event = "unparsed"
+			c.CostUSD = worstCase(c.Model, len(body), rq.MaxTokens)
+		}
+	} else {
+		parseReply(&c, resp.Header.Get("Content-Encoding"), respBody)
 	}
 
+	// The line is written before the client hears back.
+	if r.write(c) != nil {
+		jsonError(w, http.StatusServiceUnavailable, "recorder_stopped", "the recorder cannot write its log and forwards nothing")
+		return
+	}
 	h := w.Header()
 	for k, v := range resp.Header {
 		h[k] = v
@@ -180,7 +262,6 @@ func (r *Recorder) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	h.Del("Content-Length")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(respBody)
-	r.write(c)
 }
 
 func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
@@ -192,19 +273,20 @@ func stripHop(h http.Header) {
 }
 
 // parseReply fills c from a response body; what cannot be read stays empty.
-func parseReply(c *Call, encoding string, body []byte) {
+// It reports whether the body held a usage.
+func parseReply(c *Call, encoding string, body []byte) bool {
 	if strings.EqualFold(encoding, "gzip") {
 		zr, err := gzip.NewReader(bytes.NewReader(body))
 		if err != nil {
-			return
+			return false
 		}
 		if body, err = io.ReadAll(zr); err != nil {
-			return
+			return false
 		}
 	}
 	var rs struct {
 		StopReason string `json:"stop_reason"`
-		Usage      struct {
+		Usage      *struct {
 			InputTokens  int `json:"input_tokens"`
 			OutputTokens int `json:"output_tokens"`
 		} `json:"usage"`
@@ -218,10 +300,12 @@ func parseReply(c *Call, encoding string, body []byte) {
 		} `json:"content"`
 	}
 	if json.Unmarshal(body, &rs) != nil {
-		return
+		return false
 	}
 	c.StopReason = rs.StopReason
-	c.InputTokens, c.OutputTokens = rs.Usage.InputTokens, rs.Usage.OutputTokens
+	if rs.Usage != nil {
+		c.InputTokens, c.OutputTokens = rs.Usage.InputTokens, rs.Usage.OutputTokens
+	}
 	for _, b := range rs.Content {
 		if b.Type != "tool_use" {
 			continue
@@ -237,8 +321,9 @@ func parseReply(c *Call, encoding string, body []byte) {
 			continue
 		}
 		c.Title, c.Explanation = b.Input.Title, b.Input.Explanation
-		return
+		break
 	}
+	return rs.Usage != nil
 }
 
 // ReadCalls returns the calls of a recorder file, in order.

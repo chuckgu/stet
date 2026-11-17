@@ -489,6 +489,11 @@ func benchLLMRecorder(args []string) error {
 	if *out == "" {
 		return errors.New("bench llm-recorder: -out is required")
 	}
+	// Only *.jsonl files of the directory count against the cap; any other name
+	// would let a restart forget what this file spent.
+	if !strings.HasSuffix(*out, ".jsonl") {
+		return fmt.Errorf("bench llm-recorder: -out %q: the name must end in .jsonl, or a restart would not count its spend", *out)
+	}
 	spent, err := bench.SpentIn(filepath.Dir(*out))
 	if err != nil {
 		return fmt.Errorf("bench llm-recorder: %w", err)

@@ -2,7 +2,11 @@ package bench
 
 import (
 	"bytes"
+	"compress/gzip"
+	"context"
+	"errors"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 const fakeReply = `{"content":[{"type":"tool_use","name":"report_high_risk","input":{"title":"Unbounded update","explanation":"No WHERE clause"}}],"stop_reason":"tool_use","usage":{"input_tokens":1500,"output_tokens":150}}`
@@ -52,11 +57,23 @@ func (f *fakeAnthropic) hitCount() int {
 
 func postMessages(t *testing.T, url, body string) (int, string) {
 	t.Helper()
-	req, _ := http.NewRequest("POST", url+"/v1/messages", strings.NewReader(body))
+	return postWith(t, url+"/v1/messages", body, nil)
+}
+
+// postWith posts body to url; an Accept-Encoding in extra is sent as is, so
+// the client does not decode the reply itself.
+func postWith(t *testing.T, url, body string, extra map[string]string) (int, string) {
+	t.Helper()
+	req, _ := http.NewRequest("POST", url, strings.NewReader(body))
+	for k, v := range extra {
+		req.Header.Set(k, v)
+	}
 	req.Header.Set("x-api-key", testKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("content-type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	// A redirect the recorder relays is the client's to follow, not the test's.
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,14 +82,34 @@ func postMessages(t *testing.T, url, body string) (int, string) {
 	return resp.StatusCode, string(b)
 }
 
-func newTestRecorder(t *testing.T, upstream string, capUSD, spent float64) (*httptest.Server, *bytes.Buffer) {
-	out := &bytes.Buffer{}
+// logBuffer is a log the test reads while the recorder may still write.
+type logBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *logBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *logBuffer) Bytes() []byte {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return bytes.Clone(l.b.Bytes())
+}
+
+func (l *logBuffer) String() string { return string(l.Bytes()) }
+
+func newTestRecorder(t *testing.T, upstream string, capUSD, spent float64) (*httptest.Server, *logBuffer) {
+	out := &logBuffer{}
 	srv := httptest.NewServer(NewRecorder(upstream, out, capUSD, spent))
 	t.Cleanup(srv.Close)
 	return srv, out
 }
 
-func parseCalls(t *testing.T, out *bytes.Buffer) []Call {
+func parseCalls(t *testing.T, out *logBuffer) []Call {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "calls.jsonl")
 	if err := os.WriteFile(path, out.Bytes(), 0o600); err != nil {
@@ -118,23 +155,79 @@ func TestRecorderForwardsAndLogs(t *testing.T) {
 	}
 }
 
-func TestRecorderNeverLogsTheKey(t *testing.T) {
-	// Even an upstream that echoes the key back must not get it into the log
-	// through anything but the response the client sees; the file holds only
-	// Call fields, and the test client's own output holds nothing of the key.
-	fake := newFakeAnthropic(t, 200, fakeReply)
-	srv, out := newTestRecorder(t, fake.URL, 10, 0)
-	// Capture the process's stdout and stderr while the recorder runs.
-	oldOut, oldErr := os.Stdout, os.Stderr
-	r, w, _ := os.Pipe()
+// capture returns what the process wrote to stdout, stderr and the default
+// logger while f ran.
+func capture(t *testing.T, f func()) string {
+	t.Helper()
+	oldOut, oldErr, oldLog := os.Stdout, os.Stderr, log.Writer()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var captured []byte
+	done := make(chan struct{})
+	go func() { captured, _ = io.ReadAll(r); close(done) }()
 	os.Stdout, os.Stderr = w, w
-	postMessages(t, srv.URL, fakeRequest)
-	postMessages(t, srv.URL, `not json`)
+	log.SetOutput(w)
+	defer func() {
+		os.Stdout, os.Stderr = oldOut, oldErr
+		log.SetOutput(oldLog)
+	}()
+	f()
 	w.Close()
-	os.Stdout, os.Stderr = oldOut, oldErr
-	captured, _ := io.ReadAll(r)
-	if bytes.Contains(captured, []byte(testKey)) || strings.Contains(out.String(), testKey) {
-		t.Fatalf("the key leaked: %q / %q", captured, out.String())
+	<-done
+	return string(captured)
+}
+
+func TestRecorderNeverLogsTheKey(t *testing.T) {
+	// The upstream echoes the request headers in an error body, answers with
+	// garbage, closes mid-body, and then is gone: every path that makes the
+	// recorder write an error string of its own.
+	mode := "echo"
+	var mu sync.Mutex
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		m := mode
+		mu.Unlock()
+		switch m {
+		case "echo":
+			w.WriteHeader(400)
+			io.WriteString(w, `{"type":"error","error":{"message":"headers: `+r.Header.Get("x-api-key")+`"}}`)
+		case "garbage":
+			io.WriteString(w, `not json`)
+		case "cut":
+			conn, buf, _ := w.(http.Hijacker).Hijack()
+			buf.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\npartial")
+			buf.Flush()
+			conn.Close()
+		}
+	}))
+	defer up.Close()
+	srv, out := newTestRecorder(t, up.URL, 10, 0)
+	dead := httptest.NewServer(http.NotFoundHandler())
+	deadURL := dead.URL
+	dead.Close()
+	deadSrv, deadOut := newTestRecorder(t, deadURL, 10, 0)
+
+	var generated []string // bodies the recorder itself wrote
+	captured := capture(t, func() {
+		for _, m := range []string{"echo", "garbage", "cut"} {
+			mu.Lock()
+			mode = m
+			mu.Unlock()
+			_, b := postMessages(t, srv.URL, fakeRequest)
+			if m == "cut" {
+				generated = append(generated, b)
+			}
+		}
+		_, b := postMessages(t, deadSrv.URL, fakeRequest)
+		generated = append(generated, b)
+		postMessages(t, srv.URL, `not json`)
+	})
+	for _, s := range append(generated, captured, out.String(), deadOut.String()) {
+		if strings.Contains(s, testKey) {
+			t.Fatalf("the key leaked: %q", s)
+		}
 	}
 }
 
@@ -242,5 +335,231 @@ func TestReadCalls(t *testing.T) {
 		if calls[i].TotalUSD <= calls[i-1].TotalUSD {
 			t.Fatalf("not in order: %+v", calls)
 		}
+	}
+}
+
+func gz(t *testing.T, s string) string {
+	var b bytes.Buffer
+	zw := gzip.NewWriter(&b)
+	zw.Write([]byte(s))
+	zw.Close()
+	return b.String()
+}
+
+func TestRecorderRelaysGzipUnchangedAndParsesIt(t *testing.T) {
+	zipped := gz(t, fakeReply)
+	var gotEncoding string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotEncoding = r.Header.Get("Accept-Encoding")
+		w.Header().Set("Content-Encoding", "gzip")
+		io.WriteString(w, zipped)
+	}))
+	defer up.Close()
+	srv, out := newTestRecorder(t, up.URL, 10, 0)
+	status, body := postWith(t, srv.URL+"/v1/messages", fakeRequest, map[string]string{"Accept-Encoding": "gzip"})
+	if status != 200 || body != zipped || gotEncoding != "gzip" {
+		t.Fatalf("status %d, encoding %q, body relayed unchanged: %v", status, gotEncoding, body == zipped)
+	}
+	c := parseCalls(t, out)[0]
+	if c.InputTokens != 1500 || c.Level != "high" || c.Event != "" || !near(c.CostUSD, 0.000225) {
+		t.Fatalf("call %+v", c)
+	}
+}
+
+func TestRecorderAsksUpstreamForAnEncodingItCanRead(t *testing.T) {
+	// A client that does not take gzip (or asks for br) is sent identity, so
+	// the usage stays readable and the client can decode what it gets.
+	for _, ae := range []string{"", "br", "zstd, deflate", "identity"} {
+		var got string
+		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got = r.Header.Get("Accept-Encoding")
+			io.WriteString(w, fakeReply)
+		}))
+		srv, out := newTestRecorder(t, up.URL, 10, 0)
+		extra := map[string]string{"Accept-Encoding": ae}
+		if ae == "" {
+			extra = map[string]string{"Accept-Encoding": "identity"}
+		}
+		status, body := postWith(t, srv.URL+"/v1/messages", fakeRequest, extra)
+		up.Close()
+		if status != 200 || body != fakeReply || got != "identity" {
+			t.Fatalf("client asked %q: upstream was asked %q, client got %d %q", ae, got, status, body)
+		}
+		if c := parseCalls(t, out)[0]; c.Event != "" || c.InputTokens != 1500 {
+			t.Fatalf("call %+v", c)
+		}
+	}
+}
+
+// worst is what a call whose usage cannot be read is charged: the request's
+// bytes as input tokens (a token is never shorter than a byte) and max_tokens
+// as output.
+func worst(model, request string, maxTokens int) float64 {
+	return price(model, len(request), maxTokens)
+}
+
+func TestRecorderChargesTheWorstCaseWhenUsageCannotBeRead(t *testing.T) {
+	for _, reply := range []string{`not json`, `{"content":[],"stop_reason":"end_turn"}`, `{"usage":`} {
+		fake := newFakeAnthropic(t, 200, reply)
+		srv, out := newTestRecorder(t, fake.URL, 10, 0)
+		status, body := postMessages(t, srv.URL, fakeRequest)
+		c := parseCalls(t, out)[0]
+		if status != 200 || body != reply {
+			t.Fatalf("client got %d %q", status, body)
+		}
+		if c.Event != "unparsed" || !near(c.CostUSD, worst("claude-haiku-5-5", fakeRequest, 1024)) || !near(c.TotalUSD, c.CostUSD) {
+			t.Fatalf("reply %q: call %+v", reply, c)
+		}
+	}
+}
+
+func TestRecorderChargesTheWorstCaseWhenTheReplyIsCutShort(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, buf, _ := w.(http.Hijacker).Hijack()
+		buf.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\npartial")
+		buf.Flush()
+		conn.Close()
+	}))
+	defer up.Close()
+	srv, out := newTestRecorder(t, up.URL, 10, 0)
+	status, _ := postMessages(t, srv.URL, fakeRequest)
+	c := parseCalls(t, out)[0]
+	if status != 502 || c.Event != "upstream_error" || c.Status != 502 || !near(c.CostUSD, worst("claude-haiku-5-5", fakeRequest, 1024)) {
+		t.Fatalf("status %d call %+v", status, c)
+	}
+}
+
+func TestRecorderUpstreamUnreachableCostsNothing(t *testing.T) {
+	dead := httptest.NewServer(http.NotFoundHandler())
+	url := dead.URL
+	dead.Close()
+	srv, out := newTestRecorder(t, url, 10, 0)
+	status, body := postMessages(t, srv.URL, fakeRequest)
+	c := parseCalls(t, out)[0]
+	if status != 502 || !strings.Contains(body, "error") || c.Status != 502 || c.Event != "upstream_error" || c.CostUSD != 0 || c.Tag != "123456789012" {
+		t.Fatalf("status %d %q call %+v", status, body, c)
+	}
+}
+
+func TestRecorderFinishesACallTheClientGaveUpOn(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		io.WriteString(w, fakeReply)
+	}))
+	defer up.Close()
+	srv, out := newTestRecorder(t, up.URL, 10, 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "POST", srv.URL+"/v1/messages", strings.NewReader(fakeRequest))
+	if _, err := http.DefaultClient.Do(req); err == nil {
+		t.Fatal("the client did not give up")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for len(out.Bytes()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	calls := parseCalls(t, out)
+	if len(calls) != 1 || calls[0].Status != 200 || calls[0].InputTokens != 1500 || !near(calls[0].CostUSD, 0.000225) {
+		t.Fatalf("calls %+v", calls)
+	}
+}
+
+func TestRecorderDoesNotFollowRedirects(t *testing.T) {
+	other := newFakeAnthropic(t, 200, fakeReply)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+"/v1/messages", http.StatusTemporaryRedirect)
+	}))
+	defer up.Close()
+	srv, out := newTestRecorder(t, up.URL, 10, 0)
+	status, _ := postMessages(t, srv.URL, fakeRequest)
+	c := parseCalls(t, out)[0]
+	if status != 307 || other.hitCount() != 0 || c.Status != 307 || c.CostUSD != 0 {
+		t.Fatalf("status %d, other hit %d, call %+v", status, other.hitCount(), c)
+	}
+}
+
+func TestRecorderForwardsOnlyPostMessages(t *testing.T) {
+	fake := newFakeAnthropic(t, 200, fakeReply)
+	srv, out := newTestRecorder(t, fake.URL, 10, 0)
+	if s, _ := postWith(t, srv.URL+"/v1/other", fakeRequest, nil); s != 404 {
+		t.Fatalf("other path: %d", s)
+	}
+	resp, err := http.Get(srv.URL + "/v1/messages")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 405 {
+		t.Fatalf("GET: %d", resp.StatusCode)
+	}
+	if fake.hitCount() != 0 || out.String() != "" {
+		t.Fatalf("hits %d, log %q", fake.hitCount(), out.String())
+	}
+	if s, _ := postWith(t, srv.URL+"/v1/messages?beta=true", fakeRequest, nil); s != 200 || fake.hitCount() != 1 {
+		t.Fatalf("with a query: %d, hits %d", s, fake.hitCount())
+	}
+}
+
+// failingWriter is a log that cannot be written.
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("disk full") }
+
+func TestRecorderStopsWhenTheLogCannotBeWritten(t *testing.T) {
+	fake := newFakeAnthropic(t, 200, fakeReply)
+	srv := httptest.NewServer(NewRecorder(fake.URL, failingWriter{}, 10, 0))
+	defer srv.Close()
+	var s1, s2 int
+	captured := capture(t, func() {
+		s1, _ = postMessages(t, srv.URL, fakeRequest)
+		s2, _ = postMessages(t, srv.URL, fakeRequest)
+	})
+	if s1 < 500 || s2 < 500 || fake.hitCount() != 1 {
+		t.Fatalf("statuses %d %d, upstream hit %d times", s1, s2, fake.hitCount())
+	}
+	if !strings.Contains(captured, "disk full") || strings.Contains(captured, testKey) {
+		t.Fatalf("stderr: %q", captured)
+	}
+}
+
+func TestRecorderSaysOnceWhenTheCapTrips(t *testing.T) {
+	fake := newFakeAnthropic(t, 200, fakeReply)
+	srv, out := newTestRecorder(t, fake.URL, 0.0004, 0)
+	captured := capture(t, func() {
+		for i := 0; i < 4; i++ {
+			postMessages(t, srv.URL, fakeRequest)
+		}
+	})
+	if n := strings.Count(captured, "cost cap"); n != 1 {
+		t.Fatalf("%d cap lines in %q", n, captured)
+	}
+	if calls := parseCalls(t, out); len(calls) != 4 || calls[3].Event != "cap_reached" {
+		t.Fatalf("calls %+v", calls)
+	}
+}
+
+func TestRecorderKeepsTheSpendConsistentUnderConcurrency(t *testing.T) {
+	fake := newFakeAnthropic(t, 200, fakeReply)
+	srv, out := newTestRecorder(t, fake.URL, 100, 0)
+	const n = 24
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); postMessages(t, srv.URL, fakeRequest) }()
+	}
+	wg.Wait()
+	calls := parseCalls(t, out)
+	if len(calls) != n {
+		t.Fatalf("%d calls", len(calls))
+	}
+	sum := 0.0
+	for i, c := range calls {
+		sum += c.CostUSD
+		if !near(c.TotalUSD, sum) {
+			t.Fatalf("line %d: total %v, running sum %v", i, c.TotalUSD, sum)
+		}
+	}
+	if !near(sum, n*0.000225) {
+		t.Fatalf("sum %v", sum)
 	}
 }
