@@ -288,24 +288,29 @@ func TestForeignNamesAreRefused(t *testing.T) {
 	ctx := context.Background()
 	d, _ := testDataset()
 	ns := time.Now().UnixNano()
-	ours := fmt.Sprintf("crm_t%d_c", ns)
-	t.Cleanup(func() { Drop(context.Background(), a, ours) })
+	// No call names a database that exists as something to drop or create:
+	// if a guard broke, the test fails instead of dropping a shared database.
+	foreign, foreignClone, foreignTmpl := fmt.Sprintf("nocrm_%d", ns), fmt.Sprintf("nocrm_%d_c", ns), fmt.Sprintf("nocrm_%d_base", ns)
+	clone := fmt.Sprintf("crm_t%d_c", ns)
+	t.Cleanup(func() { Drop(context.Background(), a, clone) })
 
-	if err := Drop(ctx, a, "stet_test"); err == nil {
-		t.Error("Drop(stet_test) = nil, want an error")
+	if err := Drop(ctx, a, foreign); err == nil {
+		t.Errorf("Drop(%s) = nil, want an error", foreign)
 	}
-	if err := Clone(ctx, a, n, tmpl, "stet_test2", false); err == nil {
-		t.Error("Clone(..., stet_test2) = nil, want an error")
+	if err := Clone(ctx, a, n, tmpl, foreignClone, false); err == nil {
+		t.Errorf("Clone(..., %s) = nil, want an error", foreignClone)
 	}
-	if err := Clone(ctx, a, n, "stet_test", ours, false); err == nil {
-		t.Error("Clone from stet_test = nil, want an error")
+	// template1 exists, is not the benchmark's, and is only read as a
+	// template: without the guard the clone would be made from it.
+	if err := Clone(ctx, a, n, "template1", clone, false); err == nil {
+		t.Error("Clone from template1 = nil, want an error")
 	}
-	if err := CreateTemplate(ctx, a, n, "base", d, b, nil); err == nil {
-		t.Error("CreateTemplate(base) = nil, want an error")
+	if err := CreateTemplate(ctx, a, n, foreignTmpl, d, b, nil); err == nil {
+		t.Errorf("CreateTemplate(%s) = nil, want an error", foreignTmpl)
 	}
 
 	su := connectAs(t, a, a.User, a.Password, "postgres")
-	for db, want := range map[string]bool{"stet_test": true, "stet_test2": false, "base": false, ours: false} {
+	for db, want := range map[string]bool{"stet_test": true, foreign: false, foreignClone: false, foreignTmpl: false, clone: false} {
 		var got bool
 		if err := su.QueryRow(ctx, "select exists (select 1 from pg_database where datname = $1)", db).Scan(&got); err != nil {
 			t.Fatal(err)
@@ -313,6 +318,34 @@ func TestForeignNamesAreRefused(t *testing.T) {
 		if got != want {
 			t.Errorf("database %s exists: %v, want %v", db, got, want)
 		}
+	}
+}
+
+func TestCloneWhoseGrantFailsIsDropped(t *testing.T) {
+	a, _, tmpl, _ := testTemplate(t)
+	ctx := context.Background()
+	n := testNames(t)
+	clone := fmt.Sprintf("crm_t%d_c", time.Now().UnixNano())
+	t.Cleanup(func() {
+		if err := Drop(context.Background(), a, clone); err != nil {
+			t.Error(err)
+		}
+	})
+	// The owner exists and the gate account does not, so the database is
+	// made and the grant fails.
+	su := connectAs(t, a, a.User, a.Password, "postgres")
+	if _, err := su.Exec(ctx, fmt.Sprintf("create role %s login password '%s'", ident(n.Owner()), OwnerPassword)); err != nil {
+		t.Fatal(err)
+	}
+	if err := Clone(ctx, a, n, tmpl, clone, true); err == nil {
+		t.Fatal("Clone with a gate account that does not exist = nil, want an error")
+	}
+	var exists bool
+	if err := su.QueryRow(ctx, "select exists (select 1 from pg_database where datname = $1)", clone).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Errorf("%s exists after its grant failed", clone)
 	}
 }
 

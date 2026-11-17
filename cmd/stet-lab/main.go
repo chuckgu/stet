@@ -29,7 +29,7 @@ commands:
   score    score arms against the labels (A0, A1, and A2 are computed; model arms read lab.replays)
   label    give one recorded write a label by hand
   bench    the hoop benchmark's databases: prepare the snapshot, clone it per arm, drop, list
-           (stet-lab bench prepare|clone|drop|list)
+           (stet-lab bench <subcommand>; run it without arguments for the list)
 `
 
 func main() {

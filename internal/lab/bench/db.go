@@ -231,6 +231,11 @@ func fillTemplate(ctx context.Context, addr string, n Names, name string, d *crm
 		}
 	}
 
+	// On PostgreSQL 14 schema public belongs to the bootstrap superuser, so
+	// the owner's "grant usage on schema public" only raises a warning: the
+	// agents' USAGE on public, like EXECUTE on the fixture functions, comes
+	// from PUBLIC's defaults, so every agent role and the gate's login can
+	// call the fixtures. The benchmark leaves PUBLIC alone on purpose.
 	agents := idents(n.Agents())
 	grants := []string{
 		"grant usage on schema public to " + agents,
@@ -283,7 +288,8 @@ func fillTemplate(ctx context.Context, addr string, n Names, name string, d *crm
 }
 
 // Clone creates the database name from template, owned by the owner. With
-// gate, Stet's account may create its schema there.
+// gate, Stet's account may create its schema there; a clone whose grant
+// failed is dropped.
 func Clone(ctx context.Context, a Admin, n Names, template, name string, gate bool) error {
 	if err := ours(name); err != nil {
 		return err
@@ -302,7 +308,11 @@ func Clone(ctx context.Context, a Admin, n Names, template, name string, gate bo
 	}
 	if gate {
 		if _, err := su.Exec(ctx, fmt.Sprintf("grant create on database %s to %s", ident(name), ident(n.Gate()))); err != nil {
-			return fmt.Errorf("grant create on %s to %s: %w", name, n.Gate(), err)
+			err = fmt.Errorf("grant create on %s to %s: %w", name, n.Gate(), err)
+			if _, derr := su.Exec(ctx, fmt.Sprintf("drop database if exists %s with (force)", ident(name))); derr != nil {
+				return errors.Join(err, fmt.Errorf("drop the unfinished %s: %w", name, derr))
+			}
+			return err
 		}
 	}
 	return nil

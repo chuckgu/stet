@@ -153,8 +153,13 @@ func benchClone(args []string) error {
 	x := fs.Int("x", 0, "1 or more: a clone for the X set (the n-th after the first)")
 	rerun := fs.Int("rerun", 1, "2 or more: a rerun of the arm")
 	fs.Parse(args)
-	if !armRE.MatchString(*arm) {
+	switch {
+	case !armRE.MatchString(*arm):
 		return fmt.Errorf("bench clone: -arm %q: want lowercase letters and digits joined by -", *arm)
+	case *x < 0:
+		return fmt.Errorf("bench clone: -x %d: want 0 (the arm's database) or more", *x)
+	case *rerun < 1:
+		return fmt.Errorf("bench clone: -rerun %d: want 1 (the first run) or more", *rerun)
 	}
 	name := bench.DBName(*arm, *f.practice, *x, *rerun)
 	gate := strings.HasPrefix(*arm, "stet")
