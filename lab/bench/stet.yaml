@@ -1,0 +1,53 @@
+# Stet 설정: hoop 대비 벤치마크의 stet arm용 (docs/spec-v0.2-benchmark.md 5장). enforce 모드로 실제로 막는다.
+# 계정과 비밀번호(gate_svc, agent_v·agent_i·agent_x·agent_sync)는 `stet-lab bench prepare`가 만드는 벤치마크 전용
+# 값이다. gate_svc는 Stet 자신의 접속 계정이고 네 에이전트 계정의 구성원이다. 그래서 agents.roles에 넣지 않는다.
+# upstream의 데이터베이스(crm_gate)는 실행마다 다르다(X용 복제본, 연습, stet-bind, 다시 돌리기). 이 파일은 고치지 않고
+# `stet-lab bench stet-config -database <데이터베이스>`가 그 부분만 바꾼 사본을 실행 디렉터리에 쓴다.
+# 동결 커밋(스펙 10장 5번) 뒤에는 이 파일을 바꾸지 않는다.
+# tables는 lab/stet-lab.yaml의 것을 주석까지 그대로 옮기고, 두 테이블에 스펙 5장의 한도(문장당 100행, 계정과 테이블마다
+# 1분에 500행)와 unsupported: reject를 더했다. 임계값은 등록된 기본값 그대로다.
+
+mode: enforce
+listen: 127.0.0.1:56433
+upstream: postgres://gate_svc:gate-pw@127.0.0.1:55432/crm_gate
+
+agents:
+  roles: [agent_v, agent_i, agent_x, agent_sync]
+
+model: {adapter: jev, version: jev-1.14.0, timeout_ms: 800}
+
+tables:
+  contacts:
+    pk: id
+    entity: "B2B CRM contact"
+    send_fields: [account_id, name, email, title, status, marketing_consent, consent_source, notes]
+    # 같은 이메일, 또는 같은 계정의 연락처를 이름이 비슷한 순서로. 한글 이름과 로마자 이름은
+    # 철자가 겹치지 않으므로 이름 유사도만으로 거르지 않고 계정 안의 연락처를 모두 후보로 올린다.
+    candidates:
+      sql: |
+        (select id, name, email, title, account_id from contacts where lower(email) = lower(:email))
+        union
+        (select id, name, email, title, account_id from contacts
+         where account_id = :account_id
+         order by similarity(lower(name), lower(:name)) desc
+         limit 10)
+    context:
+      sql: |
+        select count(*) filter (where stage = 'open') as open_deals_at_account
+        from deals where account_id = :account_id
+    recent_window: 6h
+    policy:
+      - Do not set status to 'churned' while the contact's account has an open deal.
+      - Do not overwrite a title with an older value from a stale source.
+      - Do not set marketing_consent to true unless consent_source records where the consent was given.
+    impact: {max_rows: 100, cumulative: {max_rows: 500, window: 1m}}
+    unsupported: reject
+
+  deals:
+    pk: id
+    entity: "B2B CRM deal"
+    send_fields: [account_id, contact_id, stage, amount]
+    questions: [conflict]
+    recent_window: 6h
+    impact: {max_rows: 100, cumulative: {max_rows: 500, window: 1m}}
+    unsupported: reject

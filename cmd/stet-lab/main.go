@@ -28,7 +28,7 @@ commands:
   replay   ask a model arm about every recorded write it has not answered (stored in lab.replays)
   score    score arms against the labels (A0, A1, and A2 are computed; model arms read lab.replays)
   label    give one recorded write a label by hand
-  bench    the hoop benchmark's databases: prepare the snapshot, clone it per arm, drop, list
+  bench    the hoop benchmark: databases, sending, recorder, collect, score, choose, run configs
            (stet-lab bench <subcommand>; run it without arguments for the list)
 `
 

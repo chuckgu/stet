@@ -52,6 +52,12 @@ commands:
            it is not listed (-arms none,stet,hoop[:rerun],... [-practice] [-out <file>])
   choose   choose hoop's configuration by spec 6 from the practice runs of hoop-a, hoop-b, hoop-c and
            none (always the practice databases) and print the six candidates' J and blocked passes
+  hoop-config  write one of hoop's configurations, a candidate of spec 6 or a reference arm, from the base
+           to a new file (prompts b and c are read beside the base, as prompt-b.txt and prompt-c.txt)
+           (-prompt a|b|c -medium allow|block [-cache] [-model <id>] [-no-endpoint] [-base lab/bench/hoop.yaml]
+            -out <file>)
+  stet-config  write the frozen Stet config with only its upstream's database replaced, to a new file
+           (-database <db> [-in lab/bench/stet.yaml] -out <file>)
 `
 
 // benchEpoch is the date the benchmark's data is generated relative to.
@@ -85,6 +91,10 @@ func runBench(args []string) error {
 		return benchScore(args[1:])
 	case "choose":
 		return benchChoose(args[1:])
+	case "hoop-config":
+		return benchHoopConfig(args[1:])
+	case "stet-config":
+		return benchStetConfig(args[1:])
 	}
 	fmt.Fprint(os.Stderr, benchUsage)
 	os.Exit(2)
@@ -781,5 +791,73 @@ func benchChoose(args []string) error {
 	}
 	fmt.Printf("chosen: prompt %s, medium: %s (J %.4f, %d blocked passes)\n", name[best.Prompt], best.Medium, best.J,
 		best.FalseBlocks)
+	return nil
+}
+
+// benchHoopConfig writes one of hoop's configurations (spec 6, plan B2) from the base to a new file:
+// a run's own copy, never one a running hoop already reads.
+func benchHoopConfig(args []string) error {
+	fs := flag.NewFlagSet("bench hoop-config", flag.ExitOnError)
+	prompt := fs.String("prompt", "", "a (hoop's own guidance), b (it and the policy paragraph) or c (the dedicated prompt)")
+	medium := fs.String("medium", "", "what a statement graded medium gets: allow or block")
+	cache := fs.Bool("cache", false, "turn on hoop's verdict cache (size 10000, ttl_sec 86400): the hoop-cache arm")
+	model := fs.String("model", "", "the analyzer's model instead of the base's, such as claude-opus-5-5 (hoop-opus)")
+	noEndpoint := fs.Bool("no-endpoint", false, "drop analyzer.endpoint: hoop calls the Anthropic API itself, not the recorder")
+	base := fs.String("base", "lab/bench/hoop.yaml", "the base config; prompt-b.txt and prompt-c.txt are read from its directory")
+	out := fs.String("out", "", "the file to write, which must not exist; - or /dev/stdout for standard output")
+	fs.Parse(args)
+	if *out == "" {
+		return errors.New("bench hoop-config: -out is required")
+	}
+	b, err := os.ReadFile(*base)
+	if err != nil {
+		return fmt.Errorf("bench hoop-config: %w", err)
+	}
+	v := bench.HoopVariant{Prompt: *prompt, Medium: *medium, Cache: *cache, Model: *model, NoEndpoint: *noEndpoint}
+	if *prompt == "b" || *prompt == "c" {
+		text, err := os.ReadFile(filepath.Join(filepath.Dir(*base), "prompt-"+*prompt+".txt"))
+		if err != nil {
+			return fmt.Errorf("bench hoop-config: %w", err)
+		}
+		v.PromptText = string(text)
+	}
+	cfg, err := bench.HoopConfig(b, v)
+	if err != nil {
+		return fmt.Errorf("bench hoop-config: %w", err)
+	}
+	if err := bench.WriteConfig(*out, cfg); err != nil {
+		return fmt.Errorf("bench hoop-config: %w", err)
+	}
+	if *out != "-" && *out != "/dev/stdout" {
+		fmt.Fprintf(os.Stderr, "bench hoop-config: wrote %s\n", *out)
+	}
+	return nil
+}
+
+// benchStetConfig writes the frozen Stet config with its upstream's database replaced (plan B2) to a
+// new file: Stet's upstream names one database, and an arm runs against several.
+func benchStetConfig(args []string) error {
+	fs := flag.NewFlagSet("bench stet-config", flag.ExitOnError)
+	database := fs.String("database", "", "the database Stet fronts, such as crm_gate, crm_gate_x or crm_practice_gate")
+	in := fs.String("in", "lab/bench/stet.yaml", "the frozen config")
+	out := fs.String("out", "", "the file to write, which must not exist; - or /dev/stdout for standard output")
+	fs.Parse(args)
+	if *database == "" || *out == "" {
+		return errors.New("bench stet-config: -database and -out are required")
+	}
+	b, err := os.ReadFile(*in)
+	if err != nil {
+		return fmt.Errorf("bench stet-config: %w", err)
+	}
+	cfg, err := bench.StetConfig(b, *database)
+	if err != nil {
+		return fmt.Errorf("bench stet-config: %w", err)
+	}
+	if err := bench.WriteConfig(*out, cfg); err != nil {
+		return fmt.Errorf("bench stet-config: %w", err)
+	}
+	if *out != "-" && *out != "/dev/stdout" {
+		fmt.Fprintf(os.Stderr, "bench stet-config: wrote %s\n", *out)
+	}
 	return nil
 }

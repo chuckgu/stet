@@ -471,6 +471,95 @@ hard negative 유형별 막은 건수:
 - 모두 스크립트 주입이고 문장 모양이 단순하다. 에이전트 쓰기가 없어서 에이전트 쓰기의 false hold는 이번 녹화로 볼 수 없다.
 - B(Opus)는 돌리지 않았다. 그래서 프런티어 LLM 기준선과 D(C → B)는 이번 녹화에 없다. 10월 단가로 975건에 약 $9로 추정한다.
 
+## hoop 대비 벤치마크
+
+작성: 2026-11-17. 설계와 판독 기준은 [스펙](spec-v0.2-benchmark.md)(9장은 결과 전에 고정), 도구와 실행 순서는 [계획](plan-v0.2-benchmark.md)에 있다. 계획의 Part B가 런북이다.
+
+같은 DB 스냅숏과 같은 쓰기 스트림(V·I·X 세트)을 hoop의 배포 이미지와 enforce 모드의 Stet에 보낸다. 쓰기마다 클라이언트가 본 결과(실행됨, 프록시가 막음, DB가 거부, 알 수 없음)를 적고 정답 라벨과 비교한다.
+
+**arm** (arm마다 스냅숏을 따로 복제한 데이터베이스를 쓴다)
+
+| arm | 구성 | 보내는 것 | 쓰임 |
+|---|---|---|---|
+| `none` | 프록시 없이 DB에 직접 | V, I, X | 라벨 확인, 지연의 기준선 |
+| `stet` | Stet enforce, Jev `jev-1.14.0`, 단순 질의 | V, I, X | 판독 |
+| `hoop` | hoop, `claude-haiku-5-5`, 연습에서 고른 설정, 캐시 끔, 단순 질의 | V, I, X | 판독 |
+| `hoop-cache` | `hoop`과 같고 캐시만 켬 | V, I | 참고: 모양 재사용 |
+| `hoop-bind`, `stet-bind` | `hoop`, `stet`과 같고 값을 바인딩으로 | V·I의 정해진 부분 | 참고: 확장 프로토콜 |
+| `hoop-opus` | `hoop`과 같고 모델만 `claude-opus-5-5` | V·I의 정해진 부분 | 참고. hoop 1.310.0의 요청을 Opus가 거절하면 돌리지 않는다(스펙 3장) |
+| 연습 `none`, `stet`, `hoop-a`, `hoop-b`, `hoop-c` | 연습 스트림. `hoop-a`~`c`는 프롬프트 (가)·(나)·(다), `medium: allow` | V, I | hoop 설정 고르기(스펙 6장) |
+
+**이름.** 데이터베이스와 역할에 프로젝트 이름을 넣지 않는다(hoop이 데이터베이스 이름을 LLM에 보낸다).
+
+- 템플릿은 `crm_base`(채점)와 `crm_practice`(연습)다.
+- arm의 데이터베이스는 `crm_`(연습은 `crm_practice_`) 뒤에 arm 이름을 붙이되 `stet`은 `gate`로, `-`는 `_`로 쓴다: `crm_none`, `crm_gate`, `crm_hoop`, `crm_hoop_cache`, `crm_gate_bind`, `crm_practice_hoop_a`. X용 복제본은 `_x`, 다시 복제하면 `_x2`, 다시 돌리면 `_r2`가 붙는다.
+- 역할은 `crm_owner`(소유자), `gate_svc`(Stet 자신의 계정. 네 에이전트 계정의 구성원), `agent_v`(V), `agent_i`(I), `agent_x`(X), `agent_sync`(준비 쓰기)다. 비밀번호는 `internal/lab/bench/db.go`의 테스트용 값이다.
+
+**명령** (`bin/stet-lab bench <명령>`. 인자 없이 실행하면 목록과 플래그가 나온다)
+
+| 명령 | 하는 일 |
+|---|---|
+| `prepare` | 역할과 스냅숏 템플릿을 만들고 세트별 문장 수를 찍는다(`-practice`는 연습 스냅숏) |
+| `clone` | 템플릿을 arm의 데이터베이스로 복제한다(`-arm`, X용은 `-x N`, 다시 돌리기는 `-rerun N`) |
+| `drop` | 벤치마크의 데이터베이스 하나를 지운다(`-name`) |
+| `list` | 벤치마크가 만든 데이터베이스와 역할을 찍는다 |
+| `send` | arm의 스트림을 `-addr`로 보내고 결과를 `lab.outcomes`에 적는다. `-sets X`는 공격을 X용 복제본에 보내고, 전제를 깨는 공격이 실행되면 종료 코드 3과 다음 공격 번호를 낸다 |
+| `exec` | 문장 하나를 `send`와 같은 방식으로 보내고 결과를 찍는다. 아무것도 적지 않는다(확인용) |
+| `llm-recorder` | hoop의 LLM 호출을 Anthropic API로 넘기며 시각·등급·토큰·비용을 JSON 줄로 적고, 비용 상한에서 멈춘다. 키는 적지 않는다 |
+| `collect` | 프록시가 남긴 것(Stet의 `stet.decisions`, hoop의 감사 로그와 기록기 파일)을 꼬리표와 그 쓰기의 시간 창으로 이어 `lab.proxy`에 적는다 |
+| `score` | 데이터베이스에 남은 것만으로 채점해 스펙 8·9장의 표와 판독을 한국어 마크다운으로 쓴다 |
+| `choose` | 연습 실행에서 hoop 설정 후보 여섯의 J를 내고 하나를 고른다 |
+| `hoop-config` | `lab/bench/hoop.yaml`에서 후보나 참고 arm의 hoop 설정을 새 파일로 만든다 |
+| `stet-config` | `lab/bench/stet.yaml`에서 `upstream`의 데이터베이스만 바꾼 사본을 새 파일로 만든다 |
+
+**설정** (`lab/bench/`. 동결 커밋 뒤에는 바꾸지 않는다)
+
+- `stet.yaml`: `lab/stet-lab.yaml`의 테이블 설정을 주석까지 그대로 두고 enforce, 네 에이전트 계정, `jev-1.14.0`, 한도(문장당 100행, 계정과 테이블마다 1분에 500행), `unsupported: reject`를 더한 것이다. Stet은 `127.0.0.1:56433`에서 받는다.
+- `hoop.yaml`: 스펙 6장의 고정 표와 후보 (가)·`medium: allow`다. 경로와 주소는 컨테이너 안의 것이다. `prompt-b.txt`는 hoop의 기본 안내문에 정책 문단을 붙인 것, `prompt-c.txt`는 전용 프롬프트다.
+- 실행에 쓰는 설정은 두 파일을 고치지 않고 `bench hoop-config -prompt a|b|c -medium allow|block [-cache] [-model <모델>] [-no-endpoint] -out <파일>`과 `bench stet-config -database <데이터베이스> -out <파일>`로 실행마다 새 파일로 만든다. 두 명령은 있는 파일에 쓰지 않는다. 돌고 있는 hoop은 자기 설정 파일이 바뀌면 다시 읽기 때문이다.
+- 동결할 때 고른 hoop 설정(`hoop.yaml`, `hoop-cache.yaml`, 되면 `hoop-opus.yaml`)을 `lab/bench/run/`에 커밋한다.
+
+**`scripts/hoop.sh`** (hoop 컨테이너. 환경 변수 `BENCH_DIR`, `DOCKER`, `HOOP_IMAGE`, `HOOP_DIGEST`, `ANTHROPIC_ENV`, `HOOP_USER`)
+
+| 명령 | 하는 일 |
+|---|---|
+| `pull` | `hoophq/hoopsidecar:1.310.0`을 받아 다이제스트가 고정값(`sha256:737e87b7…`)인지 보고 `$BENCH_DIR/hoop.digest`에 적는다. 다른 명령은 이 다이제스트로만 이미지를 부른다 |
+| `start <설정> <실행 이름>` | 컨테이너 `bench-hoop`을 띄워 `127.0.0.1:15432`로 낸다. 붙이는 것은 설정과 키 파일(둘 다 읽기 전용), 그 실행의 감사 로그 디렉터리 `$BENCH_DIR/hoop/audit-<실행 이름>/` 셋뿐이다. 이미 로그가 든 실행 이름, 경로가 이 마운트와 맞지 않는 설정(`audit.file`, `credentials_file`, `listen`), 시계가 호스트와 1초 넘게 어긋난 컨테이너는 거부한다 |
+| `validate <설정>` | 같은 이미지·설정·키로 `hoop start sidecar --validate` |
+| `clock` | 컨테이너와 호스트의 UTC 시각과 차이를 찍고, 1초를 넘으면 실패한다(`collect`는 2초까지 받는다) |
+| `stop`, `logs` | 컨테이너를 지운다, 그 로그를 찍는다 |
+
+- 키 파일 `$BENCH_DIR/hoop/anthropic.key`가 없으면 `ANTHROPIC_ENV`(기본 `~/.config/stet/anthropic.env`)에서 키만 0600으로 쓴다. 키는 화면과 인자에 나오지 않는다. 벤치마크가 끝나면 지운다.
+- 로그인하지 않고(`HOOP_SIDECAR_FREE_STANDALONE=true`) 사용 통계를 끈다(`HOOP_SIDECAR_ANALYTICS=off`). 컨테이너는 내 uid로 돈다(`HOOP_USER=`로 비우면 이미지의 사용자).
+- 컨테이너는 `host.docker.internal`로 호스트의 DB(55432)와 기록기(18080)에 닿는다.
+- 실행마다 감사 로그 디렉터리와 기록기 파일을 따로 둔다. hoop은 감사 로그에 덧붙여 쓰고 `collect`는 시간 창으로 잇기 때문이다. 로그가 든 실행 이름은 다시 쓸 수 없다. 다시 띄우려면 `stop` 뒤에 새 이름을 준다(로그가 비어 있으면 같은 이름도 된다).
+
+**한 실행의 모양** (연습의 `hoop-a`와 `stet`. 전체 순서와 확인할 것은 계획의 Part B)
+
+```bash
+B=~/.local/share/stet/bench-2026-11
+bin/stet-lab bench clone -practice -arm hoop-a                  # crm_practice_hoop_a
+bin/stet-lab bench llm-recorder -out $B/llm/practice-hoop-a.jsonl -cap-usd 10 &
+bin/stet-lab bench hoop-config -prompt a -medium allow -out $B/hoop/practice-a.yaml
+scripts/hoop.sh start $B/hoop/practice-a.yaml practice-a && sleep 3
+bin/stet-lab bench send -practice -arm hoop-a -addr 127.0.0.1:15432
+scripts/hoop.sh stop; kill %1; wait
+bin/stet-lab bench collect -practice -arm hoop-a -audit $B/hoop/audit-practice-a/audit.jsonl -llm $B/llm/practice-hoop-a.jsonl
+
+bin/stet-lab bench clone -practice -arm stet                    # crm_practice_gate
+bin/stet-lab bench stet-config -database crm_practice_gate -out $B/stet/practice.yaml
+( source ~/.config/stet/typesafe.env; exec bin/stet proxy -config $B/stet/practice.yaml ) 2> $B/stet/practice.log &
+bin/stet-lab bench send -practice -arm stet -addr 127.0.0.1:56433
+kill %1; wait
+bin/stet-lab bench collect -practice -arm stet
+```
+
+**결과가 놓이는 곳**
+
+- arm의 데이터베이스의 `lab` 스키마: `lab.writes`(스트림과 라벨), `lab.outcomes`(클라이언트가 본 결과), `lab.attacks`(X 공격마다 실행 여부), `lab.proxy`(프록시가 남긴 판단을 쓰기에 이은 것), `lab.meta`(`collect`의 합계). 에이전트 계정은 `lab`을 읽지 못한다.
+- `~/.local/share/stet/bench-2026-11/`: `hoop.digest`, `hoop/`(실행별 hoop 설정과 감사 로그 `audit-<실행 이름>/`), `llm/`(기록기 파일), `stet/`(실행별 Stet 설정과 로그), `dumps/`(arm별 덤프), `report/`(채점 결과와 터미널 출력). 녹화는 임시 디렉터리에 두지 않는다.
+- 결과 문서 `docs/benchmark-hoop.md`는 실행 뒤에 생긴다.
+
 ## 합성 CRM
 
 - 규모: 계정 약 800개, 연락처 약 5,000개. 계정마다 딜 0~3개.

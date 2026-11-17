@@ -1,0 +1,52 @@
+# hoop 설정의 기본형: 후보 (가)와 medium: allow (docs/spec-v0.2-benchmark.md 6장). hoophq/hoopsidecar 1.310.0의
+# 컨테이너에서 쓴다. 경로와 주소는 컨테이너 안의 것이다. scripts/hoop.sh가 실행마다 감사 로그 디렉터리를 /var/log/hoop에,
+# 키 파일을 /run/hoop/anthropic.key에, 설정을 /etc/hoop-inspect/config.yaml에 붙이고 15432 포트를 호스트의
+# 127.0.0.1:15432로 낸다. host.docker.internal은 컨테이너에서 본 호스트다(DB는 55432, LLM 기록기는 18080).
+#
+# 실행에 쓰는 설정은 이 파일을 고치지 않고 bench hoop-config가 새 파일로 만든다. 돌고 있는 hoop은 자기 설정 파일이
+# 바뀌면 다시 읽으므로, 한 번 쓴 파일은 고쳐 쓰지 않는다(bench hoop-config는 있는 파일에 쓰지 않는다).
+#   bench hoop-config -prompt a|b|c -medium allow|block [-cache] [-model <모델>] [-no-endpoint] -out <새 파일>
+#
+# 연습 스트림의 J로 고르는 후보 여섯:
+#   (가) hoop의 기본 안내문 그대로             -prompt a -medium allow, -prompt a -medium block
+#   (나) 기본 안내문 + 정책 문단(prompt-b.txt)  -prompt b -medium allow, -prompt b -medium block
+#   (다) 전용 프롬프트(prompt-c.txt)            -prompt c -medium allow, -prompt c -medium block
+# (나)와 (다)는 listeners[0].analyzer.prompt에 들어가 기본 안내문을 바꾼다. 답하는 형식은 hoop이 항상 뒤에 붙인다.
+# 참고 arm: hoop-cache는 -cache(analyzer.cache: {size: 10000, ttl_sec: 86400}), hoop-opus는 -model claude-opus-5-5.
+# 기록기를 쓰지 못하면 -no-endpoint로 analyzer.endpoint를 지운다(hoop이 Anthropic API를 직접 부른다).
+#
+# 고정한 값(6장의 표): 가드레일 규칙 하나(무료 빌드의 한도), 분석기 anthropic·claude-haiku-5-5, insert·update·delete만
+# 분석, fail_open: false, timeout_sec 30, max_retries 2, max_input_bytes 65536, 캐시·max_calls·rate_limit 없음,
+# high: block, low: allow. 문장은 그대로 보낸다(send: raw). 감사 로그는 JSON 줄 파일이고 문장을 가리지 않는다.
+# 막힌 문장의 감사 로그 줄은 rule에 막은 쪽을 적는다: 분석기면 리스너 이름 crm, 가드레일이면 규칙 이름 destructive.
+# bench collect가 그 줄을 lab.proxy에 옮긴다. 두 이름을 바꾸지 않는다.
+
+log_level: info
+audit:
+  file: /var/log/hoop/audit.jsonl
+analyzer:
+  provider: anthropic
+  model: claude-haiku-5-5
+  credentials_file: /run/hoop/anthropic.key
+  endpoint: http://host.docker.internal:18080/v1/messages
+  send: raw
+  fail_open: false
+  timeout_sec: 30
+  max_retries: 2
+  max_input_bytes: 65536
+listeners:
+  - name: crm
+    protocol: postgres
+    listen: 0.0.0.0:15432
+    upstream: host.docker.internal:55432
+    guardrails:
+      mode: enforce
+      rules:
+        - name: destructive
+          type: operation
+          operations: [truncate, drop, alter, create, grant, revoke, call, unknown]
+    analyzer:
+      trigger: {operations: [insert, update, delete]}
+      high: block
+      medium: allow
+      low: allow
