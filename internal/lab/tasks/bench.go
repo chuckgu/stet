@@ -164,8 +164,8 @@ func argText(v any) (string, error) {
 	return "", fmt.Errorf("unsupported plan argument type %T", v)
 }
 
-// BuildBench builds the benchmark stream on d. Only the V and P sets are
-// built here.
+// BuildBench builds the benchmark stream on d. Only the P, V and I sets
+// are built here.
 func BuildBench(d *crm.Dataset, o BenchOptions) (Bench, error) {
 	plan := Build(d, o.Plan)
 	b := Bench{Plan: plan}
@@ -279,6 +279,10 @@ func BuildBench(d *crm.Dataset, o BenchOptions) (Bench, error) {
 			}
 			b.Stream = append(b.Stream, s)
 		}
+	}
+
+	if err := addISet(&b, d, o, sel); err != nil {
+		return Bench{}, err
 	}
 
 	tags := stream(o.Plan.Seed, tagStream)
