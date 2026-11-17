@@ -243,6 +243,7 @@ func MarkFailed(ctx context.Context, q Querier, id, reason string) error
 
 - (P1) `TestApprovedWrites`는 순서와 `limit`을 자기가 넣은 id들 안에서만 확인한다. 공유 데이터베이스 `stet_test`에는 다른 테스트의 줄이 있을 수 있다.
 - (P3) 검토자 역할을 만드는 테스트 헬퍼는 `GRANT`와, 나중의 `DROP OWNED BY`를 `Migrate`가 잡는 것과 같은 advisory lock(`pg_advisory_xact_lock`, 같은 키)을 먼저 잡은 트랜잭션에서 한다. 다른 패키지의 `Migrate`가 같은 때에 두 함수와 뷰의 카탈로그 줄을 고쳐 쓰면 `tuple concurrently updated`로 실패하기 때문이다.
+- (Task 2에서 바뀐 것) `Store.Migrate`는 이제 `stet.schema_version`의 표시가 이 바이너리의 `schema.sql` 해시와 같으면 DDL을 실행하지 않는다. 그래서 "스키마를 다시 올려도 검토자의 권한이 남고 PUBLIC에는 없다"를 확인하는 테스트는 다시 실행을 강제해야 한다. 테스트가 만든 자기 데이터베이스에서 표시를 다른 값으로 덮어쓴 뒤 `Migrate`를 부른다. 공유 데이터베이스 `stet_test`의 표시는 건드리지 않는다.
 - (P5, B9에 더함) `MarkApplied`와 `MarkFailed`는 `applied_at`에 `clock_timestamp()`를 쓴다. 스펙 4장의 뜻은 실행을 끝낸 시각이다.
 
 ---
@@ -524,5 +525,5 @@ func (a *Applier) Close()
 
 **실행 전 점검의 판정.** 이 Task의 본문과 다르면 이것을 따른다.
 
-- (P4) Step 3은 B1~B9 전부를 스펙의 해당 장(2·4·5·6·7장)에 옮긴다. B3의 5장 설명과 B9의 `clock_timestamp()`(6·7장, `applied_at` 포함)가 빠지지 않게 한다. 실행 전 점검의 판정 가운데 스펙의 문장을 바꾸는 것(P2: 스키마가 맞으면 `Migrate`가 `stet.held_writes`를 잠그지 않는다)도 4장에 한 줄로 적는다.
+- (P4) Step 3은 B1~B9 전부를 스펙의 해당 장(2·4·5·6·7장)에 옮긴다. B3의 5장 설명과 B9의 `clock_timestamp()`(6·7장, `applied_at` 포함)가 빠지지 않게 한다. 실행 중에 정한 것 가운데 스펙의 문장을 바꾸는 것도 적는다. `Migrate`는 `schema.sql`이 DB가 마지막으로 실행한 것과 같으면(`stet.schema_version`의 해시) 실행하지 않는다는 것을 4장에 적고, 그 이유(검토자의 열린 트랜잭션이 시작하는 Stet을 막지 않게)와 대가(손으로 고친 스키마를 되돌리지 않는다, 스키마가 바뀐 첫 시작은 잠금을 잡는다)를 11장에 적는다. spec-v0.1 8장의 "Stet은 시작할 때마다 이 파일을 실행한다"도 같은 뜻으로 고친다.
 
