@@ -1,6 +1,6 @@
 # Stet v0.2 3단계 스펙: hoop 대비 벤치마크
 
-상태: 설계 (2026-11-17). 근거는 concept-v0.2 6·9·10장, experiment.md의 레드팀 세트, lab.md의 녹화 2다.
+상태: 실행함 (2026-11-18). 결과는 benchmark-hoop.md. 근거는 concept-v0.2 6·9·10장, experiment.md의 레드팀 세트, lab.md의 녹화 2다.
 
 ## 1. 목표와 비목표
 
@@ -350,22 +350,22 @@ J = (막은 결함과 큰 쪽) / (결함과 큰 쪽 전체)  −  (막은 정상
 
 ## 14. 수용 기준
 
-- [ ] 이 문서(9장 포함)가 채점 실행보다 먼저 커밋돼 있다.
-- [ ] 같은 seed로 스트림을 두 번 만들면 문장과 라벨이 같다.
-- [ ] 꼬리표와 문장에서 라벨을 알아낼 수 없다(id가 코드나 배치를 담지 않는다). 꼬리표는 숫자뿐이다.
-- [ ] `hoop-cache`에서 캐시가 실제로 맞는다(LLM 호출 수가 문장 수보다 훨씬 적다).
-- [ ] 동결 커밋의 제품 코드가 `1491a3e`와 같다(`git diff`).
-- [ ] `none` arm에서 I 세트의 작은 쪽은 모두 100행 이하, 큰 쪽은 모두 100행 초과를 바꾼다.
-- [ ] 보내기가 에러 뒤에 다시 붙고, 결과 넷(실행됨, 프록시가 막음, DB가 거부, 알 수 없음)을 구분한다. Stet과, hoop의 거부 응답을 흉내 낸 가짜 서버로 테스트한다.
-- [ ] hoop이 다이제스트로 고정된 이미지에서, 로그인 없이, 사용 통계를 끈 채 돈다.
-- [ ] LLM 기록기가 키를 파일에 남기지 않고, 상한에서 멈춘다.
-- [ ] hoop 설정이 6장의 규칙으로 골라졌고, 연습 결과와 함께 15장에 적혀 있다.
-- [ ] 동결 커밋 뒤에 `lab/bench/`의 설정이 바뀌지 않았다.
-- [ ] 판독에 쓰는 arm이 9장의 "유효한 실행"을 지킨다. 다시 돌린 arm이 있으면 두 실행이 모두 적혀 있다.
-- [ ] `docs/benchmark-hoop.md`에 세트별 표, R1~R3의 판독, 한계, 재현 명령이 있다.
-- [ ] 덤프와 로그가 `~/.local/share/stet/bench-2026-11/`에 있다.
-- [ ] 벤치마크가 `stet_test`, `PUBLIC`, 기존 역할을 바꾸지 않았다. 만든 데이터베이스와 역할의 목록이 결과 문서에 있다.
-- [ ] `go test -race ./...`가 통과한다(`STET_TEST_PG` 설정).
+- [x] 이 문서(9장 포함)가 채점 실행보다 먼저 커밋돼 있다. (`e98eee8`. 채점 실행은 동결 커밋 `9b542d2` 뒤다)
+- [x] 같은 seed로 스트림을 두 번 만들면 문장과 라벨이 같다. (`TestBenchIsDeterministic`, `TestWholeStreamIsDeterministic`)
+- [x] 꼬리표와 문장에서 라벨을 알아낼 수 없다(id가 코드나 배치를 담지 않는다). 꼬리표는 숫자뿐이다. (`TestTagsAreOpaque`, `TestWholeStreamNeverSaysStet`)
+- [x] `hoop-cache`에서 캐시가 실제로 맞는다(LLM 호출 수가 문장 수보다 훨씬 적다). (1,391문장에 호출 26건)
+- [x] 동결 커밋의 제품 코드가 `1491a3e`와 같다(`git diff`). (출력 없음)
+- [x] `none` arm에서 I 세트의 작은 쪽은 모두 100행 이하, 큰 쪽은 모두 100행 초과를 바꾼다. (60쌍 모두. `TestISetChangesTheRowsItWasBuiltFor`)
+- [x] 보내기가 에러 뒤에 다시 붙고, 결과 넷(실행됨, 프록시가 막음, DB가 거부, 알 수 없음)을 구분한다. Stet과, hoop의 거부 응답을 흉내 낸 가짜 서버로 테스트한다. (`TestSendThroughStet`, `TestSendThroughAHoopLikeServer`, `TestClassify`)
+- [x] hoop이 다이제스트로 고정된 이미지에서, 로그인 없이, 사용 통계를 끈 채 돈다. (`TestHoopScript*`와 실제 실행의 로그)
+- [x] LLM 기록기가 키를 파일에 남기지 않고, 상한에서 멈춘다. (`TestRecorderNeverLogsTheKey`, `TestRecorderStopsAtTheCap`. 실행 뒤 기록 파일에 키가 없는 것도 확인했다)
+- [x] hoop 설정이 6장의 규칙으로 골라졌고, 연습 결과와 함께 15장에 적혀 있다. (`TestChoose`, 15장 "동결 기록")
+- [x] 동결 커밋 뒤에 `lab/bench/`의 설정이 바뀌지 않았다. (`git diff --stat 9b542d2 -- lab/bench`의 출력 없음)
+- [x] 판독에 쓰는 arm이 9장의 "유효한 실행"을 지킨다. 다시 돌린 arm이 있으면 두 실행이 모두 적혀 있다. (`stet`과 `hoop` 모두 유효. 다시 돌린 arm 없음)
+- [x] `docs/benchmark-hoop.md`에 세트별 표, R1~R3의 판독, 한계, 재현 명령이 있다. (전체 표는 `docs/benchmark-hoop-score.md`)
+- [x] 덤프와 로그가 `~/.local/share/stet/bench-2026-11/`에 있다. (덤프 19개, 감사 로그, 기록기 파일, 보고서)
+- [x] 벤치마크가 `stet_test`, `PUBLIC`, 기존 역할을 바꾸지 않았다. 만든 데이터베이스와 역할의 목록이 결과 문서에 있다. (실행 전후의 `datacl`, `nspacl`이 같고 역할은 여섯 개만 늘었다)
+- [x] `go test -race ./...`가 통과한다(`STET_TEST_PG` 설정).
 
 ## 15. 정한 것과 남긴 것
 
