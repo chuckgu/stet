@@ -487,7 +487,7 @@ hard negative 유형별 막은 건수:
 | `hoop-cache` | `hoop`과 같고 캐시만 켬 | V, I | 참고: 모양 재사용 |
 | `hoop-bind`, `stet-bind` | `hoop`, `stet`과 같고 값을 바인딩으로 | V·I의 정해진 부분 | 참고: 확장 프로토콜 |
 | `hoop-opus` | `hoop`과 같고 모델만 `claude-opus-5-5` | V·I의 정해진 부분 | 참고. 스펙 3장: 돌릴 수 없음; 런북 3.5에서 다시 확인 |
-| 연습 `none`, `stet`, `hoop-a`, `hoop-b`, `hoop-c` | 연습 스트림. `hoop-a`~`c`는 프롬프트 (가)·(나)·(다), `medium: allow` | V, I | hoop 설정 고르기(스펙 6장) |
+| 연습 `none`, `stet`, `hoop-a`, `hoop-b`, `hoop-c` | 연습 스트림. `hoop-a`~`c`는 프롬프트 (가)·(나)·(다), `medium: allow` | V, I. X는 `-sets X`로 따로 | hoop 설정 고르기(스펙 6장). X는 채점 전에 공격 도구를 확인하는 것이고 고르기에 쓰지 않는다 |
 
 **이름.** 데이터베이스와 역할에 프로젝트 이름을 넣지 않는다(hoop이 데이터베이스 이름을 LLM에 보낸다).
 
@@ -499,15 +499,15 @@ hard negative 유형별 막은 건수:
 
 | 명령 | 하는 일 |
 |---|---|
-| `prepare` | 역할과 스냅숏 템플릿을 만들고 세트별 문장 수를 찍는다(`-practice`는 연습 스냅숏) |
+| `prepare` | 역할과 스냅숏 템플릿을 만들고 세트별 문장 수를 찍는다(`-practice`는 연습 스냅숏: P 80, V 360, I 40, X 442, 공격 113. X는 연습 seed로 만든 같은 경로·같은 수의 공격이다) |
 | `clone` | 템플릿을 arm의 데이터베이스로 복제한다(`-arm`, X용은 `-x N`, 다시 돌리기는 `-rerun N`) |
 | `drop` | 벤치마크의 데이터베이스 하나를 지운다(`-name`) |
 | `list` | 벤치마크가 만든 데이터베이스와 역할을 찍는다 |
-| `send` | arm의 스트림을 `-addr`로 보내고 결과를 `lab.outcomes`에 적는다. `-sets X`는 공격을 X용 복제본에 보내고, 전제를 깨는 공격이 실행되면 종료 코드 3과 다음 공격 번호를 낸다 |
+| `send` | arm의 스트림을 `-addr`로 보내고 결과를 `lab.outcomes`에 적는다. `-addr`는 그 arm의 프록시이고 `-pg`(DB 서버)와 같으면 거부한다. `none`만 `-pg`와 같아야 한다(`localhost`와 `127.0.0.1`은 같은 호스트로 본다). `-sets X`는 공격을 X용 복제본에 보내고(`-practice`면 연습 arm의 X용 복제본), 전제를 깨는 공격이 실행되면 종료 코드 3과 다음 공격 번호를 낸다. 공격마다 먼저 `-addr`에 한 번 접속해 보고, 닿지 않거나 공격의 단계가 접속하지 못하면 그 공격을 기록하지 않고 멈춰 멈춘 번호를 찍는다. `-from`으로 이어 간다(32개 연결의 공격은 모든 단계가 접속하지 못했을 때만 멈춘다) |
 | `exec` | 문장 하나를 `send`와 같은 방식으로 보내고 결과를 찍는다. 아무것도 적지 않는다(확인용) |
 | `llm-recorder` | hoop의 LLM 호출을 Anthropic API로 넘기며 시각·등급·토큰·비용을 JSON 줄로 적고, 비용 상한에서 멈춘다. 키는 적지 않는다 |
-| `collect` | 프록시가 남긴 것(Stet의 `stet.decisions`, hoop의 감사 로그와 기록기 파일)을 꼬리표와 그 쓰기의 시간 창으로 이어 `lab.proxy`에 적는다 |
-| `score` | 데이터베이스에 남은 것만으로 채점해 스펙 8·9장의 표와 판독을 한국어 마크다운으로 쓴다 |
+| `collect` | 프록시가 남긴 것(Stet의 `stet.decisions`, hoop의 감사 로그와 기록기 파일)을 꼬리표와 그 쓰기의 시간 창으로 이어 `lab.proxy`에 적는다. 보낸 쓰기 가운데 기록이 이어진 수를 찍고, 하나도 이어지지 않으면(프록시를 거치지 않고 보냈거나 다른 실행의 기록) 아무것도 적지 않고 실패한다 |
+| `score` | 데이터베이스에 남은 것만으로 채점해 스펙 8·9장의 표와 판독을 한국어 마크다운으로 쓴다. 1절에 세트별로 DB가 거부한 쓰기와 알 수 없는 쓰기를 심각도·SQLSTATE별로, `collect`의 창 밖 기록과 확인되지 않은 거부 수를 함께 적는다(채점은 바꾸지 않는다). 데이터베이스가 없는 arm은 이름을 대고 멈춘다 |
 | `choose` | 연습 실행에서 hoop 설정 후보 여섯의 J를 내고 하나를 고른다 |
 | `hoop-config` | `lab/bench/hoop.yaml`에서 후보나 참고 arm의 hoop 설정을 새 파일로 만든다 |
 | `stet-config` | `lab/bench/stet.yaml`에서 `upstream`의 데이터베이스만 바꾼 사본을 새 파일로 만든다 |
@@ -554,6 +554,8 @@ bin/stet-lab bench send -practice -arm stet -addr 127.0.0.1:56433
 kill %1; wait
 bin/stet-lab bench collect -practice -arm stet
 ```
+
+연습 arm도 공격을 `clone -practice -arm <arm> -x 1`로 만든 X용 복제본에 `send -practice -arm <arm> -sets X`로 보낼 수 있다. 채점 실행 전에 공격 도구를 확인하려는 것이고, 간격(쪼개기 묶음 앞의 70초 포함)은 채점 실행과 같다. `choose`는 V와 I만 읽으므로 고르는 결과는 바뀌지 않는다.
 
 **결과가 놓이는 곳**
 
