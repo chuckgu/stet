@@ -28,6 +28,8 @@ commands:
   replay   ask a model arm about every recorded write it has not answered (stored in lab.replays)
   score    score arms against the labels (A0, A1, and A2 are computed; model arms read lab.replays)
   label    give one recorded write a label by hand
+  bench    the hoop benchmark's databases: prepare the snapshot, clone it per arm, drop, list
+           (stet-lab bench prepare|clone|drop|list)
 `
 
 func main() {
@@ -51,6 +53,8 @@ func main() {
 		err = runScore(os.Args[2:])
 	case "label":
 		err = runLabel(os.Args[2:])
+	case "bench":
+		err = runBench(os.Args[2:])
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
