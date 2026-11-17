@@ -548,11 +548,26 @@ func sentText(sql, inline, wire string, bind bool) string {
 	return inline
 }
 
+// noneJoined is the error of a collect that joined a record of the proxy to none of the arm's writes: they did
+// not go through the arm's proxy (bench send -addr was the database server), or the records given are not this
+// run's. Nothing is stored then.
+func noneJoined(arm, records string, sent []Sent) error {
+	tagged := 0
+	for _, s := range sent {
+		if s.Tag != "" {
+			tagged++
+		}
+	}
+	return fmt.Errorf("%s joined none of arm %s's writes: 0 of %d writes sent (%d tagged) have a record. Were they "+
+		"sent through the arm's proxy, and are these the records of this run? nothing was stored", records, arm,
+		len(sent), tagged)
+}
+
 // CollectHoop joins hoop's audit events and the recorder's calls to the arm's writes as recorded in
 // lab.outcomes of conn, the arm's own database (bind: the arm sends bound values; byText: join by text and
 // order, see FromAudit), and stores the result there in one transaction: the arm's rows of lab.proxy are
 // replaced, Unconfirm runs with the violations within the writes' windows, and Collected goes to lab.meta.
-// When FromAudit refuses, nothing is stored.
+// When FromAudit refuses, or no judgment line joined any of the writes, nothing is stored.
 func CollectHoop(ctx context.Context, conn *pgx.Conn, arm string, bind bool, events []AuditEvent, calls []Call, byText bool) ([]Proxy, Collected, error) {
 	sent, err := sentOf(ctx, conn, arm, bind)
 	if err != nil {
@@ -562,6 +577,9 @@ func CollectHoop(ctx context.Context, conn *pgx.Conn, arm string, bind bool, eve
 	if err != nil {
 		return nil, Collected{}, err
 	}
+	if len(rows) == 0 {
+		return nil, Collected{}, noneJoined(arm, "hoop's audit log", sent)
+	}
 	c, err = storeCollected(ctx, conn, arm, rows, violations, c)
 	return rows, c, err
 }
@@ -570,7 +588,8 @@ func CollectHoop(ctx context.Context, conn *pgx.Conn, arm string, bind bool, eve
 // clones, joins them by tag to the arm's writes as recorded in lab.outcomes of conn, the arm's own
 // database, and stores the result there in one transaction: the arm's rows of lab.proxy are replaced and
 // Collected goes to lab.meta. A write decided in several of the databases takes the decision made within its
-// window (pickDecision); when not exactly one was, it is an error and nothing is stored.
+// window (pickDecision); when not exactly one was, it is an error and nothing is stored. When no decision joined
+// any of the writes, nothing is stored either.
 func CollectStet(ctx context.Context, conn *pgx.Conn, arm string, decisions []*pgx.Conn) ([]Proxy, Collected, error) {
 	sent, err := sentOf(ctx, conn, arm, false)
 	if err != nil {
@@ -606,6 +625,9 @@ func CollectStet(ctx context.Context, conn *pgx.Conn, arm string, decisions []*p
 		c.OutOfWindow += outside
 		c.LLMCostUSD += d.CostUSD
 		rows = append(rows, d.Proxy)
+	}
+	if len(rows) == 0 {
+		return nil, Collected{}, noneJoined(arm, "stet.decisions", sent)
 	}
 	c, err = storeCollected(ctx, conn, arm, rows, nil, c)
 	return rows, c, err

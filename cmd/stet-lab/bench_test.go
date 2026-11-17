@@ -37,12 +37,39 @@ func TestSendKeepsTheXFlagsToTheXSet(t *testing.T) {
 		{[]string{"-sets", "X", "-from", "-2"}, "bench send: -from -2:"},
 		{[]string{"-arm", "hoop-cache", "-sets", "X"}, `bench send: -sets: arm hoop-cache does not send set "X"`},
 	} {
-		// Nothing listens on the address: without the check the command
+		// Nothing listens on the addresses: without the check the command
 		// fails to connect instead.
-		args := append([]string{"-pg", "127.0.0.1:1", "-arm", "hoop", "-addr", "127.0.0.1:1"}, c.args...)
+		args := append([]string{"-pg", "127.0.0.1:1", "-arm", "hoop", "-addr", "127.0.0.1:2"}, c.args...)
 		err := benchSend(args)
 		if err == nil || !strings.HasPrefix(err.Error(), c.want) {
 			t.Errorf("bench send %s: err = %v, want one starting %q", strings.Join(c.args, " "), err, c.want)
+		}
+	}
+}
+
+func TestSendGoesThroughTheArmsProxy(t *testing.T) {
+	for _, c := range []struct {
+		args    []string
+		refused bool
+	}{
+		{[]string{"-arm", "hoop", "-addr", "127.0.0.1:1"}, true}, // the database server itself
+		{[]string{"-arm", "hoop", "-addr", "localhost:1"}, true},
+		{[]string{"-arm", "stet", "-sets", "X", "-addr", "127.0.0.1:1"}, true},
+		{[]string{"-arm", "stet-bind", "-sets", "V", "-addr", "localhost:1"}, true},
+		{[]string{"-practice", "-arm", "hoop-a", "-addr", "127.0.0.1:1"}, true},
+		{[]string{"-arm", "none", "-addr", "127.0.0.1:2"}, true}, // none goes to the database server
+		{[]string{"-arm", "none", "-sets", "X", "-addr", "127.0.0.1:2"}, true},
+		{[]string{"-arm", "hoop", "-addr", "127.0.0.1:2"}, false},
+		{[]string{"-arm", "stet", "-sets", "X", "-addr", "localhost:2"}, false},
+		{[]string{"-arm", "none", "-addr", "localhost:1"}, false},
+		{[]string{"-arm", "none", "-sets", "X", "-addr", "127.0.0.1:1"}, false},
+	} {
+		// Nothing listens on either address: an address that passes the check
+		// fails to connect instead.
+		err := benchSend(append([]string{"-pg", "127.0.0.1:1"}, c.args...))
+		refused := err != nil && strings.HasPrefix(err.Error(), "bench send: -addr ")
+		if err == nil || refused != c.refused {
+			t.Errorf("bench send %s: err = %v, want the -addr refused: %v", strings.Join(c.args, " "), err, c.refused)
 		}
 	}
 }

@@ -709,6 +709,50 @@ func TestCollectThroughTheFake(t *testing.T) {
 	}
 }
 
+// TestCollectRefusesWritesNoRecordJoins: an arm's writes sent straight to the database, around its proxy, have
+// no record of the proxy. collect stores nothing and says how many of the writes sent had a record.
+func TestCollectRefusesWritesNoRecordJoins(t *testing.T) {
+	ctx := context.Background()
+	ta, tn, _, _ := testTemplate(t)
+	clone := testClone(t, false)
+	lab := connectAs(t, ta, tn.Owner(), OwnerPassword, clone)
+	stmts := vWrites(t, 3)
+	for _, arm := range []string{"hoop", "stet"} {
+		o := fastOptions(1)
+		o.Arm = arm
+		if err := Record(ctx, lab, Target{Addr: ta.Addr, Database: clone, Names: tn}, singles(stmts...), o, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	other := testStmt(9, "update contacts set notes = 'other run' where id = 9") // a record of no write of these arms
+	events := []AuditEvent{judgment(other, time.Now(), true)}
+	_, database, n := startStet(t) // its stet.decisions holds nothing of these writes
+	gate, err := pgx.Connect(ctx, GateURL(ta.Addr, n, database))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Close(ctx)
+
+	for arm, collect := range map[string]func() error{
+		"hoop": func() error { _, _, err := CollectHoop(ctx, lab, "hoop", false, events, nil, false); return err },
+		"stet": func() error { _, _, err := CollectStet(ctx, lab, "stet", []*pgx.Conn{gate}); return err },
+	} {
+		if err := collect(); err == nil || !strings.Contains(err.Error(), "0 of 3 writes sent") {
+			t.Errorf("%s: collect = %v, want a refusal saying 0 of 3 writes sent have a record", arm, err)
+		}
+		if n, _ := proxyRows(t, lab, arm); n != 0 {
+			t.Errorf("%s: lab.proxy holds %d rows, want none stored", arm, n)
+		}
+		var meta bool
+		if err := lab.QueryRow(ctx, "select exists (select 1 from lab.meta where key = $1)", "collect:"+arm).Scan(&meta); err != nil {
+			t.Fatal(err)
+		}
+		if meta {
+			t.Errorf("%s: lab.meta holds collect:%s, want nothing stored", arm, arm)
+		}
+	}
+}
+
 func TestCollectStetJoinsTheDecisionsByTag(t *testing.T) {
 	addr, database, n := startStet(t)
 	ctx := context.Background()

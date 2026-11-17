@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -239,7 +240,8 @@ func benchList(args []string) error {
 // benchSend sends an arm's stream to -addr (spec 4, "보내는 방식") and
 // records every write's outcome in lab.outcomes of the arm's database. A set
 // the arm already has outcomes of is not sent again. -sets X goes its own
-// way (benchSendX).
+// way (benchSendX). -addr is the arm's proxy, never the database server
+// (-pg); for none it is the database server (throughProxy).
 func benchSend(args []string) error {
 	fs := flag.NewFlagSet("bench send", flag.ExitOnError)
 	f := newBenchFlags(fs)
@@ -268,6 +270,9 @@ func benchSend(args []string) error {
 				return errors.New("bench send: -sets: X is sent alone")
 			}
 		}
+	}
+	if err := throughProxy(*arm, *addr, *f.pg); err != nil {
+		return fmt.Errorf("bench send: %w", err)
 	}
 	if slices.Equal(sets, []string{tasks.SetX}) {
 		reclone, err := benchSendX(f, *arm, *rerun, *x, *from, *addr, bind)
@@ -333,6 +338,38 @@ func benchSend(args []string) error {
 	}
 	fmt.Printf("%s, arm %s, sets %s: %d of %d sent; %s\n", db, *arm, strings.Join(sets, ","), done, total, outcomeCounts(count))
 	return err
+}
+
+// throughProxy refuses an -addr that would skip the arm's proxy: every arm but none sends to its proxy, never
+// to the database server (-pg) itself, and none sends to the database server. Both are host:port, with
+// localhost and the loopback addresses taken as one host. Without it a proxied arm sent to the database runs
+// everything, and its collect finds no record of a proxy.
+func throughProxy(arm, addr, pg string) error {
+	same := sameServer(addr, pg)
+	switch {
+	case arm == "none" && !same:
+		return fmt.Errorf("-addr %s: arm none sends to the database server itself, -pg %s", addr, pg)
+	case arm != "none" && same:
+		return fmt.Errorf("-addr %s is the database server (-pg %s): arm %s sends through its proxy, at the proxy's "+
+			"address", addr, pg, arm)
+	}
+	return nil
+}
+
+// sameServer reports whether two host:port addresses name the same server.
+func sameServer(a, b string) bool {
+	norm := func(addr string) string {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return addr
+		}
+		switch strings.ToLower(host) {
+		case "localhost", "127.0.0.1", "::1":
+			host = "loopback"
+		}
+		return net.JoinHostPort(host, port)
+	}
+	return norm(a) == norm(b)
 }
 
 // benchSendX sends the arm's attacks from attack from on into its X clone x
@@ -553,7 +590,9 @@ func (r *repeated) Set(v string) error { *r = append(*r, v); return nil }
 // earlier rows. A stet arm's decisions are read, as Stet's account, from its database and from each -db (its
 // X clones). A hoop arm's come from its audit logs and the recorder's files, and its blocked outcomes whose
 // write has no violation line in the logs become unknown (bench.Unconfirm). What it found is kept in
-// lab.meta as collect:<arm> and printed on one line.
+// lab.meta as collect:<arm> and printed on one line, with how many of the writes sent have a record. When no
+// record joined any of them (the arm was sent around its proxy, or the records are another run's), it fails
+// and stores nothing.
 func benchCollect(args []string) error {
 	fs := flag.NewFlagSet("bench collect", flag.ExitOnError)
 	f := newBenchFlags(fs)
@@ -639,6 +678,10 @@ func benchCollect(args []string) error {
 	if err != nil {
 		return fmt.Errorf("bench collect: %s: nothing was stored: %w", db, err)
 	}
+	var sent int
+	if err := conn.QueryRow(ctx, "select count(*) from lab.outcomes where arm = $1", *arm).Scan(&sent); err != nil {
+		return fmt.Errorf("bench collect: %s: count the writes sent: %w", db, err)
+	}
 
 	blocked, layers := 0, map[string]int{}
 	for _, p := range rows {
@@ -655,8 +698,9 @@ func benchCollect(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("%s, arm %s: %d writes in lab.proxy, %d blocked (%s); %d records of its writes outside their time "+
-		"window left out; collect:%s %s\n", db, *arm, len(rows), blocked, strings.Join(by, ", "), c.OutOfWindow, *arm, meta)
+	fmt.Printf("%s, arm %s: %d of %d writes sent have a record of the proxy (lab.proxy), %d blocked (%s); %d records "+
+		"of its writes outside their time window left out; collect:%s %s\n", db, *arm, len(rows), sent, blocked,
+		strings.Join(by, ", "), c.OutOfWindow, *arm, meta)
 	return nil
 }
 
