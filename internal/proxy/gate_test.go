@@ -608,6 +608,47 @@ func TestGateSeesSessionSettings(t *testing.T) {
 	}
 }
 
+// The server reads a prepared statement's literals at its Parse, so a write
+// run from a statement parsed before an answered SET changed the time zone
+// was not read under the zone the gate is handed: Begin is told so. One
+// parsed after the change is not.
+func TestGateSeesAStatementParsedUnderOtherSettings(t *testing.T) {
+	table := watchedTable(t)
+	g := newRecordingGate(watches(table))
+	addr, _ := startProxyWith(t, upstream(t), g, proxy.Policy{Enforce: true})
+	fe := rawAgent(t, addr, table)
+	insert := func(id int) string { return fmt.Sprintf("insert into %s values (%d, 'x')", table, id) }
+	query := func(sql string) {
+		t.Helper()
+		sendAll(t, fe, &pgproto3.Query{String: sql})
+		untilReady(t, fe)
+	}
+
+	query("set timezone = 'Asia/Tokyo'")
+	sendAll(t, fe, &pgproto3.Parse{Name: "before", Query: insert(1)}, &pgproto3.Sync{})
+	untilReady(t, fe)
+	query("set timezone = 'UTC'")
+	sendAll(t, fe, &pgproto3.Parse{Name: "after", Query: insert(2)}, &pgproto3.Sync{})
+	untilReady(t, fe)
+	for _, name := range []string{"before", "after"} {
+		sendAll(t, fe, &pgproto3.Bind{PreparedStatement: name}, &pgproto3.Execute{}, &pgproto3.Sync{})
+		untilReady(t, fe)
+	}
+
+	bs, os := g.outcomes(t, 2)
+	for i, o := range os {
+		if !o.Executed {
+			t.Errorf("write %d: %+v, want executed", i+1, o)
+		}
+	}
+	if info := bs[0].info; info.TimeZone != "UTC" || !info.SetPending {
+		t.Errorf("write parsed before the SET began with %+v, want TimeZone UTC and SetPending", info)
+	}
+	if info := bs[1].info; info.TimeZone != "UTC" || info.SetPending {
+		t.Errorf("write parsed after the SET began with %+v, want TimeZone UTC and no SetPending", info)
+	}
+}
+
 // Only the sessions of the listed login roles are shown to the gate. Another
 // role's session is relayed without it: nothing is inspected or begun.
 func TestSessionsOfOtherRolesAreNotSeen(t *testing.T) {

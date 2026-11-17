@@ -674,6 +674,7 @@ func TestClassifySets(t *testing.T) {
 		{"set time zone 'UTC'", true},
 		{"reset timezone", true},
 		{"reset all", true},
+		{"set timezone to default", true},
 		{"begin; set local a.b = '1'", true},
 
 		{"show timezone", false},

@@ -156,10 +156,12 @@ type SessionInfo struct {
 	// TimeZone, DateStyle and IntervalStyle are what the server last reported for
 	// the session; "" for one it has not reported. Followed on enforced sessions only.
 	TimeZone, DateStyle, IntervalStyle string
-	// SetPending means a SET or RESET was sent that no ReadyForQuery has answered
-	// yet, before the statement or in its own message: the three settings may
-	// not be the ones the statement runs under. Like them, followed on enforced
-	// sessions only.
+	// SetPending means the three settings may not be the ones the server read
+	// the statement's literals and bind values under: a SET or RESET was sent
+	// that no ReadyForQuery has answered yet, before the statement or in its
+	// own message; or the statement's Parse or its portal's Bind came before
+	// the server reported a change of one of the three, or while such a SET
+	// was not answered. Like them, followed on enforced sessions only.
 	SetPending bool
 }
 
@@ -258,19 +260,40 @@ type session struct {
 	// Query unit whose current COPY FROM STDIN the client has not ended yet
 	// (see admit, copyIn). timeZone, dateStyle and intervalStyle: what the
 	// server last reported of TimeZone, DateStyle and IntervalStyle (see
-	// parameter); setsCarried: since the last ReadyForQuery, an unsynced unit
+	// parameter), and changes: how many times one of them changed (see
+	// readUnder); setsCarried: since the last ReadyForQuery, an unsynced unit
 	// that held a SET or RESET was answered (see setPending).
 	utf8, standard                     bool
 	serverUTF8                         bool
 	end                                string
 	lastQuery, copying                 *unit
 	timeZone, dateStyle, intervalStyle string
+	changes                            int
 	setsCarried                        bool
 }
 
+// readUnder is what an enforced session knew of its settings when a Parse or
+// Bind arrived. The server reads a statement's literals under TimeZone,
+// DateStyle and IntervalStyle at its Parse, and a portal's text bind values
+// at its Bind, not at the Execute that runs them (checked on PostgreSQL
+// 14.18). changes is session.changes then; pending says a SET or RESET not
+// answered then may have changed them before the server read the message
+// (setPending), or that the record stands for reads under different counts
+// (see with).
+type readUnder struct {
+	changes int
+	pending bool
+}
+
+// with is a record read otherwise (readOtherwise) whenever r or o is.
+func (r readUnder) with(o readUnder) readUnder {
+	return readUnder{changes: r.changes, pending: r.pending || o.pending || r.changes != o.changes}
+}
+
 type prepared struct {
-	st   Statement
-	oids []uint32
+	st      Statement
+	atParse readUnder // enforced sessions only: when its Parse arrived
+	oids    []uint32
 	// unread: set by a Parse the proxy could not read. What it runs is
 	// unknown.
 	unread bool
@@ -291,6 +314,21 @@ type bound struct {
 	// (see names.get): the portal runs one of them if the newest did not
 	// hold.
 	others []prepared
+	// Enforced sessions only: atParse is the Parse of each meaning its
+	// statement's name had at the Bind, folded into one (see readUnder.with);
+	// atBind, when the Bind arrived.
+	atParse, atBind readUnder
+}
+
+// read is what a write run by an Execute of b was read under: its
+// statement's Parse and its Bind, and those of others, the other meanings of
+// the portal's name, any of which the Execute may run.
+func (b bound) read(others []bound) readUnder {
+	r := b.atParse.with(b.atBind)
+	for _, o := range others {
+		r = r.with(o.atParse).with(o.atBind)
+	}
+	return r
 }
 
 // unit is the stretch of client messages answered by one ReadyForQuery: a
@@ -327,7 +365,7 @@ type unit struct {
 	copies, copyEnds, strayAt int
 	query                     bool
 	dirty                     bool // it holds a statement that is not clean (see Statement.Clean)
-	sets                      bool // on an enforced session: it holds a SET or RESET (see setPending)
+	sets                      bool // on an enforced session: it may hold a SET or RESET (see setPending)
 	executes                  int  // Execute messages so far
 	completions               int  // CommandComplete, EmptyQueryResponse, PortalSuspended
 	err                       string
@@ -611,7 +649,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 				return s.block(u, 0, 'Q', "", reason), nil
 			}
 		}
-		return s.statement(u, 0, 0, 'Q', st, nil, nil, flush), nil
+		return s.statement(u, 0, 0, 'Q', st, nil, nil, nil, flush), nil
 
 	case 'P':
 		var m pgproto3.Parse
@@ -668,6 +706,9 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 			return s.block(u, pos, 'P', name, BlockNameEncoding), nil
 		}
 		if read {
+			if s.enforce {
+				p.atParse = s.readNow()
+			}
 			s.stmts.put(u, pos, m.Name, true, p)
 		} else {
 			s.stmts.putUnread(u, pos, prepared{unread: true})
@@ -680,6 +721,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		var p prepared
 		var ok bool
 		var others []prepared
+		var atParse, atBind readUnder
 		if !s.enforce && !read {
 			s.wouldBlock(unreadable(body))
 		}
@@ -693,6 +735,15 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		}
 		if read {
 			p, ok, others = s.stmts.get(u, m.PreparedStatement)
+			if s.enforce && ok {
+				// The portal runs whichever meaning of the name holds, one
+				// dropped below as the same statement included, and each may
+				// have been parsed under other settings.
+				atParse = p.atParse
+				for _, q := range others {
+					atParse = atParse.with(q.atParse)
+				}
+			}
 			// An older meaning that is the same statement is no other meaning.
 			others = slices.DeleteFunc(others, func(q prepared) bool { return ok && p.same(q) })
 		}
@@ -708,12 +759,16 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 			s.mu.Unlock()
 			return s.block(u, pos, 'B', "", BlockNameEncoding), nil
 		}
+		if s.enforce {
+			atBind = s.readNow()
+		}
 		s.mu.Unlock()
 		// Bind values are copied without the lock: the server side takes it
 		// for every completion it counts.
 		b := bound{unread: true}
 		if read {
 			b = binding(&m, p, ok, others)
+			b.atParse, b.atBind = atParse, atBind
 		}
 		s.mu.Lock()
 		if read {
@@ -765,7 +820,12 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 			s.markDirty(u)
 			return nil, nil
 		}
-		r := s.statement(u, idx, pos, 'E', b.st, b.params, b.rows, flush)
+		var under *readUnder
+		if s.enforce && b.st.Watch {
+			at := b.read(others)
+			under = &at
+		}
+		r := s.statement(u, idx, pos, 'E', b.st, b.params, b.rows, under, flush)
 		if mayRunUnclean(b, others) {
 			s.markDirty(u) // the server may run another meaning of the name
 		}
@@ -880,15 +940,17 @@ func (s *session) firstTime(reason string) bool {
 
 // statement follows st, arriving as a Query (idx and pos 0) or as Execute idx
 // at pos of u, with the bind values ps and the running row count rows of its
-// portal. It returns the message to send in its place when the gate refused
-// it, and nil to forward it.
+// portal, and, for a watched write an Execute runs on an enforced session,
+// what its statement and portal were read under (nil otherwise: a Query is
+// read where it runs). It returns the message to send in its place when the
+// gate refused it, and nil to forward it.
 //
 // A refused statement never runs, so it leaves on_behalf_of and the cursor
 // table as they were. It still marks u: its replacement was sent and fails,
 // and the server's answer settles the rest.
-func (s *session) statement(u *unit, idx, pos int, t byte, st Statement, ps []Param, rows *int64, flush func() error) []byte {
+func (s *session) statement(u *unit, idx, pos int, t byte, st Statement, ps []Param, rows *int64, under *readUnder, flush func() error) []byte {
 	if st.Watch {
-		if r := s.begin(u, idx, pos, t, st, ps, flush); r != nil {
+		if r := s.begin(u, idx, pos, t, st, ps, under, flush); r != nil {
 			s.dirties(u, st)
 			return r
 		}
@@ -935,7 +997,7 @@ func (s *session) markDirty(u *unit) {
 	s.mu.Unlock()
 }
 
-// markSets notes that u, on an enforced session, holds a SET or RESET.
+// markSets notes that u, on an enforced session, may hold a SET or RESET.
 func (s *session) markSets(u *unit) {
 	s.mu.Lock()
 	u.sets = true
@@ -974,14 +1036,34 @@ func (s *session) setPending() bool {
 	return s.setsCarried || slices.ContainsFunc(s.units, func(u *unit) bool { return u.sets })
 }
 
-// begin hands a watched write, arriving as message t at pos of u (see
-// statement), to the gate. Messages already queued go out first so they are
-// not held back while the gate reads state. When the gate refuses the write,
-// begin returns the message to send in its place.
-func (s *session) begin(u *unit, idx, pos int, t byte, st Statement, ps []Param, flush func() error) []byte {
+// readNow is what a Parse or Bind arriving now is read under (see readUnder).
+// It runs with s.mu held, once the message has joined its unit, so a SET
+// earlier in the unit counts.
+func (s *session) readNow() readUnder {
+	return readUnder{changes: s.changes, pending: s.setPending()}
+}
+
+// readOtherwise reports whether what was read under r may have been read
+// under other settings than the ones the server reported last: one of them
+// changed since, or a SET or RESET was not answered then. It runs with s.mu
+// held.
+func (s *session) readOtherwise(r readUnder) bool {
+	return r.pending || r.changes != s.changes
+}
+
+// begin hands a watched write, arriving as message t at pos of u and read
+// under under (see statement), to the gate. Messages already queued go out
+// first so they are not held back while the gate reads state. When the gate
+// refuses the write, begin returns the message to send in its place.
+func (s *session) begin(u *unit, idx, pos int, t byte, st Statement, ps []Param, under *readUnder, flush func() error) []byte {
 	flush()
 	s.mu.Lock()
 	info := s.identity()
+	if under != nil && s.readOtherwise(*under) {
+		// Its statement or portal was read under settings other than those
+		// handed over. Compared under the lock that took them.
+		info.SetPending = true
+	}
 	s.mu.Unlock()
 	if st.OnBehalfOf != nil {
 		info.OnBehalfOf = *st.OnBehalfOf // a SET in the write's own message counts for it

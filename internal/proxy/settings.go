@@ -27,7 +27,14 @@ import (
 // An enforced session also follows TimeZone, DateStyle and IntervalStyle,
 // by which the server reads a date, time or interval sent as text, and hands
 // them to the gate, which keeps them with a write it holds so that the write
-// runs later as it would have then (spec 4).
+// runs later as it would have then (spec 4). The server reads a statement's
+// literals under them at its Parse, and a portal's text bind values at its
+// Bind, not at the Execute, and reports a change only before the
+// ReadyForQuery that follows it. So the gate is also told, through
+// SetPending, when the settings handed over may not be the ones the server
+// read a write's literals and values under: a SET or RESET not answered yet
+// (setPending), or a statement or portal read before a change or while such
+// a SET was not answered (readUnder).
 
 // readable reports whether the server reads this session's statements as the
 // classifier does: it last reported client_encoding UTF8 (or UNICODE) and
@@ -70,13 +77,13 @@ func (s *session) parameter(head *unit, body []byte) error {
 		s.serverUTF8 = string(value) == "UTF8"
 		return nil
 	case "TimeZone":
-		s.timeZone = string(value)
+		s.follow(&s.timeZone, value)
 		return nil
 	case "DateStyle":
-		s.dateStyle = string(value)
+		s.follow(&s.dateStyle, value)
 		return nil
 	case "IntervalStyle":
-		s.intervalStyle = string(value)
+		s.follow(&s.intervalStyle, value)
 		return nil
 	default:
 		return nil
@@ -85,6 +92,16 @@ func (s *session) parameter(head *unit, body []byte) error {
 		return s.endWith(BlockSettingChanged)
 	}
 	return nil
+}
+
+// follow keeps value, which the server reported for one of the settings the
+// gate is handed, in *setting, and counts a change when it differs from what
+// was there (see readUnder). It runs with s.mu held.
+func (s *session) follow(setting *string, value []byte) {
+	if *setting != string(value) {
+		*setting = string(value)
+		s.changes++
+	}
 }
 
 // sentAfter reports whether the server may have read, after a change made by

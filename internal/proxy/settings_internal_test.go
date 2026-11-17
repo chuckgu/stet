@@ -386,6 +386,13 @@ func TestSessionSettingsAreFollowed(t *testing.T) {
 	if info.TimeZone != "UTC" || info.DateStyle != "ISO, MDY" || info.IntervalStyle != "postgres" || info.SetPending {
 		t.Errorf("write after the SET began with %+v, want UTC, ISO, MDY, postgres and no SET pending", info)
 	}
+	serve(s, tag("INSERT 0 1"), ready)
+	send(s, queryMsg("set datestyle = 'SQL, DMY'; set intervalstyle = 'iso_8601'"))
+	serve(s, tag("SET"), tag("SET"), setting("DateStyle", "SQL, DMY"), setting("IntervalStyle", "iso_8601"), ready)
+	info = began(t, g, s, queryMsg(ins))
+	if info.TimeZone != "UTC" || info.DateStyle != "SQL, DMY" || info.IntervalStyle != "iso_8601" || info.SetPending {
+		t.Errorf("write after the second SET began with %+v, want UTC, SQL, DMY, iso_8601 and no SET pending", info)
+	}
 
 	g = newSetGate()
 	s = startEnforced(g, setting("TimeZone", "UTC"))
@@ -419,6 +426,14 @@ func TestSetPendingUntilReadyForQuery(t *testing.T) {
 			func(s *session) { send(s, queryMsg(set)) },
 			msgs(queryMsg(ins)), true,
 			msgs2(tag("SET"), setting("TimeZone", "UTC"), ready, tag("INSERT 0 1"), ready)},
+		{"a Query of RESET not answered yet",
+			func(s *session) { send(s, queryMsg("reset timezone")) },
+			msgs(queryMsg(ins)), true,
+			msgs2(tag("RESET"), ready, tag("INSERT 0 1"), ready)}, // already the default: nothing reported
+		{"a Query of SET ... TO DEFAULT not answered yet",
+			func(s *session) { send(s, queryMsg("set timezone to default")) },
+			msgs(queryMsg(ins)), true,
+			msgs2(tag("SET"), ready, tag("INSERT 0 1"), ready)},
 		{"a Query of SET answered by its ReadyForQuery",
 			func(s *session) {
 				send(s, queryMsg(set))
@@ -494,6 +509,135 @@ func TestSetPendingForAnotherMeaningOfAName(t *testing.T) {
 	}
 }
 
+// The server reads a statement's literals under the session's settings at
+// its Parse, and a portal's text bind values at its Bind, not at the Execute
+// (checked on PostgreSQL 14.18). So a write run from a statement or portal
+// read before the server reported a change of TimeZone, DateStyle or
+// IntervalStyle, or while a SET or RESET was not answered, is begun with
+// SetPending, even once everything was answered. A report that repeats a
+// value, or of another setting, changes nothing.
+func TestSetPendingForWhatWasReadUnderOtherSettings(t *testing.T) {
+	const set = "set timezone = 'UTC'"
+	parsed := func(s *session) {
+		send(s, parseMsg("s1", ins), syncMsg)
+		serve(s, parseOK, ready)
+	}
+	// reported sends a SET and answers it with reports.
+	reported := func(s *session, status byte, reports ...pgproto3.BackendMessage) {
+		send(s, queryMsg(set))
+		serve(s, tag("SET"))
+		serve(s, reports...)
+		serve(s, readyWith(status))
+	}
+	run := msgs(bindMsg("", "s1"), execMsg(""), syncMsg)
+	for _, c := range []struct {
+		name   string
+		before func(s *session)
+		write  []pgproto3.FrontendMessage
+		want   bool
+	}{
+		{"parsed before a change of TimeZone", func(s *session) {
+			parsed(s)
+			reported(s, 'I', setting("TimeZone", "UTC"))
+		}, run, true},
+		{"parsed before a change of DateStyle", func(s *session) {
+			parsed(s)
+			reported(s, 'I', setting("DateStyle", "SQL, DMY"))
+		}, run, true},
+		{"parsed before a change of IntervalStyle", func(s *session) {
+			parsed(s)
+			reported(s, 'I', setting("IntervalStyle", "iso_8601"))
+		}, run, true},
+		{"parsed before a report of the same value", func(s *session) {
+			parsed(s)
+			reported(s, 'I', setting("TimeZone", "Asia/Seoul"))
+		}, run, false},
+		{"parsed before a change of another setting", func(s *session) {
+			parsed(s)
+			reported(s, 'I', setting("application_name", "x"))
+		}, run, false},
+		{"parsed with no SET since", parsed, run, false},
+		{"parsed while a SET was not answered", func(s *session) {
+			send(s, queryMsg(set), parseMsg("s1", ins), syncMsg)
+			serve(s, tag("SET"), setting("TimeZone", "UTC"), ready, parseOK, ready)
+		}, run, true},
+		// Read under UTC, though the server reports nothing: the zone ends as
+		// it was.
+		{"parsed between a SET and its undoing under one Sync", func(s *session) {
+			send(s, parseMsg("", set), bindMsg("", ""), execMsg(""), parseMsg("s1", ins),
+				parseMsg("", "set timezone = 'Asia/Seoul'"), bindMsg("", ""), execMsg(""), syncMsg)
+			serve(s, parseOK, bindOK, tag("SET"), parseOK, parseOK, bindOK, tag("SET"), ready)
+		}, run, true},
+		{"parsed again after the change", func(s *session) {
+			parsed(s)
+			reported(s, 'I', setting("TimeZone", "UTC"))
+			send(s, closeMsg('S', "s1"), parseMsg("s1", ins), syncMsg)
+			serve(s, closeOK, parseOK, ready)
+		}, run, false},
+		// The server refuses the second Parse (42P05) and runs the statement
+		// it holds, read before the change.
+		{"parsed again under its name, not answered yet", func(s *session) {
+			parsed(s)
+			reported(s, 'I', setting("TimeZone", "UTC"))
+			send(s, parseMsg("s1", ins), syncMsg)
+		}, run, true},
+		{"bound before a change, in a transaction", func(s *session) {
+			send(s, queryMsg("begin"))
+			serve(s, tag("BEGIN"), readyWith('T'))
+			send(s, parseMsg("s1", ins), bindMsg("p", "s1"), syncMsg)
+			serve(s, parseOK, bindOK, readyWith('T'))
+			reported(s, 'T', setting("TimeZone", "UTC"))
+		}, msgs(execMsg("p"), syncMsg), true},
+		{"bound while a SET was not answered", func(s *session) {
+			send(s, queryMsg("begin"))
+			serve(s, tag("BEGIN"), readyWith('T'))
+			send(s, parseMsg("s1", ins), syncMsg)
+			serve(s, parseOK, readyWith('T'))
+			// A SET of the zone the session has: the server reports nothing.
+			send(s, queryMsg("set timezone = 'Asia/Seoul'"), bindMsg("p", "s1"), syncMsg)
+			serve(s, tag("SET"), readyWith('T'), bindOK, readyWith('T'))
+		}, msgs(execMsg("p"), syncMsg), true},
+		{"parsed and bound after the change, in a transaction", func(s *session) {
+			send(s, queryMsg("begin"))
+			serve(s, tag("BEGIN"), readyWith('T'))
+			reported(s, 'T', setting("TimeZone", "UTC"))
+			send(s, parseMsg("s1", ins), bindMsg("p", "s1"), syncMsg)
+			serve(s, parseOK, bindOK, readyWith('T'))
+		}, msgs(execMsg("p"), syncMsg), false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			g := newSetGate()
+			s := startEnforced(g, setting("TimeZone", "Asia/Seoul"), setting("DateStyle", "ISO, MDY"), setting("IntervalStyle", "postgres"))
+			c.before(s)
+			if info := began(t, g, s, c.write...); info.SetPending != c.want {
+				t.Errorf("write began with SetPending %v, want %v", info.SetPending, c.want)
+			}
+		})
+	}
+}
+
+// What an Execute runs may be any meaning its portal's name has, so each of
+// them read under other settings counts (see bound.read).
+func TestEveryMeaningOfAPortalCounts(t *testing.T) {
+	s := startEnforced(newSetGate(), setting("TimeZone", "UTC"))
+	now := readUnder{changes: s.changes}
+	fresh := bound{atParse: now, atBind: now}
+	for _, c := range []struct {
+		name   string
+		others []bound
+		want   bool
+	}{
+		{"none", nil, false},
+		{"one read now", []bound{fresh}, false},
+		{"one parsed before a change", []bound{{atParse: readUnder{changes: s.changes - 1}, atBind: now}}, true},
+		{"one bound while a SET was pending", []bound{{atParse: now, atBind: readUnder{changes: s.changes, pending: true}}}, true},
+	} {
+		if got := s.readOtherwise(fresh.read(c.others)); got != c.want {
+			t.Errorf("%s: read otherwise %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
 // A session that does not enforce follows none of this: its server tap is
 // not shown ParameterStatus, and Begin is handed none of the three settings
 // and no SET pending (rule 6: the shadow path stays as it was).
@@ -507,6 +651,14 @@ func TestShadowSessionsFollowNoSettings(t *testing.T) {
 	send(s, queryMsg("set timezone = 'UTC'"))
 	if info := began(t, g, s, queryMsg(ins)); info.TimeZone != "" || info.DateStyle != "" || info.IntervalStyle != "" || info.SetPending {
 		t.Errorf("write began with %+v, want no settings and no SET pending", info)
+	}
+	serve(s, tag("SET"), ready, tag("INSERT 0 1"), ready)
+	send(s, parseMsg("s1", ins), syncMsg)
+	serve(s, parseOK, ready)
+	send(s, queryMsg("set timezone = 'Asia/Tokyo'"))
+	serve(s, tag("SET"), setting("TimeZone", "Asia/Tokyo"), ready)
+	if info := began(t, g, s, bindMsg("", "s1"), execMsg(""), syncMsg); info.SetPending {
+		t.Errorf("write of a statement parsed before a SET began with %+v, want no SET pending", info)
 	}
 }
 
