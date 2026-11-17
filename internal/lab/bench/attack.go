@@ -41,11 +41,15 @@ type AttackResult struct {
 //
 // owner is the owner's connection to t.Database itself, not through the arm's proxy: it runs the probes,
 // resolves the OIDs of FunctionCall steps, opens the connection that holds an attack's lock, and waits for the
-// database to settle before each after probe. stmts holds the steps by ID. Before the first attack RunAttacks
-// connects once to t as that attack's first step would, and when that fails it returns an error having sent and
-// recorded nothing. Every step's outcome goes to save and every attack's result to saveAttack, one call at a
-// time. On an error, next is the attack that was not finished: its result was not saved, though some of its
-// steps' outcomes may have been.
+// database to settle before each after probe. stmts holds the steps by ID. Every step's outcome goes to save
+// and every attack's result to saveAttack, one call at a time.
+//
+// The run stops with an error at an attack the arm cannot be reached for, so that an arm that went away is not
+// recorded as having stopped what it was never sent: before each attack's probe it connects once to t as the
+// attack's first step would, and stops having sent and recorded nothing of the attack when that fails; and a
+// step whose connection cannot be opened stops it at that step, unrecorded (the burst, whose workers reconnect
+// on their own, only when not one of its steps could connect). On an error, next is the attack that was not
+// finished: its result was not saved, though some of its steps' outcomes may have been (CheckResume names them).
 func RunAttacks(ctx context.Context, t Target, owner *pgx.Conn, attacks []tasks.Attack, stmts map[string]tasks.Stmt,
 	from int, o Options, save func(Outcome) error, saveAttack func(AttackResult) error) (next int, reclone bool, err error) {
 	if from < 0 || from > len(attacks) {
@@ -57,13 +61,6 @@ func RunAttacks(ctx context.Context, t Target, owner *pgx.Conn, attacks []tasks.
 	}
 	if o.Sleep == nil {
 		o.Sleep = time.Sleep
-	}
-	if from < len(attacks) && len(attacks[from].Steps) > 0 {
-		if s, ok := stmts[attacks[from].Steps[0]]; ok {
-			if err := reach(ctx, t, s.Role, s.App); err != nil {
-				return from, false, fmt.Errorf("run attacks: %w", err)
-			}
-		}
 	}
 	x := &attackRun{t: t, owner: owner, stmts: stmts, o: o, lim: newLimiter(o.PerSecond), oids: map[string]uint32{},
 		save: save}
@@ -179,8 +176,8 @@ type attackRun struct {
 	save   func(Outcome) error
 }
 
-// run runs attack i: the pause, the probe, the connections, the lock, the steps, the lock's release, the
-// database settling, the probe.
+// run runs attack i: the pause, the check that the arm answers, the probe, the connections, the lock, the
+// steps, the lock's release, the database settling, the probe.
 func (x *attackRun) run(ctx context.Context, i int, a tasks.Attack) (AttackResult, error) {
 	r := AttackResult{Arm: x.o.Arm, Index: i, Path: a.Path, Code: a.Code, Payload: a.Payload, Database: x.t.Database}
 	steps := make([]tasks.Stmt, len(a.Steps))
@@ -196,6 +193,11 @@ func (x *attackRun) run(ctx context.Context, i int, a tasks.Attack) (AttackResul
 	}
 	if err := ctx.Err(); err != nil {
 		return r, err
+	}
+	if len(steps) > 0 {
+		if err := reach(ctx, x.t, steps[0].Role, steps[0].App); err != nil {
+			return r, err
+		}
 	}
 	before, okBefore, err := x.probe(ctx, a.Probe)
 	if err != nil {
@@ -420,10 +422,17 @@ func (rt *route) hangUp() {
 // send sends the steps and reports each outcome. One after another, each step waits for the shared rate; at
 // once, the workers send their steps in parallel without it. It stops at the first error save returns, or when
 // ctx ends: no step starts after that, and one already sent finishes and is reported as the far side answered.
+//
+// One after another, a step whose connection could not be opened is an error, not reported: the arm went away
+// and the attack is cut there. At once, such a step is reported like any other (a worker that cannot reconnect
+// is part of the burst), and only when every step was one is it an error.
 func (x *attackRun) send(ctx context.Context, rt *route, steps []tasks.Stmt) error {
 	if !rt.atOnce {
 		for i, s := range steps {
 			out, err := x.step(ctx, rt.via[i], s, x.lim)
+			if err == nil && out.unreached {
+				err = fmt.Errorf("step %s was not sent: %s", s.ID, out.Message)
+			}
 			if err == nil {
 				err = x.report(out)
 			}
@@ -435,11 +444,21 @@ func (x *attackRun) send(ctx context.Context, rt *route, steps []tasks.Stmt) err
 	}
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	var wg sync.WaitGroup
+	var (
+		wg        sync.WaitGroup
+		mu        sync.Mutex
+		unreached int
+		last      string // the message of the last step whose connection could not be opened
+	)
 	for k, w := range rt.workers {
 		wg.Go(func() {
 			for i := k; i < len(steps) && ctx.Err() == nil; i += len(rt.workers) {
 				out, err := x.step(ctx, w, steps[i], nil)
+				if err == nil && out.unreached {
+					mu.Lock()
+					unreached, last = unreached+1, out.Message
+					mu.Unlock()
+				}
 				if err == nil {
 					err = x.report(out)
 				}
@@ -451,7 +470,13 @@ func (x *attackRun) send(ctx context.Context, rt *route, steps []tasks.Stmt) err
 		})
 	}
 	wg.Wait()
-	return context.Cause(ctx)
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	if unreached == len(steps) {
+		return fmt.Errorf("not one of the %d steps sent at once could connect (the last: %s)", len(steps), last)
+	}
+	return nil
 }
 
 func (x *attackRun) report(out Outcome) error {

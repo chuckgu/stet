@@ -40,6 +40,9 @@ type fakeHoop struct {
 	Mode  string                // "answer" (default), "hang" (never answers), "drop" (closes without answering)
 	Exec  func(sql string)      // called before answering or dropping; tests run the statement on a real database with it
 	Audit string                // a file to append hoop-shaped audit lines to; "" writes none (Task 8)
+	// Refuse is asked about each connection by its number, from 1 in the order accepted: true answers the
+	// startup with FATAL 53300 and hangs up, so that connecting fails. nil refuses none.
+	Refuse func(conn int) bool
 
 	ln     net.Listener
 	wg     sync.WaitGroup
@@ -171,6 +174,12 @@ func (f *fakeHoop) session(c net.Conn, id int) {
 		return
 	}
 	s.user, s.database, s.app = sm.Parameters["user"], sm.Parameters["database"], sm.Parameters["application_name"]
+	if f.Refuse != nil && f.Refuse(id) {
+		s.be.Send(&pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: "53300",
+			Message: "sorry, too many clients already"})
+		s.be.Flush()
+		return
+	}
 	s.deny, s.mode, s.exec, s.audit = f.Deny, f.Mode, f.Exec, f.Audit
 	s.sessionID = randomHex()
 	s.write(auditLine{Kind: "session_start", Principal: "anonymous"})

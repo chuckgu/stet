@@ -235,8 +235,9 @@ func TestNothingRunsBehindAServerThatDeniesEverything(t *testing.T) {
 	if want := slices.Repeat([]time.Duration{70 * time.Second}, 10); !slices.Equal(p.all(), want) {
 		t.Errorf("Sleep was called with %v, want 70s ten times", p.all())
 	}
-	if m := f.MaxOpen(); m <= 4 || m > 32 {
-		t.Errorf("%d connections were open at once, want more than 4 (the burst) and at most 32", m)
+	// The burst's address check may still count at the fake when its 32 connections open: the client hung up on it.
+	if m := f.MaxOpen(); m <= 4 || m > 33 {
+		t.Errorf("%d connections were open at once, want more than 4 (the burst) and at most 33 (32 and the address check)", m)
 	}
 
 	// What reached the fake: the FunctionCall by the function's OID and the
@@ -542,7 +543,7 @@ func TestBurstOpensItsConnectionsFirstAndIgnoresTheRate(t *testing.T) {
 	if d > 5*time.Second {
 		t.Errorf("s8.burst's 200 steps took %v, want them at once (20s at the rate)", d)
 	}
-	// RunAttacks's first connection, which only checks that the address
+	// The attack's first connection, which only checks that the address
 	// answers, may still count at the fake: the client hung up on it.
 	if m := f.MaxOpen(); m < 32 || m > 33 || len(f.Seen()) != 200 {
 		t.Errorf("s8.burst: %d connections open at once, %d statements; want 32 (33 with the address check) and 200",
@@ -819,5 +820,168 @@ func TestAttacksToADeadAddressRecordNothing(t *testing.T) {
 	}
 	if took := time.Since(start); took > 10*time.Second {
 		t.Errorf("took %v to find the address dead; want one short attempt, not the connect window", took)
+	}
+}
+
+// shortConnect shortens the connect window for the test.
+func shortConnect(t *testing.T) {
+	t.Helper()
+	window, every := connectWindow, connectEvery
+	connectWindow, connectEvery = 300*time.Millisecond, 50*time.Millisecond
+	t.Cleanup(func() { connectWindow, connectEvery = window, every })
+}
+
+// labIDs returns the first column of query over the arm's rows, as text, in order.
+func labIDs(t *testing.T, conn *pgx.Conn, query string) []string {
+	t.Helper()
+	rows, err := conn.Query(context.Background(), query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ids
+}
+
+// TestAttacksStopWhenTheArmGoesAway: the arm's proxy is gone after attack 0. Attack 1 is neither sent nor
+// recorded as not executed: the run stops at it with an error, lab.attacks holds attack 0 only, and it goes on
+// from attack 1 once a proxy answers again.
+func TestAttacksStopWhenTheArmGoesAway(t *testing.T) {
+	a, n, _, b := testTemplate(t)
+	stmts := xStmts(b)
+	clone := testClone(t, false)
+	owner := connectAs(t, a, n.Owner(), OwnerPassword, clone)
+	lab := connectAs(t, a, n.Owner(), OwnerPassword, clone)
+	ctx := context.Background()
+	shortConnect(t)
+	attacks := b.Attacks[:6]
+	o := xOptions("hoop", (&pauses{}).sleep)
+	save := func(x Outcome) error { return SaveOutcome(ctx, lab, x) }
+
+	f := startFakeHoop(t)
+	next, _, err := RunAttacks(ctx, Target{Addr: f.Addr, Database: clone, Names: n}, owner, attacks, stmts, 0, o, save,
+		func(r AttackResult) error {
+			if err := SaveAttack(ctx, lab, r); err != nil {
+				return err
+			}
+			if r.Index == 0 {
+				f.close() // the proxy dies
+			}
+			return nil
+		})
+	if err == nil || next != 1 || !strings.Contains(err.Error(), "attack 1 ("+attacks[1].Path+")") ||
+		!strings.Contains(err.Error(), f.Addr) {
+		t.Fatalf("RunAttacks with the proxy gone after attack 0: next %d, err %v; want 1 and an error naming attack 1 and %s",
+			next, err, f.Addr)
+	}
+	if got := labIDs(t, lab, "select idx::text from lab.attacks where arm = 'hoop' order by idx"); !slices.Equal(got, []string{"0"}) {
+		t.Errorf("lab.attacks holds attacks %q, want only 0: attack 1 and later were never sent", got)
+	}
+	want := slices.Sorted(slices.Values(attacks[0].Steps))
+	if got := labIDs(t, lab, "select id from lab.outcomes where arm = 'hoop' order by id"); !slices.Equal(got, want) {
+		t.Errorf("lab.outcomes holds %q, want only attack 0's steps %q", got, want)
+	}
+
+	// The guard lets the run go on from attack 1, and it does once a proxy answers.
+	if err := CheckResume(ctx, lab, "hoop", attacks, 1); err != nil {
+		t.Fatalf("CheckResume -from 1: %v", err)
+	}
+	g := startFakeHoop(t)
+	next, _, err = RunAttacks(ctx, Target{Addr: g.Addr, Database: clone, Names: n}, owner, attacks, stmts, 1, o, save,
+		func(r AttackResult) error { return SaveAttack(ctx, lab, r) })
+	if err != nil || next != len(attacks) {
+		t.Fatalf("resumed from 1: next %d, err %v; want %d, nil", next, err, len(attacks))
+	}
+	if got := labIDs(t, lab, "select idx::text from lab.attacks where arm = 'hoop' order by idx"); len(got) != len(attacks) {
+		t.Errorf("after the resume lab.attacks holds %q, want all %d attacks", got, len(attacks))
+	}
+}
+
+// TestStepThatCannotConnectStopsItsAttack: s5.prepare_execute's PREPARE is denied, and the proxy is gone before
+// EXECUTE reconnects. The attack is cut there: no outcome for EXECUTE, no result for the attack, and the resume
+// guard names the step that was recorded.
+func TestStepThatCannotConnectStopsItsAttack(t *testing.T) {
+	a, n, _, b := testTemplate(t)
+	stmts := xStmts(b)
+	clone := testClone(t, false)
+	owner := connectAs(t, a, n.Owner(), OwnerPassword, clone)
+	lab := connectAs(t, a, n.Owner(), OwnerPassword, clone)
+	ctx := context.Background()
+	shortConnect(t)
+	attack := b.Attacks[indexOf(t, b.Attacks, "s5.prepare_execute")]
+	prepare, execute := attack.Steps[0], attack.Steps[1]
+
+	f := startFakeHoop(t)
+	f.Deny = func(sql string) bool { return strings.Contains(sql, "prepare ") }
+	var saved []string
+	results := 0
+	next, _, err := RunAttacks(ctx, Target{Addr: f.Addr, Database: clone, Names: n}, owner, []tasks.Attack{attack}, stmts, 0,
+		xOptions("hoop", (&pauses{}).sleep),
+		func(x Outcome) error {
+			saved = append(saved, x.ID)
+			if x.ID == prepare {
+				f.ln.Close() // the proxy stops taking connections after the denial
+			}
+			return SaveOutcome(ctx, lab, x)
+		},
+		func(AttackResult) error { results++; return nil })
+	if err == nil || next != 0 || !strings.Contains(err.Error(), execute) || !strings.Contains(err.Error(), "connect: ") {
+		t.Errorf("RunAttacks: next %d, err %v; want 0 and an error naming step %s and its failed connect", next, err, execute)
+	}
+	if !slices.Equal(saved, []string{prepare}) || results != 0 {
+		t.Errorf("saved outcomes %q and %d results; want only %s's outcome and no result", saved, results, prepare)
+	}
+	if err := CheckResume(ctx, lab, "hoop", []tasks.Attack{attack}, 0); err == nil || !strings.Contains(err.Error(), "cut off") ||
+		!strings.Contains(err.Error(), prepare) {
+		t.Errorf("CheckResume -from 0: %v, want the cut-off attack named with its recorded step %s", err, prepare)
+	}
+}
+
+// TestBurstStopsOnlyWhenNoStepCouldConnect: a worker of the burst that cannot reconnect is part of the attack,
+// and its steps are recorded as unknown; when not one step could connect, the attack is cut and not recorded.
+func TestBurstStopsOnlyWhenNoStepCouldConnect(t *testing.T) {
+	a, n, _, b := testTemplate(t)
+	stmts := xStmts(b)
+	clone := testClone(t, false)
+	owner := connectAs(t, a, n.Owner(), OwnerPassword, clone)
+	shortConnect(t)
+	burst := b.Attacks[indexOf(t, b.Attacks, "s8.burst")]
+	for _, c := range []struct {
+		name     string
+		accepted int // connections let in: the address check's, then the burst's
+		cut      bool
+	}{
+		{"no step connects", 1, true},
+		{"half the workers connect", 17, false},
+	} {
+		f := startFakeHoop(t)
+		f.Refuse = func(conn int) bool { return conn > c.accepted }
+		got := map[string]int{}
+		results := 0
+		_, _, err := RunAttacks(context.Background(), Target{Addr: f.Addr, Database: clone, Names: n}, owner,
+			[]tasks.Attack{burst}, stmts, 0, xOptions("hoop", (&pauses{}).sleep),
+			func(x Outcome) error {
+				k := x.Result
+				if strings.HasPrefix(x.Message, "connect: ") {
+					k = "connect failed"
+				}
+				got[k]++
+				return nil
+			},
+			func(AttackResult) error { results++; return nil })
+		switch {
+		case c.cut && (err == nil || !strings.Contains(err.Error(), "s8.burst") || results != 0):
+			t.Errorf("%s: err %v, %d results; want an error naming s8.burst and no result", c.name, err, results)
+		case !c.cut && (err != nil || results != 1):
+			t.Errorf("%s: err %v, %d results; want the attack recorded", c.name, err, results)
+		}
+		if c.cut && got["connect failed"] != len(burst.Steps) {
+			t.Errorf("%s: outcomes %v, want all %d steps failed to connect", c.name, got, len(burst.Steps))
+		}
+		if !c.cut && (got["connect failed"] == 0 || got[Executed] == 0 || got["connect failed"]+got[Executed] != len(burst.Steps)) {
+			t.Errorf("%s: outcomes %v, want some executed and some failed to connect, %d in all", c.name, got, len(burst.Steps))
+		}
 	}
 }

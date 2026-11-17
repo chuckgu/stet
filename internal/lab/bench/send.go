@@ -36,6 +36,9 @@ type Outcome struct {
 	Result                      string
 	Rows                        *int64
 	SQLState, Severity, Message string
+	// unreached is not stored: the statement was not sent, because its connection could not be opened. Its
+	// result is unknown and its message starts with "connect: ".
+	unreached bool
 }
 
 // Classify turns the answer to one statement into the result, rows and error fields of an Outcome.
@@ -251,7 +254,7 @@ func (w *worker) send(ctx context.Context, t Target, s tasks.Stmt, o Options, li
 			// Not classified: a server that refuses the session (FATAL
 			// 42501 for a missing CONNECT right, say) refused no statement.
 			return Outcome{Arm: o.Arm, ID: s.ID, Tag: s.Tag, Set: s.Set, SentAt: time.Now(), Result: Unknown,
-				Message: err.Error()}, nil
+				Message: err.Error(), unreached: true}, nil
 		}
 		w.conn, w.role, w.app = c, s.Role, s.App
 	}
