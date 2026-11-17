@@ -75,8 +75,10 @@ CREATE INDEX IF NOT EXISTS decisions_verdict_idx ON stet.decisions (verdict, cre
 CREATE INDEX IF NOT EXISTS decisions_agent_idx ON stet.decisions (agent_id, created_at DESC);
 
 -- 규칙 3: append-only. 사후 라벨 컬럼만 바꿀 수 있다. 역할 권한과 별개로 DB가 직접 막는다.
+-- search_path를 고정한다. 트리거를 일으킨 세션의 search_path에 행 타입에 꼭 맞는 to_jsonb 같은 함수가 있으면
+-- pg_catalog의 것 대신 그것이 불려 무엇이든 통과시킬 수 있다. 아래의 held_writes_guard도 같다.
 CREATE OR REPLACE FUNCTION stet.decisions_append_only() RETURNS trigger
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
   IF TG_OP = 'UPDATE'
      AND (to_jsonb(NEW) - '{label,label_by,labeled_at}'::text[])
@@ -169,7 +171,7 @@ CREATE INDEX IF NOT EXISTS held_writes_approved ON stet.held_writes (resolved_at
 -- 그래서 승인된 줄의 max_rows를 넓히거나 resolved_at을 늦춰 10분을 다시 세게 할 수 없다. Stet의 계정도 마찬가지다.
 -- DELETE는 막지 않는다.
 CREATE OR REPLACE FUNCTION stet.held_writes_guard() RETURNS trigger
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
   free CONSTANT text[] := '{status,in_transaction,resolved_by,resolved_at,note,max_rows,applied_at,rows_affected,error}';
 BEGIN
@@ -209,6 +211,7 @@ CREATE TRIGGER held_writes_guard
 -- 검토자가 보는 것 (docs/spec-v0.2-approve.md 5장). 보류 건과 판단 기록의 근거를 함께 보여 준다.
 -- 판단 기록이 없는 줄도 나온다. expires_at이 지난 pending은 expired로 보인다(저장하는 상태가 아니다).
 -- 뷰는 소유자(Stet의 계정)의 권한으로 읽으므로 검토자에게 두 테이블의 권한이 필요 없다.
+-- settings는 텍스트 값이 읽힐 설정이다. 마지막 컬럼으로 둔다. CREATE OR REPLACE VIEW는 컬럼을 끝에 더하는 것만 받는다.
 CREATE OR REPLACE VIEW stet.review AS
 SELECT h.id,
        CASE WHEN h.status = 'pending' AND (h.expires_at IS NULL OR h.expires_at <= now())
@@ -219,7 +222,8 @@ SELECT h.id,
        h.verdict, h.reasons, h.planned_rows, h.rows_exact,
        d.impact, d.cumulative, d.proposed, d.state, d.answers,
        h.resolved_by, h.resolved_at, h.note, h.max_rows,
-       h.applied_at, h.rows_affected, h.error
+       h.applied_at, h.rows_affected, h.error,
+       h.settings
 FROM stet.held_writes h LEFT JOIN stet.decisions d ON d.id = h.decision_id;
 
 -- 승인과 거부 (docs/spec-v0.2-approve.md 6장). 줄의 상태만 바꾸고 문장은 실행하지 않는다. 실행은 Stet 프로세스가 한다(7장).

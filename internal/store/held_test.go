@@ -336,6 +336,56 @@ func TestHeldWritesContentIsFixed(t *testing.T) {
 	}
 }
 
+// The two guard triggers resolve what they call in pg_catalog whatever the
+// search_path of the session that fires them. A function named like one they
+// call that fits the row exactly, as to_jsonb(stet.held_writes) does better
+// than pg_catalog's to_jsonb(anyelement), would be chosen from that path and
+// could let any change through. It runs in a database of its own, so that
+// the schema it adds is seen by no other test.
+func TestGuardTriggersIgnoreTheCallersSearchPath(t *testing.T) {
+	ctx := context.Background()
+	pool := newPool(t, ownDatabase(t))
+	s := store.New(pool)
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	h := sampleHeld()
+	if err := s.InsertHeldWrite(ctx, h); err != nil {
+		t.Fatal(err)
+	}
+	d := sample(uniqueTable(t))
+	if err := s.Insert(ctx, d); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	for _, sql := range []string{
+		"create schema hostile",
+		`create function hostile.to_jsonb(stet.held_writes) returns jsonb language sql as $$ select '{}'::jsonb $$`,
+		`create function hostile.to_jsonb(stet.decisions) returns jsonb language sql as $$ select '{}'::jsonb $$`,
+		"set search_path = hostile",
+	} {
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	for _, c := range []struct{ sql, id, message string }{
+		{"update stet.held_writes set statement = 'delete from contacts' where id = $1", h.ID,
+			"stet.held_writes: what was held cannot change"},
+		{"update stet.decisions set statement = 'delete from contacts' where id = $1", d.ID,
+			"stet.decisions is append-only: only label, label_by, labeled_at may change"},
+	} {
+		_, err := conn.Exec(ctx, c.sql, c.id)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "ST004" || pgErr.Message != c.message {
+			t.Errorf("%s under search_path hostile: err = %v, want SQLSTATE ST004 %q", c.sql, err, c.message)
+		}
+	}
+}
+
 // status moves only along the arrows of spec 3; an update that keeps it
 // passes, and a row in any status can be deleted.
 func TestHeldWritesStatusFollowsTheArrows(t *testing.T) {

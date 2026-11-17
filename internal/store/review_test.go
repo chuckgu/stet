@@ -319,6 +319,23 @@ func TestReviewShowsAHeldWriteWithItsDecision(t *testing.T) {
 	}
 }
 
+// The view shows the session settings a held write will be run under, by
+// which its text values are read: a reviewer can tell what '01/02/2026' is.
+func TestReviewShowsTheSettingsAHeldWriteRunsUnder(t *testing.T) {
+	s, pool := testStore(t)
+	rev, _ := reviewer(t)
+	h := sampleHeld()
+	h.Settings = map[string]string{"TimeZone": "Asia/Seoul", "DateStyle": "ISO, DMY", "IntervalStyle": "postgres"}
+	pendingHeld(t, s, pool, h)
+	var settings map[string]string
+	if err := rev.QueryRow(context.Background(), `select settings from stet.review where id = $1`, h.ID).Scan(&settings); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(settings, h.Settings) {
+		t.Errorf("settings = %v, want %v", settings, h.Settings)
+	}
+}
+
 func TestApproveMarksTheRow(t *testing.T) {
 	s, pool := testStore(t)
 	ctx := context.Background()
