@@ -29,8 +29,8 @@ func FailMarks(a *Applier, n int) {
 }
 
 // BeforeStatement has a call f once a held write passed the checks before
-// its statement, before the savepoint; nil removes it. Call it before a is
-// applying.
+// its statement, before it takes the row's role and settings; nil removes
+// it. Call it before a is applying.
 func BeforeStatement(a *Applier, f func()) {
 	a.beforeStatement = f
 }

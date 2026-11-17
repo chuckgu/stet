@@ -2,7 +2,11 @@ package apply
 
 import (
 	"context"
+	"fmt"
+	"runtime/debug"
 	"time"
+
+	"github.com/stetdb/stet/internal/store"
 )
 
 // pollEvery is how often the loop looks for approved held writes (spec 7).
@@ -54,9 +58,10 @@ func (a *Applier) loop() {
 }
 
 // poll lists the approved held writes and applies them in the listing's
-// order, one at a time, until Close is called. When Apply returns an error,
-// the write stays approved: the error is logged and the write is left out of
-// later polls until retryAfter has passed. Ids no longer listed leave retry.
+// order, one at a time, until Close is called. When Apply returns an error or
+// panics (try), the write stays approved: the error is logged and the write
+// is left out of later polls until retryAfter has passed. Ids no longer
+// listed leave retry.
 func (a *Applier) poll(retry map[string]time.Time) {
 	ctx, cancel := context.WithTimeout(a.ctx, listTimeout)
 	ws, err := a.store.ApprovedWrites(ctx, listLimit)
@@ -85,11 +90,25 @@ func (a *Applier) poll(retry map[string]time.Time) {
 		if time.Now().Before(retry[w.ID]) { // the zero time when it has not failed
 			continue
 		}
-		if err := a.applyOne(w); err != nil {
+		if err := a.try(w); err != nil {
 			retry[w.ID] = time.Now().Add(retryAfter)
 			a.log.Warn("held write not applied; it stays approved", "id", w.ID, "retry_after", retryAfter, "err", err)
 			continue
 		}
 		delete(retry, w.ID)
 	}
+}
+
+// try applies w, and turns a panic in it into an error, logged with its
+// stack: one write's processing does not take the proxy down. Apply's
+// deferred close of its connection has discarded the transaction by then, so
+// the write stays approved, as after any of Stet's own failures.
+func (a *Applier) try(w store.Approved) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			a.log.Error("panic while applying a held write", "id", w.ID, "panic", r, "stack", string(debug.Stack()))
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+	return a.applyOne(w)
 }

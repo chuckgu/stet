@@ -55,8 +55,9 @@ const (
 // settings is applied.
 var sessionSettings = []string{"TimeZone", "DateStyle", "IntervalStyle"}
 
-// savepoint is set before the statement and its role and settings (step 4),
-// so that a failure after it can be undone and the failure still recorded.
+// savepoint is set before the checks' reads (step 3), and so before the
+// statement and its role and settings (step 4), so that a failure after it
+// can be undone and the failure still recorded.
 const savepoint = "stet_apply"
 
 // Applier runs approved held writes (spec-v0.2-approve 7).
@@ -74,7 +75,7 @@ type Applier struct {
 
 	// Test seams.
 	markApplied     func(ctx context.Context, q store.Querier, id string, rows int64) error
-	beforeStatement func()                       // called once the checks pass, before the savepoint
+	beforeStatement func()                       // called once the checks pass, before the row's role and settings
 	applyOne        func(w store.Approved) error // what the loop calls for each write: Apply
 }
 
@@ -146,19 +147,19 @@ func (a *Applier) apply(ctx context.Context, conn *pgx.Conn, w store.Approved) e
 	}
 
 	// Step 3.
+	if _, err := tx.Exec(ctx, "savepoint "+savepoint); err != nil {
+		return fmt.Errorf("savepoint: %w", err)
+	}
 	reason, err := a.check(ctx, tx, c)
 	if err != nil {
 		return err
 	}
 	if reason != "" {
-		return a.fail(ctx, tx, c, reason, false)
+		return a.fail(ctx, tx, c, reason, true) // the reason may be a server error that aborted the transaction
 	}
 
 	if a.beforeStatement != nil {
 		a.beforeStatement()
-	}
-	if _, err := tx.Exec(ctx, "savepoint "+savepoint); err != nil {
-		return fmt.Errorf("savepoint: %w", err)
 	}
 	rows, reason, err := a.run(ctx, tx, c)
 	if err != nil {
@@ -183,7 +184,8 @@ func (a *Applier) apply(ctx context.Context, conn *pgx.Conn, w store.Approved) e
 }
 
 // check makes the checks before the statement (step 3) in the spec's order,
-// as Stet's account, and returns the reason not to run it, or "".
+// as Stet's account, and returns the reason not to run it, or "". A server
+// error in one of its reads may be such a reason (readFailure).
 func (a *Applier) check(ctx context.Context, tx pgx.Tx, c *store.Claimed) (string, error) {
 	if c.Lapsed {
 		return approvalLapsed, nil
@@ -215,7 +217,7 @@ func (a *Applier) check(ctx context.Context, tx pgx.Tx, c *store.Claimed) (strin
 		}
 		changed, err := rowChangedSince(ctx, tx.Conn().PgConn(), c, t.PK)
 		if err != nil {
-			return "", fmt.Errorf("read the row version: %w", err)
+			return readFailure("read the row version", err)
 		}
 		if changed {
 			return rowChanged, nil
@@ -223,12 +225,33 @@ func (a *Applier) check(ctx context.Context, tx pgx.Tx, c *store.Claimed) (strin
 	}
 	rolePath, _, err := RoleSearchPath(ctx, tx, c.LoginRole)
 	if err != nil {
-		return "", fmt.Errorf("read the role-level search_path of %s: %w", c.LoginRole, err)
+		return readFailure("read the role-level search_path of "+c.LoginRole, err)
 	}
 	if rolePath != nil && !slices.Equal(SchemaNames(*rolePath), SchemaNames(path)) {
 		return searchPathDiffers, nil
 	}
 	return "", nil
+}
+
+// readFailure sorts err from a read of the checks (step 3). A server error is
+// about the row, as a failed statement's is (its table was dropped, its key
+// does not fit the column), and is the reason to record, with its SQLSTATE
+// and message; unless it is Stet's own: a lock not had within Stet's
+// lock_timeout (55P03), or an error after which the connection is gone. That
+// one, and any other error, is returned, labelled with what was read.
+func readFailure(what string, err error) (string, error) {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code != "55P03" && !connectionGone(pgErr) {
+		return fmt.Sprintf("SQLSTATE %s: %s", pgErr.Code, pgErr.Message), nil
+	}
+	return "", fmt.Errorf("%s: %w", what, err)
+}
+
+// connectionGone reports whether the server ends the connection with e: a
+// connection exception (class 08), or an error of severity FATAL or PANIC,
+// such as 57P01 when the server shuts down.
+func connectionGone(e *pgconn.PgError) bool {
+	return strings.HasPrefix(e.Code, "08") || e.SeverityUnlocalized == "FATAL" || e.SeverityUnlocalized == "PANIC"
 }
 
 // rowChangedSince reads the target row's version as the gate does and
@@ -283,6 +306,12 @@ func (a *Applier) run(ctx context.Context, tx pgx.Tx, c *store.Claimed) (int64, 
 		return 0, reason, nil
 	}
 
+	// The statement may have changed search_path for the transaction (with
+	// set_config): Stet's own steps from here on resolve their names in
+	// pg_catalog, not through it. A failure undoes this with the statement.
+	if _, err := tx.Exec(ctx, "set local search_path = pg_catalog, pg_temp"); err != nil {
+		return 0, "", fmt.Errorf("reset search_path: %w", err)
+	}
 	var user string
 	if err := tx.QueryRow(ctx, "select current_user").Scan(&user); err != nil {
 		return 0, "", fmt.Errorf("read current_user: %w", err)

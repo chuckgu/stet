@@ -174,6 +174,53 @@ func TestLoopWaitsBeforeTryingAFailedWriteAgain(t *testing.T) {
 	e.wantName(2, "other")
 }
 
+// A panic in one write's processing is logged with its stack and is one of
+// Stet's own failures: the write stays approved and waits like one, and the
+// loop goes on with the others, at later polls too.
+func TestLoopGoesOnAfterAPanic(t *testing.T) {
+	e := setup(t)
+	panicking := e.approved(e.update("update contacts set name = 'panicking' where id = 1", 1), nil)
+	other := e.approved(e.update("update contacts set name = 'other' where id = 2", 2), nil)
+	var mu sync.Mutex
+	tried := 0
+	apply.OnApply(e.a, func(w store.Approved) error {
+		if w.ID == panicking.ID {
+			mu.Lock()
+			tried++
+			mu.Unlock()
+			panic("Apply made to panic by the test")
+		}
+		return e.a.Apply(w)
+	})
+
+	e.start()
+	e.eventually(3*time.Second, "the other approved write applied", e.settled(other.ID))
+	// Approved after the panic, so applied by a later poll: the loop is alive.
+	later := e.update("update contacts set name = 'later' where id = 3", 3)
+	e.pending(later)
+	e.exec("select stet.approve($1)", later.ID)
+	e.eventually(3*time.Second, "the write approved after the panic applied", e.settled(later.ID))
+
+	e.wantApplied(other.ID, 1)
+	e.wantName(2, "other")
+	e.wantApplied(later.ID, 1)
+	e.wantName(3, "later")
+	e.wantApproved(panicking.ID)
+	e.wantName(1, "n1")
+	mu.Lock()
+	n := tried
+	mu.Unlock()
+	if n != 1 {
+		t.Errorf("the panicking write was tried %d times, want once: it waits %s like any of Stet's own failures", n, 30*time.Second)
+	}
+	if !e.logged("level=ERROR", "id="+panicking.ID, "Apply made to panic by the test", "goroutine ") {
+		t.Errorf("no error line with the panic and its stack for %s; log:\n%s", panicking.ID, e.log)
+	}
+	if !e.logged("level=WARN", "id="+panicking.ID, `msg="held write not applied; it stays approved"`) {
+		t.Errorf("no warn line for %s as for one of Stet's own failures; log:\n%s", panicking.ID, e.log)
+	}
+}
+
 func TestCloseWaitsForTheWriteBeingApplied(t *testing.T) {
 	e := setup(t)
 	slow := e.approved(e.update("update contacts set name = (select 'slept' from pg_sleep(1)) where id = 1", 1), nil)
@@ -198,10 +245,10 @@ func TestCloseWaitsForTheWriteBeingApplied(t *testing.T) {
 
 func TestCloseAbandonsAWritePastItsBound(t *testing.T) {
 	e := setup(t)
-	e.cfg.Held.ApplyTimeout = time.Second
-	t.Cleanup(apply.SetGrace(-700 * time.Millisecond)) // a bound of 300ms; runs after Close
+	e.cfg.Held.ApplyTimeout = 2 * time.Second
+	t.Cleanup(apply.SetGrace(-time.Second)) // a bound of 1s, before the server's 2s; runs after Close
 	before := e.contents(table)
-	statement := "update contacts set name = (select 'slept' from pg_sleep(2)) where id = 1"
+	statement := "update contacts set name = (select 'slept' from pg_sleep(3)) where id = 1"
 	slow := e.approved(e.update(statement, 1), nil)
 	entered := entering(e.a)
 
@@ -209,8 +256,9 @@ func TestCloseAbandonsAWritePastItsBound(t *testing.T) {
 	e.wait(entered, "the slow write reached its statement")
 	began := time.Now()
 	e.a.Close()
-	if d := time.Since(began); d > time.Second {
-		t.Errorf("Close took %s, want under 1s", d)
+	// At the bound, not when the statement or the server's timeout ends it.
+	if d := time.Since(began); d > 2*time.Second {
+		t.Errorf("Close took %s, want under 2s", d)
 	}
 	e.wantApproved(slow.ID)
 	e.wantUnchanged(table, before)

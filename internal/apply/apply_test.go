@@ -769,6 +769,24 @@ func TestApplyKeepsToTheApprovedRows(t *testing.T) {
 	e.wantUnchanged(table, after)
 }
 
+// The statement may change search_path for the rest of the transaction.
+// Stet's own steps after it do not resolve their names through it: here the
+// statement puts first a schema whose clock_timestamp() would date the
+// write's applied_at in 2000.
+func TestApplyIgnoresTheSearchPathItsStatementSets(t *testing.T) {
+	e := setup(t)
+	e.exec("create schema trap")
+	e.exec(`create function trap.clock_timestamp() returns timestamptz language sql
+		as $$ select timestamptz '2000-01-01 00:00:00+00' $$`)
+	h := e.update("update contacts set name = set_config('search_path', 'trap, pg_catalog', true) where id = 1", 1)
+	e.apply(e.approved(h, nil))
+	e.wantApplied(h.ID, 1)
+	e.wantName(1, "trap, pg_catalog")
+	if r := e.row(h.ID); r.AppliedAt == nil || time.Since(*r.AppliedAt).Abs() > time.Minute {
+		t.Errorf("applied_at is %v, want about now: it came from trap.clock_timestamp()", deref(r.AppliedAt))
+	}
+}
+
 // Spec 11: a statement that changes the role is undone, and the executor
 // goes on with a connection of its own for the next row.
 func TestApplyUndoesAWriteThatChangesRole(t *testing.T) {
@@ -849,6 +867,21 @@ func TestApplyRecordsTheServersError(t *testing.T) {
 	}
 	e.wantUnchanged(table, before)
 	e.wantUnchanged("deferred", deferredBefore)
+}
+
+// A server error while a check reads what it needs is about the row, not one
+// of Stet's own failures: the gated table was dropped after the hold. It is
+// recorded as a failed statement's is, not retried until the approval lapses.
+func TestApplyRecordsAServerErrorInTheChecks(t *testing.T) {
+	e := setup(t)
+	h := e.update("update contacts set name = 'x' where id = 1", 1)
+	w := e.approved(h, nil)
+	e.exec("drop table contacts")
+	e.apply(w)
+	e.wantFailed(h.ID, `SQLSTATE 42P01: relation "contacts" does not exist`, true)
+	if !e.logged("level=WARN", `msg="held write failed"`, "id="+h.ID, `error="SQLSTATE 42P01: `) {
+		t.Errorf("no warn line for failed held write %s; log:\n%s", h.ID, e.log)
+	}
 }
 
 func TestApplyLeavesOtherStatusesAlone(t *testing.T) {
