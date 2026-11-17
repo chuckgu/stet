@@ -62,16 +62,61 @@ type AuditEvent struct {
 type Sent struct {
 	ID, Tag, Text string
 	At            time.Time
+	LatencyMS     float64 // from At to its answer, as lab.outcomes has it
 }
 
-// Collected is what a collect found, kept in lab.meta under "collect:<arm>".
+// joinSkew is how far a proxy's record of a write may lie outside the time the write was out: the proxies
+// run on the sender's machine, but hoop's clock is a container's.
+const joinSkew = 2 * time.Second
+
+// window is the time a proxy's records of the write fall in: from joinSkew before it was sent to joinSkew
+// after its answer. A record of the same tag outside it is another run's, or an abandoned attempt's.
+func (s Sent) window() (from, to time.Time) {
+	return s.At.Add(-joinSkew), s.At.Add(time.Duration(s.LatencyMS*float64(time.Millisecond)) + joinSkew)
+}
+
+func (s Sent) holds(t time.Time) bool {
+	from, to := s.window()
+	return !t.Before(from) && !t.After(to)
+}
+
+// runWindow is the run's window, from the earliest write's to the latest's; nothing sent holds nothing.
+func runWindow(sent []Sent) func(time.Time) bool {
+	if len(sent) == 0 {
+		return func(time.Time) bool { return false }
+	}
+	from, to := sent[0].window()
+	for _, s := range sent[1:] {
+		f, t := s.window()
+		from, to = minTime(from, f), maxTime(to, t)
+	}
+	return func(t time.Time) bool { return !t.Before(from) && !t.After(to) }
+}
+
+func minTime(a, b time.Time) time.Time {
+	if b.Before(a) {
+		return b
+	}
+	return a
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
+}
+
+// Collected is what a collect found, kept in lab.meta under "collect:<arm>". The hoop counts are of the
+// records joined to the arm's writes and of the untagged ones within the run's window, never the whole files.
 type Collected struct {
 	Join            string  `json:"join"`             // tag | text: how hoop's lines were joined to the writes
-	LLMCalls        int     `json:"llm_calls"`        // hoop: the lines of the recorder's files
+	LLMCalls        int     `json:"llm_calls"`        // hoop: the recorder's calls; one refused at the cap is none
 	LLMCostUSD      float64 `json:"llm_cost_usd"`     // the model's cost: the recorder's calls, or Stet's decisions
 	CapReached      bool    `json:"cap_reached"`      // hoop: a recorder line has event cap_reached
 	BudgetExhausted bool    `json:"budget_exhausted"` // hoop: an audit line has ai_status budget_exhausted
 	Unconfirmed     int     `json:"unconfirmed"`      // hoop: blocked outcomes whose write has no violation (Unconfirm)
+	OutOfWindow     int     `json:"out_of_window"`    // records of the arm's writes left out: outside the write's window
 }
 
 // TagOf returns the 12 digits of a "/* w:... */" comment anywhere in text, or "".
@@ -102,7 +147,10 @@ func ReadAudit(path string) ([]AuditEvent, error) {
 		}
 		events = append(events, e)
 	}
-	return events, sc.Err()
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return events, nil
 }
 
 // stetFailures are the reasons that mean Stet's judgment failed (plan B17): the model's error or absence,
@@ -144,111 +192,220 @@ func HoopLayer(e AuditEvent) (layer string, blocked, failure bool) {
 // and a padded statement may be megabytes long.
 const statementHead = 8192
 
-// FromDecisions reads stet.decisions of conn's database; ids maps a tag to its write id.
-//
-// A decision is joined by its statement's tag; of several on one tag the earliest counts. A decision
-// without a tag, or with one ids lacks, is dropped. conn must be able to read the stet schema: Stet's own
-// account owns it (GateURL).
-func FromDecisions(ctx context.Context, conn *pgx.Conn, arm string, ids map[string]string) ([]Proxy, error) {
-	rows, err := conn.Query(ctx, `select left(statement, $1), verdict, reasons, coalesce(refused, ''),
+// decision is a write's earliest decision in one database.
+type decision struct {
+	Proxy
+	At time.Time // created_at: when Stet received the statement
+	DB string
+}
+
+// readDecisions returns the earliest decision on each tag ids has in conn's database, in created_at order.
+func readDecisions(ctx context.Context, conn *pgx.Conn, arm string, ids map[string]string) ([]decision, error) {
+	db := conn.Config().Database
+	rows, err := conn.Query(ctx, `select left(statement, $1), created_at, verdict, reasons, coalesce(refused, ''),
 		coalesce(cost_usd, 0)::float8, coalesce(model_latency_ms, 0)
 		from stet.decisions order by created_at, id`, statementHead)
 	if err != nil {
-		return nil, fmt.Errorf("read stet.decisions of %s: %w", conn.Config().Database, err)
+		return nil, fmt.Errorf("read stet.decisions of %s: %w", db, err)
 	}
-	var out []Proxy
+	var out []decision
 	seen := map[string]bool{}
 	var head string
-	var p Proxy
-	_, err = pgx.ForEachRow(rows, []any{&head, &p.Verdict, &p.Reasons, &p.Refused, &p.CostUSD, &p.ModelMS}, func() error {
+	var d decision
+	_, err = pgx.ForEachRow(rows, []any{&head, &d.At, &d.Verdict, &d.Reasons, &d.Refused, &d.CostUSD, &d.ModelMS}, func() error {
 		tag := TagOf(head)
 		id, ok := ids[tag]
 		if tag == "" || !ok || seen[id] {
 			return nil
 		}
 		seen[id] = true
-		r := p
-		r.Reasons = slices.Clone(p.Reasons) // the next row scans into p
-		r.Arm, r.ID, r.Source = arm, id, "stet"
+		r := d
+		r.Reasons = slices.Clone(d.Reasons) // the next row scans into d
+		r.Arm, r.ID, r.Source, r.DB = arm, id, "stet", db
 		r.Layer, r.Blocked, r.Escalated, r.Failure = StetLayer(r.Verdict, r.Reasons, r.Refused)
 		out = append(out, r)
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("read stet.decisions of %s: %w", conn.Config().Database, err)
+		return nil, fmt.Errorf("read stet.decisions of %s: %w", db, err)
 	}
 	return out, nil
+}
+
+// FromDecisions reads stet.decisions of conn's database; ids maps a tag to its write id.
+//
+// A decision is joined by its statement's tag; of several on one tag the earliest counts. A decision
+// without a tag, or with one ids lacks, is dropped. conn must be able to read the stet schema: Stet's own
+// account owns it (GateURL).
+func FromDecisions(ctx context.Context, conn *pgx.Conn, arm string, ids map[string]string) ([]Proxy, error) {
+	ds, err := readDecisions(ctx, conn, arm, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Proxy, len(ds))
+	for i, d := range ds {
+		out[i] = d.Proxy
+	}
+	return out, nil
+}
+
+// pickDecision chooses write w's decision among its earliest decisions in each of the databases read, ds:
+// the one, when there is one. A tag decided in several databases is a step sent again, into a fresh clone,
+// after a cut-off: the decision made within the write's window is chosen, and outside counts the others.
+// When not exactly one was made within it, none is chosen.
+func pickDecision(w Sent, ds []decision) (d decision, outside int, err error) {
+	if len(ds) == 1 {
+		return ds[0], 0, nil
+	}
+	var in []decision
+	where := make([]string, len(ds))
+	for i, d := range ds {
+		if w.holds(d.At) {
+			in = append(in, d)
+		}
+		where[i] = fmt.Sprintf("%s at %s", d.DB, d.At.UTC().Format(time.RFC3339Nano))
+	}
+	if len(in) != 1 {
+		from, to := w.window()
+		return decision{}, 0, fmt.Errorf("write %s (tag %s) has decisions in %s, and %d of them fall within the time "+
+			"it was out (%s to %s): give only the databases its outcome was recorded from", w.ID, w.Tag,
+			strings.Join(where, ", "), len(in), from.UTC().Format(time.RFC3339Nano), to.UTC().Format(time.RFC3339Nano))
+	}
+	return in[0], len(ds) - 1, nil
 }
 
 // FromAudit joins audit events and recorder calls to writes. byText joins by statement text and order instead of by tag.
 // violations holds the ids of the writes that have a violation line.
 //
-// Only client lines (direction client or none) count. A write's judgment line is its first statement or
-// violation line in time order; hoop writes a denied statement as one violation line and no statement line,
-// so that line is both the judgment and the proof of the denial. Lines and calls no write is found for are
-// dropped. A write's recorder calls give it their count, cost and summed latency, and the title and
-// explanation of the last call that chose a level. Rows come in the order of sent.
-func FromAudit(arm string, events []AuditEvent, calls []Call, sent []Sent, byText bool) (rows []Proxy, violations map[string]bool, budgetExhausted bool) {
+// A record is joined to a write of its tag (or, byText, of its statement's text) only within the write's
+// window (Sent.holds): the files may hold other runs of the same tags, a rerun appended to them, or an
+// attempt abandoned and sent again. Records of the arm's writes outside their windows are left out and
+// counted in c.OutOfWindow.
+//
+// Only client lines (direction client or none) of kind statement or violation are judgments. A write's
+// judgment line is the one within its window; hoop writes a denied statement as one violation line and no
+// statement line, so that line is both the judgment and the proof of the denial. A write with two judgment
+// lines within its window is an error: none is picked. A write's recorder calls give it their count, cost and
+// summed latency, and the title and explanation of the last call that chose a level; a call refused at the
+// cost cap was never sent, and only sets c.CapReached. c's totals are of the records joined to the writes and
+// of the untagged ones (byText: those of no write's text, too) within the run's window; c.Unconfirmed is left
+// to Unconfirm. Rows come in the order of sent.
+func FromAudit(arm string, events []AuditEvent, calls []Call, sent []Sent, byText bool) (rows []Proxy, violations map[string]bool, c Collected, err error) {
+	c.Join = "tag"
+	if byText {
+		c.Join = "text"
+	}
+	key := func(statement string) string {
+		if byText {
+			return textKey(statement)
+		}
+		return TagOf(statement)
+	}
+	callKey := func(call Call) string {
+		if !byText {
+			return call.Tag
+		}
+		_, text, ok := strings.Cut(call.Input, "\n\n") // hoop's message: its headers, a blank line, the statement
+		if !ok {
+			return ""
+		}
+		return textKey(text)
+	}
+	// The writes of each tag or text, in the order sent. An empty text is no write's: a FunctionCall
+	// message has none, and a line without a statement is not its by position.
+	of := map[string][]Sent{}
+	ordered := slices.Clone(sent)
+	slices.SortStableFunc(ordered, func(a, b Sent) int { return a.At.Compare(b.At) })
+	for _, s := range ordered {
+		k := s.Tag
+		if byText {
+			k = textKey(s.Text)
+		}
+		if k != "" {
+			of[k] = append(of[k], s)
+		}
+	}
+	within := func(ws []Sent, t time.Time) []Sent {
+		var in []Sent
+		for _, w := range ws {
+			if w.holds(t) {
+				in = append(in, w)
+			}
+		}
+		return in
+	}
+	inRun := runWindow(sent)
+
 	var lines []AuditEvent
 	for _, e := range events {
-		if e.Direction != "client" && e.Direction != "" {
-			continue
-		}
-		if e.Metadata["ai_status"] == "budget_exhausted" {
-			budgetExhausted = true
-		}
-		if e.Kind == "statement" || e.Kind == "violation" {
+		if (e.Direction == "client" || e.Direction == "") && (e.Kind == "statement" || e.Kind == "violation") {
 			lines = append(lines, e)
 		}
 	}
 	slices.SortStableFunc(lines, func(a, b AuditEvent) int { return a.Timestamp.Compare(b.Timestamp) })
-	calls = slices.Clone(calls)
-	slices.SortStableFunc(calls, func(a, b Call) int { return a.Time.Compare(b.Time) })
-
-	var lineIDs, callIDs []string // the write of each line and call; "" for none
-	if byText {
-		lineIDs = joinByText(sent, len(lines), func(i int) (string, bool) { return lines[i].Statement, true })
-		callIDs = joinByText(sent, len(calls), func(i int) (string, bool) {
-			_, text, ok := strings.Cut(calls[i].Input, "\n\n") // hoop's message: its headers, a blank line, the statement
-			return text, ok
-		})
-	} else {
-		byTag := map[string]string{}
-		for _, s := range sent {
-			if s.Tag != "" {
-				byTag[s.Tag] = s.ID
-			}
-		}
-		for _, e := range lines {
-			lineIDs = append(lineIDs, byTag[TagOf(e.Statement)])
-		}
-		for _, c := range calls {
-			callIDs = append(callIDs, byTag[c.Tag])
-		}
-	}
-
 	violations = map[string]bool{}
 	judged := map[string]AuditEvent{}
-	for i, e := range lines {
-		id := lineIDs[i]
-		if id == "" {
+	for _, e := range lines {
+		exhausted := e.Metadata["ai_status"] == "budget_exhausted"
+		ws := of[key(e.Statement)]
+		if len(ws) == 0 {
+			if TagOf(e.Statement) == "" && inRun(e.Timestamp) && exhausted {
+				c.BudgetExhausted = true
+			}
 			continue
 		}
+		in := within(ws, e.Timestamp)
+		if len(in) == 0 {
+			c.OutOfWindow++
+			continue
+		}
+		i := slices.IndexFunc(in, func(w Sent) bool { _, ok := judged[w.ID]; return !ok })
+		if i < 0 {
+			w := in[0]
+			return nil, nil, Collected{}, fmt.Errorf("write %s (tag %s) has two judgment lines in hoop's audit log "+
+				"within the time it was out, at %s and %s: none is taken", w.ID, w.Tag,
+				judged[w.ID].Timestamp.UTC().Format(time.RFC3339Nano), e.Timestamp.UTC().Format(time.RFC3339Nano))
+		}
+		judged[in[i].ID] = e
 		if e.Kind == "violation" {
-			violations[id] = true
+			violations[in[i].ID] = true
 		}
-		if _, ok := judged[id]; !ok {
-			judged[id] = e
-		}
+		c.BudgetExhausted = c.BudgetExhausted || exhausted
 	}
+
+	calls = slices.Clone(calls)
+	slices.SortStableFunc(calls, func(a, b Call) int { return a.Time.Compare(b.Time) })
 	type usage struct {
 		calls              int
 		cost, ms           float64
 		title, explanation string
 	}
 	used := map[string]*usage{}
-	for i, c := range calls {
-		id := callIDs[i]
+	for _, call := range calls {
+		var id string
+		if ws := of[callKey(call)]; len(ws) > 0 {
+			in := within(ws, call.Time)
+			if len(in) == 0 {
+				c.OutOfWindow++
+				continue
+			}
+			// Of writes of one text out at once, the call is the latest's sent before it.
+			w := in[0]
+			for _, s := range in[1:] {
+				if !s.At.After(call.Time) {
+					w = s
+				}
+			}
+			id = w.ID
+		} else if call.Tag != "" || !inRun(call.Time) {
+			continue // another arm's write, or another run's
+		}
+		if call.Event == "cap_reached" {
+			c.CapReached = true // refused by the recorder: never sent
+			continue
+		}
+		c.LLMCalls++
+		c.LLMCostUSD += call.CostUSD
 		if id == "" {
 			continue
 		}
@@ -258,10 +415,10 @@ func FromAudit(arm string, events []AuditEvent, calls []Call, sent []Sent, byTex
 			used[id] = u
 		}
 		u.calls++
-		u.cost += c.CostUSD
-		u.ms += c.LatencyMS
-		if c.Level != "" {
-			u.title, u.explanation = c.Title, c.Explanation
+		u.cost += call.CostUSD
+		u.ms += call.LatencyMS
+		if call.Level != "" {
+			u.title, u.explanation = call.Title, call.Explanation
 		}
 	}
 
@@ -280,7 +437,7 @@ func FromAudit(arm string, events []AuditEvent, calls []Call, sent []Sent, byTex
 		}
 		rows = append(rows, p)
 	}
-	return rows, violations, budgetExhausted
+	return rows, violations, c, nil
 }
 
 // leadingTagRE is a tag comment at the start of a text.
@@ -289,31 +446,6 @@ var leadingTagRE = regexp.MustCompile(`^/\* w:\d{12} \*/`)
 // textKey is the text a join by text compares: without its leading tag comment and the spaces around.
 func textKey(text string) string {
 	return strings.TrimSpace(leadingTagRE.ReplaceAllString(strings.TrimSpace(text), ""))
-}
-
-// joinByText gives each of n items, in time order, a write id: the k-th item whose text is t goes to the
-// k-th write sent with text t (by Sent.At). An item without a text (text returns false), or one beyond the
-// writes sent with its text, gets "".
-func joinByText(sent []Sent, n int, text func(i int) (string, bool)) []string {
-	ordered := slices.Clone(sent)
-	slices.SortStableFunc(ordered, func(a, b Sent) int { return a.At.Compare(b.At) })
-	queue := map[string][]string{}
-	for _, s := range ordered {
-		k := textKey(s.Text)
-		queue[k] = append(queue[k], s.ID)
-	}
-	ids := make([]string, n)
-	for i := range n {
-		t, ok := text(i)
-		if !ok {
-			continue
-		}
-		k := textKey(t)
-		if q := queue[k]; len(q) > 0 {
-			ids[i], queue[k] = q[0], q[1:]
-		}
-	}
-	return ids
 }
 
 // proxyCols are lab.proxy's columns in Proxy's field order.
@@ -377,10 +509,10 @@ func GateURL(addr string, n Names, db string) string {
 	return pgURL(addr, n.Gate(), GatePassword, db)
 }
 
-// sentOf returns the arm's writes as recorded in lab.outcomes, in the order sent, each with the text it
-// went out with (sentText; bind: the arm sends bound values).
+// sentOf returns the arm's writes as recorded in lab.outcomes, in the order sent, each with the time it was
+// out and the text it went out with (sentText; bind: the arm sends bound values).
 func sentOf(ctx context.Context, conn *pgx.Conn, arm string, bind bool) ([]Sent, error) {
-	rows, err := conn.Query(ctx, `select o.id, o.tag, o.sent_at, w.sql, w.inline, w.wire
+	rows, err := conn.Query(ctx, `select o.id, o.tag, o.sent_at, o.latency_ms, w.sql, w.inline, w.wire
 		from lab.outcomes o join lab.writes w on w.id = o.id
 		where o.arm = $1 order by o.sent_at, o.id`, arm)
 	if err != nil {
@@ -389,7 +521,7 @@ func sentOf(ctx context.Context, conn *pgx.Conn, arm string, bind bool) ([]Sent,
 	sent, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (Sent, error) {
 		var s Sent
 		var sql, inline, wire string
-		err := r.Scan(&s.ID, &s.Tag, &s.At, &sql, &inline, &wire)
+		err := r.Scan(&s.ID, &s.Tag, &s.At, &s.LatencyMS, &sql, &inline, &wire)
 		s.Text = sentText(sql, inline, wire, bind)
 		return s, err
 	})
@@ -419,20 +551,16 @@ func sentText(sql, inline, wire string, bind bool) string {
 // CollectHoop joins hoop's audit events and the recorder's calls to the arm's writes as recorded in
 // lab.outcomes of conn, the arm's own database (bind: the arm sends bound values; byText: join by text and
 // order, see FromAudit), and stores the result there in one transaction: the arm's rows of lab.proxy are
-// replaced, Unconfirm runs, and Collected goes to lab.meta.
+// replaced, Unconfirm runs with the violations within the writes' windows, and Collected goes to lab.meta.
+// When FromAudit refuses, nothing is stored.
 func CollectHoop(ctx context.Context, conn *pgx.Conn, arm string, bind bool, events []AuditEvent, calls []Call, byText bool) ([]Proxy, Collected, error) {
 	sent, err := sentOf(ctx, conn, arm, bind)
 	if err != nil {
 		return nil, Collected{}, err
 	}
-	rows, violations, budget := FromAudit(arm, events, calls, sent, byText)
-	c := Collected{Join: "tag", LLMCalls: len(calls), BudgetExhausted: budget}
-	if byText {
-		c.Join = "text"
-	}
-	for _, call := range calls {
-		c.LLMCostUSD += call.CostUSD
-		c.CapReached = c.CapReached || call.Event == "cap_reached"
+	rows, violations, c, err := FromAudit(arm, events, calls, sent, byText)
+	if err != nil {
+		return nil, Collected{}, err
 	}
 	c, err = storeCollected(ctx, conn, arm, rows, violations, c)
 	return rows, c, err
@@ -441,7 +569,8 @@ func CollectHoop(ctx context.Context, conn *pgx.Conn, arm string, bind bool, eve
 // CollectStet reads stet.decisions through each of decisions, the arm's own database first and then its X
 // clones, joins them by tag to the arm's writes as recorded in lab.outcomes of conn, the arm's own
 // database, and stores the result there in one transaction: the arm's rows of lab.proxy are replaced and
-// Collected goes to lab.meta. A write decided in two of the databases is an error, and nothing is stored.
+// Collected goes to lab.meta. A write decided in several of the databases takes the decision made within its
+// window (pickDecision); when not exactly one was, it is an error and nothing is stored.
 func CollectStet(ctx context.Context, conn *pgx.Conn, arm string, decisions []*pgx.Conn) ([]Proxy, Collected, error) {
 	sent, err := sentOf(ctx, conn, arm, false)
 	if err != nil {
@@ -453,24 +582,30 @@ func CollectStet(ctx context.Context, conn *pgx.Conn, arm string, decisions []*p
 			ids[s.Tag] = s.ID
 		}
 	}
-	var rows []Proxy
-	from := map[string]string{} // write id -> the database its decision came from
-	c := Collected{Join: "tag"}
+	of := map[string][]decision{} // write id -> its earliest decision in each database
 	for _, d := range decisions {
-		db := d.Config().Database
-		got, err := FromDecisions(ctx, d, arm, ids)
+		ds, err := readDecisions(ctx, d, arm, ids)
 		if err != nil {
 			return nil, Collected{}, err
 		}
-		for _, p := range got {
-			if other, ok := from[p.ID]; ok {
-				return nil, Collected{}, fmt.Errorf("write %s has decisions in %s and in %s: give only the databases "+
-					"its outcome was recorded from", p.ID, other, db)
-			}
-			from[p.ID] = db
-			c.LLMCostUSD += p.CostUSD
-			rows = append(rows, p)
+		for _, x := range ds {
+			of[x.ID] = append(of[x.ID], x)
 		}
+	}
+	var rows []Proxy
+	c := Collected{Join: "tag"}
+	for _, s := range sent {
+		ds := of[s.ID]
+		if len(ds) == 0 {
+			continue
+		}
+		d, outside, err := pickDecision(s, ds)
+		if err != nil {
+			return nil, Collected{}, err
+		}
+		c.OutOfWindow += outside
+		c.LLMCostUSD += d.CostUSD
+		rows = append(rows, d.Proxy)
 	}
 	c, err = storeCollected(ctx, conn, arm, rows, nil, c)
 	return rows, c, err

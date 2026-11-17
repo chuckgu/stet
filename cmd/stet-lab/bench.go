@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -40,10 +41,10 @@ commands:
             [-tag <12 digits>] -sql <statement> [-args a,b])
   llm-recorder  forward a proxy's calls to the Anthropic API, log level, tokens and cost, and stop at a dollar cap
            ([-listen 127.0.0.1:18080] -out <file> [-cap-usd 10] [-upstream https://api.anthropic.com])
-  collect  join what an arm's proxy recorded about each write to it by tag, store it in lab.proxy of the
-           arm's database and the totals in lab.meta (collect:<arm>): a stet arm's stet.decisions of its
-           database and of each -db (its X clones); a hoop arm's audit logs and recorder files, after which
-           its denials the log does not confirm are unknown
+  collect  join what an arm's proxy recorded about each write to it by tag, within the time the write was
+           out, store it in lab.proxy of the arm's database and the totals in lab.meta (collect:<arm>): a stet
+           arm's stet.decisions of its database and of each -db (this run's X clones); a hoop arm's audit logs
+           and recorder files, after which its denials the log does not confirm are unknown
            (-arm <arm> [-practice] [-rerun N] [-db <db>]... [-audit <file>]... [-llm <file>]... [-join tag|text])
 `
 
@@ -507,6 +508,20 @@ func benchLLMRecorder(args []string) error {
 	return http.ListenAndServe(*listen, bench.NewRecorder(*upstream, f, *capUSD, spent))
 }
 
+// runDatabase reports whether name is one of the databases of a run of the arm: its own, or one of its X
+// clones as bench clone -x names them. Another run's clone would join that run's decisions.
+func runDatabase(arm string, practice bool, rerun int, name string) bool {
+	if name == bench.DBName(arm, practice, 0, rerun) || name == bench.DBName(arm, practice, 1, rerun) {
+		return true
+	}
+	rest, ok := strings.CutPrefix(name, bench.DBName(arm, practice, 0, rerun)+"_x")
+	if !ok {
+		return false
+	}
+	x, err := strconv.Atoi(rest)
+	return err == nil && x >= 2 && bench.DBName(arm, practice, x, rerun) == name
+}
+
 // repeated is a flag that may be given more than once.
 type repeated []string
 
@@ -549,6 +564,18 @@ func benchCollect(args []string) error {
 	case hoop && len(audits) == 0:
 		return errors.New("bench collect: -audit is required for a hoop arm: without hoop's log no denial is confirmed")
 	}
+	db := bench.DBName(*arm, *f.practice, 0, *rerun)
+	read := []string{db} // the databases whose decisions are read, each once
+	for _, name := range dbs {
+		if !runDatabase(*arm, *f.practice, *rerun, name) {
+			return fmt.Errorf("bench collect: -db %s: not a database of this run of arm %s: want %s or one of its X "+
+				"clones (%s, %s, ...)", name, *arm, db, bench.DBName(*arm, *f.practice, 1, *rerun),
+				bench.DBName(*arm, *f.practice, 2, *rerun))
+		}
+		if !slices.Contains(read, name) {
+			read = append(read, name)
+		}
+	}
 
 	var events []bench.AuditEvent
 	for _, path := range audits {
@@ -568,7 +595,6 @@ func benchCollect(args []string) error {
 	}
 
 	ctx := context.Background()
-	db := bench.DBName(*arm, *f.practice, 0, *rerun)
 	conn, err := pgx.Connect(ctx, bench.OwnerURL(*f.pg, bench.Names{}, db))
 	if err != nil {
 		return err
@@ -578,7 +604,7 @@ func benchCollect(args []string) error {
 	var c bench.Collected
 	if stet {
 		var decisions []*pgx.Conn
-		for _, name := range append([]string{db}, dbs...) {
+		for _, name := range read {
 			d, err := pgx.Connect(ctx, bench.GateURL(*f.pg, bench.Names{}, name))
 			if err != nil {
 				return fmt.Errorf("bench collect: %s: %w", name, err)
@@ -609,7 +635,7 @@ func benchCollect(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("%s, arm %s: %d writes in lab.proxy, %d blocked (%s); collect:%s %s\n", db, *arm, len(rows), blocked,
-		strings.Join(by, ", "), *arm, meta)
+	fmt.Printf("%s, arm %s: %d writes in lab.proxy, %d blocked (%s); %d records of its writes outside their time "+
+		"window left out; collect:%s %s\n", db, *arm, len(rows), blocked, strings.Join(by, ", "), c.OutOfWindow, *arm, meta)
 	return nil
 }

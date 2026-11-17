@@ -64,3 +64,34 @@ func TestLLMRecorderOutMustBeAJSONLFile(t *testing.T) {
 		}
 	}
 }
+
+func TestCollectTakesOnlyTheArmsOwnDatabases(t *testing.T) {
+	for _, c := range []struct {
+		args []string
+		ok   bool
+	}{
+		{[]string{"-arm", "stet", "-db", "crm_gate"}, true},
+		{[]string{"-arm", "stet", "-db", "crm_gate_x"}, true},
+		{[]string{"-arm", "stet", "-db", "crm_gate_x", "-db", "crm_gate_x3"}, true},
+		{[]string{"-arm", "stet", "-rerun", "2", "-db", "crm_gate_r2_x2"}, true},
+		{[]string{"-arm", "stet-bind", "-db", "crm_gate_bind_x"}, true},
+		{[]string{"-arm", "stet", "-practice", "-db", "crm_practice_gate_x"}, true},
+		{[]string{"-arm", "stet", "-rerun", "2", "-db", "crm_gate_x"}, false}, // run 1's X clone
+		{[]string{"-arm", "stet", "-db", "crm_gate_r2_x"}, false},             // rerun 2's
+		{[]string{"-arm", "stet", "-db", "crm_gate_bind_x"}, false},           // another arm's
+		{[]string{"-arm", "stet", "-db", "crm_hoop_x"}, false},
+		{[]string{"-arm", "stet", "-db", "crm_gate_x1"}, false}, // the first X clone is crm_gate_x
+		{[]string{"-arm", "stet", "-db", "crm_gate_x0"}, false},
+		{[]string{"-arm", "stet", "-db", "crm_gate_xx"}, false},
+		{[]string{"-arm", "stet", "-db", "crm_gate_x", "-db", "crm_other"}, false},
+		{[]string{"-arm", "stet", "-practice", "-db", "crm_gate_x"}, false},
+	} {
+		// Nothing listens on the address: a database that passes the check
+		// fails to connect instead.
+		err := benchCollect(append([]string{"-pg", "127.0.0.1:1"}, c.args...))
+		refused := err != nil && strings.HasPrefix(err.Error(), "bench collect: -db ")
+		if refused == c.ok {
+			t.Errorf("bench collect %s: err = %v, want the -db refused: %v", strings.Join(c.args, " "), err, !c.ok)
+		}
+	}
+}
