@@ -568,6 +568,20 @@ func TestSetPendingForWhatWasReadUnderOtherSettings(t *testing.T) {
 				parseMsg("", "set timezone = 'Asia/Seoul'"), bindMsg("", ""), execMsg(""), syncMsg)
 			serve(s, parseOK, bindOK, tag("SET"), parseOK, parseOK, bindOK, tag("SET"), ready)
 		}, run, true},
+		// The second Parse of the unnamed statement repeats the first, so the
+		// table keeps one change for both; the server holds the second, read
+		// under UTC, and reports nothing.
+		{"unnamed parsed again between a SET and its undoing under one Sync", func(s *session) {
+			send(s, parseMsg("", ins), parseMsg("utc", set), bindMsg("", "utc"), execMsg(""), parseMsg("", ins),
+				parseMsg("seoul", "set timezone = 'Asia/Seoul'"), bindMsg("", "seoul"), execMsg(""), syncMsg)
+			serve(s, parseOK, parseOK, bindOK, tag("SET"), parseOK, parseOK, bindOK, tag("SET"), ready)
+		}, msgs(bindMsg("", ""), execMsg(""), syncMsg), true},
+		// The same, with the SET undone by an error later under the Sync.
+		{"unnamed parsed again after a SET rolled back under one Sync", func(s *session) {
+			send(s, parseMsg("", ins), parseMsg("utc", set), bindMsg("", "utc"), execMsg(""), parseMsg("", ins),
+				parseMsg("bad", "select 1/0"), bindMsg("", "bad"), execMsg(""), syncMsg)
+			serve(s, parseOK, parseOK, bindOK, tag("SET"), parseOK, parseOK, bindOK, serverErr("22012"), ready)
+		}, msgs(bindMsg("", ""), execMsg(""), syncMsg), true},
 		{"parsed again after the change", func(s *session) {
 			parsed(s)
 			reported(s, 'I', setting("TimeZone", "UTC"))
@@ -634,6 +648,41 @@ func TestEveryMeaningOfAPortalCounts(t *testing.T) {
 	} {
 		if got := s.readOtherwise(fresh.read(c.others)); got != c.want {
 			t.Errorf("%s: read otherwise %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// When a change repeats the one before it to the same name in its unit, the
+// table keeps one change for both (names.put); the server holds the later,
+// which may have been read under other settings. So the kept change carries
+// a record that counts whenever either's does, for statements and for
+// portals.
+func TestARepeatedChangeKeepsTheSettingsRecordsOfBoth(t *testing.T) {
+	u := &unit{}
+	clean, pending := readUnder{changes: 1}, readUnder{changes: 1, pending: true}
+	s := &session{changes: 1}
+
+	var stmts names[prepared]
+	stmts.put(u, 1, "", true, prepared{st: Statement{SQL: ins}, atParse: clean})
+	stmts.put(u, 2, "", true, prepared{st: Statement{SQL: ins}, atParse: pending})
+	if n := stmts.waiting(); n != 1 {
+		t.Errorf("statements: %d changes kept, want the repeated Parse merged into one", n)
+	}
+	if p, _, _ := stmts.get(u, ""); !s.readOtherwise(p.atParse) {
+		t.Errorf("statement kept with %+v, want the later Parse's pending record", p.atParse)
+	}
+
+	var portals names[bound]
+	portals.put(u, 3, "", true, bound{st: Statement{SQL: "select 1"}, atParse: clean, atBind: clean})
+	portals.put(u, 4, "", true, bound{st: Statement{SQL: "select 1"}, atParse: clean, atBind: pending})
+	portals.put(u, 5, "p", true, bound{st: Statement{SQL: "select 1"}, atParse: pending, atBind: clean})
+	portals.put(u, 6, "p", true, bound{st: Statement{SQL: "select 1"}, atParse: clean, atBind: clean})
+	if n := portals.waiting(); n != 2 {
+		t.Errorf("portals: %d changes kept, want each repeated Bind merged into one", n)
+	}
+	for _, name := range []string{"", "p"} {
+		if b, _, _ := portals.get(u, name); !s.readOtherwise(b.read(nil)) {
+			t.Errorf("portal %q kept with %+v and %+v, want a pending record", name, b.atParse, b.atBind)
 		}
 	}
 }

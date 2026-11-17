@@ -40,6 +40,10 @@ type names[T meaning[T]] struct {
 type meaning[T any] interface {
 	// same reports whether the name means the same with either value.
 	same(T) bool
+	// merged is the value kept for this one and a later one that means the
+	// same (see put): its settings records count whenever either's do (see
+	// readUnder).
+	merged(T) T
 }
 
 type change[T any] struct {
@@ -71,7 +75,9 @@ func nameKey(name string) string {
 //
 // It is not kept when the change before it to the name in u, with no unread
 // change between them, already gives the name the same meaning: whichever of
-// the two the server reaches, the name means the same. In a unit that
+// the two the server reaches, the name means the same. The server may have
+// read the later one under other settings, so the change kept takes the
+// records of both (merged). In a unit that
 // already failed, the server skips every message still to come, so none of
 // its waiting changes will hold; only the newest per name counts, for the
 // messages behind it in u, and it takes the place of the one before.
@@ -80,6 +86,7 @@ func (n *names[T]) put(u *unit, pos int, name string, set bool, v T) {
 	if i := n.last(u, c.name); i >= 0 {
 		switch prev := &n.changes[i]; {
 		case prev.set == set && prev.v.same(v):
+			prev.v = prev.v.merged(v)
 			return
 		case u.errPos != 0 && prev.pos >= u.errPos:
 			*prev = c
@@ -238,12 +245,26 @@ func (p prepared) same(q prepared) bool {
 	return p.unread == q.unread && p.st.SQL == q.st.SQL && slices.Equal(p.oids, q.oids)
 }
 
+// merged is p with the Parse record of q too.
+func (p prepared) merged(q prepared) prepared {
+	p.atParse = p.atParse.with(q.atParse)
+	return p
+}
+
 // same reports whether portals a and b run the same statement and Stet keeps
 // nothing of either beyond it: no bind values, no row count, no other
 // meanings. Two portals of statements Stet does not follow are the same.
 func (a bound) same(b bound) bool {
 	return !a.unread && !b.unread && a.params == nil && b.params == nil && a.rows == nil && b.rows == nil &&
 		len(a.others) == 0 && len(b.others) == 0 && a.st.SQL == b.st.SQL
+}
+
+// merged is a with the Parse and Bind records of b too. A watched write's
+// portal keeps its bind values, so it is never the same as another and never
+// merged.
+func (a bound) merged(b bound) bound {
+	a.atParse, a.atBind = a.atParse.with(b.atParse), a.atBind.with(b.atBind)
+	return a
 }
 
 // mayRunUnclean reports whether an Execute of a portal whose newest meaning
