@@ -177,8 +177,9 @@ func openGate(ctx context.Context, cfg *config.Config, log *slog.Logger) (g *gat
 // its own write's state assembly for long. DateStyle and IntervalStyle are
 // pinned, whatever the database or role sets, so that a binary value Stet
 // turns into text reads the same under any session's settings
-// (spec-v0.2-approve 4). The executor's connections start with these
-// settings too.
+// (spec-v0.2-approve 4), and extra_float_digits, so that a binary float
+// turns into text without rounding. The executor's connections start with
+// these settings too (a copy of the pool's connection config).
 func openPool(ctx context.Context, upstream string) (*pgxpool.Pool, error) {
 	pc, err := pgxpool.ParseConfig(upstream)
 	if err != nil {
@@ -188,6 +189,7 @@ func openPool(ctx context.Context, upstream string) (*pgxpool.Pool, error) {
 	pc.ConnConfig.RuntimeParams["lock_timeout"] = "200ms"
 	pc.ConnConfig.RuntimeParams["DateStyle"] = "ISO"
 	pc.ConnConfig.RuntimeParams["IntervalStyle"] = "postgres"
+	pc.ConnConfig.RuntimeParams["extra_float_digits"] = "1"
 	pool, err := pgxpool.NewWithConfig(ctx, pc)
 	if err != nil {
 		return nil, err

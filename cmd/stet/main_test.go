@@ -532,7 +532,9 @@ func holdingConfig(t *testing.T, pg, db, table string) *config.Config {
 	return cfg
 }
 
-func TestPoolPinsDateStyleAndIntervalStyle(t *testing.T) {
+// extra_float_digits of 0 or less would round a binary float that Stet turns
+// into text.
+func TestPoolPinsDateStyleIntervalStyleAndFloatDigits(t *testing.T) {
 	pg := testPG(t)
 	ctx := context.Background()
 	db := cleanDatabase(t, pg)
@@ -540,21 +542,33 @@ func TestPoolPinsDateStyleAndIntervalStyle(t *testing.T) {
 	in := connectTo(t, pg, db, "postgres", "postgres-pw")
 	mustExec(t, in, "alter database "+db+" set datestyle = 'German, DMY'")
 	mustExec(t, in, "alter database "+db+" set intervalstyle = 'sql_standard'")
+	mustExec(t, in, "alter database "+db+" set extra_float_digits = 0")
 
 	pool, err := openPool(ctx, "postgres://stet_scram:scram-pw@"+pg+"/"+db+"?sslmode=disable")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	var dateStyle, intervalStyle string
+	var dateStyle, intervalStyle, floatDigits, third string
 	if err := pool.QueryRow(ctx, "show datestyle").Scan(&dateStyle); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, "show intervalstyle").Scan(&intervalStyle); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(dateStyle, "ISO") || intervalStyle != "postgres" {
-		t.Errorf("DateStyle %q, IntervalStyle %q; want ISO first and postgres", dateStyle, intervalStyle)
+	if err := pool.QueryRow(ctx, "show extra_float_digits").Scan(&floatDigits); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(dateStyle, "ISO") || intervalStyle != "postgres" || floatDigits != "1" {
+		t.Errorf("DateStyle %q, IntervalStyle %q, extra_float_digits %q; want ISO first, postgres and 1",
+			dateStyle, intervalStyle, floatDigits)
+	}
+	// As the gate decodes a binary value: it reads back as the same float.
+	if err := pool.QueryRow(ctx, "select $1::float8::text", 1.0/3).Scan(&third); err != nil {
+		t.Fatal(err)
+	}
+	if third != "0.3333333333333333" {
+		t.Errorf("1/3 as text is %q, want 0.3333333333333333", third)
 	}
 }
 
@@ -1109,15 +1123,21 @@ func TestCheckFollowsRoleMembership(t *testing.T) {
 		}
 	})
 
+	// In a database of its own: a GRANT on schema stet, and the DROP OWNED
+	// that takes it back, in stet_test would race the grants internal/store's
+	// tests make there under Migrate's lock ("tuple concurrently updated").
 	t.Run("rights through a NOINHERIT chain", func(t *testing.T) {
 		agent := createRole(t, su, "agent", "login noinherit")
 		mid := createRole(t, su, "mid", "nologin")
-		owner := createRole(t, su, "owner", "nologin")
+		owner := createRole(t, su, "owner", "nologin") // before the database: see cleanDatabase
+		db := cleanDatabase(t, pg)
+		pool := stetPoolIn(t, pg, db)
+		in := connectTo(t, pg, db, "postgres", "postgres-pw")
 		mustExec(t, su, "grant "+mid+" to "+agent)
 		mustExec(t, su, "grant "+owner+" to "+mid)
-		mustExec(t, su, "grant usage on schema stet to "+owner)
-		owned := freshTable(t, su, 1)
-		mustExec(t, su, "alter table "+owned+" owner to "+owner)
+		mustExec(t, in, "grant usage on schema stet to "+owner)
+		owned := freshTable(t, in, 1)
+		mustExec(t, in, "alter table "+owned+" owner to "+owner)
 
 		warnings, err := check(ctx, pool, enforceConfig(agent, owned))
 		if err != nil {
