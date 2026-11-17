@@ -257,7 +257,7 @@ HINT:   update contacts.id=4812 instead of inserting a new row
 
 ## 8. 판단 기록 스키마
 
-`stet.decisions`의 정본은 [`internal/store/schema.sql`](../internal/store/schema.sql)이다. Stet은 시작할 때마다 이 파일을 실행한다(advisory lock으로 직렬화, 여러 번 실행해도 안전). 처음 초안에서 바뀐 점은 다음과 같다.
+`stet.decisions`의 정본은 [`internal/store/schema.sql`](../internal/store/schema.sql)이다. Stet은 시작할 때 이 파일이 데이터베이스가 마지막으로 실행한 것과 다를 때만 실행한다. 같은지는 파일의 SHA-256을 `stet.schema_version`에 적힌 값과 비교해 안다(2b에서 바뀜: spec-v0.2-approve 4·11장). 실행은 advisory lock으로 직렬화하고, 여러 번 실행해도 안전하다. 처음 초안에서 바뀐 점은 다음과 같다.
 
 - `params jsonb` 추가: 바인딩 값의 텍스트 배열. 실험에서 쓰기 스트림을 재생하려면 문장과 값이 둘 다 있어야 한다.
 - `op`에 `merge`, `copy`, `truncate` 추가: 미지원 형태도 기록하기 때문이다.

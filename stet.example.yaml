@@ -9,12 +9,25 @@ mode: shadow                 # shadow | enforce
 # 권한과 소유는 PUBLIC에 준 것과 SET ROLE로 될 수 있는 역할을 거친 것도 센다).
 # Stet이 접속한 계정이 목록에 있으면 시작하지 않는다. enforce에서는 서버의 db_user_namespace가 켜져 있을
 # 때도, 그 설정이나 Stet이 접속한 계정을 확인하지 못했을 때도 시작하지 않는다.
-# 운영자가 DB에서 해 둘 일은 docs/spec-v0.2-enforce.md 8장에 있다.
+# Stet의 계정은 각 에이전트 계정의 구성원이어야 하고(GRANT agent_x TO <Stet 계정>) superuser가 아니어야 한다.
+# 승인된 쓰기를 Stet의 연결에서 그 에이전트 계정으로 실행하기 때문이다. enforce로 시작할 때 둘 다 확인해 경고한다.
+# 운영자가 DB에서 해 둘 일은 docs/spec-v0.2-enforce.md 8장과 docs/spec-v0.2-approve.md 6·10장에 있다.
 # agents:
 #   roles: [agent_enricher, agent_support]
 # 동시에 판단 중인 쓰기의 상한. 상태 읽기, 영향 측정, 모델 호출을 합친 수다. 기본 32
 # limits:
 #   max_inflight: 32
+# 보류 건의 승인(docs/spec-v0.2-approve.md). expire_after는 보류 건을 승인할 수 있는 기간이다. 1m 이상 30d 이하,
+# 기본 24h. apply_timeout은 승인된 쓰기 하나를 실행하는 시간의 상한이다. 1s 이상 10m 이하, 기본 30s.
+# 섀도에서도 검증하지만 쓰이지 않는다. 승인된 쓰기는 enforce로 도는 Stet만 실행한다.
+# held:
+#   expire_after: 24h
+#   apply_timeout: 30s
+# 검토자는 DB 계정이다. stet.review를 읽고 stet.approve(id)나 stet.reject(id)를 부른다. Stet은 역할을 만들지
+# 않는다. 운영자가 검토자에게 줄 권한은 아래 셋이다. 에이전트 계정에는 주지 않는다.
+#   GRANT USAGE ON SCHEMA stet TO reviewer;
+#   GRANT SELECT ON stet.review TO reviewer;
+#   GRANT EXECUTE ON FUNCTION stet.approve(uuid, text, bigint), stet.reject(uuid, text) TO reviewer;
 listen: 0.0.0.0:6432
 upstream: postgres://app@db:5432/crm
 
