@@ -82,13 +82,15 @@ var (
 	// The statements that leave a transaction clean, as the classifier marks
 	// them; the test double reads one statement per message.
 	cleanRE = regexp.MustCompile(`(?i)^\s*(begin|start\s+transaction|set|show)\b`)
+	// A SET or RESET (Statement.Sets). Clean is cleanRE's: RESET is not clean.
+	setRE = regexp.MustCompile(`(?i)^\s*(set|reset)\b`)
 )
 
 func (g *recordingGate) Inspect(sql string) proxy.Statement {
 	g.mu.Lock()
 	g.inspects++
 	g.mu.Unlock()
-	st := proxy.Statement{SQL: sql, Watch: g.match(sql), Observe: g.observeMatch != nil && g.observeMatch(sql), Clean: cleanRE.MatchString(sql)}
+	st := proxy.Statement{SQL: sql, Watch: g.match(sql), Observe: g.observeMatch != nil && g.observeMatch(sql), Clean: cleanRE.MatchString(sql), Sets: setRE.MatchString(sql)}
 	if m := oboRE.FindStringSubmatch(sql); m != nil {
 		st.OnBehalfOf = &m[1]
 	}
@@ -564,6 +566,45 @@ func TestGateSeesCleanTransactions(t *testing.T) {
 		if b.info.TxDirty != wantDirty[i] || b.info.TxOpen != wantOpen[i] {
 			t.Errorf("write %d (%s): TxDirty %v TxOpen %v, want %v and %v", i+1, b.st.SQL, b.info.TxDirty, b.info.TxOpen, wantDirty[i], wantOpen[i])
 		}
+	}
+}
+
+// An enforced session hands Begin the TimeZone, DateStyle and IntervalStyle
+// the server last reported, and tells it when a SET sent before the write was
+// not answered yet: the server reports the change only before the
+// ReadyForQuery that answers it, so the values handed may not be the ones the
+// write runs under (spec 4, correction B2).
+func TestGateSeesSessionSettings(t *testing.T) {
+	table := watchedTable(t)
+	g := newRecordingGate(watches(table))
+	addr, _ := startProxyWith(t, upstream(t), g, proxy.Policy{Enforce: true})
+	fe := rawAgent(t, addr, table)
+	insert := func(id int) string { return fmt.Sprintf("insert into %s values (%d, 'x')", table, id) }
+
+	sendAll(t, fe, &pgproto3.Query{String: "set timezone = 'UTC'"})
+	untilReady(t, fe)
+	sendAll(t, fe, &pgproto3.Query{String: insert(1)})
+	untilReady(t, fe)
+	// The SET and the write under one Sync.
+	sendAll(t, fe, append(slices.Concat(unnamed("set timezone = 'Asia/Tokyo'"), unnamed(insert(2))), &pgproto3.Sync{})...)
+	untilReady(t, fe)
+	sendAll(t, fe, &pgproto3.Query{String: insert(3)})
+	untilReady(t, fe)
+
+	bs, os := g.outcomes(t, 3)
+	for i, o := range os {
+		if !o.Executed {
+			t.Errorf("write %d: %+v, want executed", i+1, o)
+		}
+	}
+	if info := bs[0].info; info.TimeZone != "UTC" || info.IntervalStyle != "postgres" || info.DateStyle == "" || info.SetPending {
+		t.Errorf("write after an answered SET began with %+v, want TimeZone UTC, IntervalStyle postgres, a DateStyle, no SET pending", info)
+	}
+	if info := bs[1].info; !info.SetPending {
+		t.Errorf("write under the SET's Sync began with %+v, want a SET pending", info)
+	}
+	if info := bs[2].info; info.TimeZone != "Asia/Tokyo" || info.SetPending {
+		t.Errorf("write after that Sync began with %+v, want TimeZone Asia/Tokyo, no SET pending", info)
 	}
 }
 

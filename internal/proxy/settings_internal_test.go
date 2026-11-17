@@ -3,6 +3,7 @@ package proxy
 import (
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -325,6 +326,187 @@ func TestCopyRuleHoldsOnlyDuringTheCopy(t *testing.T) {
 				t.Errorf("%v, ending for %q; want ending for %q", err, s.end, c.ends)
 			}
 		})
+	}
+}
+
+// setGate is objGate that marks SQL beginning with set or reset as holding a
+// SET or RESET, and SET as clean, as the classifier does.
+type setGate struct{ *objGate }
+
+func newSetGate() setGate { return setGate{&objGate{fakeGate: newFakeGate()}} }
+
+func (g setGate) Inspect(sql string) Statement {
+	st := g.objGate.Inspect(sql)
+	first, _, _ := strings.Cut(strings.ToLower(strings.TrimSpace(sql)), " ")
+	st.Sets = first == "set" || first == "reset"
+	st.Clean = first == "set"
+	return st
+}
+
+// startEnforced is a session of an enforcing proxy whose server reported at
+// startup the settings the classifier reads statements by, and reports.
+func startEnforced(g Gate, reports ...*pgproto3.ParameterStatus) *session {
+	s := newSession(g, SessionInfo{})
+	s.enforce = true
+	serve(s, setting("client_encoding", "UTF8"), setting("standard_conforming_strings", "on"), setting("server_encoding", "UTF8"))
+	for _, r := range reports {
+		serve(s, r)
+	}
+	serve(s, ready)
+	return s
+}
+
+// began sends msgs, the last of which holds a watched write, and returns the
+// session Begin was handed for it.
+func began(t *testing.T, g setGate, s *session, msgs ...pgproto3.FrontendMessage) SessionInfo {
+	t.Helper()
+	n := len(g.infos)
+	send(s, msgs...)
+	if len(g.infos) != n+1 {
+		t.Fatalf("%d writes begun, want 1", len(g.infos)-n)
+	}
+	return g.infos[n]
+}
+
+// An enforced session follows what the server reports of TimeZone, DateStyle
+// and IntervalStyle, at startup and before the ReadyForQuery after a change,
+// and hands Begin the values last reported. One the server never reported
+// is "".
+func TestSessionSettingsAreFollowed(t *testing.T) {
+	g := newSetGate()
+	s := startEnforced(g, setting("TimeZone", "Asia/Seoul"), setting("DateStyle", "ISO, MDY"), setting("IntervalStyle", "postgres"))
+	info := began(t, g, s, queryMsg(ins))
+	if info.TimeZone != "Asia/Seoul" || info.DateStyle != "ISO, MDY" || info.IntervalStyle != "postgres" || info.SetPending {
+		t.Errorf("first write began with %+v, want Asia/Seoul, ISO, MDY, postgres and no SET pending", info)
+	}
+	serve(s, tag("INSERT 0 1"), ready)
+	send(s, queryMsg("set timezone = 'UTC'"))
+	serve(s, tag("SET"), setting("TimeZone", "UTC"), ready)
+	info = began(t, g, s, queryMsg(ins))
+	if info.TimeZone != "UTC" || info.DateStyle != "ISO, MDY" || info.IntervalStyle != "postgres" || info.SetPending {
+		t.Errorf("write after the SET began with %+v, want UTC, ISO, MDY, postgres and no SET pending", info)
+	}
+
+	g = newSetGate()
+	s = startEnforced(g, setting("TimeZone", "UTC"))
+	if info := began(t, g, s, queryMsg(ins)); info.TimeZone != "UTC" || info.DateStyle != "" || info.IntervalStyle != "" {
+		t.Errorf("write began with %+v, want TimeZone UTC and the two never reported empty", info)
+	}
+}
+
+// Begin is told a SET or RESET is pending when one was sent that no
+// ReadyForQuery has answered yet, since the server reports a change of
+// setting only just before the ReadyForQuery that follows it: in a unit
+// still waiting, the write's own included; in the write's own message; or in
+// an unsynced unit, which the server answers with no ReadyForQuery, until
+// the next ReadyForQuery (spec 4, correction B2).
+func TestSetPendingUntilReadyForQuery(t *testing.T) {
+	const set = "set timezone = 'UTC'"
+	for _, c := range []struct {
+		name   string
+		before func(s *session) // sends, and answers, what comes before the write
+		write  []pgproto3.FrontendMessage
+		want   bool
+		// answer answers the write and everything before it. A write sent
+		// after that is told of no SET pending.
+		answer []pgproto3.BackendMessage
+	}{
+		{"SET and the write under one Sync",
+			func(s *session) { send(s, parseMsg("", set), bindMsg("", ""), execMsg("")) },
+			msgs(parseMsg("", ins), bindMsg("", ""), execMsg(""), syncMsg), true,
+			msgs2(parseOK, bindOK, tag("SET"), parseOK, bindOK, tag("INSERT 0 1"), setting("TimeZone", "UTC"), ready)},
+		{"a Query of SET not answered yet",
+			func(s *session) { send(s, queryMsg(set)) },
+			msgs(queryMsg(ins)), true,
+			msgs2(tag("SET"), setting("TimeZone", "UTC"), ready, tag("INSERT 0 1"), ready)},
+		{"a Query of SET answered by its ReadyForQuery",
+			func(s *session) {
+				send(s, queryMsg(set))
+				serve(s, tag("SET"), setting("TimeZone", "UTC"), ready)
+			},
+			msgs(queryMsg(ins)), false,
+			msgs2(tag("INSERT 0 1"), ready)},
+		{"a write Query behind a completed unsynced SET",
+			func(s *session) {
+				send(s, parseMsg("", set), bindMsg("", ""), execMsg(""))
+				serve(s, parseOK, bindOK, tag("SET"))
+			},
+			msgs(queryMsg(ins)), true,
+			msgs2(tag("INSERT 0 1"), setting("TimeZone", "UTC"), ready)},
+		{"a write after an unsynced SET answered with no ReadyForQuery",
+			func(s *session) {
+				send(s, parseMsg("", set), bindMsg("", ""), execMsg(""), queryMsg("select 1"))
+				serve(s, parseOK, bindOK, tag("SET"), tag("SELECT 1")) // the unsynced unit is answered
+			},
+			msgs(queryMsg(ins)), true,
+			msgs2(setting("TimeZone", "UTC"), ready, tag("INSERT 0 1"), ready)},
+		{"SET in the write's own message",
+			func(s *session) {},
+			msgs(queryMsg(set + "; " + ins)), true,
+			msgs2(tag("SET"), tag("INSERT 0 1"), setting("TimeZone", "UTC"), ready)},
+		{"RESET and the write under one Sync",
+			func(s *session) { send(s, parseMsg("", "reset timezone"), bindMsg("", ""), execMsg("")) },
+			msgs(parseMsg("", ins), bindMsg("", ""), execMsg(""), syncMsg), true,
+			msgs2(parseOK, bindOK, tag("RESET"), parseOK, bindOK, tag("INSERT 0 1"), setting("TimeZone", "Asia/Seoul"), ready)},
+		{"no SET in the session",
+			func(s *session) {},
+			msgs(queryMsg(ins)), false,
+			msgs2(tag("INSERT 0 1"), ready)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			g := newSetGate()
+			s := startEnforced(g, setting("TimeZone", "Asia/Seoul"))
+			c.before(s)
+			if info := began(t, g, s, c.write...); info.SetPending != c.want {
+				t.Errorf("write began with SetPending %v, want %v", info.SetPending, c.want)
+			}
+			serve(s, c.answer...)
+			if len(s.units) != 0 {
+				t.Fatalf("%d units waiting once answered, want none", len(s.units))
+			}
+			if info := began(t, g, s, queryMsg(ins)); info.SetPending {
+				t.Error("write after the ReadyForQuery began with SetPending, want none")
+			}
+		})
+	}
+}
+
+// An Execute that may run another meaning of its portal's name, one that
+// holds a SET, counts as a SET sent: the server has not said which meaning
+// holds (see anyOther).
+func TestSetPendingForAnotherMeaningOfAName(t *testing.T) {
+	for _, c := range []struct {
+		old  string // what s1 meant before the unanswered change
+		want bool
+	}{
+		{"set timezone = 'UTC'", true},
+		{"show timezone", false},
+	} {
+		g := newSetGate()
+		s := startEnforced(g)
+		send(s, parseMsg("s1", c.old), syncMsg)
+		serve(s, parseOK, ready)
+		send(s, parseMsg("s1", "show datestyle"), syncMsg) // the server refuses it (42P05), but has not said so yet
+		send(s, bindMsg("", "s1"), execMsg(""), syncMsg)
+		if info := began(t, g, s, queryMsg(ins)); info.SetPending != c.want {
+			t.Errorf("s1 was %q: write began with SetPending %v, want %v", c.old, info.SetPending, c.want)
+		}
+	}
+}
+
+// A session that does not enforce follows none of this: its server tap is
+// not shown ParameterStatus, and Begin is handed none of the three settings
+// and no SET pending (rule 6: the shadow path stays as it was).
+func TestShadowSessionsFollowNoSettings(t *testing.T) {
+	g := newSetGate()
+	s := newSession(g, SessionInfo{})
+	if s.serverTap().want('S') {
+		t.Error("the server tap of a session that does not enforce is shown ParameterStatus")
+	}
+	serve(s, setting("TimeZone", "Asia/Seoul"), setting("DateStyle", "ISO, MDY"), setting("IntervalStyle", "postgres"), ready)
+	send(s, queryMsg("set timezone = 'UTC'"))
+	if info := began(t, g, s, queryMsg(ins)); info.TimeZone != "" || info.DateStyle != "" || info.IntervalStyle != "" || info.SetPending {
+		t.Errorf("write began with %+v, want no settings and no SET pending", info)
 	}
 }
 

@@ -112,6 +112,9 @@ type Statement struct {
 	Several bool
 	// Clean marks a message whose statements are all BEGIN, START TRANSACTION, SET or SHOW.
 	Clean bool
+	// Sets says the message holds a SET or RESET: what the server reports of
+	// the session's settings may change at its ReadyForQuery.
+	Sets bool
 	// Block says why the message cannot be inspected (BlockUnparsed, BlockDo,
 	// BlockDefinesCode); "" when it can.
 	Block string
@@ -150,6 +153,14 @@ type SessionInfo struct {
 	// SHOW has been sent since the server last reported the session idle,
 	// whether or not the server has answered it yet (spec 4).
 	TxDirty bool
+	// TimeZone, DateStyle and IntervalStyle are what the server last reported for
+	// the session; "" for one it has not reported. Followed on enforced sessions only.
+	TimeZone, DateStyle, IntervalStyle string
+	// SetPending means a SET or RESET was sent that no ReadyForQuery has answered
+	// yet, before the statement or in its own message: the three settings may
+	// not be the ones the statement runs under. Like them, followed on enforced
+	// sessions only.
+	SetPending bool
 }
 
 type Outcome struct {
@@ -245,11 +256,16 @@ type session struct {
 	// not (see endWith). lastQuery: the newest Query unit, until the client
 	// sends anything after it but a Flush, CopyDone or CopyFail; copying: the
 	// Query unit whose current COPY FROM STDIN the client has not ended yet
-	// (see admit, copyIn).
-	utf8, standard     bool
-	serverUTF8         bool
-	end                string
-	lastQuery, copying *unit
+	// (see admit, copyIn). timeZone, dateStyle and intervalStyle: what the
+	// server last reported of TimeZone, DateStyle and IntervalStyle (see
+	// parameter); setsCarried: since the last ReadyForQuery, an unsynced unit
+	// that held a SET or RESET was answered (see setPending).
+	utf8, standard                     bool
+	serverUTF8                         bool
+	end                                string
+	lastQuery, copying                 *unit
+	timeZone, dateStyle, intervalStyle string
+	setsCarried                        bool
 }
 
 type prepared struct {
@@ -311,6 +327,7 @@ type unit struct {
 	copies, copyEnds, strayAt int
 	query                     bool
 	dirty                     bool // it holds a statement that is not clean (see Statement.Clean)
+	sets                      bool // on an enforced session: it holds a SET or RESET (see setPending)
 	executes                  int  // Execute messages so far
 	completions               int  // CommandComplete, EmptyQueryResponse, PortalSuspended
 	err                       string
@@ -454,9 +471,11 @@ type answer struct {
 // unit whose messages all completed. What comes after it runs in the same
 // implicit transaction, so its statements ran inside a transaction and its
 // marks pass to the session as at a ReadyForQuery that leaves one open
-// (ruling P6). It runs on the server side with s.mu held, before a server
-// message is matched to the unit it answers. The rows not yet settled
-// belong to the unit after it: its own were settled at its completions.
+// (ruling P6). A SET or RESET it held is reported only before the next
+// ReadyForQuery, so the session holds that mark until then (setsCarried).
+// It runs on the server side with s.mu held, before a server message is
+// matched to the unit it answers. The rows not yet settled belong to the
+// unit after it: its own were settled at its completions.
 func (s *session) answeredUnsynced(done []answer) []answer {
 	for len(s.units) > 0 {
 		u := s.units[0]
@@ -464,6 +483,7 @@ func (s *session) answeredUnsynced(done []answer) []answer {
 			break
 		}
 		s.leave(u, 'T')
+		s.setsCarried = s.setsCarried || u.sets
 		done = append(done, answer{u, true})
 	}
 	return done
@@ -749,6 +769,9 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		if mayRunUnclean(b, others) {
 			s.markDirty(u) // the server may run another meaning of the name
 		}
+		if s.enforce && anyOther(b, others, func(st Statement, unread bool) bool { return unread || st.Sets }) {
+			s.markSets(u) // the meaning it runs may hold a SET or RESET
+		}
 		return r, nil
 
 	case 'C':
@@ -890,10 +913,15 @@ func (s *session) apply(st Statement) {
 // dirties marks u when the message st stands for, sent as part of u, is not
 // clean: the transaction it runs in is dirty from then on. A watched write
 // is never clean; it marks u only here, after Begin was told whether the
-// transaction was clean when it arrived.
+// transaction was clean when it arrived. On an enforced session it also
+// marks u when st holds a SET or RESET (see setPending), likewise after
+// Begin was told of one in the write's own message.
 func (s *session) dirties(u *unit, st Statement) {
 	if unclean(st) {
 		s.markDirty(u)
+	}
+	if s.enforce && st.Sets {
+		s.markSets(u)
 	}
 }
 
@@ -904,6 +932,13 @@ func unclean(st Statement) bool { return st.Watch || !st.Clean }
 func (s *session) markDirty(u *unit) {
 	s.mu.Lock()
 	u.dirty = true
+	s.mu.Unlock()
+}
+
+// markSets notes that u, on an enforced session, holds a SET or RESET.
+func (s *session) markSets(u *unit) {
+	s.mu.Lock()
+	u.sets = true
 	s.mu.Unlock()
 }
 
@@ -929,6 +964,16 @@ func (s *session) txDirty() bool {
 	return false
 }
 
+// setPending reports whether a SET or RESET was sent that no ReadyForQuery
+// has answered yet: in a unit still waiting, or in an unsynced unit the
+// server answered with none (setsCarried). The server reports what that
+// changed of the session's settings only just before the ReadyForQuery that
+// answers it (spec correction B2). Enforced sessions only; it runs with s.mu
+// held.
+func (s *session) setPending() bool {
+	return s.setsCarried || slices.ContainsFunc(s.units, func(u *unit) bool { return u.sets })
+}
+
 // begin hands a watched write, arriving as message t at pos of u (see
 // statement), to the gate. Messages already queued go out first so they are
 // not held back while the gate reads state. When the gate refuses the write,
@@ -940,6 +985,9 @@ func (s *session) begin(u *unit, idx, pos int, t byte, st Statement, ps []Param,
 	s.mu.Unlock()
 	if st.OnBehalfOf != nil {
 		info.OnBehalfOf = *st.OnBehalfOf // a SET in the write's own message counts for it
+	}
+	if s.enforce && st.Sets {
+		info.SetPending = true // so does any SET or RESET there, for what the server reports
 	}
 	h, refuse := s.beginGate(info, st, ps)
 	w := watchedWrite{handle: h, idx: idx, several: st.Several}
@@ -1007,7 +1055,9 @@ func (s *session) arriving(st Statement, idx int, total *int64) observedRead {
 // so the role its startup packet names is not passed on. TxOpen is whether
 // the last ReadyForQuery left a transaction open, TxDirty whether a statement
 // that is not clean was sent since the last idle one; the statement arriving
-// has not marked its unit yet. It runs with s.mu held.
+// has not marked its unit yet. An enforced session also passes on the
+// settings the server last reported, and whether a SET or RESET it has not
+// answered may have changed them (setPending). It runs with s.mu held.
 func (s *session) identity() SessionInfo {
 	info := s.info
 	if !s.ready {
@@ -1015,6 +1065,10 @@ func (s *session) identity() SessionInfo {
 	}
 	info.TxOpen = s.status != 'I'
 	info.TxDirty = s.txDirty()
+	if s.enforce {
+		info.TimeZone, info.DateStyle, info.IntervalStyle = s.timeZone, s.dateStyle, s.intervalStyle
+		info.SetPending = s.setPending()
+	}
 	return info
 }
 
@@ -1079,7 +1133,7 @@ func binding(m *pgproto3.Bind, p prepared, ok bool, others []prepared) bound {
 		b.st, b.params = p.st, params(m, p.oids)
 	case p.st.Observe:
 		b.st, b.rows = p.st, new(int64)
-	case p.st.Clean || p.st.OnBehalfOf != nil || len(p.st.Cursors) > 0 || runsNames(p.st):
+	case p.st.Clean || p.st.Sets || p.st.OnBehalfOf != nil || len(p.st.Cursors) > 0 || runsNames(p.st):
 		b.st = p.st
 	}
 	return b
@@ -1157,6 +1211,7 @@ func (s *session) readyForQuery(head *unit, body []byte, done []answer) []answer
 	}
 	before := s.status
 	s.status = status
+	s.setsCarried = false // the server reported what the unsynced units changed
 	if status == 'I' {
 		// No transaction is open: what was answered before cannot make the
 		// next one dirty. The units still waiting keep theirs.

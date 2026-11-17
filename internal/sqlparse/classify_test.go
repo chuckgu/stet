@@ -661,6 +661,37 @@ func TestClassifyClean(t *testing.T) {
 	}
 }
 
+// Sets marks SQL holding a SET or RESET among its statements: what the
+// server reports of the session's settings may change. A function that sets
+// a setting (set_config) is not one, nor is an UPDATE's SET clause.
+func TestClassifySets(t *testing.T) {
+	cases := []struct {
+		sql  string
+		sets bool
+	}{
+		{"set timezone = 'UTC'", true},
+		{"set local datestyle to 'SQL, DMY'", true},
+		{"set time zone 'UTC'", true},
+		{"reset timezone", true},
+		{"reset all", true},
+		{"begin; set local a.b = '1'", true},
+
+		{"show timezone", false},
+		{"begin", false},
+		{"select set_config('timezone', 'UTC', false)", false},
+		{"update contacts set title = 'x' where id = 1", false},
+	}
+	for _, tc := range cases {
+		r, err := Classify(tc.sql, gated)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Sets != tc.sets {
+			t.Errorf("%q: Sets = %v, want %v", tc.sql, r.Sets, tc.sets)
+		}
+	}
+}
+
 // A DO block's writes cannot be seen, so the statement is Pass; Do says one
 // is there.
 func TestClassifyDo(t *testing.T) {

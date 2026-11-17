@@ -888,6 +888,20 @@ func TestInspectMarksCopyFromStdin(t *testing.T) {
 	}
 }
 
+// A SET or RESET is marked for the proxy, which tells Begin of one the
+// server has not answered yet (spec 4).
+func TestInspectMarksSets(t *testing.T) {
+	e := setup(t, calm())
+	for sql, want := range map[string]bool{
+		"set timezone = 'UTC'": true,
+		"select 1":             false,
+	} {
+		if got := e.gate.Inspect(sql).Sets; got != want {
+			t.Errorf("Inspect(%q).Sets = %v, want %v", sql, got, want)
+		}
+	}
+}
+
 // A session the proxy ends gets decide.Blocked's error too, and its warning
 // says the session was ended; a refused message's says it was refused.
 func TestBlockedSaysWhatItEnded(t *testing.T) {

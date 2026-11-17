@@ -145,6 +145,7 @@ type Result struct {
 	OnBehalfOf *string
 
 	Clean bool // every statement is BEGIN, START TRANSACTION, SET or SHOW; true for SQL with no statement
+	Sets  bool // some statement is SET or RESET (any VariableSetStmt)
 	Do    bool // some statement is a DO block
 	// DefinesCode: some statement defines a function, procedure, rule or
 	// trigger, or a view whose query reads a gated table (see definesCode):
@@ -192,6 +193,7 @@ func Classify(sql string, tables Tables) (Result, error) {
 		executes []string
 		portals  []string
 		clean    = true
+		sets     bool
 		do       bool
 		defines  bool
 		prepares bool // a SQL PREPARE of a gated write
@@ -216,6 +218,7 @@ func Classify(sql string, tables Tables) (Result, error) {
 		}
 		executes = appendExecutes(executes, raw.Stmt)
 		clean = clean && leavesClean(raw.Stmt)
+		sets = sets || raw.Stmt.GetVariableSetStmt() != nil
 		do = do || raw.Stmt.GetDoStmt() != nil
 		defines = defines || definesCode(raw.Stmt, m)
 		if c := raw.Stmt.GetCopyStmt(); c != nil && c.IsFrom && !c.IsProgram && c.Filename == "" {
@@ -248,7 +251,7 @@ func Classify(sql string, tables Tables) (Result, error) {
 	}
 	r.Table, r.Op = target.table, target.op // empty when nothing gated is written
 	r.OnBehalfOf, r.Cursors, r.Statements = obo, cursors, len(tree.Stmts)
-	r.Clean, r.Do, r.Executes, r.Portals = clean, do, executes, portals
+	r.Clean, r.Sets, r.Do, r.Executes, r.Portals = clean, sets, do, executes, portals
 	r.DefinesCode, r.CopyIn = defines, copyIn
 	return r, nil
 }

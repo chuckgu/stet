@@ -23,6 +23,11 @@ import (
 // classifier assumes it refuses what the server may read otherwise (see
 // misread and fromClient). Shadow sessions do not look: they classify as
 // before, and may record such a statement wrongly.
+//
+// An enforced session also follows TimeZone, DateStyle and IntervalStyle,
+// by which the server reads a date, time or interval sent as text, and hands
+// them to the gate, which keeps them with a write it holds so that the write
+// runs later as it would have then (spec 4).
 
 // readable reports whether the server reads this session's statements as the
 // classifier does: it last reported client_encoding UTF8 (or UNICODE) and
@@ -63,6 +68,15 @@ func (s *session) parameter(head *unit, body []byte) error {
 		s.standard = string(value) == "on"
 	case "server_encoding": // reported at startup, never changes
 		s.serverUTF8 = string(value) == "UTF8"
+		return nil
+	case "TimeZone":
+		s.timeZone = string(value)
+		return nil
+	case "DateStyle":
+		s.dateStyle = string(value)
+		return nil
+	case "IntervalStyle":
+		s.intervalStyle = string(value)
 		return nil
 	default:
 		return nil
