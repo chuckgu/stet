@@ -829,6 +829,12 @@ func TestCheckWarnsAboutAgentRoles(t *testing.T) {
 	pool := stetPoolIn(t, pg, db)
 	admin := connectTo(t, pg, db, "stet_scram", "scram-pw")
 	table := freshTable(t, admin, 1)
+	// Stet's account is a member of the agent roles whose cases expect no
+	// warning at all: not being one is a warning too.
+	su := superuser(t, pg)
+	// (stet_md5 already is, on the test server, and stays so.)
+	mustExec(t, su, "grant stet_clear, stet_md5 to stet_scram")
+	t.Cleanup(func() { su.Exec(ctx, "revoke stet_clear from stet_scram") })
 
 	cases := []struct {
 		name, role string
@@ -1179,6 +1185,7 @@ func TestCheckWarnsAboutRightsToCreateObjects(t *testing.T) {
 	// and schema warn, and once they are revoked nothing does.
 	t.Run("granted, then revoked", func(t *testing.T) {
 		agent := createRole(t, su, "agent", "login") // before the database: see cleanDatabase
+		mustExec(t, su, "grant "+agent+" to stet_scram")
 		db := cleanDatabase(t, pg)
 		pool := stetPoolIn(t, pg, db)
 		table := freshTable(t, connectTo(t, pg, db, "stet_scram", "scram-pw"), 1)

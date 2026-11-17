@@ -38,6 +38,7 @@ func check(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config) (warning
 	if cfg.Mode == config.ModeEnforce {
 		c.userNamespace()
 		c.passSettings()
+		c.stetSuperuser()
 		c.agentRoles(own)
 	}
 	return c.warnings, errors.Join(c.errs...)
@@ -189,6 +190,27 @@ func (c *checker) tableKeys() []string {
 	return keys
 }
 
+// stetSuperuser warns when Stet's own account is a superuser: an approved
+// write runs on Stet's connection as the agent's role (spec 10), and a
+// statement of it that undoes SET LOCAL ROLE would run with a superuser's
+// rights.
+func (c *checker) stetSuperuser() {
+	var session string
+	var super bool
+	err := c.read(func(tx pgx.Tx) error {
+		return tx.QueryRow(c.ctx, "select session_user, rolsuper from pg_roles where rolname = session_user").
+			Scan(&session, &super)
+	})
+	switch {
+	case err != nil:
+		c.warn("whether Stet's account is a superuser could not be checked: %v", err)
+	case super:
+		c.warn("Stet's account %q is a superuser: an approved write runs on Stet's connection, and a statement that "+
+			"undoes SET LOCAL ROLE runs with a superuser's rights; fix: connect Stet as a role that has only the stet "+
+			"schema and membership in the agent roles", session)
+	}
+}
+
 // ownedTable is a gated table and the role that owns it.
 type ownedTable struct {
 	key, owner string
@@ -294,6 +316,9 @@ func (c *checker) agentRole(role string, tables []ownedTable, stetPath, database
 	case err != nil:
 		c.warn("agent role %q could not be checked: %v", role, err)
 		return
+	}
+	c.stetMember(role, id, oid)
+	switch {
 	// A superuser passes every right below; one line says enough.
 	case super:
 		c.warn("agent role %q is a superuser: it can change the gated tables, the stet schema and the server's "+
@@ -334,6 +359,27 @@ func (c *checker) agentRole(role string, tables []ownedTable, stetPath, database
 	}
 
 	c.searchPath(role, stetPath, database, pathErr)
+}
+
+// stetMember warns when Stet's account cannot act as the agent role: an
+// approved write of the role runs as it (SET ROLE), and its multi-row writes
+// are measured as it. MEMBER counts a NOINHERIT membership, which SET ROLE
+// reaches, and a superuser is a member of every role.
+func (c *checker) stetMember(role, id string, oid uint32) {
+	var session string
+	var member bool
+	err := c.read(func(tx pgx.Tx) error {
+		return tx.QueryRow(c.ctx, "select session_user, pg_has_role(session_user, $1::oid, 'MEMBER')", oid).
+			Scan(&session, &member)
+	})
+	switch {
+	case err != nil:
+		c.warn("whether Stet's account is a member of agent role %q could not be checked: %v", role, err)
+	case !member:
+		c.warn("Stet's account %q is not a member of agent role %q: an approved write of that role ends as failed, "+
+			"and its multi-row writes are not measured; fix: GRANT %s TO %s",
+			session, role, id, pgx.Identifier{session}.Sanitize())
+	}
 }
 
 // schemaRights warns when the agent has a right on the stet schema: granted
