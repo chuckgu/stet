@@ -580,11 +580,15 @@ func (g *Gate) judge(p *pending, o proxy.Outcome) {
 // settleHeld moves p's held write out of unconfirmed once its outcome o is
 // known (spec-v0.2-approve 4). It runs after the decision on p was recorded,
 // or failed to be, so that a held write a reviewer can approve usually has
-// its reasons recorded already. The write becomes pending, with whether it
-// came in a transaction as the proxy reports it (plan correction B3), only
-// when the proxy reports that its refusal reached the client and that it was
-// neither run nor lost; otherwise it becomes undelivered. One the proxy
-// reports as run cannot be approved: that could run it twice.
+// its reasons recorded already. o is the outcome End passed on: for a write
+// Begin refused, which every held write is, End put its own refusal in place
+// of what the proxy reported, keeping Undelivered and InTransaction, unless
+// the proxy reported the write as run or lost. So the write becomes pending,
+// with whether it came in a transaction as the proxy reports it (plan
+// correction B3), only when the proxy reported neither that its refusal did
+// not reach the client (Undelivered) nor that it was run or lost (Executed,
+// Lost); otherwise it becomes undelivered. One the proxy reports as run
+// cannot be approved: that could run it twice.
 //
 // A held write whose insert reported an error was not named to the client
 // either, so it becomes undelivered too, should it have landed (marking an id
@@ -809,7 +813,10 @@ func (s State) CouldUndoRecent() bool {
 // kept as the bytes the client sent, also next to binary ones (plan
 // correction B1): read back, a value whose meaning depends on the session's
 // settings, such as an untyped date under DateStyle, would come back as
-// Stet's connection reads it, not as the client's session does.
+// Stet's connection reads it, not as the client's session does. Nor are they
+// sent with the binary ones to be decoded: one valid only under the client's
+// settings ('13/02/2026' under DMY) would fail the decoding there. Sent as
+// NULL instead, a value of a NOT NULL domain would fail it too.
 //
 // Decoding runs the types' code, a domain's CHECK included, on Stet's
 // connection as Stet's own account, and the agent chose both the statement
@@ -820,8 +827,8 @@ func (g *Gate) paramTexts(ctx context.Context, sql string, ps []proxy.Param) ([]
 	if out := textParams(ps); out != nil || len(ps) == 0 {
 		return out, nil
 	}
-	// A value is binary: the server decodes every value, as it would to run
-	// the statement, and the binary ones are read back as text.
+	// A value is binary: the server decodes the binary ones, with the types
+	// it would run the statement with, and they are read back as text.
 	out := make([]*string, len(ps))
 
 	pg, done, err := g.txConn(ctx)
@@ -843,27 +850,31 @@ func (g *Gate) paramTexts(ctx context.Context, sql string, ps []proxy.Param) ([]
 	}
 	var q strings.Builder
 	q.WriteString("select ")
-	values := make([][]byte, len(ps))
-	formats := make([]int16, len(ps))
+	var binary []int // the index in ps of each binary value, in the query's order
+	var values [][]byte
+	var oids []uint32
 	for i, p := range ps {
-		if i > 0 {
+		if p.Format == 0 {
+			if p.Value != nil {
+				out[i] = ptr(string(p.Value))
+			}
+			continue
+		}
+		if len(binary) > 0 {
 			q.WriteString(", ")
 		}
-		fmt.Fprintf(&q, "$%d::text", i+1)
-		values[i], formats[i] = p.Value, p.Format
+		binary = append(binary, i)
+		fmt.Fprintf(&q, "$%d::text", len(binary))
+		values = append(values, p.Value)
+		oids = append(oids, sd.ParamOIDs[i])
 	}
-	res := pg.ExecParams(ctx, q.String(), values, sd.ParamOIDs, formats, nil).Read()
+	res := pg.ExecParams(ctx, q.String(), values, oids, []int16{1}, nil).Read()
 	if res.Err != nil {
 		return nil, res.Err
 	}
-	for i, v := range res.Rows[0] {
-		switch {
-		case ps[i].Format == 0:
-			if ps[i].Value != nil {
-				out[i] = ptr(string(ps[i].Value))
-			}
-		case v != nil:
-			out[i] = ptr(string(v))
+	for k, v := range res.Rows[0] {
+		if v != nil {
+			out[binary[k]] = ptr(string(v))
 		}
 	}
 	return out, nil

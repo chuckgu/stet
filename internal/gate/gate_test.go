@@ -31,6 +31,7 @@ type fakeDecider struct {
 	answers map[string]decide.Answer
 	err     error
 	delay   time.Duration
+	cost    float64 // what each call costs, in USD; 0 for 0.0002
 	// onDecide, when set, is called inside Decide with the call's number,
 	// counted from 1, before it answers.
 	onDecide func(call int)
@@ -67,7 +68,11 @@ func (f *fakeDecider) Decide(ctx context.Context, state json.RawMessage, qs []de
 		}
 	}
 	f.mu.Unlock()
-	return decide.Answers{ByQuestion: out, CostUSD: 0.0002}, nil
+	cost := f.cost
+	if cost == 0 {
+		cost = 0.0002
+	}
+	return decide.Answers{ByQuestion: out, CostUSD: cost}, nil
 }
 
 // setAnswers replaces the table f answers from, between calls.

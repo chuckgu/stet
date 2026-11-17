@@ -426,6 +426,33 @@ func TestHeldWriteKeepsTextValuesAsSentAmongBinaryOnes(t *testing.T) {
 	}
 }
 
+// Next to a binary value, a text one may be valid only under the client's
+// session's settings: '13/02/2026' is a date under DMY, not under the server's
+// default MDY that Stet's connection keeps here. Only the binary value is
+// decoded on Stet's connection, so the write is judged like any other and,
+// held, stored with the text as sent.
+func TestHeldWriteKeepsATextValueOnlyItsSessionReads(t *testing.T) {
+	e := setupEnforce(t, holding())
+	e.seed(t)
+	mustExec(t, e.admin, "alter table "+e.table+" add column since date")
+	conn := e.agent(t, "jdbc")
+	mustExec(t, conn, "set datestyle = 'ISO, DMY'")
+	res := conn.PgConn().ExecParams(context.Background(), "update "+e.table+" set since = $1 where id = $2",
+		[][]byte{[]byte("13/02/2026"), {0, 0, 0, 2}}, []uint32{0, 23}, []int16{0, 1}, nil).Read()
+	wantRefused(t, res.Err, "ST001", "write held by stet: it breaks policy rule 1")
+
+	want := []*string{ptr("13/02/2026"), ptr("2")}
+	h := e.held(t, 1)[0]
+	if !reflect.DeepEqual(h.Params, want) || h.Settings["DateStyle"] != "ISO, DMY" {
+		t.Errorf("held params = %#v, DateStyle %q; want %#v and ISO, DMY", values(h.Params), h.Settings["DateStyle"], values(want))
+	}
+	r := e.enforced(t, 1)[0]
+	wantEnforced(t, 0, r, "hold", "policy:1")
+	if got := e.decisions(t, 1)[0].Params; !reflect.DeepEqual(got, want) {
+		t.Errorf("decision params = %#v, want %#v", values(got), values(want))
+	}
+}
+
 // values is ps with each value in place of its pointer, for messages.
 func values(ps []*string) []any {
 	out := make([]any, len(ps))
@@ -1425,6 +1452,29 @@ func TestHeldWriteStaysUnconfirmedWhenItCannotBeMarked(t *testing.T) {
 		t.Errorf("status %s in_transaction %v, want unconfirmed and NULL", h.Status, deref(h.InTransaction))
 	}
 	wantErrorLogs(t, &logs, "held write not marked pending", 1)
+}
+
+// A held write whose decision cannot be recorded still becomes pending once
+// its refusal reached the client: the marking comes after the insert, whether
+// or not it failed (spec-v0.2-approve 4). Here the server refuses the
+// decision because the model's cost overflows cost_usd.
+func TestHeldWriteIsPendingWhenItsDecisionIsNotRecorded(t *testing.T) {
+	d := holding()
+	d.cost = 1e7 // cost_usd is numeric(12,6)
+	e := setupEnforce(t, d)
+	var logs lockedBuffer
+	gate.SetLogger(e.gate, slog.New(slog.NewJSONHandler(&logs, nil)))
+	e.seed(t)
+	_, err := e.agent(t, "a").Exec(context.Background(), "update "+e.table+" set status = 'churned' where id = 2")
+	pgErr := wantRefused(t, err, "ST001", "write held by stet: it breaks policy rule 1")
+	if !strings.Contains(pgErr.Detail, "held_write=") {
+		t.Errorf("detail = %q, want the held write named", pgErr.Detail)
+	}
+	waitErrorLog(t, &logs, "decision not recorded")
+	e.waitHeldStatus(t, "pending")
+	if n := len(e.decisions(t, 0)); n != 0 {
+		t.Errorf("%d decisions recorded, want none", n)
+	}
 }
 
 // A held write becomes pending, and so approvable, only once the decision on
