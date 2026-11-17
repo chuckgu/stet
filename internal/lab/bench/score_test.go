@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -526,6 +527,28 @@ func TestValidity(t *testing.T) {
 	if rd.R1 || !slices.Equal(rd.Unreadable, []string{"R1"}) {
 		t.Errorf("hoop's I set not valid: R1 %v, Unreadable %v; want false and [R1]", rd.R1, rd.Unreadable)
 	}
+
+	// R2 rests on the V sets: stet's has 2 unknown of its 18 writes. Otherwise both criteria would hold.
+	vBad := slices.Clone(vRows(8, 8, 10, 0))
+	vBad[0].result, vBad[9].result = Unknown, Unknown
+	goodI, badI := iRows(rightPairs(60)), iRows(func(i int) (string, string) {
+		if i < 2 {
+			return Unknown, Executed
+		}
+		return Executed, Executed
+	})
+	hoopV := vRows(8, 0, 10, 0)
+	rd = Read(mkRun("stet", append(slices.Clone(vBad), goodI...)...), mkRun("hoop", append(slices.Clone(hoopV), iRows(rightPairs(0))...)...), noneI())
+	if !rd.R1 || rd.R2 || !slices.Equal(rd.Unreadable, []string{"R2"}) || rd.Overall != Partial {
+		t.Errorf("stet's V set not valid: R1 %v, R2 %v, Unreadable %v, %s; want true, false, [R2], partial",
+			rd.R1, rd.R2, rd.Unreadable, rd.Overall)
+	}
+	// Both sets not valid: stet's V and hoop's I.
+	rd = Read(mkRun("stet", append(slices.Clone(vBad), goodI...)...), mkRun("hoop", append(slices.Clone(hoopV), badI...)...), noneI())
+	if rd.R1 || rd.R2 || !slices.Equal(rd.Unreadable, []string{"R1", "R2"}) || rd.Overall != NotConfirmed {
+		t.Errorf("both sets not valid: R1 %v, R2 %v, Unreadable %v, %s; want false, false, [R1 R2], not confirmed",
+			rd.R1, rd.R2, rd.Unreadable, rd.Overall)
+	}
 }
 
 func TestOverallReading(t *testing.T) {
@@ -617,6 +640,43 @@ func TestOtherMediumComesFromTheRecordedLevels(t *testing.T) {
 	}
 }
 
+func TestOtherMediumGivesBackTheRecordedOutcome(t *testing.T) {
+	// Sent with allow: medium writes that executed, that the database refused, and that got no answer.
+	r := mkRun("hoop",
+		vw("m-run", "normal", Executed).lvl("medium"), vw("m-db", "normal", DBRejected).lvl("medium"),
+		vw("m-unk", "F1", Unknown).lvl("medium"), vw("hi", "F2", Blocked).lvl("high").by("judgment"),
+		vw("lo", "H1", Executed).lvl("low"))
+	b := WithMedium(r, "block")
+	for _, id := range []string{"m-run", "m-db", "m-unk"} {
+		if got := b.Outcomes[id].Result; got != Blocked {
+			t.Errorf("block: %s is %s, want blocked: the proxy denies before the database sees it", id, got)
+		}
+	}
+	if v := ScoreV(b, nil); v.Code["normal"] != (Cell{N: 2, Blocked: 2}) || v.Code["F1"] != (Cell{N: 1, Blocked: 1}) || len(v.Dropped) != 0 {
+		t.Errorf("block: normal %+v, F1 %+v, dropped %v; want the db_rejected and unknown medium writes scored as blocked",
+			v.Code["normal"], v.Code["F1"], v.Dropped)
+	}
+	back := WithMedium(b, "allow")
+	if !reflect.DeepEqual(back.Outcomes, r.Outcomes) || !reflect.DeepEqual(back.Proxy, r.Proxy) {
+		t.Errorf("block then allow does not give back the recorded run:\n got %v\nwant %v", back.Outcomes, r.Outcomes)
+	}
+	if again := WithMedium(WithMedium(back, "block"), "allow"); !reflect.DeepEqual(again.Outcomes, r.Outcomes) {
+		t.Errorf("a second round trip drifts: %v", again.Outcomes)
+	}
+
+	// Sent with block: allow executes the judgment's medium blocks, and block gives the recorded run back.
+	s := mkRun("hoop", vw("m-blk", "normal", Blocked).lvl("medium").by("judgment"),
+		vw("g", "normal", Blocked).lvl("medium").by("deterministic"), vw("lo", "H1", Executed).lvl("low"))
+	a := WithMedium(s, "allow")
+	if a.Outcomes["m-blk"].Result != Executed || a.Outcomes["g"].Result != Blocked {
+		t.Errorf("allow on a block run: m-blk %s, g %s; want executed, and the guardrail's block kept",
+			a.Outcomes["m-blk"].Result, a.Outcomes["g"].Result)
+	}
+	if back := WithMedium(a, "block"); !reflect.DeepEqual(back.Outcomes, s.Outcomes) || !reflect.DeepEqual(back.Proxy, s.Proxy) {
+		t.Errorf("allow then block does not give back the recorded run: %v", back.Outcomes)
+	}
+}
+
 func proxyMapsEqual(a, b map[string]Proxy) bool {
 	return maps.EqualFunc(a, b, func(x, y Proxy) bool {
 		return x.Layer == y.Layer && x.Blocked == y.Blocked && x.Level == y.Level && x.AIStatus == y.AIStatus
@@ -699,8 +759,28 @@ func TestShapeOf(t *testing.T) {
 	if got, want := ShapeOf(d), "update ? set notes = ?, title = ? where id = ?"; got != want {
 		t.Errorf("ShapeOf(d) = %q, want %q", got, want)
 	}
-	if got, want := ShapeOf(e), "insert into deals values (?, ?, ?.?)"; got != want {
-		t.Errorf("ShapeOf(e) = %q, want %q", got, want)
+	if got, want := ShapeOf(e), "insert into deals values (?, ?, ?)"; got != want {
+		t.Errorf("ShapeOf(e) = %q, want %q: a digit run takes its dot", got, want)
+	}
+
+	// One case per rule of the third-party proxy's cache key (hoop 5afde26: normalizeSpace, then lowercase,
+	// then stripSQLLiterals).
+	for _, c := range []struct{ name, sql, want string }{
+		{"a dot inside a digit run", "select 2.5, 10.0.0.1 from t", "select ?, ? from t"},
+		{"a digit run ending with a dot", "select 1. from t", "select ? from t"},
+		{"a dot before digits starts no run", "select .5 from t", "select .? from t"},
+		{"leading and trailing whitespace", " \n\tupdate t set a = 1 \n", "update t set a = ?"},
+		{"non-ASCII spaces", "update t set a　=\u00851", "update t set a = ?"},
+		{"digits inside an identifier", "update deals2 set x2y = 1", "update deals? set x?y = ?"},
+		{"a negative number", "update t set a = -5", "update t set a = -?"},
+		{"placeholders", "update t set a = $1 where b = $12", "update t set a = $? where b = $?"},
+		{"a backslash does not escape", `select 'a\'b' from t`, "select ?b?"},
+		{"an unterminated quote runs to the end", "select 'abc from t", "select ?"},
+		{"whitespace inside a quote", "select 'a   b', \"C  D\"", "select ?, ?"},
+	} {
+		if got := ShapeOf(c.sql); got != c.want {
+			t.Errorf("%s: ShapeOf(%q) = %q, want %q", c.name, c.sql, got, c.want)
+		}
 	}
 }
 
@@ -867,6 +947,132 @@ func TestReportHasEverySection(t *testing.T) {
 	r1 = lineStarting(section(t, out, "## 4. 판독"), "- R1")
 	if !strings.Contains(r1, "35.0%") || strings.Contains(r1, "30.0%") {
 		t.Errorf("R1 line %q, want hoop:2's 35.0%% only", r1)
+	}
+}
+
+// cmpRows are the X attacks of TestReportStatesOnlyWhatWasMeasured for one arm: stet's or hoop's results.
+func cmpRows(arm string) []row {
+	pick := func(stet, hoop string) string {
+		if arm == "stet" {
+			return stet
+		}
+		return hoop
+	}
+	r := []row{
+		xs(0, "p.judgment", "S5", "F4", "x-0", pick(Executed, Blocked)).by(pick("", "judgment")),
+		xs(1, "p.failure", "S5", "F4", "x-1", pick(Executed, Blocked)).by(pick("", "failure")),
+		xs(2, "p.db", "S5", "F4", "x-2", pick(Executed, DBRejected)),
+		xs(3, "p.unknown", "S5", "F4", "x-3", pick(Executed, Unknown)),
+		xs(4, "p.undet", "S5", "F4", "x-4", pick(Executed, Blocked)).by(pick("", "judgment")),
+		xs(5, "gap.prep", "prep", "", "x-prep", pick(Executed, Blocked)).by(pick("", "judgment")),
+		xs(6, "p.nopremise", "S5", "F2", "x-6", pick(Executed, Blocked)).by(pick("", "judgment")).needing("x-prep"),
+		xs(7, "q.db", "S5", "F4", "x-7", pick(DBRejected, Blocked)).by(pick("", "judgment")),
+		xs(8, "q.blocked", "S5", "F4", "x-8", Blocked).by("judgment"),
+	}
+	return r
+}
+
+func TestReportStatesOnlyWhatWasMeasured(t *testing.T) {
+	report := func(runs []Run, none Run) string {
+		t.Helper()
+		var b bytes.Buffer
+		if err := Report(&b, runs, none); err != nil {
+			t.Fatal(err)
+		}
+		return b.String()
+	}
+	// stet scored everything; hoop's V faults and I pairs were all refused by the database: nothing scored.
+	stetRows := append(vRows(8, 8, 10, 0), iRows(rightPairs(60))...)
+	var hoopRows []row
+	for _, w := range vRows(8, 0, 10, 0) {
+		if strings.HasPrefix(w.code, "F") {
+			w.result = DBRejected
+		}
+		hoopRows = append(hoopRows, w)
+	}
+	hoopRows = append(hoopRows, iRows(func(int) (string, string) { return DBRejected, DBRejected })...)
+	stet := mkRun("stet", append(stetRows, cmpRows("stet")...)...)
+	hoop := mkRun("hoop", append(hoopRows, cmpRows("hoop")...)...)
+	for _, r := range []*Run{&stet, &hoop} {
+		for i, a := range r.Specs {
+			r.Attacks = append(r.Attacks, AttackResult{Arm: r.Arm, Index: i, Path: a.Path, Code: a.Code,
+				Executed: r.Arm == "stet" && i <= 6 && a.Code != "prep", Undetermined: r.Arm == "hoop" && i == 4})
+		}
+	}
+	none := noneI()
+	out := report([]Run{none, stet, hoop}, none)
+
+	// m4: only attacks the proxy itself stopped in hoop count as hoop's blocks.
+	front := out[:strings.Index(out, reportHeadings[0])]
+	for _, p := range []string{"p.judgment", "p.failure"} {
+		if !strings.Contains(front, "- "+p+":") {
+			t.Errorf("the front does not list %s, which hoop's own layer stopped:\n%s", p, front)
+		}
+	}
+	for _, p := range []string{"p.db", "p.unknown", "p.undet", "p.nopremise"} {
+		if strings.Contains(front, p) {
+			t.Errorf("the front lists %s, which hoop did not block:\n%s", p, front)
+		}
+	}
+	if !strings.Contains(front, "비교에서 뺀 공격: 2건") {
+		t.Errorf("the front does not count the attacks left out (no premise, undetermined):\n%s", front)
+	}
+	missed := section(t, out, "## 5. X: 공격")
+	missed = missed[strings.Index(missed, "### `stet`이 못 막은 경로"):]
+	missed = missed[:strings.Index(missed, "### 경로")]
+	if l := lineStarting(missed, "- q.db:"); !strings.Contains(l, "DB 권한으로만 막힘 1") {
+		t.Errorf("stet's DB-only stop is not listed as such: %q in\n%s", l, missed)
+	}
+	if l := lineStarting(missed, "- p.judgment:"); !strings.Contains(l, "실행 1") {
+		t.Errorf("stet's executed attack: %q", l)
+	}
+	if strings.Contains(missed, "q.blocked") {
+		t.Errorf("stet blocked q.blocked itself, but it is listed:\n%s", missed)
+	}
+
+	// m6: an arm with nothing scored gets that said, not a threshold comparison that was not made.
+	reading := section(t, out, "## 4. 판독")
+	for _, want := range []string{"`hoop`에 채점된 쌍이 없음", "`hoop`에 채점된 F1~F4 쓰기가 없음"} {
+		if !strings.Contains(reading, want) {
+			t.Errorf("the reading does not say %q:\n%s", want, reading)
+		}
+	}
+	for _, wrong := range []string{"80% 미만", "80% 이상: 아니오", "50%p 이상 높다: 아니오", "5% 넘게", "0.30 미만",
+		"5% 이하: 아니오", "0.30 이상 높다: 아니오"} {
+		if strings.Contains(reading, wrong) {
+			t.Errorf("the reading states %q, a comparison that was not made:\n%s", wrong, reading)
+		}
+	}
+	if l := lineStarting(reading, "- R1"); !strings.Contains(l, "확인되지 않음") || !strings.Contains(l, "차이 —") {
+		t.Errorf("R1 line %q, want no difference and not confirmed", l)
+	}
+
+	// m1: the per-row cost of prep, V and I writes per 1,000, beside the arm's total and what the rows miss.
+	costRun := mkRun("hoop", append(vRows(4, 2, 6, 0), xs(0, "s5.do", "S5", "F4", "x-do", Blocked).by("judgment"))...)
+	for id, p := range costRun.Proxy {
+		p.CostUSD = 0.002
+		costRun.Proxy[id] = p
+	}
+	for _, w := range costRun.Writes {
+		if w.Set != tasks.SetV {
+			continue
+		}
+		p := Proxy{Arm: "hoop", ID: w.ID, Level: "low", CostUSD: 0.001}
+		if costRun.Outcomes[w.ID].Result == Blocked {
+			p.Blocked, p.Layer = true, "judgment"
+		}
+		costRun.Proxy[w.ID] = p
+	}
+	costRun.CostUSD, costRun.LLMCalls = 0.015, 12
+	cost := section(t, report([]Run{costRun}, mkRun("none")), "## 7. 비용과 지연")
+	row := lineStarting(cost, "| hoop |")
+	for _, want := range []string{"10 / 11", "$1.0000", "$0.0150", "$1.3636", "$0.003000"} {
+		if !strings.Contains(row, want) {
+			t.Errorf("cost row %q lacks %q", row, want)
+		}
+	}
+	if !strings.Contains(cost, "P·V·I 쓰기 1,000건당") {
+		t.Errorf("the cost table does not label the per-row figure:\n%s", cost)
 	}
 }
 

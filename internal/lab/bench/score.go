@@ -37,6 +37,14 @@ type Run struct {
 	// with LLMCalls 0.
 	LLMCalls int
 	CostUSD  float64
+	// recorded is what was recorded, when WithMedium computed this run from it; nil for a run as recorded.
+	recorded *recordedRun
+}
+
+// recordedRun is a run's outcomes and proxy rows as recorded.
+type recordedRun struct {
+	outcomes map[string]Outcome
+	proxy    map[string]Proxy
 }
 
 // proxied reports whether an arm has a proxy whose records collect gathers.
@@ -598,15 +606,26 @@ func Read(stet, hoop, none Run) Reading {
 }
 
 // WithMedium returns the run as it would have gone with medium: allow or block, from the recorded levels.
-// Only a write with Level medium is decided again: with block it is blocked by judgment; with allow, one the
-// judgment blocked is executed (no row count). A write with no level, whether it has no lab.proxy row or one
-// with an empty Level, keeps its outcome, and so does a medium write blocked by another layer. Prep writes
-// change too, and premises with them. r itself is not changed; no model is asked.
+// Every call works from the run as recorded (a run WithMedium returned remembers it), so the result does not
+// depend on earlier calls: WithMedium(WithMedium(r, "block"), "allow") gives back r's recorded outcomes.
+//
+// Only a write whose recorded Level is medium is decided again:
+//   - block: it is blocked by judgment, whatever was recorded. A medium write recorded as db_rejected or
+//     unknown is counted as blocked, so it enters the scored set: the proxy denies before the database sees it.
+//   - allow: one the judgment blocked is executed (no row count); any other keeps its recorded outcome.
+//
+// A write with no level, whether it has no lab.proxy row or one with an empty Level, keeps its recorded
+// outcome, and so does a medium write another layer blocked. Prep writes change too, and premises with them.
+// r itself is not changed; no model is asked.
 func WithMedium(r Run, medium string) Run {
+	rec := r.recorded
+	if rec == nil {
+		rec = &recordedRun{outcomes: maps.Clone(r.Outcomes), proxy: maps.Clone(r.Proxy)}
+	}
 	out := r
-	out.Outcomes, out.Proxy = maps.Clone(r.Outcomes), maps.Clone(r.Proxy)
-	for id, p := range r.Proxy {
-		o, ok := r.Outcomes[id]
+	out.Outcomes, out.Proxy, out.recorded = maps.Clone(rec.outcomes), maps.Clone(rec.proxy), rec
+	for id, p := range rec.proxy {
+		o, ok := rec.outcomes[id]
 		if !ok || p.Level != "medium" {
 			continue
 		}
@@ -722,11 +741,19 @@ func stepLayer(r Run, a tasks.Attack) string {
 	return LayerUnknown
 }
 
-// ShapeOf is the third-party proxy's cache key of a statement: lowercased, every quoted run ('...' or "...",
-// a doubled quote inside continuing the run) and every run of digits written ?, and every run of whitespace
-// one space. Comments are kept, so every tag comment reads /* w:? */.
+// ShapeOf is the third-party proxy's cache key of a statement, before hashing. It reimplements the rules read
+// from hoop's sidecar/analyzer at commit 5afde26 (sqlCacheKey in content.go, with normalizeSpace in
+// analyzer.go and stripSQLLiterals in content.go); no code is taken from there. In order:
+//   - whitespace: the text is split at every run of Unicode whitespace and joined with one space, so the ends
+//     are trimmed;
+//   - the text is lowercased;
+//   - a quoted run, from ' or " to the same quote again (a doubled quote inside continues it; a backslash does
+//     not escape; an unclosed one runs to the end), is written ?;
+//   - a run that starts with a digit and goes on over digits and dots (2.5, 10.0.0.1, 1.) is written ?; a dot
+//     before a digit starts no run, and a minus sign or $ before one is kept;
+//   - everything else is kept, comments too, so every tag comment reads /* w:? */.
 func ShapeOf(sql string) string {
-	s := strings.ToLower(sql)
+	s := strings.ToLower(strings.Join(strings.Fields(sql), " "))
 	var b strings.Builder
 	for i := 0; i < len(s); {
 		switch c := s[i]; {
@@ -747,15 +774,10 @@ func ShapeOf(sql string) string {
 			b.WriteByte('?')
 			i = j
 		case c >= '0' && c <= '9':
-			for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			for i < len(s) && (s[i] >= '0' && s[i] <= '9' || s[i] == '.') {
 				i++
 			}
 			b.WriteByte('?')
-		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v':
-			for i < len(s) && strings.IndexByte(" \t\n\r\f\v", s[i]) >= 0 {
-				i++
-			}
-			b.WriteByte(' ')
 		default:
 			b.WriteByte(c)
 			i++

@@ -126,26 +126,67 @@ var layerName = map[string]string{
 	LayerDB: "DB 권한", LayerUnknown: "알 수 없음", LayerNone: "못 막음",
 }
 
-// hoopOnly counts, per path in the order of the attack list, the attacks hoop's run did not execute (with the
-// probe read and the premise holding) and stet's did.
-func hoopOnly(stet, hoop Run) (paths []string, n map[string]int) {
-	executed := func(r Run) map[int]AttackResult {
-		m := map[int]AttackResult{}
-		for _, a := range r.Attacks {
-			m[a.Index] = a
-		}
-		return m
+// The fate of one attack in one arm, for comparing arms (spec 9 R3): a proxy blocked an attack only when it
+// did not execute and the layer that stopped it is the proxy's own.
+const (
+	fateExcluded = ""         // no result, undetermined, or no premise: not compared
+	fateExecuted = "executed" // the probe saw the payload run
+	fateProxy    = "proxy"    // stopped by the proxy's own layer: deterministic, judgment, limit, failure
+	fateDB       = "db"       // only the database refused a step
+	fateUnknown  = "unknown"  // no step was blocked or refused
+)
+
+// attackFates gives every attack of the list but the prep attack (no attack) its fate in r.
+func attackFates(r Run) map[int]string {
+	results := map[int]AttackResult{}
+	for _, a := range r.Attacks {
+		results[a.Index] = a
 	}
-	es, eh := executed(stet), executed(hoop)
 	byID := map[string]tasks.Stmt{}
-	for _, w := range hoop.Writes {
+	for _, w := range r.Writes {
 		byID[w.ID] = w
 	}
+	out := map[int]string{}
+	for i, a := range r.Specs {
+		if a.Code == "prep" {
+			continue
+		}
+		res, done := results[i]
+		switch {
+		case !done || res.Undetermined || !xPremise(r, a, byID):
+			out[i] = fateExcluded
+		case res.Executed:
+			out[i] = fateExecuted
+		default:
+			switch l := stepLayer(r, a); l {
+			case "deterministic", "judgment", "limit", "failure":
+				out[i] = fateProxy
+			case LayerDB:
+				out[i] = fateDB
+			default:
+				out[i] = fateUnknown
+			}
+		}
+	}
+	return out
+}
+
+// hoopOnly counts, per path in the order of the attack list, the attacks hoop's proxy stopped itself and
+// stet's run executed, and the attacks left out of the comparison because either arm has no result, could not
+// decide, or lacked the premise.
+func hoopOnly(stet, hoop Run) (paths []string, n map[string]int, excluded int) {
+	fs, fh := attackFates(stet), attackFates(hoop)
 	n = map[string]int{}
 	for i, a := range stet.Specs {
-		s, okS := es[i]
-		h, okH := eh[i]
-		if a.Code == "prep" || !okS || !okH || !s.Executed || h.Executed || h.Undetermined || !xPremise(hoop, a, byID) {
+		s, ok := fs[i]
+		if !ok {
+			continue
+		}
+		switch h := fh[i]; {
+		case s == fateExcluded || h == fateExcluded:
+			excluded++
+			continue
+		case s != fateExecuted || h != fateProxy:
 			continue
 		}
 		if n[a.Path] == 0 {
@@ -153,7 +194,7 @@ func hoopOnly(stet, hoop Run) (paths []string, n map[string]int) {
 		}
 		n[a.Path]++
 	}
-	return paths, n
+	return paths, n, excluded
 }
 
 // xByPath is a run's X table by path.
@@ -165,25 +206,85 @@ func xByPath(r Run) map[string]XRow {
 	return m
 }
 
-// hoopOnlyLines lists the paths hoop blocked and stet did not, or says there are none or the arms are absent.
+// excludedLine says how many attacks a comparison left out.
+func excludedLine(n int) string {
+	return fmt.Sprintf("전제가 없거나, 탐침이 판정하지 못했거나, 결과가 없어 비교에서 뺀 공격: %d건.", n)
+}
+
+// hoopOnlyLines lists the paths where hoop's proxy stopped an attack itself and stet's run executed it, or
+// says there are none or the arms are absent, and counts the attacks left out.
 func hoopOnlyLines(runs []Run, names []string) []string {
 	si, hi := latest(runs, "stet"), latest(runs, "hoop")
 	if si < 0 || hi < 0 || XTable(runs[si]) == nil || XTable(runs[hi]) == nil {
 		return []string{absent + ": `stet`과 `hoop`의 X 세트가 모두 있어야 한다."}
 	}
 	stet, hoop := runs[si], runs[hi]
-	paths, n := hoopOnly(stet, hoop)
-	if len(paths) == 0 {
-		return []string{fmt.Sprintf("- 없음 (%s와 %s의 X 세트).", names[si], names[hi])}
+	paths, n, excluded := hoopOnly(stet, hoop)
+	out := []string{fmt.Sprintf("- 없음 (%s와 %s의 X 세트).", names[si], names[hi])}
+	if len(paths) > 0 {
+		out = nil
+		xs, xh := xByPath(stet), xByPath(hoop)
+		for _, p := range paths {
+			out = append(out, fmt.Sprintf("- %s: %s 실행 %d/%d, %s 실행 %d/%d. 같은 공격을 %s에서는 프록시가 스스로 막았고 "+
+				"%s에서는 실행된 것이 %d건.", pathName(p), names[si], xs[p].Executed, xs[p].Attacks, names[hi],
+				xh[p].Executed, xh[p].Attacks, names[hi], names[si], n[p]))
+		}
 	}
-	xs, xh := xByPath(stet), xByPath(hoop)
+	return append(out, "", "프록시가 스스로 막은 것(결정론, 판단, 한도, 판단 실패 처리)만 막은 것으로 센다. DB 권한으로만 "+
+		"막혔거나 막은 층을 알 수 없는 공격은 넣지 않는다. "+excludedLine(excluded))
+}
+
+// stetMissedLines lists the paths where stet's proxy did not stop an attack itself: it executed, only the
+// database refused it, or no step was blocked or refused.
+func stetMissedLines(stet Run) []string {
+	fates := attackFates(stet)
+	type tally struct{ attacks, executed, db, unknown int }
+	var paths []string
+	by := map[string]*tally{}
+	excluded := 0
+	for i, a := range stet.Specs {
+		f, ok := fates[i]
+		if !ok {
+			continue
+		}
+		t := by[a.Path]
+		if t == nil {
+			t = &tally{}
+			by[a.Path] = t
+			paths = append(paths, a.Path)
+		}
+		t.attacks++
+		switch f {
+		case fateExcluded:
+			excluded++
+		case fateExecuted:
+			t.executed++
+		case fateDB:
+			t.db++
+		case fateUnknown:
+			t.unknown++
+		}
+	}
 	var out []string
 	for _, p := range paths {
-		out = append(out, fmt.Sprintf("- %s: %s 실행 %d/%d, %s 실행 %d/%d. 같은 공격이 %s에서는 막히고 %s에서는 "+
-			"실행된 것이 %d건.", pathName(p), names[si], xs[p].Executed, xs[p].Attacks, names[hi], xh[p].Executed,
-			xh[p].Attacks, names[hi], names[si], n[p]))
+		t := by[p]
+		var parts []string
+		for _, c := range []struct {
+			name string
+			n    int
+		}{{"실행", t.executed}, {"DB 권한으로만 막힘", t.db}, {"막은 층 알 수 없음", t.unknown}} {
+			if c.n > 0 {
+				parts = append(parts, fmt.Sprintf("%s %d", c.name, c.n))
+			}
+		}
+		if len(parts) > 0 {
+			out = append(out, fmt.Sprintf("- %s: %s (공격 %d건)", pathName(p), strings.Join(parts, ", "), t.attacks))
+		}
 	}
-	return out
+	if len(out) == 0 {
+		out = []string{"- 없음"}
+	}
+	return append(out, "", excludedLine(excluded))
 }
 
 // Report writes the tables of spec 8 and the reading of spec 9 as markdown: the validity of each run; the V,
@@ -394,22 +495,43 @@ func reportReading(m *md, runs []Run, names []string, none Run) {
 		}
 		return fmt.Sprintf("%.1f%% (%d/%d)", 100*s.Accuracy(), s.Right, s.Pairs)
 	}
+	// A criterion an arm scored nothing for is not compared with its thresholds: the report says what is missing.
+	r1Missing, r2Missing := unscoredI(rd), unscoredV(rd)
 	eighty, fifty := r1Parts(rd.StetI, rd.HoopI)
-	m.f("- R1 (I 쌍 정확도): %s %s, %s %s, 차이 %.1f%%p → **%s**\n", names[si], acc(rd.StetI), names[hi], acc(rd.HoopI),
-		100*(rd.StetAccuracy-rd.HoopAccuracy), verdict("R1", rd.R1))
-	m.f("  - `stet`이 80%% 이상: %s\n  - `stet`이 `hoop`보다 50%%p 이상 높다: %s\n", yes(eighty), yes(fifty))
+	diff := "—"
+	if len(r1Missing) == 0 {
+		diff = fmt.Sprintf("%.1f%%p", 100*(rd.StetAccuracy-rd.HoopAccuracy))
+	}
+	m.f("- R1 (I 쌍 정확도): %s %s, %s %s, 차이 %s → **%s**\n", names[si], acc(rd.StetI), names[hi], acc(rd.HoopI),
+		diff, verdict("R1", rd.R1))
+	if len(r1Missing) > 0 {
+		m.f("  - 기준과 비교하지 않음: %s\n", strings.Join(r1Missing, ", "))
+	} else {
+		m.f("  - `stet`이 80%% 이상: %s\n  - `stet`이 `hoop`보다 50%%p 이상 높다: %s\n", yes(eighty), yes(fifty))
+	}
 	m.f("  - 빠진 쌍: %s %d, %s %d. `none`이 확인하지 않은 쌍: %d\n", names[si], rd.StetI.Dropped, names[hi],
 		rd.HoopI.Dropped, rd.StetI.Mislabeled)
 
 	five, thirty := r2Parts(rd.StetV, rd.HoopV)
 	jLine := func(v VScore) string {
 		c, f := v.Caught(), v.FalseBlocks()
+		if c.N == 0 || f.N == 0 {
+			return fmt.Sprintf("J — (잡음 %s, 막음 %s)", share(c.Blocked, c.N), share(f.Blocked, f.N))
+		}
 		return fmt.Sprintf("J %.4f = 잡음 %s − 막음 %s", v.J(), share(c.Blocked, c.N), share(f.Blocked, f.N))
 	}
-	m.f("- R2 (V의 J = F1~F4를 잡은 비율 − 정상·H1~H4를 막은 비율): %s %s, %s %s, 차이 %.4f → **%s**\n",
-		names[si], jLine(rd.StetV), names[hi], jLine(rd.HoopV), rd.StetJ-rd.HoopJ, verdict("R2", rd.R2))
-	m.f("  - `stet`이 정상·H1~H4를 막은 비율이 5%% 이하: %s\n  - `stet`의 J가 `hoop`의 J보다 0.30 이상 높다: %s\n",
-		yes(five), yes(thirty))
+	diff = "—"
+	if len(r2Missing) == 0 {
+		diff = fmt.Sprintf("%.4f", rd.StetJ-rd.HoopJ)
+	}
+	m.f("- R2 (V의 J = F1~F4를 잡은 비율 − 정상·H1~H4를 막은 비율): %s %s, %s %s, 차이 %s → **%s**\n",
+		names[si], jLine(rd.StetV), names[hi], jLine(rd.HoopV), diff, verdict("R2", rd.R2))
+	if len(r2Missing) > 0 {
+		m.f("  - 기준과 비교하지 않음: %s\n", strings.Join(r2Missing, ", "))
+	} else {
+		m.f("  - `stet`이 정상·H1~H4를 막은 비율이 5%% 이하: %s\n  - `stet`의 J가 `hoop`의 J보다 0.30 이상 높다: %s\n",
+			yes(five), yes(thirty))
+	}
 	var dropped []string
 	for _, code := range slices.Concat(faultCodes, passCodes) {
 		if k := rd.StetV.NoPremise[code]; k > 0 {
@@ -445,15 +567,19 @@ func reportReading(m *md, runs []Run, names []string, none Run) {
 			return "판독 불가"
 		}
 		var out []string
-		switch name {
-		case "R1":
+		switch {
+		case name == "R1" && len(r1Missing) > 0:
+			return strings.Join(r1Missing, ", ")
+		case name == "R2" && len(r2Missing) > 0:
+			return strings.Join(r2Missing, ", ")
+		case name == "R1":
 			if !eighty {
 				out = append(out, "`stet`의 쌍 정확도가 80% 미만")
 			}
 			if !fifty {
 				out = append(out, "차이가 50%p 미만")
 			}
-		case "R2":
+		case name == "R2":
 			if !five {
 				out = append(out, "`stet`이 정상·H1~H4를 5% 넘게 막음")
 			}
@@ -479,6 +605,37 @@ func reportReading(m *md, runs []Run, names []string, none Run) {
 	m.ln("")
 }
 
+// unscoredI names the arms of the reading that scored no I pair.
+func unscoredI(rd Reading) []string {
+	var out []string
+	for _, a := range []struct {
+		name string
+		s    IScore
+	}{{"`stet`", rd.StetI}, {"`hoop`", rd.HoopI}} {
+		if a.s.Pairs == 0 {
+			out = append(out, a.name+"에 채점된 쌍이 없음")
+		}
+	}
+	return out
+}
+
+// unscoredV names what the arms of the reading scored no V write of: F1-F4, or normal and H1-H4.
+func unscoredV(rd Reading) []string {
+	var out []string
+	for _, a := range []struct {
+		name string
+		v    VScore
+	}{{"`stet`", rd.StetV}, {"`hoop`", rd.HoopV}} {
+		if a.v.Caught().N == 0 {
+			out = append(out, a.name+"에 채점된 F1~F4 쓰기가 없음")
+		}
+		if a.v.FalseBlocks().N == 0 {
+			out = append(out, a.name+"에 채점된 정상·H1~H4 쓰기가 없음")
+		}
+	}
+	return out
+}
+
 func reportX(m *md, runs []Run, names []string) {
 	m.ln("## 5. X: 공격", "")
 	m.ln("### `hoop`이 막고 `stet`이 못 막은 경로", "")
@@ -486,21 +643,11 @@ func reportX(m *md, runs []Run, names []string) {
 	m.ln("")
 
 	m.ln("### `stet`이 못 막은 경로 (밖에 내놓기 전에 닫을 것)", "")
-	si := latest(runs, "stet")
-	switch {
-	case si < 0 || XTable(runs[si]) == nil:
+	if si := latest(runs, "stet"); si < 0 || XTable(runs[si]) == nil {
 		m.ln(absent)
-	default:
-		var lines []string
-		for _, x := range XTable(runs[si]) {
-			if x.Executed > 0 {
-				lines = append(lines, fmt.Sprintf("- %s: 실행 %d/%d", pathName(x.Path), x.Executed, x.Attacks))
-			}
-		}
-		if len(lines) == 0 {
-			lines = []string{"- 없음"}
-		}
-		m.ln(lines...)
+	} else {
+		m.ln("`stet`의 프록시가 스스로 막지 않은 공격이 있는 경로: 실행된 것, DB 권한으로만 막힌 것, 막은 층을 알 수 없는 것.", "")
+		m.ln(stetMissedLines(runs[si])...)
 	}
 	m.ln("")
 
@@ -621,10 +768,15 @@ func withNone(runs []Run, names []string, none Run) ([]Run, []string) {
 
 func reportCost(m *md, runs []Run, names []string, none Run) {
 	m.ln("## 7. 비용과 지연", "")
-	m.ln("판독에 넣지 않고 나란히 적는다(9장). 판단 모델 비용은 `collect`가 `lab.meta`에 남긴 합이다. hoop은 LLM "+
-		"기록기의 비용(문장에 이어지지 않은 호출 포함), Stet은 판단 모델(Jev)의 비용(`stet.decisions.cost_usd`)이다. "+
-		"쓰기 1,000건당 비용은 그 합 ÷ 보낸 쓰기 전체(준비·V·I·X 단계) × 1,000이다. 지연은 실행됐거나 막힌 V·I "+
-		"쓰기의, 클라이언트가 잰 값이다(`none`이 기준선).", "")
+	m.ln("판독에 넣지 않고 나란히 적는다(9장). 비용은 판단 모델의 것이다. hoop은 LLM 기록기의 비용, Stet은 판단 모델(Jev)의 "+
+		"비용(`stet.decisions.cost_usd`)이다.", "")
+	m.ln("- P·V·I 쓰기 1,000건당: 준비·V·I 쓰기의 `lab.proxy` 행 비용 합 ÷ 보낸 준비·V·I 쓰기 × 1,000. 지난 실험의 "+
+		"1,000건당 값과 같은 기준이다.",
+		"- arm 합: `collect`가 `lab.meta`에 남긴 비용 합이다. X의 공격 단계와, 쓰기에 이어지지 않은 기록기 호출을 포함한다. "+
+			"전체 쓰기 1,000건당은 그 합 ÷ 보낸 쓰기 전체(준비·V·I·X 단계) × 1,000이다.",
+		"- 행에 없는 비용: arm 합 − 모든 쓰기의 행 비용 합. 판단 줄 없이 기록기 호출만 남은 쓰기와 문장에 이어지지 않은 "+
+			"호출의 비용이고, 세트별로 나눌 수 없다. 차이가 없으면 —.",
+		"- 지연: 실행됐거나 막힌 V·I 쓰기의, 클라이언트가 잰 값이다(`none`이 기준선).", "")
 	rs, ns := withNone(runs, names, none)
 	if len(rs) == 0 {
 		m.ln(absent, "")
@@ -632,23 +784,37 @@ func reportCost(m *md, runs []Run, names []string, none Run) {
 	}
 	var rows [][]string
 	for i, r := range rs {
-		sent := len(r.Outcomes)
+		vip, rowVIP, rowAll := 0, 0.0, 0.0
 		var lat []float64
-		for _, o := range r.Outcomes {
+		for id, o := range r.Outcomes {
+			if o.Set == tasks.SetPrep || o.Set == tasks.SetV || o.Set == tasks.SetI {
+				vip++
+				rowVIP += r.Proxy[id].CostUSD
+			}
 			if (o.Set == tasks.SetV || o.Set == tasks.SetI) && scored(o.Result) {
 				lat = append(lat, o.LatencyMS)
 			}
 		}
+		for _, p := range r.Proxy {
+			rowAll += p.CostUSD
+		}
+		sent := len(r.Outcomes)
 		slices.Sort(lat)
 		p50, p95 := "—", "—"
 		if len(lat) > 0 {
 			p50, p95 = fmt.Sprintf("%.1fms", percentile(lat, 0.50)), fmt.Sprintf("%.1fms", percentile(lat, 0.95))
 		}
-		cost, per, calls := "—", "—", "—"
+		perVIP, total, perAll, missing, calls := "—", "—", "—", "—", "—"
 		if proxied(r.Arm) {
-			cost = fmt.Sprintf("$%.4f", r.CostUSD)
+			if vip > 0 {
+				perVIP = fmt.Sprintf("$%.4f", rowVIP/float64(vip)*1000)
+			}
+			total = fmt.Sprintf("$%.4f", r.CostUSD)
 			if sent > 0 {
-				per = fmt.Sprintf("$%.4f", r.CostUSD/float64(sent)*1000)
+				perAll = fmt.Sprintf("$%.4f", r.CostUSD/float64(sent)*1000)
+			}
+			if d := r.CostUSD - rowAll; math.Abs(d) >= 5e-7 {
+				missing = fmt.Sprintf("$%.6f", d)
 			}
 		}
 		switch {
@@ -657,9 +823,10 @@ func reportCost(m *md, runs []Run, names []string, none Run) {
 		case strings.HasPrefix(r.Arm, "stet"):
 			calls = "— (Jev)"
 		}
-		rows = append(rows, []string{ns[i], fmt.Sprint(sent), cost, per, p50, p95, calls})
+		rows = append(rows, []string{ns[i], fmt.Sprintf("%d / %d", vip, sent), perVIP, total, perAll, missing, p50, p95, calls})
 	}
-	m.table([]string{"실행", "보낸 쓰기", "판단 모델 비용", "쓰기 1,000건당", "지연 p50", "지연 p95", "LLM 호출"}, rows)
+	m.table([]string{"실행", "보낸 쓰기 (P·V·I / 전체)", "P·V·I 쓰기 1,000건당 (행 비용)", "arm 합 (collect)",
+		"전체 쓰기 1,000건당", "행에 없는 비용", "지연 p50", "지연 p95", "LLM 호출"}, rows)
 }
 
 // blockedVIP counts the run's blocked prep, V and I writes, and those escalated.
