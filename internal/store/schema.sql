@@ -162,8 +162,11 @@ ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS error         text;       
 CREATE INDEX IF NOT EXISTS held_writes_approved ON stet.held_writes (resolved_at) WHERE status = 'approved';
 
 -- 보류된 것은 바뀌지 않는다 (docs/spec-v0.2-approve.md 4장, 계획의 보정 B4). 역할 권한과 별개로 DB가 직접 막는다.
--- free의 아홉 컬럼만 바뀔 수 있고, 나머지는 나중에 더해지는 컬럼까지 모두 고정이다. 아홉 가운데 둘에는 규칙이 있다.
+-- free의 아홉 컬럼만 바뀔 수 있고, 나머지는 나중에 더해지는 컬럼까지 모두 고정이다. 아홉도 저마다 바뀌는 때가 정해져 있다.
 -- in_transaction은 unconfirmed에서 pending이 되는 그 갱신에서만 바뀐다. status는 3장의 화살표로만 바뀐다.
+-- resolved_by, resolved_at, note, max_rows는 pending에서 approved나 rejected가 되는 그 갱신에서만,
+-- applied_at, rows_affected, error는 approved에서 applied나 failed가 되는 그 갱신에서만 바뀐다 (계획의 판정 12).
+-- 그래서 승인된 줄의 max_rows를 넓히거나 resolved_at을 늦춰 10분을 다시 세게 할 수 없다. Stet의 계정도 마찬가지다.
 -- DELETE는 막지 않는다.
 CREATE OR REPLACE FUNCTION stet.held_writes_guard() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -183,6 +186,17 @@ BEGIN
                                           ('approved', 'applied'), ('approved', 'failed')) THEN
     RAISE EXCEPTION 'stet.held_writes: status cannot go from % to %', OLD.status, NEW.status USING ERRCODE = 'ST004';
   END IF;
+  IF (NEW.resolved_by, NEW.resolved_at, NEW.note, NEW.max_rows)
+       IS DISTINCT FROM (OLD.resolved_by, OLD.resolved_at, OLD.note, OLD.max_rows)
+     AND NOT (OLD.status = 'pending' AND NEW.status IN ('approved', 'rejected')) THEN
+    RAISE EXCEPTION 'stet.held_writes: resolved_by, resolved_at, note and max_rows are set once, when the row is approved or rejected'
+      USING ERRCODE = 'ST004';
+  END IF;
+  IF (NEW.applied_at, NEW.rows_affected, NEW.error) IS DISTINCT FROM (OLD.applied_at, OLD.rows_affected, OLD.error)
+     AND NOT (OLD.status = 'approved' AND NEW.status IN ('applied', 'failed')) THEN
+    RAISE EXCEPTION 'stet.held_writes: applied_at, rows_affected and error are set once, when the row is applied or fails'
+      USING ERRCODE = 'ST004';
+  END IF;
   RETURN NEW;
 END
 $$;
@@ -191,3 +205,96 @@ DROP TRIGGER IF EXISTS held_writes_guard ON stet.held_writes;
 CREATE TRIGGER held_writes_guard
   BEFORE UPDATE ON stet.held_writes
   FOR EACH ROW EXECUTE FUNCTION stet.held_writes_guard();
+
+-- 검토자가 보는 것 (docs/spec-v0.2-approve.md 5장). 보류 건과 판단 기록의 근거를 함께 보여 준다.
+-- 판단 기록이 없는 줄도 나온다. expires_at이 지난 pending은 expired로 보인다(저장하는 상태가 아니다).
+-- 뷰는 소유자(Stet의 계정)의 권한으로 읽으므로 검토자에게 두 테이블의 권한이 필요 없다.
+CREATE OR REPLACE VIEW stet.review AS
+SELECT h.id,
+       CASE WHEN h.status = 'pending' AND (h.expires_at IS NULL OR h.expires_at <= now())
+            THEN 'expired' ELSE h.status END AS status,
+       h.created_at, h.expires_at,
+       h.login_role, d.agent_id, d.on_behalf_of,
+       h.target_table, h.target_pk, h.statement, h.params, h.in_transaction,
+       h.verdict, h.reasons, h.planned_rows, h.rows_exact,
+       d.impact, d.cumulative, d.proposed, d.state, d.answers,
+       h.resolved_by, h.resolved_at, h.note, h.max_rows,
+       h.applied_at, h.rows_affected, h.error
+FROM stet.held_writes h LEFT JOIN stet.decisions d ON d.id = h.decision_id;
+
+-- 승인과 거부 (docs/spec-v0.2-approve.md 6장). 줄의 상태만 바꾸고 문장은 실행하지 않는다. 실행은 Stet 프로세스가 한다(7장).
+-- 줄을 잠근 뒤 정해진 순서로 확인하고, 걸리면 ST005로 거절한다. 시각은 트랜잭션의 시작(now())이 아니라
+-- clock_timestamp()다(계획의 보정 B9). 검토자가 오래 열어 둔 트랜잭션에서도 만료를 지금 시각으로 보고,
+-- resolved_at은 실제로 승인·거부한 시각이 된다. 상한이 없는 승인은 받지 않는다(보정 B5).
+CREATE OR REPLACE FUNCTION stet.approve(id uuid, note text DEFAULT NULL, max_rows bigint DEFAULT NULL) RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+  h stet.held_writes;
+BEGIN
+  SELECT * INTO h FROM stet.held_writes w WHERE w.id = approve.id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'held write % does not exist', approve.id USING ERRCODE = 'ST005';
+  END IF;
+  IF h.status = 'unconfirmed' THEN
+    RAISE EXCEPTION 'held write % is unconfirmed: it is not confirmed that the agent was told of it', approve.id
+      USING ERRCODE = 'ST005';
+  END IF;
+  IF h.status <> 'pending' THEN
+    RAISE EXCEPTION 'held write % is %, not pending', approve.id, h.status USING ERRCODE = 'ST005';
+  END IF;
+  IF h.expires_at IS NULL OR h.expires_at <= clock_timestamp() THEN
+    RAISE EXCEPTION 'held write % has expired', approve.id USING ERRCODE = 'ST005';
+  END IF;
+  IF session_user = h.login_role THEN
+    RAISE EXCEPTION '% sent this write and cannot approve it', session_user USING ERRCODE = 'ST005';
+  END IF;
+  IF 'concurrent_change' = ANY (h.reasons) THEN
+    RAISE EXCEPTION 'held write % was held because its row kept changing while it was judged (concurrent_change): '
+      'its stored state is stale and it would not run; the agent must send it again', approve.id
+      USING ERRCODE = 'ST005';
+  END IF;
+  IF approve.max_rows < 0 THEN
+    RAISE EXCEPTION 'max_rows must not be negative' USING ERRCODE = 'ST005';
+  END IF;
+  IF approve.max_rows IS NULL AND (h.rows_exact IS NOT TRUE OR h.planned_rows IS NULL) THEN
+    RAISE EXCEPTION 'held write % was not measured exactly (planned_rows: %): pass max_rows, the most rows it may change',
+      approve.id, coalesce(h.planned_rows::text, 'unknown') USING ERRCODE = 'ST005';
+  END IF;
+  UPDATE stet.held_writes w
+     SET status = 'approved', resolved_by = session_user, resolved_at = clock_timestamp(),
+         note = approve.note, max_rows = approve.max_rows
+   WHERE w.id = approve.id;
+  RETURN 'approved';
+END
+$$;
+
+-- 거부는 앞의 세 확인만 한다. 만료된 줄도, 자기 쓰기도 거부할 수 있다.
+CREATE OR REPLACE FUNCTION stet.reject(id uuid, note text DEFAULT NULL) RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+  h stet.held_writes;
+BEGIN
+  SELECT * INTO h FROM stet.held_writes w WHERE w.id = reject.id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'held write % does not exist', reject.id USING ERRCODE = 'ST005';
+  END IF;
+  IF h.status = 'unconfirmed' THEN
+    RAISE EXCEPTION 'held write % is unconfirmed: it is not confirmed that the agent was told of it', reject.id
+      USING ERRCODE = 'ST005';
+  END IF;
+  IF h.status <> 'pending' THEN
+    RAISE EXCEPTION 'held write % is %, not pending', reject.id, h.status USING ERRCODE = 'ST005';
+  END IF;
+  UPDATE stet.held_writes w
+     SET status = 'rejected', resolved_by = session_user, resolved_at = clock_timestamp(), note = reject.note
+   WHERE w.id = reject.id;
+  RETURN 'rejected';
+END
+$$;
+
+-- 새로 만든 함수는 PUBLIC이 실행할 수 있다. 이 파일을 실행할 때마다 거둔다. Migrate는 한 트랜잭션이므로 PUBLIC이
+-- 부를 수 있는 틈이 없고, CREATE OR REPLACE는 이미 준 권한을 지우지 않는다. 누가 승인할 수 있는지는 운영자가 정한다:
+--   GRANT USAGE ON SCHEMA stet TO reviewer;
+--   GRANT SELECT ON stet.review TO reviewer;
+--   GRANT EXECUTE ON FUNCTION stet.approve(uuid, text, bigint), stet.reject(uuid, text) TO reviewer;
+REVOKE EXECUTE ON FUNCTION stet.approve(uuid, text, bigint), stet.reject(uuid, text) FROM PUBLIC;

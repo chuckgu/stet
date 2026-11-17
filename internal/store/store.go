@@ -41,12 +41,18 @@ func New(pool *pgxpool.Pool) *Store {
 //
 // It runs schema.sql only when the file differs from the one the database
 // last ran, as stet.schema_version records. On a current schema it runs no
-// DDL and takes no lock on Stet's tables, so a Stet starting while others
-// hold open transactions on them (a reviewer around stet.approve, the
-// executor applying a held write) does not wait for them. The flip side: an
-// object dropped by hand is not recreated until schema.sql changes.
+// DDL and takes no lock that an open transaction on Stet's tables can block
+// (only an AccessShareLock on stet.schema_version, which nothing but Migrate
+// writes), so a Stet starting while others hold open transactions on them
+// (a reviewer around stet.approve, the executor applying a held write) does
+// not wait for them. The flip side: an object dropped by hand is not
+// recreated until schema.sql changes.
+//
+// Its transaction is READ COMMITTED whatever the server's default: a Migrate
+// that waited for another's lock must read the marker that one committed,
+// which a snapshot taken before the wait (REPEATABLE READ) would not show.
 func (s *Store) Migrate(ctx context.Context) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	return pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, "select pg_advisory_xact_lock($1)", migrateLock); err != nil {
 			return err
 		}

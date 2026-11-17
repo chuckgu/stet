@@ -227,7 +227,7 @@ func TestMigrateDoesNotWaitForOpenTransactions(t *testing.T) {
 	ctx := context.Background()
 	h := insertHeld(t, s, pool)
 	for _, c := range []struct{ name, sql string }{
-		{"an uncommitted update of stet.held_writes", `update stet.held_writes set note = 'reviewing' where id = $1`},
+		{"an uncommitted update of stet.held_writes", `update stet.held_writes set status = 'pending', in_transaction = false where id = $1`},
 		{"an uncommitted insert into stet.held_writes", `
 			insert into stet.held_writes (id, decision_id, created_at, login_role, database, statement,
 			                              target_table, verdict, reasons)
@@ -275,6 +275,82 @@ func TestMigrateFromNothing(t *testing.T) {
 	}
 	if got, want := schemaMarker(t, pool), schemaHash(t); got != want {
 		t.Errorf("schema marker = %q, want %q", got, want)
+	}
+}
+
+// Stets that start at once against a database without the stet schema all
+// succeed: the first to take Migrate's lock runs schema.sql, and the others,
+// which waited for it, find the marker it wrote. Also when the server's
+// default isolation is repeatable read, where a Migrate that read the marker
+// in a snapshot taken before it waited would run the file again and fail to
+// write the marker (40001).
+func TestConcurrentMigratesFromNothing(t *testing.T) {
+	for _, isolation := range []string{"read committed", "repeatable read"} {
+		t.Run(isolation, func(t *testing.T) {
+			dsn := ownDatabase(t)
+			ctx := context.Background()
+			cfg, err := pgxpool.ParseConfig(dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.ConnConfig.RuntimeParams["default_transaction_isolation"] = isolation
+			pool, err := pgxpool.NewWithConfig(ctx, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(pool.Close)
+
+			// Hold Migrate's lock until every Migrate waits for it, so that
+			// each has begun its transaction before the schema exists.
+			holder, err := pgx.Connect(ctx, dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { holder.Close(context.Background()) })
+			lock, err := holder.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := lock.Exec(ctx, "select pg_advisory_xact_lock($1)", store.MigrateLock); err != nil {
+				t.Fatal(err)
+			}
+			const n = 3
+			errs := make(chan error, n)
+			for range n {
+				go func() { errs <- store.New(pool).Migrate(ctx) }()
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				var waiting int
+				if err := lock.QueryRow(ctx, `select count(*) from pg_locks
+					where locktype = 'advisory' and not granted
+					  and database = (select oid from pg_database where datname = current_database())`).Scan(&waiting); err != nil {
+					t.Fatal(err)
+				}
+				if waiting == n {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("%d of %d Migrates wait for the lock", waiting, n)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if err := lock.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			for range n {
+				if err := <-errs; err != nil {
+					t.Errorf("migrate: %v", err)
+				}
+			}
+			var markers int
+			if err := pool.QueryRow(ctx, `select count(*) from stet.schema_version`).Scan(&markers); err != nil {
+				t.Fatal(err)
+			}
+			if got, want := schemaMarker(t, pool), schemaHash(t); markers != 1 || got != want {
+				t.Errorf("%d marker rows, marker %q, want one row %q", markers, got, want)
+			}
+		})
 	}
 }
 

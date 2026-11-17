@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -106,6 +107,40 @@ func heldStatus(t *testing.T, pool *pgxpool.Pool, id string) (string, *bool) {
 		t.Fatal(err)
 	}
 	return status, inTransaction
+}
+
+// statuses are the statuses of spec 3 that a held write can be stored in.
+var statuses = []string{"unconfirmed", "pending", "undelivered", "approved", "rejected", "applied", "failed"}
+
+// arrows are the status changes of spec 3.
+var arrows = [][2]string{
+	{"unconfirmed", "pending"}, {"unconfirmed", "undelivered"},
+	{"pending", "approved"}, {"pending", "rejected"},
+	{"approved", "applied"}, {"approved", "failed"},
+}
+
+// wayTo is the path from unconfirmed to each status along the arrows.
+var wayTo = map[string][]string{
+	"unconfirmed": nil,
+	"pending":     {"pending"},
+	"undelivered": {"undelivered"},
+	"approved":    {"pending", "approved"},
+	"rejected":    {"pending", "rejected"},
+	"applied":     {"pending", "approved", "applied"},
+	"failed":      {"pending", "approved", "failed"},
+}
+
+// heldWithStatus stores a sampleHeld row and moves it to status along the
+// arrows, changing nothing else. It is removed when the test ends.
+func heldWithStatus(t *testing.T, s *store.Store, pool *pgxpool.Pool, status string) *store.HeldWrite {
+	t.Helper()
+	h := insertHeld(t, s, pool)
+	for _, step := range wayTo[status] {
+		if _, err := pool.Exec(context.Background(), `update stet.held_writes set status = $2 where id = $1`, h.ID, step); err != nil {
+			t.Fatalf("on the way to %s, %s: %v", status, step, err)
+		}
+	}
+	return h
 }
 
 // wantST004 runs sql on id and checks that the guard trigger refuses it
@@ -284,17 +319,18 @@ func TestHeldWritesContentIsFixed(t *testing.T) {
 	} {
 		wantST004(t, pool, "update stet.held_writes set "+set+" where id = $1", h.ID, fixed)
 	}
-	if _, err := pool.Exec(ctx, `update stet.held_writes set note = 'looked at it' where id = $1`, h.ID); err != nil {
-		t.Errorf("note: %v", err)
-	}
 
 	const once = "stet.held_writes: in_transaction is set once, when the row becomes pending"
 	wantST004(t, pool, "update stet.held_writes set in_transaction = true where id = $1", h.ID, once)
+	// An arrow that is allowed does not carry in_transaction with it.
+	wantST004(t, pool, "update stet.held_writes set status = 'undelivered', in_transaction = true where id = $1", h.ID, once)
 	if err := s.MarkDelivered(ctx, h.ID, false); err != nil {
 		t.Fatal(err)
 	}
 	wantST004(t, pool, "update stet.held_writes set in_transaction = true where id = $1", h.ID, once)
 	wantST004(t, pool, "update stet.held_writes set in_transaction = null where id = $1", h.ID, once)
+	// Nor does it carry a change to what was held.
+	wantST004(t, pool, "update stet.held_writes set status = 'approved', statement = 'delete from contacts' where id = $1", h.ID, fixed)
 	if status, inTransaction := heldStatus(t, pool, h.ID); status != "pending" || inTransaction == nil || *inTransaction {
 		t.Errorf("status=%q in_transaction=%v, want pending false", status, inTransaction)
 	}
@@ -305,37 +341,12 @@ func TestHeldWritesContentIsFixed(t *testing.T) {
 func TestHeldWritesStatusFollowsTheArrows(t *testing.T) {
 	s, pool := testStore(t)
 	ctx := context.Background()
-	arrows := map[[2]string]bool{
-		{"unconfirmed", "pending"}: true, {"unconfirmed", "undelivered"}: true,
-		{"pending", "approved"}: true, {"pending", "rejected"}: true,
-		{"approved", "applied"}: true, {"approved", "failed"}: true,
-	}
-	// way is the path from unconfirmed to each status along the arrows.
-	way := map[string][]string{
-		"unconfirmed": nil,
-		"pending":     {"pending"},
-		"undelivered": {"undelivered"},
-		"approved":    {"pending", "approved"},
-		"rejected":    {"pending", "rejected"},
-		"applied":     {"pending", "approved", "applied"},
-		"failed":      {"pending", "approved", "failed"},
-	}
-	statuses := []string{"unconfirmed", "pending", "undelivered", "approved", "rejected", "applied", "failed"}
-	setStatus := func(id, status string) error {
-		_, err := pool.Exec(ctx, `update stet.held_writes set status = $2 where id = $1`, id, status)
-		return err
-	}
 	for _, from := range statuses {
 		for _, to := range statuses {
 			t.Run(from+"_to_"+to, func(t *testing.T) {
-				h := insertHeld(t, s, pool)
-				for _, step := range way[from] {
-					if err := setStatus(h.ID, step); err != nil {
-						t.Fatalf("on the way to %s, %s: %v", from, step, err)
-					}
-				}
-				err := setStatus(h.ID, to)
-				if from == to || arrows[[2]string{from, to}] {
+				h := heldWithStatus(t, s, pool, from)
+				_, err := pool.Exec(ctx, `update stet.held_writes set status = $2 where id = $1`, h.ID, to)
+				if from == to || slices.Contains(arrows, [2]string{from, to}) {
 					if err != nil {
 						t.Errorf("%s to %s: %v", from, to, err)
 					}
@@ -351,6 +362,76 @@ func TestHeldWritesStatusFollowsTheArrows(t *testing.T) {
 					t.Errorf("delete: %v %v", tag, err)
 				}
 			})
+		}
+	}
+}
+
+// What a reviewer and the executor write moves only with its arrow (plan
+// ruling 12): resolved_by, resolved_at, note and max_rows as the row goes
+// from pending to approved or rejected; applied_at, rows_affected and error
+// as it goes from approved to applied or failed. No one can widen an
+// approval or restart its ten minutes afterwards.
+func TestHeldWritesResultsMoveWithTheirArrow(t *testing.T) {
+	s, pool := testStore(t)
+	ctx := context.Background()
+	const (
+		resolution = "stet.held_writes: resolved_by, resolved_at, note and max_rows are set once, when the row is approved or rejected"
+		result     = "stet.held_writes: applied_at, rows_affected and error are set once, when the row is applied or fails"
+	)
+	resolving := [][2]string{{"pending", "approved"}, {"pending", "rejected"}}
+	applying := [][2]string{{"approved", "applied"}, {"approved", "failed"}}
+	columns := []struct {
+		column, value, message string
+		own                    [][2]string
+	}{
+		{"resolved_by", "'stet_reviewer'", resolution, resolving},
+		{"resolved_at", "clock_timestamp()", resolution, resolving},
+		{"note", "'looked at it'", resolution, resolving},
+		{"max_rows", "3", resolution, resolving},
+		{"applied_at", "clock_timestamp()", result, applying},
+		{"rows_affected", "1", result, applying},
+		{"error", "'row_changed'", result, applying},
+	}
+	// One row in each status. Refused updates leave them as they are.
+	at := map[string]*store.HeldWrite{}
+	for _, status := range statuses {
+		at[status] = heldWithStatus(t, s, pool, status)
+	}
+	for _, c := range columns {
+		set := c.column + " = " + c.value
+		for _, status := range statuses {
+			wantST004(t, pool, "update stet.held_writes set "+set+" where id = $1", at[status].ID, c.message)
+		}
+		for _, a := range arrows {
+			sql := "update stet.held_writes set status = '" + a[1] + "', " + set + " where id = $1"
+			if !slices.Contains(c.own, a) {
+				wantST004(t, pool, sql, at[a[0]].ID, c.message)
+				continue
+			}
+			h := heldWithStatus(t, s, pool, a[0])
+			if _, err := pool.Exec(ctx, sql, h.ID); err != nil {
+				t.Errorf("%s: %v", sql, err)
+				continue
+			}
+			var written bool
+			if err := pool.QueryRow(ctx, "select "+c.column+" is not null and status = $2 from stet.held_writes where id = $1",
+				h.ID, a[1]).Scan(&written); err != nil {
+				t.Fatal(err)
+			}
+			if !written {
+				t.Errorf("%s: the row is not %s with %s set", sql, a[1], c.column)
+			}
+		}
+	}
+	for _, status := range statuses {
+		var got string
+		var nulls int
+		if err := pool.QueryRow(ctx, `select status, num_nulls(resolved_by, resolved_at, note, max_rows, applied_at, rows_affected, error)
+			from stet.held_writes where id = $1`, at[status].ID).Scan(&got, &nulls); err != nil {
+			t.Fatal(err)
+		}
+		if got != status || nulls != 7 {
+			t.Errorf("%s row after refused updates: status %s, %d of 7 result columns NULL", status, got, nulls)
 		}
 	}
 }
