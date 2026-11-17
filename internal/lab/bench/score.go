@@ -37,6 +37,10 @@ type Run struct {
 	// with LLMCalls 0.
 	LLMCalls int
 	CostUSD  float64
+	// Also from collect:<arm>, reported and not scored: the proxy's records of the arm's writes left out for
+	// falling outside the write's time window, and (hoop) the denials its audit log did not confirm, which
+	// collect turned into unknown.
+	OutOfWindow, Unconfirmed int
 	// recorded is what was recorded, when WithMedium computed this run from it; nil for a run as recorded.
 	recorded *recordedRun
 }
@@ -147,6 +151,7 @@ func LoadRun(ctx context.Context, conn *pgx.Conn, arm string, rerun int) (Run, e
 			return Run{}, fmt.Errorf("read collect:%s: %w", arm, err)
 		}
 		r.CapReached, r.BudgetExhausted, r.LLMCalls, r.CostUSD = c.CapReached, c.BudgetExhausted, c.LLMCalls, c.LLMCostUSD
+		r.OutOfWindow, r.Unconfirmed = c.OutOfWindow, c.Unconfirmed
 	}
 	return r, nil
 }

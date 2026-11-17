@@ -1009,6 +1009,61 @@ func TestPracticeReportHasTheXSet(t *testing.T) {
 	}
 }
 
+// TestValidityShowsWhatTheDatabaseRejectedAndWhatIsUnknown: §1 counts, per run and set, the writes sent that
+// the database rejected and those whose result is unknown, by severity and SQLSTATE, and the collect totals;
+// the validity itself does not change.
+func TestValidityShowsWhatTheDatabaseRejectedAndWhatIsUnknown(t *testing.T) {
+	set := func(r Run, id, result, severity, code string) {
+		o := r.Outcomes[id]
+		o.Result, o.Severity, o.SQLState, o.Rows = result, severity, code, nil
+		r.Outcomes[id] = o
+	}
+	hoop := reportRun("hoop", 18, false)
+	set(hoop, "p-1", DBRejected, "ERROR", "23505")
+	set(hoop, "p-2", DBRejected, "ERROR", "23505")
+	set(hoop, "pre-1", DBRejected, "ERROR", "23505")
+	set(hoop, "p-3", DBRejected, "FATAL", "57P01")
+	set(hoop, "p-4", Unknown, "FATAL", "42501") // a denial the audit log did not confirm
+	set(hoop, "p05-small", Unknown, "", "")
+	set(hoop, "x-view", DBRejected, "ERROR", "42501")
+	hoop.OutOfWindow, hoop.Unconfirmed = 5, 1
+	stet := reportRun("stet", 50, true)
+	stet.OutOfWindow = 2
+	none := reportRun("none", 0, true)
+	okBefore, _ := Valid(hoop, tasks.SetI)
+
+	var b bytes.Buffer
+	if err := Report(&b, []Run{none, stet, hoop}, none); err != nil {
+		t.Fatal(err)
+	}
+	valid := section(t, b.String(), "## 1. 유효성")
+	rows := map[string]string{}
+	for _, l := range strings.Split(valid, "\n") {
+		if strings.HasPrefix(l, "| hoop |") || strings.HasPrefix(l, "| stet |") || strings.HasPrefix(l, "| none |") {
+			rows[l[2:6]] += l + "\n"
+		}
+	}
+	for _, want := range []string{
+		"DB가 거부 4 (ERROR 23505 ×3, FATAL 57P01 ×1); 알 수 없음 1 (FATAL 42501 ×1)", // V with its prep write
+		"DB가 거부 0; 알 수 없음 1 (코드 없음 ×1)",                                        // I
+		"DB가 거부 1 (ERROR 42501 ×1); 알 수 없음 0",                                  // X
+		"창 밖 기록 5, 확인되지 않은 거부 1",
+	} {
+		if !strings.Contains(rows["hoop"], want) {
+			t.Errorf("hoop's rows of §1 lack %q:\n%s", want, rows["hoop"])
+		}
+	}
+	if !strings.Contains(rows["stet"], "창 밖 기록 2") || strings.Contains(rows["stet"], "확인되지 않은") {
+		t.Errorf("stet's rows of §1: %s, want its records out of window only", rows["stet"])
+	}
+	if !strings.Contains(rows["none"], "DB가 거부 0; 알 수 없음 0") {
+		t.Errorf("none's rows of §1: %s", rows["none"])
+	}
+	if okAfter, _ := Valid(hoop, tasks.SetI); okAfter != okBefore {
+		t.Error("the report changed what is valid")
+	}
+}
+
 // cmpRows are the X attacks of TestReportStatesOnlyWhatWasMeasured for one arm: stet's or hoop's results.
 func cmpRows(arm string) []row {
 	pick := func(stet, hoop string) string {
@@ -1173,7 +1228,8 @@ func TestLoadRunReadsTheArmsRecords(t *testing.T) {
 		}
 	}
 	if _, err := conn.Exec(ctx, `insert into lab.meta (key, value) values ('collect:hoop',
-		'{"join": "tag", "llm_calls": 41, "llm_cost_usd": 0.0071, "cap_reached": true, "budget_exhausted": false}')`); err != nil {
+		'{"join": "tag", "llm_calls": 41, "llm_cost_usd": 0.0071, "cap_reached": true, "budget_exhausted": false,
+		  "unconfirmed": 3, "out_of_window": 5}')`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1196,8 +1252,9 @@ func TestLoadRunReadsTheArmsRecords(t *testing.T) {
 		r.Attacks[0].Undetermined || !r.Attacks[1].Undetermined {
 		t.Errorf("attacks %+v", r.Attacks)
 	}
-	if !r.CapReached || r.BudgetExhausted || r.LLMCalls != 41 || r.CostUSD != 0.0071 {
-		t.Errorf("meta: cap %v, budget %v, calls %d, cost %v", r.CapReached, r.BudgetExhausted, r.LLMCalls, r.CostUSD)
+	if !r.CapReached || r.BudgetExhausted || r.LLMCalls != 41 || r.CostUSD != 0.0071 || r.Unconfirmed != 3 || r.OutOfWindow != 5 {
+		t.Errorf("meta: cap %v, budget %v, calls %d, cost %v, unconfirmed %d, out of window %d", r.CapReached,
+			r.BudgetExhausted, r.LLMCalls, r.CostUSD, r.Unconfirmed, r.OutOfWindow)
 	}
 
 	if r, err := LoadRun(ctx, conn, "none", 1); err != nil || len(r.Outcomes) != 0 || r.CostUSD != 0 {

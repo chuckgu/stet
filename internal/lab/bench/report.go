@@ -6,6 +6,7 @@ package bench
 import (
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"slices"
 	"strings"
@@ -348,6 +349,62 @@ func reportValidity(m *md, runs []Run, names []string) {
 		rows = append(rows, []string{names[i], cell(r, tasks.SetV), cell(r, tasks.SetI), cell(r, tasks.SetX)})
 	}
 	m.table([]string{"실행", "V (준비 쓰기 포함)", "I", "X"}, rows)
+
+	m.ln("보낸 쓰기 가운데 DB가 거부한 것과 알 수 없는 것을 심각도·SQLSTATE별로 적는다(코드 없음: 응답 없이 연결이 끝났거나 "+
+		"시간 초과). 프록시를 둔 arm의 DB 거부는 프록시나 그 상태가 만든 것일 수 있어 따로 본다. 채점은 바꾸지 않는다. "+
+		"`collect` 열은 `collect`가 남긴 수다: 쓰기의 시간 창 밖이라 잇지 않은 프록시 기록, 그리고 hoop의 감사 로그에 "+
+		"`violation`이 없어 알 수 없음으로 바꾼 거부.", "")
+	errs := func(r Run, set string) string {
+		if !countSet(r, set).sent {
+			return "보내지 않음"
+		}
+		return errorCounts(r, set, DBRejected, "DB가 거부") + "; " + errorCounts(r, set, Unknown, "알 수 없음")
+	}
+	rows = nil
+	for i, r := range runs {
+		collected := "—"
+		switch {
+		case strings.HasPrefix(r.Arm, "hoop"):
+			collected = fmt.Sprintf("창 밖 기록 %d, 확인되지 않은 거부 %d", r.OutOfWindow, r.Unconfirmed)
+		case proxied(r.Arm):
+			collected = fmt.Sprintf("창 밖 기록 %d", r.OutOfWindow)
+		}
+		rows = append(rows, []string{names[i], errs(r, tasks.SetV), errs(r, tasks.SetI), errs(r, tasks.SetX), collected})
+	}
+	m.table([]string{"실행", "V (준비 쓰기 포함)", "I", "X", "collect"}, rows)
+}
+
+// errorCounts counts the run's sent writes of set (V: with its prep writes) whose result is result, by severity
+// and SQLSTATE, most first: "DB가 거부 4 (ERROR 23505 ×3, FATAL 57P01 ×1)". A write with neither is "코드 없음".
+func errorCounts(r Run, set, result, name string) string {
+	by := map[string]int{}
+	n := 0
+	for _, w := range r.Writes {
+		o, sent := r.Outcomes[w.ID]
+		if !sent || o.Result != result || w.Set != set && !(set == tasks.SetV && w.Set == tasks.SetPrep) {
+			continue
+		}
+		n++
+		k := strings.TrimSpace(o.Severity + " " + o.SQLState)
+		if k == "" {
+			k = "코드 없음"
+		}
+		by[k]++
+	}
+	if n == 0 {
+		return name + " 0"
+	}
+	keys := slices.SortedFunc(maps.Keys(by), func(a, b string) int {
+		if by[a] != by[b] {
+			return by[b] - by[a]
+		}
+		return strings.Compare(a, b)
+	})
+	parts := make([]string, len(keys))
+	for i, k := range keys {
+		parts[i] = fmt.Sprintf("%s ×%d", k, by[k])
+	}
+	return fmt.Sprintf("%s %d (%s)", name, n, strings.Join(parts, ", "))
 }
 
 func reportV(m *md, runs []Run, names []string) {
