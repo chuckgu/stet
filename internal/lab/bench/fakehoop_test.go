@@ -2,9 +2,11 @@ package bench
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -34,6 +36,12 @@ import (
 // not called for a FunctionCall or a COPY, nor in Mode hang. With Audit,
 // take the file's directory before starting the fake, so that it outlives
 // the sessions' last lines.
+//
+// After a denial the fake half-closes and reads what the client is still
+// sending until it hangs up, so that the client always reads the denial.
+// Hoop closes at once; Abrupt does that: a client still writing (COPY data
+// sent behind its statement, a long message) may then fail on its write
+// before it reads the denial, and record unknown.
 type fakeHoop struct {
 	Addr  string
 	Deny  func(sql string) bool // nil: deny nothing
@@ -43,6 +51,9 @@ type fakeHoop struct {
 	// Refuse is asked about each connection by its number, from 1 in the order accepted: true answers the
 	// startup with FATAL 53300 and hangs up, so that connecting fails. nil refuses none.
 	Refuse func(conn int) bool
+	// Abrupt closes the connection at once after a denial, without reading what the client is still sending,
+	// and judges a Query longer than abruptHead bytes by its first abruptHead bytes, before the rest is read.
+	Abrupt bool
 
 	ln     net.Listener
 	wg     sync.WaitGroup
@@ -140,15 +151,17 @@ func (f *fakeHoop) close() {
 type fakeSession struct {
 	f                   *fakeHoop
 	c                   net.Conn
+	in                  *frames // what be reads the client through
 	be                  *pgproto3.Backend
 	id                  int
 	user, database, app string
 
 	// The fields set before the first connection, read once the client has spoken.
-	deny  func(string) bool
-	mode  string
-	exec  func(string)
-	audit string
+	deny   func(string) bool
+	mode   string
+	exec   func(string)
+	audit  string
+	abrupt bool
 
 	sessionID          string
 	start              time.Time
@@ -163,7 +176,8 @@ type fakeSession struct {
 }
 
 func (f *fakeHoop) session(c net.Conn, id int) {
-	s := &fakeSession{f: f, c: c, be: pgproto3.NewBackend(c, c), id: id, start: time.Now(), parsed: -1}
+	s := &fakeSession{f: f, c: c, in: &frames{conn: c}, id: id, start: time.Now(), parsed: -1}
+	s.be = pgproto3.NewBackend(s.in, c)
 	defer s.hangUp(nil)
 	msg, err := s.be.ReceiveStartupMessage()
 	if err != nil {
@@ -173,6 +187,7 @@ func (f *fakeHoop) session(c net.Conn, id int) {
 	if !ok {
 		return
 	}
+	s.in.framed = true // the client sends nothing more until it is answered
 	s.user, s.database, s.app = sm.Parameters["user"], sm.Parameters["database"], sm.Parameters["application_name"]
 	if f.Refuse != nil && f.Refuse(id) {
 		s.be.Send(&pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: "53300",
@@ -180,7 +195,7 @@ func (f *fakeHoop) session(c net.Conn, id int) {
 		s.be.Flush()
 		return
 	}
-	s.deny, s.mode, s.exec, s.audit = f.Deny, f.Mode, f.Exec, f.Audit
+	s.deny, s.mode, s.exec, s.audit, s.abrupt = f.Deny, f.Mode, f.Exec, f.Audit, f.Abrupt
 	s.sessionID = randomHex()
 	s.write(auditLine{Kind: "session_start", Principal: "anonymous"})
 
@@ -190,6 +205,15 @@ func (f *fakeHoop) session(c net.Conn, id int) {
 		return
 	}
 	for {
+		if s.abrupt && !s.hung {
+			head, long, err := s.in.longQuery(abruptHead)
+			if err != nil {
+				return
+			}
+			if long && !s.queryHead(head) {
+				return
+			}
+		}
 		msg, err := s.be.Receive()
 		if err != nil {
 			return
@@ -201,6 +225,79 @@ func (f *fakeHoop) session(c net.Conn, id int) {
 			return
 		}
 	}
+}
+
+// abruptHead is how much of a long Query an Abrupt fake reads before it judges it.
+const abruptHead = 1024
+
+// queryHead judges a long Query by its head, before the rest of it is read: a denial is answered at once (the
+// client is still writing); false means the session is over. An allowed one is left for the Backend to read.
+func (s *fakeSession) queryHead(head string) bool {
+	stmts := splitStatements(head)
+	if len(stmts) == 0 || !s.denies(stmts[0]) {
+		return true
+	}
+	s.record("Query", head, nil)
+	s.judged(stmts[0], "Query", true)
+	return s.refuse()
+}
+
+// frames is what a session's Backend reads the client through. Once the startup message is through, it hands
+// out one message at a time and never reads past it, so that the session can read the next message's header,
+// and the head of a long one, before the Backend reads the message.
+type frames struct {
+	conn    io.Reader
+	framed  bool
+	pending []byte // read from conn, not yet handed out: the next message's header, and its head
+	left    int    // bytes of the current message not yet read from conn
+}
+
+func (r *frames) Read(p []byte) (int, error) {
+	if !r.framed {
+		return r.conn.Read(p)
+	}
+	if len(r.pending) == 0 && r.left == 0 {
+		if err := r.next(0); err != nil {
+			return 0, err
+		}
+	}
+	if len(r.pending) > 0 {
+		n := copy(p, r.pending)
+		r.pending = r.pending[n:]
+		return n, nil
+	}
+	n, err := r.conn.Read(p[:min(len(p), r.left)])
+	r.left -= n
+	return n, err
+}
+
+// next reads the next message's header and up to head bytes of its body.
+func (r *frames) next(head int) error {
+	h := make([]byte, 5, 5+head)
+	if _, err := io.ReadFull(r.conn, h); err != nil {
+		return err
+	}
+	body := max(int(int32(binary.BigEndian.Uint32(h[1:])))-4, 0) // a bad length is the Backend's to refuse
+	h = h[:5+min(head, body)]
+	if _, err := io.ReadFull(r.conn, h[5:]); err != nil {
+		return err
+	}
+	r.pending, r.left = h, body-(len(h)-5)
+	return nil
+}
+
+// longQuery reads the next message's header and head, at a message's boundary, and returns the head when the
+// message is a Query longer than head bytes.
+func (r *frames) longQuery(head int) (string, bool, error) {
+	if len(r.pending) == 0 && r.left == 0 {
+		if err := r.next(head); err != nil {
+			return "", false, err
+		}
+	}
+	if len(r.pending) <= 5 || r.pending[0] != 'Q' || r.left == 0 {
+		return "", false, nil
+	}
+	return string(r.pending[5:]), true, nil
 }
 
 // handle answers one message; false means the session is over.
@@ -364,12 +461,21 @@ func (s *fakeSession) run(sql string) {
 	}
 }
 
-// refuse answers as hoop does when it denies: FATAL 42501, then it hangs up.
+// refuse answers as hoop does when it denies: FATAL 42501, then it hangs up. Unless Abrupt, it half-closes
+// first and reads what the client is still sending until the client hangs up (or 10s pass), so that a client
+// still writing reads the denial instead of failing on its write.
 func (s *fakeSession) refuse() bool {
 	s.denied++
 	s.hangUp(func() {
 		s.be.Send(&pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: "42501", Message: fakeDenied})
-		s.be.Flush()
+		if s.be.Flush() != nil || s.abrupt {
+			return
+		}
+		if tc, ok := s.c.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
+		s.c.SetReadDeadline(time.Now().Add(10 * time.Second))
+		io.Copy(io.Discard, s.c)
 	})
 	return false
 }
@@ -384,12 +490,14 @@ func (s *fakeSession) hangUp(last func()) {
 	s.ended = true
 	s.f.mu.Lock()
 	s.f.open--
-	delete(s.f.conns, s.c)
 	s.f.mu.Unlock()
 	if last != nil {
 		last()
 	}
 	s.c.Close()
+	s.f.mu.Lock()
+	delete(s.f.conns, s.c) // only now: close may cut a denial's reading short
+	s.f.mu.Unlock()
 	if s.sessionID != "" {
 		n := s.statements
 		s.write(auditLine{Kind: "session_end", Principal: s.user, DurationNS: time.Since(s.start).Nanoseconds(),

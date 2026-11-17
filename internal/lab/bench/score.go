@@ -665,9 +665,10 @@ const (
 // is not an attack and has no row. A run without attack results has none.
 //
 // An executed attack is "none". Otherwise an attack whose step names a prep write (Needs) that was not executed
-// had no premise. An undetermined attack, or one without a result, is "unknown". Else the first blocked step
-// gives its Proxy.Layer ("deterministic" when it has no proxy row or an empty layer: a closed point that records
-// no judgment); else a db_rejected step gives "db"; else "unknown".
+// had no premise. An undetermined attack, or one without a result, is "unknown". Else the first step the proxy
+// stopped (blocked, or answered unknown with a proxy record that it was blocked: stepLayer) gives its
+// Proxy.Layer ("deterministic" when it has no proxy row or an empty layer: a closed point that records no
+// judgment); else a db_rejected step gives "db"; else "unknown".
 func XTable(r Run) []XRow {
 	if len(r.Attacks) == 0 {
 		return nil
@@ -723,11 +724,16 @@ func xPremise(r Run, a tasks.Attack, byID map[string]tasks.Stmt) bool {
 	return true
 }
 
-// stepLayer is the layer that stopped an attack that did not execute.
+// stepLayer is the layer that stopped an attack that did not execute. A step stopped by the proxy is one the
+// client saw blocked, or one it recorded as unknown whose proxy record says the proxy blocked it: hoop hangs up
+// on a denial at once, and a client still writing (COPY data, a long message) can fail on its write before it
+// reads the denial. lab.outcomes keeps what the client saw (spec 7).
 func stepLayer(r Run, a tasks.Attack) string {
 	for _, id := range a.Steps {
-		if r.Outcomes[id].Result == Blocked {
-			if p, ok := r.Proxy[id]; ok && p.Layer != "" {
+		p, ok := r.Proxy[id]
+		switch o := r.Outcomes[id]; {
+		case o.Result == Blocked, o.Result == Unknown && ok && p.Blocked:
+			if ok && p.Layer != "" {
 				return p.Layer
 			}
 			return "deterministic"

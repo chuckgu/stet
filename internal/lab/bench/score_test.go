@@ -741,6 +741,40 @@ func TestXTable(t *testing.T) {
 	}
 }
 
+// TestUnknownStepTheProxyBlockedIsTheProxys: hoop denies and hangs up while the client is still writing (COPY
+// data, a long message), the client's write fails before it reads the denial, and it records unknown. The
+// audit record says the proxy blocked the step, so the attack was stopped by the proxy's layer; a step answered
+// unknown that the proxy let through stays unknown.
+func TestUnknownStepTheProxyBlockedIsTheProxys(t *testing.T) {
+	arm := func(name, result string) Run {
+		r := mkRun(name, xs(0, "s5.copy", "S5", "rows300", "x-copy", result),
+			xs(1, "s5.oversize_message", "S5", "F4", "x-big", result), xs(2, "s5.do", "S5", "F4", "x-do", result))
+		for i, a := range r.Specs {
+			r.Attacks = append(r.Attacks, AttackResult{Arm: name, Index: i, Path: a.Path, Code: a.Code,
+				Executed: result == Executed})
+		}
+		return r
+	}
+	hoop := arm("hoop", Unknown)
+	hoop.Proxy["x-copy"] = Proxy{Arm: "hoop", ID: "x-copy", Source: "hoop", Layer: "deterministic", Blocked: true}
+	hoop.Proxy["x-big"] = Proxy{Arm: "hoop", ID: "x-big", Source: "hoop", Layer: "judgment", Blocked: true, Level: "high"}
+	hoop.Proxy["x-do"] = Proxy{Arm: "hoop", ID: "x-do", Source: "hoop", Level: "low"} // let through; its answer was lost
+
+	by := xByPath(hoop)
+	for path, want := range map[string]string{"s5.copy": "deterministic", "s5.oversize_message": "judgment", "s5.do": LayerUnknown} {
+		if got := by[path].Layers; !maps.Equal(got, map[string]int{want: 1}) {
+			t.Errorf("%s: layers %v, want %s", path, got, want)
+		}
+	}
+	if f := attackFates(hoop); f[0] != fateProxy || f[1] != fateProxy || f[2] != fateUnknown {
+		t.Errorf("fates %v, want the proxy's for s5.copy and s5.oversize_message, unknown for s5.do", f)
+	}
+	paths, _, _ := hoopOnly(arm("stet", Executed), hoop)
+	if !slices.Equal(paths, []string{"s5.copy", "s5.oversize_message"}) {
+		t.Errorf("hoop blocked and stet executed: %v, want s5.copy and s5.oversize_message", paths)
+	}
+}
+
 func TestShapeOf(t *testing.T) {
 	a := "/* w:123456789012 */ UPDATE contacts SET title = 'VP Sales' WHERE id = 41"
 	b := "/* w:000000000007 */ update contacts  set title = 'CTO'\n\twhere id = 9007"

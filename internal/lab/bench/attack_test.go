@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -278,6 +279,79 @@ func TestNothingRunsBehindAServerThatDeniesEverything(t *testing.T) {
 	rest := slices.DeleteFunc(slices.Clone(b.Attacks), func(a tasks.Attack) bool { return a.Path == "s8.burst" })
 	if _, f := run(rest, &pauses{}); f.MaxOpen() > 2 {
 		t.Errorf("without s8.burst %d connections were open at once, want at most 2", f.MaxOpen())
+	}
+}
+
+// TestDenialLostInTheRaceIsTheProxysByItsAuditRecord reproduces the race of a client still writing when hoop
+// denies and hangs up at once. An Abrupt fake judges s5.oversize_message by its head and closes while the client
+// is still writing the message: the client's write fails before it reads the denial, and the step is recorded
+// unknown. collect joins the audit log's violation to it, lab.outcomes keeps what the client saw, and the X
+// table gives the attack to the proxy's layer. s5.copy, whose data goes out behind its statement, is recorded
+// blocked or unknown, whichever the client meets first; either way it is the proxy's.
+func TestDenialLostInTheRaceIsTheProxysByItsAuditRecord(t *testing.T) {
+	audit := t.TempDir() + "/audit.jsonl" // before the fake: its directory outlives the fake's last lines
+	a, n, _, b := testTemplate(t)
+	stmts := xStmts(b)
+	clone := testClone(t, false)
+	owner := connectAs(t, a, n.Owner(), OwnerPassword, clone)
+	lab := connectAs(t, a, n.Owner(), OwnerPassword, clone)
+	ctx := context.Background()
+	f := startFakeHoop(t)
+	f.Audit, f.Abrupt = audit, true
+	f.Deny = func(string) bool { return true }
+
+	var attacks []tasks.Attack
+	for _, p := range []string{"s5.oversize_message", "s5.copy"} {
+		attacks = append(attacks, b.Attacks[indexOf(t, b.Attacks, p)])
+	}
+	big, copied := attacks[0].Steps[0], attacks[1].Steps[0]
+	o := xOptions("hoop", (&pauses{}).sleep)
+	o.MaxPad = 24 << 20 // more than the sockets of both sides hold: the client is still writing when the fake closes
+	_, _, err := RunAttacks(ctx, Target{Addr: f.Addr, Database: clone, Names: n}, owner, attacks, stmts, 0, o,
+		func(x Outcome) error { return SaveOutcome(ctx, lab, x) },
+		func(r AttackResult) error {
+			r.Index = indexOf(t, b.Attacks, r.Path) // its place in the stream's attack list
+			return SaveAttack(ctx, lab, r)
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sent := results(t, lab)
+	if got := sent["hoop/"+big]; got != Unknown {
+		t.Fatalf("s5.oversize_message's step: %s, want unknown: its write failed before it read the denial", got)
+	}
+	if got := sent["hoop/"+copied]; got != Blocked && got != Unknown {
+		t.Errorf("s5.copy's step: %s, want blocked or unknown", got)
+	}
+
+	events, err := ReadAudit(audit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := CollectHoop(ctx, lab, "hoop", false, events, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := results(t, lab); got["hoop/"+big] != Unknown || got["hoop/"+copied] != sent["hoop/"+copied] {
+		t.Errorf("after collect: %v, want what the client saw kept: %v", got, sent)
+	}
+	r, err := LoadRun(ctx, lab, "hoop", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := r.Proxy[big]; !p.Blocked || p.Layer != "judgment" {
+		t.Errorf("lab.proxy of s5.oversize_message's step: %+v, want blocked by judgment from the audit log's violation", p)
+	}
+	by := xByPath(r)
+	for path, want := range map[string]string{"s5.oversize_message": "judgment", "s5.copy": "deterministic"} {
+		if got := by[path]; got.Executed != 0 || !maps.Equal(got.Layers, map[string]int{want: 1}) {
+			t.Errorf("%s: %+v, want not executed, stopped by %s", path, got, want)
+		}
+	}
+	fates := attackFates(r)
+	for _, x := range attacks {
+		if f := fates[indexOf(t, b.Attacks, x.Path)]; f != fateProxy {
+			t.Errorf("%s: fate %q, want the proxy's", x.Path, f)
+		}
 	}
 }
 
