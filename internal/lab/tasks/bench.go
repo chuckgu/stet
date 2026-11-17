@@ -73,9 +73,6 @@ type BenchOptions struct {
 	Attacks    bool    // build the X set (Task 3)
 }
 
-// Attack is filled in by the X set's task.
-type Attack struct{}
-
 type Bench struct {
 	Plan     Plan        // exactly Build(d, o.Plan)
 	Extra    crm.Dataset // rows to load after d's (Task 2, 3)
@@ -164,8 +161,8 @@ func argText(v any) (string, error) {
 	return "", fmt.Errorf("unsupported plan argument type %T", v)
 }
 
-// BuildBench builds the benchmark stream on d. Only the P, V and I sets
-// are built here.
+// BuildBench builds the benchmark stream on d: the P, V and I sets, and the
+// X set when o.Attacks is on.
 func BuildBench(d *crm.Dataset, o BenchOptions) (Bench, error) {
 	plan := Build(d, o.Plan)
 	b := Bench{Plan: plan}
@@ -285,15 +282,25 @@ func BuildBench(d *crm.Dataset, o BenchOptions) (Bench, error) {
 		return Bench{}, err
 	}
 
+	if o.Attacks {
+		if err := addXSet(&b, d, o); err != nil {
+			return Bench{}, err
+		}
+	}
+
 	tags := stream(o.Plan.Seed, tagStream)
 	used := map[string]bool{}
 	for i := range b.Stream {
+		b.Stream[i].Seq = i
+		if b.Stream[i].Wire == WireFunctionCall {
+			continue // a FunctionCall message has no comment to carry a tag
+		}
 		var tag string
 		for tag == "" || used[tag] {
 			tag = fmt.Sprintf("%012d", tags.Int64N(1_000_000_000_000))
 		}
 		used[tag] = true
-		b.Stream[i].Seq, b.Stream[i].Tag = i, tag
+		b.Stream[i].Tag = tag
 	}
 	return b, nil
 }
