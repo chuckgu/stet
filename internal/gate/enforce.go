@@ -283,18 +283,21 @@ func (g *Gate) facts(p *pending) decide.Facts {
 	}
 }
 
-// hold stores p in stet.held_writes and returns the row's id, or "" when it
-// was not stored: the write is refused all the same, and its error names no
-// held write (spec 7). A write is stored only as it was sent. One whose bind
-// values were not read, or are text jsonb cannot hold as it is (not UTF-8,
-// or with a NUL), is not: approving a changed value would run another write.
+// hold stores p in stet.held_writes, unconfirmed, and returns the row's id, or
+// "" when it was not stored: the write is refused all the same, and its error
+// names no held write (spec 7). End makes the row pending once the refusal
+// reached the client (spec-v0.2-approve 4).
+//
+// The row keeps what approving the write needs (spec-v0.2-approve 4): until
+// when it can be approved, the session's settings its text values are read
+// under, the version of its row or that the row was not there, and the rows
+// it would touch. A write is stored only as it was sent, and as it would run:
+// see unstorable for one that is not stored.
 //
 // An insert that reports an error may still have landed: past its deadline
 // pgx stops waiting but does not cancel the insert on the server. Its id is
-// kept in p.heldUnsure, and End marks it undelivered. That narrows, but does
-// not close, the chance that a row the client was not told of is left
-// pending for approval: an insert still running on the server when the
-// marking runs lands afterwards as pending (spec 13).
+// kept in p.heldUnsure, and End marks it undelivered. A row that lands after
+// that marking stays unconfirmed, which no one can approve.
 func (g *Gate) hold(p *pending) string {
 	h := &store.HeldWrite{
 		ID:          store.NewID(),
@@ -309,13 +312,22 @@ func (g *Gate) hold(p *pending) string {
 		TargetPK:    p.pk,
 		Verdict:     p.verdict,
 		Reasons:     p.reasons,
+		ExpiresAt:   p.at.Add(g.cfg.Held.ExpireAfter),
+		Settings: map[string]string{
+			"TimeZone": p.session.TimeZone, "DateStyle": p.session.DateStyle, "IntervalStyle": p.session.IntervalStyle,
+		},
 	}
+	h.PlannedRows, h.RowsExact = heldRows(p)
 	if p.res.Kind == sqlparse.Gated && (p.res.Op == "update" || p.res.Op == "delete") {
 		if x, ok := p.stateVersion["xmin"]; ok {
 			h.RowVersion = &x
+		} else {
+			// Its state was read, and the row was not there: what the
+			// reviewer sees is that there is no such row.
+			h.RowAbsent = p.pk != nil && p.state != nil && p.stateErr == nil
 		}
 	}
-	err := unstorable(h, len(p.oids))
+	err := unstorable(p, h)
 	if err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), heldTimeout)
 		if err = g.insertHeld(ctx, h); err != nil {
@@ -330,11 +342,28 @@ func (g *Gate) hold(p *pending) string {
 	return h.ID
 }
 
-// unstorable says why h cannot be stored as the write was sent, with its n
-// bind values, or returns nil.
-func unstorable(h *store.HeldWrite, n int) error {
-	if len(h.Params) != n {
+// unstorable says why h, the held write of p, cannot be stored as the write
+// was sent, or returns nil. Approving a changed value would run another
+// write, so one whose bind values were not read, or are text jsonb cannot
+// hold as it is (not UTF-8, or with a NUL), is not stored. Nor is one whose
+// session's settings are not known (spec-v0.2-approve 4): a text value such
+// as a date means what TimeZone, DateStyle and IntervalStyle make of it. The
+// server reports a SET's change of them only just before the ReadyForQuery
+// that answers it, so after a SET or RESET it has not answered yet (one sent
+// under the same Sync as the write, say) the settings the proxy last heard
+// of may not be the ones the write would run under; and a setting the server
+// never reported is not known at all.
+func unstorable(p *pending, h *store.HeldWrite) error {
+	if len(h.Params) != len(p.oids) {
 		return errors.New("bind values not read")
+	}
+	if p.session.SetPending {
+		return errors.New("a SET or RESET the server has not answered yet may have changed the session's settings")
+	}
+	for _, k := range []string{"TimeZone", "DateStyle", "IntervalStyle"} {
+		if h.Settings[k] == "" {
+			return fmt.Errorf("the server has not reported the session's %s", k)
+		}
 	}
 	if !storableText(h.Statement) {
 		return errors.New("statement is not UTF-8 text without NUL")
@@ -348,6 +377,22 @@ func unstorable(h *store.HeldWrite, n int) error {
 }
 
 func storableText(s string) bool { return utf8.ValidString(s) && !strings.ContainsRune(s, 0) }
+
+// heldRows is how many rows p was found to touch when it was held, and
+// whether that number is exact: what approving it allows is measured by it
+// (spec-v0.2-approve 4, 6). 1 for a single-row write; for a measured one, the
+// rows it was measured at, exact when read from its syntax or counted under
+// the cap; none for one that was not measured.
+func heldRows(p *pending) (*int64, bool) {
+	switch im := p.impact; {
+	case p.res.Kind == sqlparse.Gated:
+		return ptr(int64(1)), true
+	case im != nil && im.Method != "" && im.Rows != nil:
+		exact := im.Method == string(sqlparse.MethodSyntax) || (im.Method == string(sqlparse.MethodCount) && !im.Capped)
+		return ptr(*im.Rows), exact
+	}
+	return nil, false
+}
 
 // textParams is ps as text when no value needs decoding, and nil otherwise.
 func textParams(ps []proxy.Param) []*string {

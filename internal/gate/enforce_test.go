@@ -142,6 +142,14 @@ type heldRow struct {
 	Verdict     string
 	Reasons     []string
 	TargetTable string
+
+	CreatedAt     time.Time
+	ExpiresAt     *time.Time
+	Settings      map[string]string
+	RowAbsent     *bool
+	InTransaction *bool
+	PlannedRows   *int64
+	RowsExact     *bool
 }
 
 // held waits for n held writes of the env's table, oldest first, and returns
@@ -153,7 +161,8 @@ func (e *env) held(t *testing.T, n int) []heldRow {
 	for {
 		rows, err := e.admin.Query(context.Background(), `
 			select id::text, decision_id::text, status, login_role, database, statement, params,
-			       param_types, target_pk, row_version, verdict, reasons, target_table
+			       param_types, target_pk, row_version, verdict, reasons, target_table,
+			       created_at, expires_at, settings, row_absent, in_transaction, planned_rows, rows_exact
 			from stet.held_writes where target_table = $1 order by created_at`, e.table)
 		if err != nil {
 			t.Fatal(err)
@@ -350,9 +359,10 @@ func TestEnforceHoldsWhatTheModelFlags(t *testing.T) {
 		t.Errorf("hint = %q, want it to name held_write %s", pgErr.Hint, h.ID)
 	}
 	if h.DecisionID != r.ID || h.Statement != fmt.Sprintf(sql, e.table) || h.LoginRole != "stet_md5" ||
-		h.Database != "stet_test" || h.TargetTable != e.table || h.Status != "unconfirmed" {
-		t.Errorf("held write %+v, want decision %s, the statement, stet_md5, stet_test, the table, unconfirmed", h, r.ID)
+		h.Database != "stet_test" || h.TargetTable != e.table {
+		t.Errorf("held write %+v, want decision %s, the statement, stet_md5, stet_test, the table", h, r.ID)
 	}
+	e.waitHeldStatus(t, "pending")
 	if h.TargetPK == nil || *h.TargetPK != "2" {
 		t.Errorf("target_pk = %v, want 2", deref(h.TargetPK))
 	}
@@ -388,6 +398,41 @@ func TestHeldWriteKeepsBinaryAndNullParamsAsText(t *testing.T) {
 	if len(h.ParamTypes) != 3 {
 		t.Errorf("param_types = %v, want 3 of them", h.ParamTypes)
 	}
+}
+
+// A Bind may mix binary values with text ones whose type the server infers,
+// as JDBC sends an integer and a date. The binary ones are decoded by the
+// server; the text ones are kept as the bytes the client sent, in the held
+// write and in the decision alike: read back on Stet's connection, they would
+// be Stet's reading of them, under its own settings (plan correction B1).
+func TestHeldWriteKeepsTextValuesAsSentAmongBinaryOnes(t *testing.T) {
+	e := setupEnforce(t, holding())
+	e.seed(t)
+	res := e.agent(t, "jdbc").PgConn().ExecParams(context.Background(),
+		"update "+e.table+" set company_id = $1, title = $2 where id = $3",
+		[][]byte{[]byte(" 07"), nil, {0, 0, 0, 2}}, []uint32{0, 0, 23}, []int16{0, 0, 1}, nil).Read()
+	wantRefused(t, res.Err, "ST001", "write held by stet: ")
+
+	want := []*string{ptr(" 07"), nil, ptr("2")}
+	h := e.held(t, 1)[0]
+	if !reflect.DeepEqual(h.Params, want) {
+		t.Errorf("held params = %#v, want %#v", values(h.Params), values(want))
+	}
+	if !reflect.DeepEqual(h.ParamTypes, []uint32{0, 0, 23}) {
+		t.Errorf("param_types = %v, want [0 0 23]", h.ParamTypes)
+	}
+	if got := e.decisions(t, 1)[0].Params; !reflect.DeepEqual(got, want) {
+		t.Errorf("decision params = %#v, want %#v", values(got), values(want))
+	}
+}
+
+// values is ps with each value in place of its pointer, for messages.
+func values(ps []*string) []any {
+	out := make([]any, len(ps))
+	for i, p := range ps {
+		out[i] = deref(p)
+	}
+	return out
 }
 
 // A held write is stored only as it was sent: approving a changed value
@@ -1087,6 +1132,329 @@ func TestEnforceMarksAnUnconfirmedHeldWriteUndelivered(t *testing.T) {
 		t.Error("the held write ran")
 	}
 	wantRefusedRecord(t, 0, e.enforced(t, 1)[0], "ST001")
+}
+
+// waitHeldStatuses waits until the env's held writes, oldest first, have
+// statuses.
+func (e *env) waitHeldStatuses(t *testing.T, statuses ...string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var got []string
+		for _, h := range e.held(t, len(statuses)) {
+			got = append(got, h.Status)
+		}
+		if reflect.DeepEqual(got, statuses) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("held write statuses %v, want %v", got, statuses)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// waitErrorLog waits until an ERROR line with message msg was logged.
+func waitErrorLog(t *testing.T, logs *lockedBuffer, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		for _, rec := range logRecords(t, logs) {
+			if rec["level"] == "ERROR" && rec["msg"] == msg {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no error %q logged:\n%s", msg, logs.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// withSettings is info as the proxy reports it once the server has
+// reported the three settings a held write is stored with.
+func withSettings(info proxy.SessionInfo) proxy.SessionInfo {
+	info.TimeZone, info.DateStyle, info.IntervalStyle = "UTC", "ISO, MDY", "postgres"
+	return info
+}
+
+// A held write keeps what approving it needs (spec-v0.2-approve 4): until
+// when it can be approved (held.expire_after after the statement arrived),
+// the session's settings its text values are read under, its row's version,
+// and the rows it would touch. Once its refusal reached the client it is
+// pending, with whether it came in a transaction.
+func TestHeldWriteCarriesWhatApprovalNeeds(t *testing.T) {
+	for name, c := range map[string]struct {
+		yaml   string
+		expire time.Duration
+	}{
+		"default":         {enforceYAML, 24 * time.Hour},
+		"expire_after 1h": {enforceYAML + "held: {expire_after: 1h}\n", time.Hour},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := setupEnforce(t, holding(), c.yaml)
+			e.seed(t)
+			ctx := context.Background()
+			conn := e.agent(t, "a")
+			want := map[string]string{}
+			for k, sql := range map[string]string{
+				"TimeZone": "show timezone", "DateStyle": "show datestyle", "IntervalStyle": "show intervalstyle",
+			} {
+				var v string
+				if err := conn.QueryRow(ctx, sql).Scan(&v); err != nil {
+					t.Fatalf("%s: %v", sql, err)
+				}
+				want[k] = v
+			}
+			_, err := conn.Exec(ctx, "update "+e.table+" set status = 'churned' where id = 2")
+			wantRefused(t, err, "ST001", "write held by stet: it breaks policy rule 1")
+
+			e.waitHeldStatus(t, "pending")
+			h := e.held(t, 1)[0]
+			if h.InTransaction == nil || *h.InTransaction {
+				t.Errorf("in_transaction = %v, want false", deref(h.InTransaction))
+			}
+			if h.ExpiresAt == nil || h.ExpiresAt.Sub(h.CreatedAt) != c.expire {
+				t.Errorf("expires_at = %v, created_at = %v; want %v after it", deref(h.ExpiresAt), h.CreatedAt, c.expire)
+			}
+			if !reflect.DeepEqual(h.Settings, want) {
+				t.Errorf("settings = %v, want the session's %v", h.Settings, want)
+			}
+			if !reflect.DeepEqual(h.PlannedRows, ptr(int64(1))) || !reflect.DeepEqual(h.RowsExact, ptr(true)) ||
+				!reflect.DeepEqual(h.RowAbsent, ptr(false)) {
+				t.Errorf("planned_rows %v rows_exact %v row_absent %v, want 1, true, false",
+					deref(h.PlannedRows), deref(h.RowsExact), deref(h.RowAbsent))
+			}
+			if h.RowVersion == nil {
+				t.Error("row_version is NULL, want the row's version")
+			}
+		})
+	}
+}
+
+// A single-row write whose row was not there when its state was read is held
+// with that said, and with no row version (spec-v0.2-approve 4).
+func TestHeldWriteOfARowThatIsNotThere(t *testing.T) {
+	e := setupEnforce(t, holding())
+	e.seed(t)
+	_, err := e.agent(t, "a").Exec(context.Background(), "update "+e.table+" set status = 'churned' where id = 424242")
+	wantRefused(t, err, "ST001", "write held by stet: it breaks policy rule 1")
+	h := e.held(t, 1)[0]
+	if !reflect.DeepEqual(h.RowAbsent, ptr(true)) || h.RowVersion != nil {
+		t.Errorf("row_absent %v row_version %v, want true and NULL", deref(h.RowAbsent), deref(h.RowVersion))
+	}
+}
+
+// A held write keeps the rows it was measured at, and whether that number is
+// exact: approving it allows no more (spec-v0.2-approve 4, 6).
+func TestHeldWritePlannedRows(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		d       func() *fakeDecider
+		yaml    string
+		before  []string // writes that run first; %[1]s is the table
+		write   string
+		busy    bool // every inflight slot is taken while it is judged
+		reasons []string
+		rows    *int64 // nil: NULL
+		est     bool   // rows is the estimate its decision records
+		exact   bool
+	}{
+		{name: "single-row insert", d: holding, yaml: enforceYAML,
+			write: "insert into %[1]s (id, name) values (50, 'new')", reasons: []string{"policy:1"}, rows: ptr(int64(1)), exact: true},
+		{name: "syntax", d: calm, yaml: enforcePrefix + impactYAML,
+			write:   "insert into %[1]s (id, name) values (50, 'a'), (51, 'b'), (52, 'c'), (53, 'd')",
+			reasons: []string{"impact:rows"}, rows: ptr(int64(4)), exact: true},
+		{name: "count under the cap", d: calm, yaml: enforcePrefix + cumYAML,
+			before: []string{
+				"update %[1]s set status = 'f1' where company_id = 9",
+				"update %[1]s set status = 'f2' where company_id = 3 and id > 2",
+			},
+			write: "update %[1]s set status = 'f3' where company_id = 9", reasons: []string{"impact:cumulative"},
+			rows: ptr(int64(2)), exact: true},
+		{name: "count at the cap", d: calm, yaml: enforcePrefix + impactYAML,
+			write: "update %[1]s set status = 'x' where company_id = 3", reasons: []string{"impact:rows"},
+			rows: ptr(int64(4)), exact: false},
+		{name: "estimate", d: calm, yaml: enforcePrefix + looseYAML,
+			write: "update %[1]s set status = 'x' where company_id in (select 9)", reasons: []string{"impact:uncertain"},
+			est: true, exact: false},
+		{name: "not measured", d: calm, yaml: enforcePrefix + impactYAML + "limits: {max_inflight: 1}\n",
+			write: "update %[1]s set status = 'x' where company_id = 9", busy: true, reasons: []string{"state_error"},
+			exact: false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e := setupEnforce(t, c.d(), c.yaml)
+			e.seedMany(t)
+			mustExec(t, e.admin, "analyze "+e.table)
+			conn := e.agent(t, "bulk")
+			for _, sql := range c.before {
+				mustExec(t, conn, fmt.Sprintf(sql, e.table))
+			}
+			release := func() {}
+			if c.busy {
+				release = gate.HoldInflight(e.gate)
+			}
+			_, err := conn.Exec(context.Background(), fmt.Sprintf(c.write, e.table))
+			release()
+			wantRefused(t, err, "ST001", "write held by stet: ")
+
+			h := e.held(t, 1)[0]
+			if !reflect.DeepEqual(h.Reasons, c.reasons) {
+				t.Fatalf("held for %v, want %v", h.Reasons, c.reasons)
+			}
+			want := c.rows
+			if c.est {
+				im := e.impacts(t, len(c.before)+1)[len(c.before)].Impact
+				rows, ok := num(im, "rows")
+				if !ok || im["method"] != "estimate" {
+					t.Fatalf("impact %v, want an estimate", im)
+				}
+				want = ptr(int64(rows))
+			}
+			if !reflect.DeepEqual(h.PlannedRows, want) || !reflect.DeepEqual(h.RowsExact, ptr(c.exact)) {
+				t.Errorf("planned_rows %v rows_exact %v, want %v and %v",
+					deref(h.PlannedRows), deref(h.RowsExact), deref(want), c.exact)
+			}
+		})
+	}
+}
+
+// The server reports a SET's change of the session's settings only just
+// before the ReadyForQuery that answers it, so a write behind a SET under the
+// same Sync may run under settings the proxy does not know yet. It cannot be
+// stored as it was sent: it is refused as a held write that was not stored
+// (spec-v0.2-approve 4).
+func TestHeldWriteBehindASetUnderOneSyncIsNotStored(t *testing.T) {
+	e := setupEnforce(t, holding())
+	var logs lockedBuffer
+	gate.SetLogger(e.gate, slog.New(slog.NewJSONHandler(&logs, nil)))
+	e.seed(t)
+	err := pipeline(t, e.agent(t, "a"), func(pl *pgconn.Pipeline) {
+		pl.SendQueryParams("set timezone = 'UTC'", nil, nil, nil, nil)
+		pl.SendQueryParams("update "+e.table+" set status = $1 where id = $2",
+			[][]byte{[]byte("churned"), []byte("2")}, nil, nil, nil)
+	})
+	pgErr := wantRefused(t, err, "ST001", "write held by stet: it breaks policy rule 1")
+	if strings.Contains(pgErr.Detail, "held_write") || !strings.Contains(pgErr.Hint, "this write") {
+		t.Errorf("detail %q hint %q, want no held write named", pgErr.Detail, pgErr.Hint)
+	}
+	wantRefusedRecord(t, 0, e.enforced(t, 1)[0], "ST001")
+	if hs := e.held(t, 0); len(hs) != 0 {
+		t.Errorf("%d held writes stored, want none", len(hs))
+	}
+	wantErrorLogs(t, &logs, "held write not stored", 1)
+	if n := e.rowsWhere(t, "id = 2 and status = 'active'"); n != 1 {
+		t.Error("row 2 changed: a held write must not run")
+	}
+}
+
+// A held write whose session's settings the server has not reported is not
+// stored either: what its text values mean is not known.
+func TestHeldWriteWithoutReportedSettingsIsNotStored(t *testing.T) {
+	e := setupEnforce(t, holding())
+	e.seed(t)
+	info := withSettings(proxy.SessionInfo{ID: "unreported", User: "stet_md5", Database: "stet_test", ApplicationName: "a"})
+	info.TimeZone = ""
+	h, refuse := e.gate.Begin(info, e.gate.Inspect("update "+e.table+" set status = 'churned' where id = 2"), nil)
+	if refuse == nil {
+		t.Fatal("the held write was let through")
+	}
+	e.gate.End(h, proxy.Outcome{Refused: true})
+	if refuse.Code != "ST001" || strings.Contains(refuse.Detail, "held_write") || !strings.Contains(refuse.Hint, "this write") {
+		t.Errorf("refusal %+v, want ST001 naming no held write", refuse)
+	}
+	wantRefusedRecord(t, 0, e.enforced(t, 1)[0], "ST001")
+	if hs := e.held(t, 0); len(hs) != 0 {
+		t.Errorf("%d held writes stored, want none", len(hs))
+	}
+}
+
+// The first write of an explicit transaction is judged as an autocommit one
+// is, and its held write says it came in a transaction: what the agent sent
+// with it in that transaction did not run (spec-v0.2-approve 4).
+func TestFirstWriteAfterBeginIsHeldInTransaction(t *testing.T) {
+	e := setupEnforce(t, holding())
+	e.seed(t)
+	conn := e.agent(t, "tx")
+	mustExec(t, conn, "begin")
+	_, err := conn.Exec(context.Background(), "update "+e.table+" set status = 'churned' where id = 2")
+	wantRefused(t, err, "ST001", "write held by stet: it breaks policy rule 1")
+	mustExec(t, conn, "rollback")
+	e.waitHeldStatus(t, "pending")
+	if h := e.held(t, 1)[0]; !reflect.DeepEqual(h.InTransaction, ptr(true)) {
+		t.Errorf("in_transaction = %v, want true", deref(h.InTransaction))
+	}
+}
+
+// A held write the proxy reports as run, or as lost, never becomes pending:
+// approving it could run it twice (spec-v0.2-approve 4).
+func TestHeldWriteTheProxyReportsAsSentIsUndelivered(t *testing.T) {
+	e := setupEnforce(t, holding())
+	e.seed(t)
+	info := withSettings(proxy.SessionInfo{ID: "defect", User: "stet_md5", Database: "stet_test", ApplicationName: "defect"})
+	for _, o := range []proxy.Outcome{
+		{Refused: true, Executed: true, Rows: ptr(int64(1))},
+		{Refused: true, Lost: true, Error: "connection closed"},
+	} {
+		h, refuse := e.gate.Begin(info, e.gate.Inspect("update "+e.table+" set status = 'churned' where id = 1"), nil)
+		if refuse == nil || !strings.Contains(refuse.Detail, "held_write=") {
+			t.Fatalf("refusal %+v, want a stored held write", refuse)
+		}
+		e.gate.End(h, o)
+	}
+	e.enforced(t, 2)
+	e.waitHeldStatuses(t, "undelivered", "undelivered")
+}
+
+// A held write that cannot be marked pending stays unconfirmed, which no one
+// can approve: the agent was told of it, but it fails toward not running
+// (spec-v0.2-approve 4).
+func TestHeldWriteStaysUnconfirmedWhenItCannotBeMarked(t *testing.T) {
+	e := setupEnforce(t, holding())
+	var logs lockedBuffer
+	gate.SetLogger(e.gate, slog.New(slog.NewJSONHandler(&logs, nil)))
+	gate.FailDelivered(e.gate, 1)
+	e.seed(t)
+	_, err := e.agent(t, "a").Exec(context.Background(), "update "+e.table+" set status = 'churned' where id = 2")
+	pgErr := wantRefused(t, err, "ST001", "write held by stet: it breaks policy rule 1")
+	if !strings.Contains(pgErr.Detail, "held_write=") {
+		t.Errorf("detail = %q, want the held write named", pgErr.Detail)
+	}
+	waitErrorLog(t, &logs, "held write not marked pending")
+	if h := e.held(t, 1)[0]; h.Status != "unconfirmed" || h.InTransaction != nil {
+		t.Errorf("status %s in_transaction %v, want unconfirmed and NULL", h.Status, deref(h.InTransaction))
+	}
+	wantErrorLogs(t, &logs, "held write not marked pending", 1)
+}
+
+// A held write becomes pending, and so approvable, only once the decision on
+// it is recorded: the reasons a reviewer reads are already there
+// (spec-v0.2-approve 4).
+func TestPendingComesAfterTheDecisionIsRecorded(t *testing.T) {
+	e := setupEnforce(t, holding())
+	recorded := make(chan bool, 1)
+	gate.OnDelivered(e.gate, func(id string) {
+		var ok bool
+		err := e.pool.QueryRow(context.Background(), `
+			select exists (select from stet.held_writes h join stet.decisions d on d.id = h.decision_id
+			               where h.id = $1)`, id).Scan(&ok)
+		if err != nil {
+			t.Errorf("decision of held write %s: %v", id, err)
+		}
+		recorded <- ok
+	})
+	e.seed(t)
+	_, err := e.agent(t, "a").Exec(context.Background(), "update "+e.table+" set status = 'churned' where id = 2")
+	wantRefused(t, err, "ST001", "write held by stet: it breaks policy rule 1")
+	select {
+	case ok := <-recorded:
+		if !ok {
+			t.Error("the held write was marked pending before its decision was recorded")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the held write was never marked pending")
+	}
+	e.waitHeldStatus(t, "pending")
 }
 
 // A row version that cannot be read again is a state error, which

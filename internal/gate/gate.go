@@ -68,11 +68,13 @@ type Gate struct {
 	inflight chan struct{}
 	wg       sync.WaitGroup
 
-	// insertHeld stores a held write (store.InsertHeldWrite), and rowVersion
-	// reads a row's version again before a judged write is sent
-	// (readRowVersion): fields so tests can make them fail.
-	insertHeld func(context.Context, *store.HeldWrite) error
-	rowVersion func(ctx context.Context, table, pk string) (string, error)
+	// insertHeld stores a held write (store.InsertHeldWrite), markDelivered
+	// makes one pending (store.MarkDelivered), and rowVersion reads a row's
+	// version again before a judged write is sent (readRowVersion): fields so
+	// tests can make them fail or watch them.
+	insertHeld    func(context.Context, *store.HeldWrite) error
+	markDelivered func(ctx context.Context, id string, inTransaction bool) error
+	rowVersion    func(ctx context.Context, table, pk string) (string, error)
 
 	warnedRoles sync.Map // client roles Stet could not assume, logged once each
 }
@@ -100,7 +102,8 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, d decide.Decid
 		sem:      make(chan struct{}, maxModelCalls),
 		inflight: make(chan struct{}, cfg.MaxInflight),
 
-		insertHeld: st.InsertHeldWrite,
+		insertHeld:    st.InsertHeldWrite,
+		markDelivered: st.MarkDelivered,
 	}
 	g.rowVersion = g.readRowVersion
 	g.usage = newUsage(st.UsageBySecond, &g.wg)
@@ -405,9 +408,9 @@ func rowsAffected(r sqlparse.Result, o proxy.Outcome) *int64 {
 
 // End records how the write ended, in the background: it does not block. A
 // write Begin refused did not run: it is recorded with the refusal's error,
-// and its reservation goes as for a write the server refused (spec 11). When
-// the client was not given the refusal, its held write is marked undelivered
-// (spec 9).
+// and its reservation goes as for a write the server refused (spec 11). Its
+// held write then becomes pending when the client was given the refusal, and
+// undelivered otherwise (see settleHeld).
 //
 // The proxy never reports a refused write as run or lost. Should it, that is
 // the worst of its defects, so End logs an error and records what the proxy
@@ -482,25 +485,9 @@ func asksInShadow(in decide.Input) bool {
 
 // judge records the decision on p. In shadow mode it decides what enforce
 // mode would have done, asking the model now; in enforce mode Begin decided,
-// and what the model answered then is recorded as it is (rule 4). It also
-// marks undelivered a held write the client was not told of: one whose
-// refusal did not reach the client, and one whose insert reported an error
-// although it may have landed (marking an id that never landed does nothing).
+// and what the model answered then is recorded as it is (rule 4). Then, also
+// when the decision could not be recorded, it settles p's held write.
 func (g *Gate) judge(p *pending, o proxy.Outcome) {
-	var untold []string
-	if o.Undelivered && p.heldID != "" {
-		untold = append(untold, p.heldID)
-	}
-	if p.heldUnsure != "" {
-		untold = append(untold, p.heldUnsure)
-	}
-	for _, id := range untold {
-		ctx, cancel := context.WithTimeout(context.Background(), recordTimeout)
-		if err := g.store.MarkUndelivered(ctx, id); err != nil {
-			g.log.Error("held write not marked undelivered", "id", id, "decision", p.id, "err", err)
-		}
-		cancel()
-	}
 	in := g.input(p)
 	d := &store.Decision{
 		ID:            p.id,
@@ -582,9 +569,52 @@ func (g *Gate) judge(p *pending, o proxy.Outcome) {
 	g.exceededAfter(p, d)
 
 	ctx, cancel := context.WithTimeout(context.Background(), recordTimeout)
-	defer cancel()
-	if err := g.store.Insert(ctx, d); err != nil {
+	err := g.store.Insert(ctx, d)
+	cancel()
+	if err != nil {
 		g.log.Error("decision not recorded", "id", d.ID, "table", d.TargetTable, "err", err)
+	}
+	g.settleHeld(p, o)
+}
+
+// settleHeld moves p's held write out of unconfirmed once its outcome o is
+// known (spec-v0.2-approve 4). It runs after the decision on p was recorded,
+// or failed to be, so that a held write a reviewer can approve usually has
+// its reasons recorded already. The write becomes pending, with whether it
+// came in a transaction as the proxy reports it (plan correction B3), only
+// when the proxy reports that its refusal reached the client and that it was
+// neither run nor lost; otherwise it becomes undelivered. One the proxy
+// reports as run cannot be approved: that could run it twice.
+//
+// A held write whose insert reported an error was not named to the client
+// either, so it becomes undelivered too, should it have landed (marking an id
+// that never landed does nothing). One that cannot be marked pending stays
+// unconfirmed, which no one can approve: the agent was told of it, but it
+// errs toward not running.
+func (g *Gate) settleHeld(p *pending, o proxy.Outcome) {
+	if p.heldUnsure != "" {
+		g.markUndelivered(p, p.heldUnsure)
+	}
+	if p.heldID == "" {
+		return
+	}
+	if !o.Refused || o.Undelivered || o.Executed || o.Lost {
+		g.markUndelivered(p, p.heldID)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), recordTimeout)
+	defer cancel()
+	if err := g.markDelivered(ctx, p.heldID, o.InTransaction); err != nil {
+		g.log.Error("held write not marked pending", "id", p.heldID, "decision", p.id, "err", err)
+	}
+}
+
+// markUndelivered marks the held write id of p undelivered.
+func (g *Gate) markUndelivered(p *pending, id string) {
+	ctx, cancel := context.WithTimeout(context.Background(), recordTimeout)
+	defer cancel()
+	if err := g.store.MarkUndelivered(ctx, id); err != nil {
+		g.log.Error("held write not marked undelivered", "id", id, "decision", p.id, "err", err)
 	}
 }
 
@@ -775,7 +805,11 @@ func (s State) CouldUndoRecent() bool {
 }
 
 // paramTexts turns bind values into text. Binary values are decoded by
-// Postgres itself, using the statement's parameter types.
+// Postgres itself, using the statement's parameter types. Text values are
+// kept as the bytes the client sent, also next to binary ones (plan
+// correction B1): read back, a value whose meaning depends on the session's
+// settings, such as an untyped date under DateStyle, would come back as
+// Stet's connection reads it, not as the client's session does.
 //
 // Decoding runs the types' code, a domain's CHECK included, on Stet's
 // connection as Stet's own account, and the agent chose both the statement
@@ -786,7 +820,8 @@ func (g *Gate) paramTexts(ctx context.Context, sql string, ps []proxy.Param) ([]
 	if out := textParams(ps); out != nil || len(ps) == 0 {
 		return out, nil
 	}
-	// A value is binary: every value is read back from the database.
+	// A value is binary: the server decodes every value, as it would to run
+	// the statement, and the binary ones are read back as text.
 	out := make([]*string, len(ps))
 
 	pg, done, err := g.txConn(ctx)
@@ -822,7 +857,12 @@ func (g *Gate) paramTexts(ctx context.Context, sql string, ps []proxy.Param) ([]
 		return nil, res.Err
 	}
 	for i, v := range res.Rows[0] {
-		if v != nil {
+		switch {
+		case ps[i].Format == 0:
+			if ps[i].Value != nil {
+				out[i] = ptr(string(ps[i].Value))
+			}
+		case v != nil:
 			out[i] = ptr(string(v))
 		}
 	}

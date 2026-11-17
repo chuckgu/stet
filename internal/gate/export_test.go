@@ -133,6 +133,33 @@ func LandHeldWritesThenFail(g *Gate, n int) {
 	}
 }
 
+// FailDelivered makes g's next n markings of a held write as pending fail.
+// Call it before any write reaches g.
+func FailDelivered(g *Gate, n int) {
+	mark := g.markDelivered
+	var mu sync.Mutex
+	g.markDelivered = func(ctx context.Context, id string, inTransaction bool) error {
+		mu.Lock()
+		fail := n > 0
+		n--
+		mu.Unlock()
+		if fail {
+			return errors.New("injected failure")
+		}
+		return mark(ctx, id, inTransaction)
+	}
+}
+
+// OnDelivered makes g call f with a held write's id each time it marks one
+// pending, just before it does. Call it before any write reaches g.
+func OnDelivered(g *Gate, f func(id string)) {
+	mark := g.markDelivered
+	g.markDelivered = func(ctx context.Context, id string, inTransaction bool) error {
+		f(id)
+		return mark(ctx, id, inTransaction)
+	}
+}
+
 // FailRowVersionReads makes g's next n re-reads of a row's version, before
 // a judged write is sent, fail.
 func FailRowVersionReads(g *Gate, n int) {
