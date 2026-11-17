@@ -15,9 +15,14 @@ type HeldWrite struct {
 	TargetPK, RowVersion                        *string
 	Verdict                                     string // hold | escalate
 	Reasons                                     []string
+	ExpiresAt                                   time.Time         // until when it can be approved
+	Settings                                    map[string]string // the session's TimeZone, DateStyle and IntervalStyle when it was held; nil is NULL
+	RowAbsent                                   bool              // its state was read and the target row was not there
+	PlannedRows                                 *int64            // the rows measured when it was held; nil when it was not measured
+	RowsExact                                   bool              // PlannedRows is exact
 }
 
-// InsertHeldWrite stores a held write with status pending.
+// InsertHeldWrite stores a held write with status unconfirmed.
 func (s *Store) InsertHeldWrite(ctx context.Context, h *HeldWrite) error {
 	var params any
 	if h.Params != nil {
@@ -34,21 +39,33 @@ func (s *Store) InsertHeldWrite(ctx context.Context, h *HeldWrite) error {
 	_, err := s.pool.Exec(ctx, `
 		insert into stet.held_writes (
 			id, decision_id, created_at, login_role, database, statement,
-			params, param_types, target_table, target_pk, row_version, verdict, reasons
+			params, param_types, target_table, target_pk, row_version, verdict, reasons,
+			expires_at, settings, row_absent, planned_rows, rows_exact
 		) values (
 			$1, $2, $3, $4, $5, $6,
-			$7::jsonb, $8::oid[], $9, $10, $11, $12, $13
+			$7::jsonb, $8::oid[], $9, $10, $11, $12, $13,
+			$14, $15::jsonb, $16, $17, $18
 		)`,
 		h.ID, h.DecisionID, h.CreatedAt, h.LoginRole, h.Database, h.Statement,
-		params, types, h.TargetTable, h.TargetPK, h.RowVersion, h.Verdict, reasons)
+		params, types, h.TargetTable, h.TargetPK, h.RowVersion, h.Verdict, reasons,
+		h.ExpiresAt, jsonArg(h.Settings), h.RowAbsent, h.PlannedRows, h.RowsExact)
 	return err
 }
 
-// MarkUndelivered sets a pending held write to undelivered. An id that is
-// unknown or already undelivered is not an error.
+// MarkDelivered sets an unconfirmed held write to pending and records
+// in_transaction. An id that is unknown or no longer unconfirmed is not an error.
+func (s *Store) MarkDelivered(ctx context.Context, id string, inTransaction bool) error {
+	_, err := s.pool.Exec(ctx, `
+		update stet.held_writes set status = 'pending', in_transaction = $2
+		where id = $1 and status = 'unconfirmed'`, id, inTransaction)
+	return err
+}
+
+// MarkUndelivered sets an unconfirmed held write to undelivered. An id that
+// is unknown or no longer unconfirmed is not an error.
 func (s *Store) MarkUndelivered(ctx context.Context, id string) error {
 	_, err := s.pool.Exec(ctx,
-		`update stet.held_writes set status = 'undelivered' where id = $1 and status = 'pending'`, id)
+		`update stet.held_writes set status = 'undelivered' where id = $1 and status = 'unconfirmed'`, id)
 	return err
 }
 

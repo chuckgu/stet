@@ -114,12 +114,13 @@ CREATE TABLE IF NOT EXISTS stet.read_log (
   exec_error    text                           -- 실패하거나 끊긴 문장이면 그 원인
 );
 
--- 보류 건 (docs/spec-v0.2-enforce.md 9장). hold와 escalate로 막은 쓰기. 트리거를 두지 않는다: 2b가 status를 바꾼다.
+-- 보류 건 (docs/spec-v0.2-enforce.md 9장, docs/spec-v0.2-approve.md 4장). hold와 escalate로 막은 쓰기.
+-- 내용은 바뀌지 않고 status는 정해진 화살표로만 바뀐다. 아래의 트리거가 막는다.
 CREATE TABLE IF NOT EXISTS stet.held_writes (
   id            uuid PRIMARY KEY,
   decision_id   uuid NOT NULL,                 -- stet.decisions의 id
   created_at    timestamptz NOT NULL,          -- 문장이 들어온 시각
-  status        text NOT NULL DEFAULT 'pending',  -- 이 단계에서는 pending | undelivered
+  status        text NOT NULL DEFAULT 'pending',  -- 처음 값은 아래에서 unconfirmed로 바꾼다. 상태는 spec-v0.2-approve 3장
   login_role    text NOT NULL,
   database      text NOT NULL,
   statement     text NOT NULL,
@@ -132,3 +133,74 @@ CREATE TABLE IF NOT EXISTS stet.held_writes (
   reasons       text[] NOT NULL
 );
 CREATE INDEX IF NOT EXISTS held_writes_pending ON stet.held_writes (created_at) WHERE status = 'pending';
+
+-- 승인과 거부 (docs/spec-v0.2-approve.md 4장).
+-- Stet이 시작할 때마다 돌므로, 스키마가 이미 맞으면 stet.held_writes를 잠그지 않는다. ALTER TABLE과 DROP TRIGGER는
+-- 아무것도 바꾸지 않아도 AccessExclusiveLock을 잡아서, 실행부가 줄을 잠근 동안 다른 Stet이 시작하지 못한다.
+-- 그래서 ALTER는 빠진 것이 있을 때만 돌고, 트리거는 없을 때만 만든다. 컬럼을 더하면 아래의 이름 목록에도 더한다.
+DO $$
+BEGIN
+  IF EXISTS (SELECT FROM unnest('{expires_at,settings,row_absent,in_transaction,planned_rows,rows_exact,
+                                  resolved_by,resolved_at,note,max_rows,applied_at,rows_affected,error}'::name[]) AS c(name)
+             WHERE NOT EXISTS (SELECT FROM pg_attribute
+                               WHERE attrelid = 'stet.held_writes'::regclass AND attname = c.name AND NOT attisdropped))
+     OR (SELECT pg_get_expr(d.adbin, d.adrelid)
+         FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+         WHERE d.adrelid = 'stet.held_writes'::regclass AND a.attname = 'status') IS DISTINCT FROM '''unconfirmed''::text'
+  THEN
+    ALTER TABLE stet.held_writes ALTER COLUMN status SET DEFAULT 'unconfirmed';
+    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS expires_at    timestamptz;  -- 이때까지 승인할 수 있다
+    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS settings      jsonb;        -- 보류될 때 그 세션의 TimeZone, DateStyle, IntervalStyle
+    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS row_absent    boolean;      -- 상태를 읽었을 때 대상 행이 없었다
+    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS in_transaction boolean;     -- 명시적 트랜잭션이거나 한 Sync 아래 다른 문장과 함께 온 쓰기였다. pending이 될 때 적는다
+    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS planned_rows  bigint;       -- 보류될 때 잰 행 수
+    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS rows_exact    boolean;      -- planned_rows가 정확한 값인가
+    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS resolved_by   text;         -- 승인·거부한 접속 계정(session_user)
+    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS resolved_at   timestamptz;
+    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS note          text;         -- 검토자가 적은 말
+    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS max_rows      bigint;       -- 승인이 허락한 행 수의 상한
+    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS applied_at    timestamptz;  -- 실행을 끝냈거나 실패로 적은 시각
+    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS rows_affected bigint;
+    ALTER TABLE stet.held_writes ADD COLUMN IF NOT EXISTS error         text;         -- failed의 이유
+  END IF;
+END
+$$;
+CREATE INDEX IF NOT EXISTS held_writes_approved ON stet.held_writes (resolved_at) WHERE status = 'approved';
+
+-- 보류된 것은 바뀌지 않는다 (docs/spec-v0.2-approve.md 4장, 계획의 보정 B4). 역할 권한과 별개로 DB가 직접 막는다.
+-- free의 아홉 컬럼만 바뀔 수 있고, 나머지는 나중에 더해지는 컬럼까지 모두 고정이다. 아홉 가운데 둘에는 규칙이 있다.
+-- in_transaction은 unconfirmed에서 pending이 되는 그 갱신에서만 바뀐다. status는 3장의 화살표로만 바뀐다.
+-- DELETE는 막지 않는다.
+CREATE OR REPLACE FUNCTION stet.held_writes_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+  free CONSTANT text[] := '{status,in_transaction,resolved_by,resolved_at,note,max_rows,applied_at,rows_affected,error}';
+BEGIN
+  IF to_jsonb(NEW) - free <> to_jsonb(OLD) - free THEN
+    RAISE EXCEPTION 'stet.held_writes: what was held cannot change' USING ERRCODE = 'ST004';
+  END IF;
+  IF NEW.in_transaction IS DISTINCT FROM OLD.in_transaction
+     AND NOT (OLD.status = 'unconfirmed' AND NEW.status = 'pending') THEN
+    RAISE EXCEPTION 'stet.held_writes: in_transaction is set once, when the row becomes pending' USING ERRCODE = 'ST004';
+  END IF;
+  IF NEW.status <> OLD.status
+     AND (OLD.status, NEW.status) NOT IN (('unconfirmed', 'pending'), ('unconfirmed', 'undelivered'),
+                                          ('pending', 'approved'), ('pending', 'rejected'),
+                                          ('approved', 'applied'), ('approved', 'failed')) THEN
+    RAISE EXCEPTION 'stet.held_writes: status cannot go from % to %', OLD.status, NEW.status USING ERRCODE = 'ST004';
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+-- 트리거는 없을 때만 만든다. 그래서 트리거의 정의(언제, 무엇에)를 바꾸려면 따로 옮겨야 한다.
+-- 함수의 본문은 위의 CREATE OR REPLACE가 매번 새로 한다.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_trigger WHERE tgrelid = 'stet.held_writes'::regclass AND tgname = 'held_writes_guard') THEN
+    CREATE TRIGGER held_writes_guard
+      BEFORE UPDATE ON stet.held_writes
+      FOR EACH ROW EXECUTE FUNCTION stet.held_writes_guard();
+  END IF;
+END
+$$;

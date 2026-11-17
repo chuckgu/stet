@@ -350,8 +350,8 @@ func TestEnforceHoldsWhatTheModelFlags(t *testing.T) {
 		t.Errorf("hint = %q, want it to name held_write %s", pgErr.Hint, h.ID)
 	}
 	if h.DecisionID != r.ID || h.Statement != fmt.Sprintf(sql, e.table) || h.LoginRole != "stet_md5" ||
-		h.Database != "stet_test" || h.TargetTable != e.table || h.Status != "pending" {
-		t.Errorf("held write %+v, want decision %s, the statement, stet_md5, stet_test, the table, pending", h, r.ID)
+		h.Database != "stet_test" || h.TargetTable != e.table || h.Status != "unconfirmed" {
+		t.Errorf("held write %+v, want decision %s, the statement, stet_md5, stet_test, the table, unconfirmed", h, r.ID)
 	}
 	if h.TargetPK == nil || *h.TargetPK != "2" {
 		t.Errorf("target_pk = %v, want 2", deref(h.TargetPK))

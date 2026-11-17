@@ -10,20 +10,27 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/stetdb/stet/internal/store"
 )
 
-func testStore(t *testing.T) (*store.Store, *pgxpool.Pool) {
+// testDSN connects as Stet's own account to the test database.
+func testDSN(t *testing.T) string {
 	t.Helper()
 	addr := os.Getenv("STET_TEST_PG")
 	if addr == "" {
 		t.Skip("STET_TEST_PG not set; start a test database with scripts/testdb.sh")
 	}
+	return "postgres://stet_scram:scram-pw@" + addr + "/stet_test?sslmode=disable"
+}
+
+func testStore(t *testing.T) (*store.Store, *pgxpool.Pool) {
+	t.Helper()
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, "postgres://stet_scram:scram-pw@"+addr+"/stet_test?sslmode=disable")
+	pool, err := pgxpool.New(ctx, testDSN(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,6 +91,44 @@ func TestMigrateIsIdempotentAndConcurrent(t *testing.T) {
 		if err := <-errs; err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// Migrate runs whenever Stet starts, in a pool that waits 200ms for a lock.
+// On a current schema it must not wait for a held write another session has
+// locked, as the executor does while it applies one (plan ruling P2).
+func TestMigrateDoesNotWaitForAHeldRowLock(t *testing.T) {
+	s, pool := testStore(t)
+	ctx := context.Background()
+	h := insertHeld(t, s, pool)
+
+	locker, err := pgx.Connect(ctx, testDSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Close(ctx)
+	tx, err := locker.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	var id string
+	if err := tx.QueryRow(ctx, `select id::text from stet.held_writes where id = $1 for update`, h.ID).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := pgxpool.ParseConfig(testDSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.RuntimeParams["lock_timeout"] = "200ms"
+	stetPool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stetPool.Close()
+	if err := store.New(stetPool).Migrate(ctx); err != nil {
+		t.Errorf("migrate while a held write is locked: %v", err)
 	}
 }
 
