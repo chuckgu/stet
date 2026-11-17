@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/stetdb/stet/internal/lab/bench"
 	"github.com/stetdb/stet/internal/lab/crm"
@@ -745,17 +746,24 @@ func parseArms(list string, practice bool) ([]armRun, error) {
 	return out, nil
 }
 
-// loadBenchRun reads one run of an arm from its own database, as the owner.
+// loadBenchRun reads one run of an arm from its own database, as the owner. Its errors name the arm, the run and
+// the database; a database that does not exist is said in so many words (an arm that was never cloned and sent,
+// such as one the runbook lists but could not run).
 func loadBenchRun(ctx context.Context, f benchFlags, cmd, arm string, practice bool, rerun int) (bench.Run, error) {
 	db := bench.DBName(arm, practice, 0, rerun)
 	conn, err := pgx.Connect(ctx, bench.OwnerURL(*f.pg, bench.Names{}, db))
-	if err != nil {
-		return bench.Run{}, fmt.Errorf("%s: %s: %w", cmd, db, err)
+	var pe *pgconn.PgError
+	switch {
+	case errors.As(err, &pe) && pe.Code == "3D000": // invalid_catalog_name
+		return bench.Run{}, fmt.Errorf("%s: arm %s (run %d): its database %s does not exist: the arm was not cloned and "+
+			"sent, or its database was dropped; nothing was written", cmd, arm, rerun, db)
+	case err != nil:
+		return bench.Run{}, fmt.Errorf("%s: arm %s (run %d), database %s: %w", cmd, arm, rerun, db, err)
 	}
 	defer conn.Close(context.Background())
 	r, err := bench.LoadRun(ctx, conn, arm, rerun)
 	if err != nil {
-		return bench.Run{}, fmt.Errorf("%s: %s: %w", cmd, db, err)
+		return bench.Run{}, fmt.Errorf("%s: arm %s (run %d), database %s: %w", cmd, arm, rerun, db, err)
 	}
 	fmt.Fprintf(os.Stderr, "%s: read arm %s (run %d) from %s: %d outcomes, %d proxy rows, %d attack results\n", cmd,
 		arm, rerun, db, len(r.Outcomes), len(r.Proxy), len(r.Attacks))

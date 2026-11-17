@@ -266,16 +266,18 @@ var (
 	settleDefault = 2 * time.Minute
 )
 
-// busySQL counts the other sessions on the owner's database that are inside a transaction. Every transaction
-// holds the lock on its own virtual transaction ID until it ends, and an idle session holds no lock; a statement
-// waiting for a row lock is inside its transaction too. pg_locks is read because pg_stat_activity shows the
-// owner no other role's state (it is no member of pg_read_all_stats, and the benchmark leaves existing roles
-// alone); a session's database and user are shown to everyone. A NULL usesysid is a background process, such
-// as autovacuum.
+// busySQL counts the other sessions on the owner's database that hold or wait for a lock. Every transaction
+// holds the lock on its own virtual transaction ID until it ends, and a statement waiting for a row lock is
+// inside its transaction too, so a session running a statement counts. An idle session holds no lock unless it
+// keeps one past its transactions: a session idle in a transaction, or one holding a session-level advisory
+// lock, counts as busy until it lets go, and while it does every attack waits out the bound and comes out
+// undetermined. pg_locks is read because pg_stat_activity shows the owner no other role's state (it is no member
+// of pg_read_all_stats, and the benchmark leaves existing roles alone); a session's database and user are shown
+// to everyone. A NULL usesysid is a background process, such as autovacuum.
 const busySQL = `select count(distinct l.pid) from pg_locks l join pg_stat_activity a on a.pid = l.pid
 	where a.datname = current_database() and a.usesysid is not null and a.pid <> pg_backend_pid()`
 
-// settle waits until no other session on the owner's database is inside a transaction, looking every
+// settle waits until no other session on the owner's database holds or waits for a lock (busySQL), looking every
 // settleEvery for at most o.Timeout; ok is false when it never saw that, or when its query failed. A
 // statement whose client stopped waiting (an arm that hung up after forwarding it, the timeout, an interrupt)
 // still runs in the database, and an after probe read before it commits would count an executed payload as

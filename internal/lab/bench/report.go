@@ -845,17 +845,23 @@ func reportCost(m *md, runs []Run, names []string, none Run) {
 	for i, r := range rs {
 		vip, rowVIP, rowAll := 0, 0.0, 0.0
 		var lat []float64
-		for id, o := range r.Outcomes {
+		// In the stream's order, never a map's: a sum of floats depends on its order, and the report is made
+		// again from the databases alone, the same every time.
+		for _, w := range r.Writes {
+			if p, ok := r.Proxy[w.ID]; ok {
+				rowAll += p.CostUSD
+			}
+			o, sent := r.Outcomes[w.ID]
+			if !sent {
+				continue
+			}
 			if o.Set == tasks.SetPrep || o.Set == tasks.SetV || o.Set == tasks.SetI {
 				vip++
-				rowVIP += r.Proxy[id].CostUSD
+				rowVIP += r.Proxy[w.ID].CostUSD
 			}
 			if (o.Set == tasks.SetV || o.Set == tasks.SetI) && scored(o.Result) {
 				lat = append(lat, o.LatencyMS)
 			}
-		}
-		for _, p := range r.Proxy {
-			rowAll += p.CostUSD
 		}
 		sent := len(r.Outcomes)
 		slices.Sort(lat)

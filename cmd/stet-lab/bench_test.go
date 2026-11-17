@@ -1,9 +1,13 @@
 package main
 
 import (
+	"fmt"
+	"net"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgproto3"
 
 	"github.com/stetdb/stet/internal/lab/bench"
 )
@@ -86,6 +90,52 @@ func TestPracticeSendsXIntoThePracticeDatabases(t *testing.T) {
 		err := benchSend([]string{"-pg", "127.0.0.1:1", "-practice", "-arm", arm, "-sets", "X", "-addr", addr})
 		if want := bench.DBName(arm, true, 0, 1); err == nil || !strings.Contains(err.Error(), "database="+want+"`") {
 			t.Errorf("bench send -practice -arm %s -sets X: err = %v, want it to connect to %s", arm, err, want)
+		}
+	}
+}
+
+// noDatabases starts a server that answers every connection's startup as PostgreSQL does for a database that
+// does not exist, and returns its address.
+func noDatabases(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				be := pgproto3.NewBackend(c, c)
+				msg, err := be.ReceiveStartupMessage()
+				if err != nil {
+					return
+				}
+				if sm, ok := msg.(*pgproto3.StartupMessage); ok {
+					be.Send(&pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: "3D000",
+						Message: fmt.Sprintf("database %q does not exist", sm.Parameters["database"])})
+					be.Flush()
+				}
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func TestScoreNamesTheArmWhoseDatabaseIsMissing(t *testing.T) {
+	addr := noDatabases(t)
+	for _, c := range []struct{ arms, arm, db string }{
+		{"hoop-opus", "hoop-opus", "crm_hoop_opus"},
+		{"hoop:2", "hoop", "crm_hoop_r2"},
+	} {
+		err := benchScore([]string{"-pg", addr, "-arms", c.arms})
+		if err == nil || !strings.Contains(err.Error(), "arm "+c.arm+" ") || !strings.Contains(err.Error(), c.db+" does not exist") {
+			t.Errorf("bench score -arms %s: err = %v, want it to name arm %s and say %s does not exist", c.arms, err, c.arm, c.db)
 		}
 	}
 }

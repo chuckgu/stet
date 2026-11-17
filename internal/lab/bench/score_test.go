@@ -984,6 +984,38 @@ func TestReportHasEverySection(t *testing.T) {
 	}
 }
 
+// TestReportIsTheSameEveryTime: a report made again from the same runs is the same, byte for byte. The costs
+// here, summed in another order, give another total (one large among many small ones), as the costs of many
+// writes can in their last printed digit.
+func TestReportIsTheSameEveryTime(t *testing.T) {
+	r := reportRun("hoop", 18, false)
+	for i, w := range r.Writes {
+		cost := 1.0
+		if i == len(r.Writes)/2 {
+			cost = 1e17
+		}
+		p := r.Proxy[w.ID]
+		p.Arm, p.ID, p.CostUSD = "hoop", w.ID, cost
+		r.Proxy[w.ID] = p
+	}
+	r.CostUSD = 1e17 + 100
+	none := reportRun("none", 0, true)
+	render := func() string {
+		var b bytes.Buffer
+		if err := Report(&b, []Run{none, r}, none); err != nil {
+			t.Fatal(err)
+		}
+		return b.String()
+	}
+	first := render()
+	for i := range 20 {
+		if again := render(); again != first {
+			t.Fatalf("render %d differs from the first in its cost section:\n%s\nwant\n%s", i+2,
+				section(t, again, "## 7. 비용과 지연"), section(t, first, "## 7. 비용과 지연"))
+		}
+	}
+}
+
 // TestPracticeReportHasTheXSet: the practice arms send X as a tool check; score -practice reports it like any
 // set, and the comparison of stet with hoop says its arms are not here.
 func TestPracticeReportHasTheXSet(t *testing.T) {
