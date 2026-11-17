@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/stetdb/stet/internal/apply"
 	"github.com/stetdb/stet/internal/config"
 	"github.com/stetdb/stet/internal/sqlparse"
 )
@@ -332,7 +333,7 @@ func (c *checker) agentRole(role string, tables []ownedTable, stetPath, database
 		}
 	}
 
-	c.searchPath(role, oid, stetPath, database, pathErr)
+	c.searchPath(role, stetPath, database, pathErr)
 }
 
 // schemaRights warns when the agent has a right on the stet schema: granted
@@ -618,87 +619,35 @@ func fixes(statements []string, public bool) string {
 
 // searchPath warns when the role has a role-level search_path, for this
 // database or for all, unlike the one Stet's connection uses: Stet resolves
-// unqualified table names with its own (spec 8, 13).
-func (c *checker) searchPath(role string, oid uint32, stetPath, database string, pathErr error) {
-	var thisDB, allDBs *string
+// unqualified table names with its own (spec 8, 13). The executor refuses to
+// run such a role's approved writes (apply.RoleSearchPath reads it for both).
+func (c *checker) searchPath(role, stetPath, database string, pathErr error) {
+	var value *string
+	var inDatabase bool
 	err := c.read(func(tx pgx.Tx) error {
-		rows, err := tx.Query(c.ctx, `
-			select s.setdatabase <> 0, s.setconfig from pg_db_role_setting s
-			where s.setrole = $1::oid
-			  and s.setdatabase in (0, (select oid from pg_database where datname = current_database()))`, oid)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var forDB bool
-			var settings []string
-			if err := rows.Scan(&forDB, &settings); err != nil {
-				return err
-			}
-			for _, s := range settings {
-				name, value, _ := strings.Cut(s, "=")
-				if !strings.EqualFold(name, "search_path") {
-					continue
-				}
-				if forDB {
-					thisDB = &value
-				} else {
-					allDBs = &value
-				}
-			}
-		}
-		return rows.Err()
+		var err error
+		value, inDatabase, err = apply.RoleSearchPath(c.ctx, tx, role)
+		return err
 	})
 	if err != nil {
 		c.warn("agent role %q could not be checked for a role-level search_path: %v", role, err)
 		return
 	}
-	value, scope := allDBs, ""
-	if thisDB != nil { // ALTER ROLE ... IN DATABASE wins over ALTER ROLE
-		value, scope = thisDB, " IN DATABASE "+pgx.Identifier{database}.Sanitize()
+	scope := ""
+	if inDatabase {
+		scope = " IN DATABASE " + pgx.Identifier{database}.Sanitize()
 	}
 	switch {
 	case value == nil:
 	case pathErr != nil:
 		c.warn("agent role %q has search_path %s, which could not be compared with Stet's: %v", role, *value, pathErr)
-	case !slices.Equal(schemaNames(*value), schemaNames(stetPath)):
+	case !slices.Equal(apply.SchemaNames(*value), apply.SchemaNames(stetPath)):
 		id := pgx.Identifier{role}.Sanitize()
 		c.warn("agent role %q has search_path %s (ALTER ROLE%s), but Stet's connection uses %s: Stet reads state "+
 			"and measures with its own search_path, so an unqualified table name in the agent's write may name "+
 			"another table than the one Stet judges; fix: ALTER ROLE %s%s RESET search_path, or SET it to %s",
 			role, *value, scope, stetPath, id, scope, stetPath)
 	}
-}
-
-// schemaNames splits a search_path value into the names Postgres reads from
-// it: unquoted names fold to lower case, quoted ones keep theirs with ""
-// read as ", and whitespace between names does not count.
-func schemaNames(path string) []string {
-	var names []string
-	var cur strings.Builder
-	quoted := false
-	for i := 0; i < len(path); i++ {
-		ch := path[i]
-		switch {
-		case quoted && ch == '"' && i+1 < len(path) && path[i+1] == '"':
-			cur.WriteByte('"')
-			i++
-		case ch == '"':
-			quoted = !quoted
-		case quoted:
-			cur.WriteByte(ch)
-		case ch == ',':
-			names = append(names, cur.String())
-			cur.Reset()
-		case ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v':
-		case 'A' <= ch && ch <= 'Z':
-			cur.WriteByte(ch + 'a' - 'A')
-		default:
-			cur.WriteByte(ch)
-		}
-	}
-	return append(names, cur.String())
 }
 
 // ident quotes a table key as the gate names it in SQL: each dotted part
