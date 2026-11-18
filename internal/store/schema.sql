@@ -299,7 +299,7 @@ $$;
 -- 되돌리기의 캡처 (docs/spec-v0.2-undo.md 4장). 테이블 소유자가 설치한 문장 단위 트리거가 stet.capture()를 부르고,
 -- 이 함수가 에이전트의 쓰기가 바꾼 행의 이전·이후 값을 쓰기와 같은 트랜잭션에서 남긴다. 롤백된 쓰기는 남지 않는다.
 -- 이 세 표에는 캡처한 에이전트의 트랜잭션이 끝날 때까지 약한 잠금이 걸린다. 표가 이미 있으면 이 파일은 그 표에 잠금을
--- 잡는 문장을 실행하지 않는다(11장의 "스키마의 잠금"). 인덱스는 없는지 먼저 보고 만든다. 컬럼을 더할 때는
+-- 잡는 문장을 실행하지 않는다(11장의 "스키마의 잠금"). 인덱스와 트리거는 없는지 먼저 보고 만든다. 컬럼을 더할 때는
 -- 이것을 다시 본다.
 
 -- 문장 하나가 한 테이블에 한 일
@@ -352,6 +352,36 @@ BEGIN
 END
 $$;
 
+-- 기록은 바뀌지 않는다 (4장). 두 표의 UPDATE와 TRUNCATE는 Stet의 계정도 못 한다. 역할 권한과 별개로 DB가 직접 막는다.
+-- DELETE는 막지 않는다(보존 기간). 문장 단위 트리거라 0행을 고치는 UPDATE도 거절한다.
+CREATE OR REPLACE FUNCTION stet.changes_guard() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+  RAISE EXCEPTION 'stet.%: what capture recorded cannot change; % is refused, only DELETE is allowed', TG_TABLE_NAME, TG_OP
+    USING ERRCODE = 'ST004';
+END
+$$;
+
+-- DROP TRIGGER IF EXISTS와 CREATE TRIGGER는 표에 강한 잠금을 잡는다. 열린 캡처가 있으면 그것을 기다리고, 그 뒤의 모든
+-- 캡처가 이것을 기다린다(11장의 "스키마의 잠금"). 그래서 pg_trigger에 없을 때만 만든다. 카탈로그를 읽는 것과 regclass는
+-- 표에 잠금을 잡지 않는다.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_catalog.pg_trigger
+                  WHERE tgrelid = 'stet.change_sets'::regclass AND tgname = 'change_sets_guard') THEN
+    CREATE TRIGGER change_sets_guard
+      BEFORE UPDATE OR TRUNCATE ON stet.change_sets
+      FOR EACH STATEMENT EXECUTE FUNCTION stet.changes_guard();
+  END IF;
+  IF NOT EXISTS (SELECT FROM pg_catalog.pg_trigger
+                  WHERE tgrelid = 'stet.changes'::regclass AND tgname = 'changes_guard') THEN
+    CREATE TRIGGER changes_guard
+      BEFORE UPDATE OR TRUNCATE ON stet.changes
+      FOR EACH STATEMENT EXECUTE FUNCTION stet.changes_guard();
+  END IF;
+END
+$$;
+
 -- 캡처 트리거 함수. 테이블마다 트리거 넷이 이 함수를 부른다. 인자는 설정의 테이블 키와 키 컬럼의 이름이다:
 --   CREATE TRIGGER stet_capture_ins AFTER INSERT ON public.deals REFERENCING NEW TABLE AS stet_new
 --     FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('deals', 'id');
@@ -374,6 +404,21 @@ $$;
 -- 값의 글자는 타입의 출력 함수로 만든다(format의 %s). ::text는 그 타입에서 text로 가는 캐스트가 있으면 그 함수를 부른다.
 -- 캐스트는 타입의 소유자가 만든 함수일 수 있고, 여기서는 Stet의 계정으로 돈다. 출력 함수는 C로만 만들 수 있다(superuser).
 -- NULL은 num_nulls로 가린다. 복합 타입의 IS NULL은 모든 필드가 NULL인 값에도 참이다.
+-- 캡처는 쓰기를 실패시키지 않는다(4장). 1부터 7까지와 설치의 확인이 한 EXCEPTION WHEN OTHERS 블록 안이고, 블록 밖에서는
+-- 실패할 수 없는 것만 한다. 블록 안에서 에러가 나면 블록이 한 일(묶음, 줄, 세는 값)이 되돌려지고, 묶음 하나를
+-- skipped = 'capture_failed'와 detail의 SQLSTATE, 메시지로 남긴다. 그것도 실패하면 서버 로그(RAISE LOG)에만 남긴다.
+-- client_min_messages가 warning이므로 클라이언트에게는 아무것도 가지 않는다. WHEN OTHERS는 시간 초과와 취소(57014)를
+-- 잡지 않으므로 그때는 쓰기가 실패한다. lock_timeout(55P03)은 잡는다.
+-- 한 트랜잭션의 상한. EXCEPTION 블록은 하위 트랜잭션이고, 표에 쓸 때만 자기 트랜잭션 id를 받는다. 커밋된 하위 트랜잭션의
+-- id는 트랜잭션이 끝날 때까지 백엔드의 캐시(64개)에 남고, 넘치면 서버 전체의 스냅숏 확인이 느려진다. 되돌려진 하위
+-- 트랜잭션은 자리를 돌려준다. 표에 쓰는 캡처 하나는 id 하나만 남긴다: 값이나 표지를 남기면 큰 블록의 것, 실패하면 큰 블록은
+-- 되돌려지고 표지를 쓴 작은 블록의 것이다. 그래서 한 트랜잭션에서 표에 쓰는 것은 32번까지다. 쓴 횟수는 트랜잭션 동안의
+-- 설정 stet.captures에 센다(계획의 보정 U9). 표에 쓸 때 같은 블록 안에서 세므로 되돌려진 쓰기는 세지 않는다. 31번 썼으면
+-- 다음에 쓰는 것은 too_many_statements 표지 하나이고, 그 뒤로는 아무것도 쓰지 않는다. 표에 쓰지 않는 길(캡처하지 않는 세션,
+-- 0행)은 세지 않고 쓰지 않는다.
+-- 그 설정은 어느 세션이나 적을 수 있다. 아홉 자리까지의 숫자가 아니면 0으로 본다. 31 이상이라고 하면 그대로 믿지 않고 이
+-- 트랜잭션이 남긴 묶음을 센다. 에이전트가 큰 값을 적어 자기 쓰기의 캡처를 끄지 못하게 하려는 것이다. 작은 값을 적어 상한을
+-- 피하는 것은 막지 않는다(11장).
 CREATE OR REPLACE FUNCTION stet.capture() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
@@ -399,114 +444,165 @@ DECLARE
   names         text[];
   img           text;
   keyval        text;
+  counted       text;
+  done          integer := 0;   -- 이 트랜잭션에서 캡처가 표에 쓴 횟수
+  failure       text;
+  code          text;
+  message       text;
 BEGIN
-  -- 1. 설정. 줄이 없으면 모든 세션을 캡처하고 상한은 10,000이다.
-  SELECT s.roles, s.max_rows INTO capture_roles, cap FROM stet.capture_settings s;
-  IF NOT FOUND THEN
-    capture_roles := NULL;
-    cap := 10000;
+  counted := current_setting('stet.captures', true);
+  IF counted ~ '^[0-9]{1,9}$' THEN
+    done := counted::integer;
   END IF;
 
-  -- 2. 쓰기의 주인. SECURITY DEFINER 안에서 current_user는 이 함수의 소유자, 곧 Stet의 계정이다. Stet의 계정이
-  --    SET LOCAL ROLE로 에이전트가 되어 실행한 승인된 쓰기는 그 에이전트의 것이다.
-  --    7. 그때만 stet.held_write를 읽는다. 다른 계정의 세션에서는 에이전트가 스스로 적을 수 있는 값이다. Stet의 세션에서도
-  --    승인된 문장(에이전트가 쓴 것)이 바꿀 수 있으므로(11장), uuid의 모양이 아니면 NULL로 남긴다.
-  IF session_user = current_user THEN
-    agent := coalesce(nullif(current_setting('role'), 'none'), session_user);
-    held_text := current_setting('stet.held_write', true);
-    IF held_text ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
-      held := held_text::uuid;
+  BEGIN
+    -- 2. 쓰기의 주인. SECURITY DEFINER 안에서 current_user는 이 함수의 소유자, 곧 Stet의 계정이다. Stet의 계정이
+    --    SET LOCAL ROLE로 에이전트가 되어 실행한 승인된 쓰기는 그 에이전트의 것이다. 1보다 먼저 정해, 설정을 읽다가
+    --    실패해도 표지에 맞는 주인이 남게 한다.
+    --    7. 그때만 stet.held_write를 읽는다. 다른 계정의 세션에서는 에이전트가 스스로 적을 수 있는 값이다. Stet의 세션에서도
+    --    승인된 문장(에이전트가 쓴 것)이 바꿀 수 있으므로(11장), uuid의 모양이 아니면 NULL로 남긴다.
+    IF session_user = current_user THEN
+      agent := coalesce(nullif(current_setting('role'), 'none'), session_user);
+      held_text := current_setting('stet.held_write', true);
+      IF held_text ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+        held := held_text::uuid;
+      END IF;
     END IF;
-  END IF;
 
-  -- 3. 캡처할 계정이 아니면 아무것도 하지 않는다.
-  IF capture_roles IS NOT NULL AND (agent = ANY (capture_roles)) IS NOT TRUE THEN
-    RETURN NULL;
-  END IF;
-
-  -- 설치의 확인. 전이 테이블을 읽기 전, 키 인자를 문장에 넣기 전이다(위의 주석).
-  IF TG_WHEN <> 'AFTER' OR TG_LEVEL <> 'STATEMENT' THEN
-    RAISE EXCEPTION 'trigger % on %.% must be AFTER ... FOR EACH STATEMENT, as stet undo-sql prints it, not % ... FOR EACH %',
-      TG_NAME, TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_WHEN, TG_LEVEL USING ERRCODE = 'trigger_protocol_violated';
-  END IF;
-  IF TG_OP <> 'TRUNCATE' THEN
-    SELECT t.tgoldtable, t.tgnewtable INTO old_table, new_table
-      FROM pg_catalog.pg_trigger t
-     WHERE t.tgrelid = TG_RELID AND t.tgname = TG_NAME;
-    IF (TG_OP <> 'INSERT' AND old_table IS DISTINCT FROM 'stet_old') OR (TG_OP <> 'DELETE' AND new_table IS DISTINCT FROM 'stet_new') THEN
-      RAISE EXCEPTION 'trigger % on %.% must say REFERENCING %, as stet undo-sql prints it', TG_NAME, TG_TABLE_SCHEMA, TG_TABLE_NAME,
-        CASE TG_OP WHEN 'INSERT' THEN 'NEW TABLE AS stet_new' WHEN 'DELETE' THEN 'OLD TABLE AS stet_old'
-                   ELSE 'OLD TABLE AS stet_old NEW TABLE AS stet_new' END
-        USING ERRCODE = 'trigger_protocol_violated';
+    -- 1. 설정. 줄이 없으면 모든 세션을 캡처하고 상한은 10,000이다.
+    SELECT s.roles, s.max_rows INTO capture_roles, cap FROM stet.capture_settings s;
+    IF NOT FOUND THEN
+      capture_roles := NULL;
+      cap := 10000;
     END IF;
-  END IF;
-  IF TG_NARGS <> 2 OR NOT EXISTS (SELECT FROM pg_catalog.pg_attribute a
-                                   WHERE a.attrelid = TG_RELID AND a.attname = TG_ARGV[1]
-                                     AND a.attnum > 0 AND NOT a.attisdropped) THEN
-    RAISE EXCEPTION 'trigger % on %.% must pass stet.capture() two arguments, the table''s key in the configuration and '
-                    'the name of one of its columns; it passes %, the second %',
-      TG_NAME, TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_NARGS, coalesce(quote_literal(TG_ARGV[1]), 'missing')
-      USING ERRCODE = 'invalid_parameter_value';
-  END IF;
 
-  -- 4. TRUNCATE는 표지만 남긴다. 5. 바뀐 행을 센다. 0이면 아무것도 남기지 않고, 상한을 넘으면 표지만 남긴다.
-  IF TG_OP = 'TRUNCATE' THEN
-    skip := 'truncate';
-  ELSE
-    -- 전이 테이블을 처음 읽기 바로 앞이다. 위의 pg_trigger 확인은 지금의 카탈로그를 읽지만, PostgreSQL은 문장이 시작할 때
-    -- 읽어 둔 트리거를 부른다. 테이블 소유자는 문장 도중에(그 문장이 부르는 함수에서) 불릴 트리거의 이름을 바꾸거나 지우고
-    -- 같은 이름으로 전이 테이블이 있는 트리거를 만들 수 있다. 그러면 위의 확인은 통과하고, 불린 트리거에는 전이 테이블이 없어
-    -- 그 이름이 pg_temp의 릴레이션으로 읽힌다. 그래서 세션의 임시 스키마에 그 이름의 릴레이션이 있으면 읽지 않는다.
-    -- 이 확인부터 전이 테이블을 마지막으로 읽는 문장까지는 고객의 코드가 돌 수 있는 것을 두지 않는다. 그 사이의 문장은
-    -- stet의 표에 넣는 것, 카탈로그를 읽는 것, 내장 함수와 타입의 출력 함수(C, superuser만 만든다)뿐이다.
-    -- 세는 문장과 값을 읽는 문장은 따로 이름을 찾지만, 그 사이에도 고객의 코드는 돌지 않는다.
-    IF EXISTS (SELECT FROM pg_catalog.pg_class c
-                WHERE c.relnamespace = pg_catalog.pg_my_temp_schema() AND c.relname IN ('stet_old', 'stet_new')) THEN
-      RAISE EXCEPTION 'this session has a temporary relation named stet_old or stet_new; stet.capture() does not read its '
-                      'transition tables while one exists, since a trigger without them would read that relation instead'
-        USING ERRCODE = 'duplicate_table';
-    END IF;
-    EXECUTE CASE TG_OP WHEN 'DELETE' THEN 'SELECT count(*) FROM stet_old' ELSE 'SELECT count(*) FROM stet_new' END INTO changed;
-    IF changed = 0 THEN
+    -- 3. 캡처할 계정이 아니면 아무것도 하지 않는다.
+    IF capture_roles IS NOT NULL AND (agent = ANY (capture_roles)) IS NOT TRUE THEN
       RETURN NULL;
     END IF;
-    IF changed > cap THEN
-      skip := 'too_many_rows';
-    END IF;
-  END IF;
 
-  -- 6. 묶음 하나
-  INSERT INTO stet.change_sets (at, stmt_at, txid, pid, login_role, agent_role, app, held_write,
-                                target_table, key_column, relid, op, query, rows, skipped)
-  VALUES (clock_timestamp(), statement_timestamp(), txid_current_if_assigned(), pg_backend_pid(), session_user, agent,
-          current_setting('application_name'), held,
-          TG_ARGV[0], TG_ARGV[1], TG_RELID, lower(TG_OP), current_query(), changed, skip)
-  RETURNING id INTO set_id;
-  IF skip IS NOT NULL THEN
+    -- 한 트랜잭션의 상한. 설정이 31 이상이라고 하면 이 트랜잭션이 남긴 묶음을 센다(위의 주석). 이 트랜잭션의 묶음은 모두
+    -- 이 백엔드의 것이고 트랜잭션이 시작한 뒤의 문장이다(change_sets_backend_idx).
+    IF done >= 31 THEN
+      SELECT count(*) INTO done FROM stet.change_sets s
+       WHERE s.pid = pg_backend_pid() AND s.stmt_at >= now() AND s.txid = txid_current_if_assigned();
+      IF done >= 32 THEN
+        RETURN NULL;
+      END IF;
+    END IF;
+
+    -- 설치의 확인. 전이 테이블을 읽기 전, 키 인자를 문장에 넣기 전이다(위의 주석).
+    IF TG_WHEN <> 'AFTER' OR TG_LEVEL <> 'STATEMENT' THEN
+      RAISE EXCEPTION 'trigger % on %.% must be AFTER ... FOR EACH STATEMENT, as stet undo-sql prints it, not % ... FOR EACH %',
+        TG_NAME, TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_WHEN, TG_LEVEL USING ERRCODE = 'trigger_protocol_violated';
+    END IF;
+    IF TG_OP <> 'TRUNCATE' THEN
+      SELECT t.tgoldtable, t.tgnewtable INTO old_table, new_table
+        FROM pg_catalog.pg_trigger t
+       WHERE t.tgrelid = TG_RELID AND t.tgname = TG_NAME;
+      IF (TG_OP <> 'INSERT' AND old_table IS DISTINCT FROM 'stet_old') OR (TG_OP <> 'DELETE' AND new_table IS DISTINCT FROM 'stet_new') THEN
+        RAISE EXCEPTION 'trigger % on %.% must say REFERENCING %, as stet undo-sql prints it', TG_NAME, TG_TABLE_SCHEMA, TG_TABLE_NAME,
+          CASE TG_OP WHEN 'INSERT' THEN 'NEW TABLE AS stet_new' WHEN 'DELETE' THEN 'OLD TABLE AS stet_old'
+                     ELSE 'OLD TABLE AS stet_old NEW TABLE AS stet_new' END
+          USING ERRCODE = 'trigger_protocol_violated';
+      END IF;
+    END IF;
+    IF TG_NARGS <> 2 OR NOT EXISTS (SELECT FROM pg_catalog.pg_attribute a
+                                     WHERE a.attrelid = TG_RELID AND a.attname = TG_ARGV[1]
+                                       AND a.attnum > 0 AND NOT a.attisdropped) THEN
+      RAISE EXCEPTION 'trigger % on %.% must pass stet.capture() two arguments, the table''s key in the configuration and '
+                      'the name of one of its columns; it passes %, the second %',
+        TG_NAME, TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_NARGS, coalesce(quote_literal(TG_ARGV[1]), 'missing')
+        USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    -- 4. TRUNCATE는 표지만 남긴다. 5. 바뀐 행을 센다. 0이면 아무것도 남기지 않고, 상한을 넘으면 표지만 남긴다.
+    IF TG_OP = 'TRUNCATE' THEN
+      skip := 'truncate';
+    ELSE
+      -- 전이 테이블을 처음 읽기 바로 앞이다. 위의 pg_trigger 확인은 지금의 카탈로그를 읽지만, PostgreSQL은 문장이 시작할 때
+      -- 읽어 둔 트리거를 부른다. 테이블 소유자는 문장 도중에(그 문장이 부르는 함수에서) 불릴 트리거의 이름을 바꾸거나 지우고
+      -- 같은 이름으로 전이 테이블이 있는 트리거를 만들 수 있다. 그러면 위의 확인은 통과하고, 불린 트리거에는 전이 테이블이
+      -- 없어 그 이름이 pg_temp의 릴레이션으로 읽힌다. 그래서 세션의 임시 스키마에 그 이름의 릴레이션이 있으면 읽지 않는다.
+      -- 이 확인부터 전이 테이블을 마지막으로 읽는 문장까지는 고객의 코드가 돌 수 있는 것을 두지 않는다. 그 사이의 문장은
+      -- stet의 표에 넣는 것, 카탈로그를 읽는 것, 내장 함수와 타입의 출력 함수(C, superuser만 만든다)뿐이다.
+      -- 세는 문장과 값을 읽는 문장은 따로 이름을 찾지만, 그 사이에도 고객의 코드는 돌지 않는다.
+      IF EXISTS (SELECT FROM pg_catalog.pg_class c
+                  WHERE c.relnamespace = pg_catalog.pg_my_temp_schema() AND c.relname IN ('stet_old', 'stet_new')) THEN
+        RAISE EXCEPTION 'this session has a temporary relation named stet_old or stet_new; stet.capture() does not read its '
+                        'transition tables while one exists, since a trigger without them would read that relation instead'
+          USING ERRCODE = 'duplicate_table';
+      END IF;
+      EXECUTE CASE TG_OP WHEN 'DELETE' THEN 'SELECT count(*) FROM stet_old' ELSE 'SELECT count(*) FROM stet_new' END INTO changed;
+      IF changed = 0 THEN
+        RETURN NULL;
+      END IF;
+      IF changed > cap THEN
+        skip := 'too_many_rows';
+      END IF;
+    END IF;
+    IF done = 31 THEN
+      skip := 'too_many_statements';
+    END IF;
+
+    -- 6. 묶음 하나
+    INSERT INTO stet.change_sets (at, stmt_at, txid, pid, login_role, agent_role, app, held_write,
+                                  target_table, key_column, relid, op, query, rows, skipped)
+    VALUES (clock_timestamp(), statement_timestamp(), txid_current_if_assigned(), pg_backend_pid(), session_user, agent,
+            current_setting('application_name'), held,
+            TG_ARGV[0], TG_ARGV[1], TG_RELID, lower(TG_OP), current_query(), changed, skip)
+    RETURNING id INTO set_id;
+
+    -- 6. 행마다 한 줄. 값은 jsonb_object(컬럼 이름의 배열, 값의 글자의 배열)이다. 지워진 컬럼은 뺀다.
+    IF skip IS NULL THEN
+      SELECT array_agg(a.attname::text ORDER BY a.attnum),
+             'jsonb_object($2, ARRAY[' || string_agg(format(text_of, a.attname), ', ' ORDER BY a.attnum) || '])'
+        INTO names, img
+        FROM pg_catalog.pg_attribute a
+       WHERE a.attrelid = TG_RELID AND a.attnum > 0 AND NOT a.attisdropped;
+      keyval := format(text_of, TG_ARGV[1]);
+      IF TG_OP = 'INSERT' THEN
+        EXECUTE format('INSERT INTO stet.changes (set_id, key, after) SELECT $1, %s, %s FROM stet_new r', keyval, img)
+          USING set_id, names;
+      ELSIF TG_OP = 'DELETE' THEN
+        EXECUTE format('INSERT INTO stet.changes (set_id, key, before) SELECT $1, %s, %s FROM stet_old r', keyval, img)
+          USING set_id, names;
+      ELSE
+        -- 이전 행들과 이후 행들을 키로 묶는다. 키가 바뀐 행은 옛 키의 줄(before만)과 새 키의 줄(after만)이 된다.
+        EXECUTE format('INSERT INTO stet.changes (set_id, key, before, after)
+                        SELECT $1, k, b.img, a.img
+                          FROM (SELECT %1$s AS k, %2$s AS img FROM stet_old r) b
+                          FULL JOIN (SELECT %1$s AS k, %2$s AS img FROM stet_new r) a USING (k)', keyval, img)
+          USING set_id, names;
+      END IF;
+    END IF;
+
+    -- 표에 쓴 것을 센다. 같은 블록 안이므로 블록이 되돌려지면 이것도 되돌려진다.
+    PERFORM set_config('stet.captures', (done + 1)::text, true);
+    RETURN NULL;
+  EXCEPTION WHEN OTHERS THEN
+    GET STACKED DIAGNOSTICS code = RETURNED_SQLSTATE, message = MESSAGE_TEXT;
+    failure := code || ': ' || message;
+  END;
+
+  -- 캡처가 실패했다. 블록 안의 변수(agent, held, changed, done)는 되돌려지지 않고 남아 있다. 상한에 닿았으면 쓰지 않고,
+  -- 32번째면 too_many_statements 표지를 쓴다. 이 표지를 쓰는 작은 블록도 하위 트랜잭션이고, 실패하면 자리를 돌려준다.
+  IF done >= 32 THEN
     RETURN NULL;
   END IF;
-
-  -- 6. 행마다 한 줄. 값은 jsonb_object(컬럼 이름의 배열, 값의 글자의 배열)이다. 지워진 컬럼은 뺀다.
-  SELECT array_agg(a.attname::text ORDER BY a.attnum),
-         'jsonb_object($2, ARRAY[' || string_agg(format(text_of, a.attname), ', ' ORDER BY a.attnum) || '])'
-    INTO names, img
-    FROM pg_catalog.pg_attribute a
-   WHERE a.attrelid = TG_RELID AND a.attnum > 0 AND NOT a.attisdropped;
-  keyval := format(text_of, TG_ARGV[1]);
-  IF TG_OP = 'INSERT' THEN
-    EXECUTE format('INSERT INTO stet.changes (set_id, key, after) SELECT $1, %s, %s FROM stet_new r', keyval, img)
-      USING set_id, names;
-  ELSIF TG_OP = 'DELETE' THEN
-    EXECUTE format('INSERT INTO stet.changes (set_id, key, before) SELECT $1, %s, %s FROM stet_old r', keyval, img)
-      USING set_id, names;
-  ELSE
-    -- 이전 행들과 이후 행들을 키로 묶는다. 키가 바뀐 행은 옛 키의 줄(before만)과 새 키의 줄(after만)이 된다.
-    EXECUTE format('INSERT INTO stet.changes (set_id, key, before, after)
-                    SELECT $1, k, b.img, a.img
-                      FROM (SELECT %1$s AS k, %2$s AS img FROM stet_old r) b
-                      FULL JOIN (SELECT %1$s AS k, %2$s AS img FROM stet_new r) a USING (k)', keyval, img)
-      USING set_id, names;
-  END IF;
+  BEGIN
+    INSERT INTO stet.change_sets (at, stmt_at, txid, pid, login_role, agent_role, app, held_write,
+                                  target_table, key_column, relid, op, query, rows, skipped, detail)
+    VALUES (clock_timestamp(), statement_timestamp(), txid_current_if_assigned(), pg_backend_pid(), session_user, agent,
+            current_setting('application_name'), held,
+            coalesce(TG_ARGV[0], ''), coalesce(TG_ARGV[1], ''), TG_RELID, lower(TG_OP), current_query(), changed,
+            CASE WHEN done = 31 THEN 'too_many_statements' ELSE 'capture_failed' END, failure);
+    PERFORM set_config('stet.captures', (done + 1)::text, true);
+  EXCEPTION WHEN OTHERS THEN
+    GET STACKED DIAGNOSTICS code = RETURNED_SQLSTATE, message = MESSAGE_TEXT;
+    RAISE LOG 'stet.capture() on %.% (trigger %, pid %): capture failed with %, and recording that failed with %: %',
+      TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_NAME, pg_backend_pid(), failure, code, message;
+  END;
   RETURN NULL;
 END
 $$;
@@ -522,3 +618,5 @@ REVOKE EXECUTE ON FUNCTION stet.approve(uuid, text, bigint), stet.reject(uuid, t
 --   GRANT USAGE ON SCHEMA stet TO table_owner;
 --   GRANT EXECUTE ON FUNCTION stet.capture() TO table_owner;
 REVOKE EXECUTE ON FUNCTION stet.capture() FROM PUBLIC;
+-- 기록을 지키는 트리거의 함수는 아무에게도 주지 않는다. 트리거는 함수의 권한 없이도 불린다.
+REVOKE EXECUTE ON FUNCTION stet.changes_guard() FROM PUBLIC;

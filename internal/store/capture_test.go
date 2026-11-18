@@ -3,7 +3,6 @@ package store_test
 import (
 	"cmp"
 	"context"
-	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -149,13 +148,28 @@ type capturedChange struct {
 // in the order it was recorded.
 func changesOf(t *testing.T, pool *pgxpool.Pool, key string) []capturedChange {
 	t.Helper()
+	return changesWhere(t, pool, `s.target_table = $1`, key)
+}
+
+// changesOn returns what capture recorded for the table relid, whatever the
+// key its triggers pass, in the order it was recorded.
+func changesOn(t *testing.T, pool *pgxpool.Pool, relid uint32) []capturedChange {
+	t.Helper()
+	return changesWhere(t, pool, `s.relid = $1`, relid)
+}
+
+// changesWhere returns the change sets for which cond holds, with their
+// lines, in the order they were recorded. cond refers to the set as s and to
+// arg as $1.
+func changesWhere(t *testing.T, pool *pgxpool.Pool, cond string, arg any) []capturedChange {
+	t.Helper()
 	rows, err := pool.Query(context.Background(), `
 		select s.id, s.at, s.stmt_at, s.txid, s.pid, s.login_role, s.agent_role, s.app, s.held_write::text,
 		       s.target_table, s.key_column, s.relid, s.op, s.query, s.rows, s.skipped, s.detail,
 		       c.id, c.key, c.before, c.after
 		from stet.change_sets s left join stet.changes c on c.set_id = s.id
-		where s.target_table = $1
-		order by s.id, c.id`, key)
+		where `+cond+`
+		order by s.id, c.id`, arg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -920,25 +934,23 @@ func plantedCode(t *testing.T, owner *pgx.Conn) (runs func() int64) {
 	}
 }
 
-// linesOn is how many lines of stet.changes were recorded for the table relid.
-func linesOn(t *testing.T, pool *pgxpool.Pool, relid uint32) int {
+// wantCaptureFailed checks that the write err reports succeeded and that
+// capture recorded for the table relid only capture_failed sets, at least
+// one, each with code as the SQLSTATE in its detail, and no line.
+func wantCaptureFailed(t *testing.T, pool *pgxpool.Pool, err error, relid uint32, code string) {
 	t.Helper()
-	var n int
-	if err := pool.QueryRow(context.Background(), `
-		select count(*) from stet.changes c join stet.change_sets s on s.id = c.set_id where s.relid = $1`, relid).Scan(&n); err != nil {
-		t.Fatal(err)
+	if err != nil {
+		t.Errorf("the write failed: %v", err)
 	}
-	return n
-}
-
-// wantRefused checks that the write err reports was refused by capture with
-// code, or succeeded: capture raises code, which fails the write until capture
-// swallows its own failures.
-func wantRefused(t *testing.T, err error, code string) {
-	t.Helper()
-	var pgErr *pgconn.PgError
-	if err != nil && (!errors.As(err, &pgErr) || pgErr.Code != code) {
-		t.Errorf("err = %v, want none or SQLSTATE %s", err, code)
+	changes := changesOn(t, pool, relid)
+	if len(changes) == 0 {
+		t.Errorf("nothing recorded, want a capture_failed set with %s", code)
+	}
+	for _, c := range changes {
+		if deref(c.Skipped) != "capture_failed" || !strings.HasPrefix(deref(c.Detail).(string), code+": ") || c.ChangeID != nil {
+			t.Errorf("recorded set %d skipped %v, detail %v, line %v; want capture_failed, %s, no line",
+				c.SetID, deref(c.Skipped), deref(c.Detail), deref(c.ChangeID), code)
+		}
 	}
 }
 
@@ -947,7 +959,8 @@ func wantRefused(t *testing.T, err error, code string) {
 // capture reads stet_old or stet_new. Read through such a trigger, those names
 // would be any relation of those names in the session's temporary schema,
 // which a captured session, the agent too, can make run its code as Stet's
-// account and record rows that were never written.
+// account and record rows that were never written. The refusal is a
+// capture_failed set; the write goes through.
 func TestCaptureRefusesATriggerNotInstalledAsPrinted(t *testing.T) {
 	pool, db := captureDB(t)
 	ctx := context.Background()
@@ -970,6 +983,9 @@ func TestCaptureRefusesATriggerNotInstalledAsPrinted(t *testing.T) {
 		// would record the whole statement again.
 		{"for each row with the transition table", `after insert on %s referencing new table as stet_new for each row`, `insert into %s values (1), (2)`},
 		{"before", `before insert on %s for each statement`, `insert into %s values (1)`},
+		// The one shape only the check of TG_WHEN refuses: PostgreSQL gives no
+		// BEFORE trigger transition tables, but a TRUNCATE trigger reads none.
+		{"before truncate", `before truncate on %s for each statement`, `truncate %s`},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			table := "public." + strings.ReplaceAll(c.name, " ", "_")
@@ -979,12 +995,9 @@ func TestCaptureRefusesATriggerNotInstalledAsPrinted(t *testing.T) {
 				"create trigger stet_capture "+fmt.Sprintf(c.trigger, table)+" execute function stet.capture('t', 'id')")
 			before := runs()
 			_, err := agent.Exec(ctx, fmt.Sprintf(c.write, table))
-			wantRefused(t, err, "39P01")
+			wantCaptureFailed(t, pool, err, relidOf(t, owner, table), "39P01")
 			if ran := runs() - before; ran != 0 {
 				t.Errorf("the planted code ran %d times", ran)
-			}
-			if n := linesOn(t, pool, relidOf(t, owner, table)); n != 0 {
-				t.Errorf("%d lines recorded, want none", n)
 			}
 		})
 	}
@@ -994,7 +1007,8 @@ func TestCaptureRefusesATriggerNotInstalledAsPrinted(t *testing.T) {
 // column of the table. A name that is no column would put r.<name> into the
 // statement capture builds, which reads as a function of the row:
 // to_jsonb(r) runs the casts to json of the row's types, code that is not
-// Stet's, as Stet's account; row_to_json(r) records the row as its key.
+// Stet's, as Stet's account; row_to_json(r) records the row as its key. The
+// refusal is a capture_failed set; the write goes through.
 func TestCaptureRefusesArgumentsThatNameNoColumn(t *testing.T) {
 	pool, db := captureDB(t)
 	ctx := context.Background()
@@ -1023,12 +1037,9 @@ func TestCaptureRefusesArgumentsThatNameNoColumn(t *testing.T) {
 					" referencing new table as stet_new for each statement execute function stet.capture("+c.args+")")
 			before := runs()
 			_, err := agent.Exec(ctx, "insert into "+table+" values (1, 'happy')")
-			wantRefused(t, err, "22023")
+			wantCaptureFailed(t, pool, err, relidOf(t, owner, table), "22023")
 			if ran := runs() - before; ran != 0 {
 				t.Errorf("code that is not Stet's ran %d times", ran)
-			}
-			if n := linesOn(t, pool, relidOf(t, owner, table)); n != 0 {
-				t.Errorf("%d lines recorded, want none", n)
 			}
 		})
 	}
@@ -1040,7 +1051,8 @@ func TestCaptureRefusesArgumentsThatNameNoColumn(t *testing.T) {
 // that has them under the same name in the middle of the statement, by
 // renaming or dropping it. The check then passes, and stet_new would be read
 // from the session's temporary schema. Capture refuses to read transition
-// tables while that schema holds a relation of either name.
+// tables while that schema holds a relation of either name; the refusal is a
+// capture_failed set and the write goes through.
 func TestCaptureRefusesATriggerSwappedDuringTheStatement(t *testing.T) {
 	pool, db := captureDB(t)
 	ctx := context.Background()
@@ -1067,20 +1079,25 @@ func TestCaptureRefusesATriggerSwappedDuringTheStatement(t *testing.T) {
 					"return 1; end $$")
 			before := runs()
 			_, err := agent.Exec(ctx, "insert into "+table+" values ("+swap+"())")
-			wantRefused(t, err, "42P07")
+			wantCaptureFailed(t, pool, err, relidOf(t, owner, table), "42P07")
 			if ran := runs() - before; ran != 0 {
 				t.Errorf("the planted code ran %d times", ran)
 			}
-			if n := linesOn(t, pool, relidOf(t, owner, table)); n != 0 {
-				t.Errorf("%d lines recorded, want none", n)
+			// The swap took place: the trigger of that name now has the
+			// transition table, so the check of pg_trigger alone passed.
+			var newTable *string
+			if err := owner.QueryRow(ctx, `select tgnewtable::text from pg_trigger
+				where tgrelid = $1::regclass and tgname = 'stet_capture_ins'`, table).Scan(&newTable); err != nil || deref(newTable) != "stet_new" {
+				t.Errorf("after the write, stet_capture_ins references new table %v (%v), want stet_new", deref(newTable), err)
 			}
 		})
 	}
 }
 
 // An agent session that holds a temporary relation named like a transition
-// table gets no values recorded, only the refusal: the cost of the check
-// above (ruling U11 makes the names unlikely to be chosen by accident).
+// table gets no values recorded, only a capture_failed set, and its write
+// goes through: the cost of the check above (ruling U11 makes the names
+// unlikely to be chosen by accident).
 func TestCaptureRefusesWhileTheSessionHoldsATransitionTableName(t *testing.T) {
 	pool, db := captureDB(t)
 	ctx := context.Background()
@@ -1090,10 +1107,11 @@ func TestCaptureRefusesWhileTheSessionHoldsATransitionTableName(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			agent := agentIn(t, db)
 			mustExec(t, agent, "create temporary table "+name+" (id int)")
-			_, err := agent.Exec(ctx, `update public.deals set amount = amount + 1 where id = 1`)
-			wantRefused(t, err, "42P07")
-			if n := linesOn(t, pool, relidOf(t, owner, "public.deals")); n != 0 {
-				t.Errorf("%d lines recorded, want none", n)
+			var amount string
+			err := agent.QueryRow(ctx, `update public.deals set amount = amount + 1 where id = 1 returning amount::text`).Scan(&amount)
+			wantCaptureFailed(t, pool, err, relidOf(t, owner, "public.deals"), "42P07")
+			if want := map[string]string{"stet_new": "11", "stet_old": "12"}[name]; amount != want {
+				t.Errorf("amount %q after the write, want %s", amount, want)
 			}
 		})
 	}
