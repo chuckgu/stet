@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -123,6 +124,26 @@ func TestCaptureFailureWhileReadingSettings(t *testing.T) {
 	}
 }
 
+// A failure before anything else, reading stet.capture_settings, still
+// leaves one capture_failed set when the agent has set the counter at or
+// near the cap or past it: the count is checked against the transaction's
+// own sets before anything that can fail, not taken from the agent.
+func TestCaptureFailureIgnoresTheAgentsCounter(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	dealsTable(t, superuserIn(t, db))
+	mustExec(t, pool, `alter table stet.capture_settings rename column max_rows to max_rows_renamed`)
+	for i, value := range []string{"32", "31", "999999999"} {
+		agent := agentIn(t, db)
+		mustExec(t, agent, "set stet.captures = '"+value+"'")
+		sql := fmt.Sprintf(`update public.deals set amount = %d where id = 1`, 100+i)
+		if _, err := agent.Exec(ctx, sql); err != nil {
+			t.Fatalf("stet.captures %s: %s: %v", value, sql, err)
+		}
+		wantSkipped(t, changesOf(t, pool, "deals"), sql, "capture_failed", "42703")
+	}
+}
+
 // When even the capture_failed set cannot be written, the write still
 // succeeds and nothing is recorded (the failure goes to the server's log).
 func TestCaptureThatCannotRecordItsFailure(t *testing.T) {
@@ -164,7 +185,9 @@ func agentHearing(t *testing.T, db, level string) (*pgx.Conn, func() []*pgconn.N
 // A failing capture sends the client nothing: no notice at all with
 // client_min_messages = log, and none that mentions stet at debug5, when the
 // capture_failed set is written and when even that fails and the function
-// logs instead.
+// logs instead. "No notice at all" at log holds on a server that sends the
+// client no LOG lines of its own, as the test server does (log_statement none,
+// no duration logging); a server that logs statements would send those.
 func TestCaptureSendsTheClientNothing(t *testing.T) {
 	pool, db := captureDB(t)
 	dealsTable(t, superuserIn(t, db))
@@ -421,6 +444,173 @@ func TestCaptureCapsStatementsPerTransaction(t *testing.T) {
 	}
 }
 
+// txRecord is what capture recorded in one transaction for a table: the
+// skipped of each set in order ("" for values) and the keys of the lines.
+type txRecord struct {
+	TxID    int64
+	Skipped []string
+	Keys    []string
+}
+
+// byTransaction groups changes, in the order they were recorded, by the
+// transaction that recorded them. A set without a txid is a group of its
+// own, with TxID 0.
+func byTransaction(changes []capturedChange) []txRecord {
+	var txs []txRecord
+	lastSet := int64(-1)
+	for _, c := range changes {
+		txid := int64(0)
+		if c.TxID != nil {
+			txid = *c.TxID
+		}
+		if len(txs) == 0 || txs[len(txs)-1].TxID != txid || txid == 0 && c.SetID != lastSet {
+			txs = append(txs, txRecord{TxID: txid})
+		}
+		tx := &txs[len(txs)-1]
+		if c.SetID != lastSet {
+			tx.Skipped = append(tx.Skipped, fmt.Sprint(deref(c.Skipped)))
+			lastSet = c.SetID
+		}
+		if c.Key != nil {
+			tx.Keys = append(tx.Keys, *c.Key)
+		}
+	}
+	for i := range txs {
+		for j, s := range txs[i].Skipped {
+			if s == "NULL" {
+				txs[i].Skipped[j] = ""
+			}
+		}
+	}
+	return txs
+}
+
+// capped is what a transaction whose captures all record values leaves when
+// it writes the keys from first on, one per write, 32 or more times: values
+// for 31 keys, then the too_many_statements set.
+func capped(first int) txRecord {
+	r := txRecord{Skipped: make([]string, 31)}
+	for k := first; k < first+31; k++ {
+		r.Keys = append(r.Keys, fmt.Sprint(k))
+	}
+	r.Skipped = append(r.Skipped, "too_many_statements")
+	return r
+}
+
+// checkTransactions checks that what was recorded for table key, grouped by
+// transaction, is want (TxID aside), and that in each transaction at most 32
+// subtransactions wrote it.
+func checkTransactions(t *testing.T, pool *pgxpool.Pool, key string, want ...txRecord) {
+	t.Helper()
+	got := byTransaction(changesOf(t, pool, key))
+	if len(got) != len(want) {
+		t.Errorf("%s: recorded in %d transactions, want %d: %+v", key, len(got), len(want), got)
+		return
+	}
+	for i := range want {
+		want[i].TxID = got[i].TxID
+		if !reflect.DeepEqual(got[i], want[i]) {
+			t.Errorf("%s: transaction %d recorded\n%+v\nwant\n%+v", key, i+1, got[i], want[i])
+		}
+		if n := writersOf(t, pool, got[i].TxID); n > 32 {
+			t.Errorf("%s: transaction %d: what capture recorded was written by %d subtransactions, want at most 32", key, i+1, n)
+		}
+	}
+}
+
+// Inside a procedure that commits, each transaction it runs in counts on its
+// own and is capped like any other: also the transaction a procedure commits
+// into and that the statements after it in the same pipeline (one Sync)
+// continue. Those writes have a statement_timestamp() before that
+// transaction's now(), so the count cannot rely on the clock.
+func TestCaptureCapsStatementsInAProcedureThatCommits(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	owner := superuserIn(t, db)
+	for _, table := range []string{"public.called", "public.piped"} {
+		mustExec(t, owner,
+			"create table "+table+" (id int primary key, v text)",
+			"insert into "+table+" select g, 'v' from generate_series(1, 60) g")
+	}
+	installCapture(t, owner, "public.called", "called", "id")
+	installCapture(t, owner, "public.piped", "piped", "id")
+	setCapture(t, pool, []string{"stet_md5"}, 10000)
+	// batch writes the keys first to last of table one at a time, and
+	// commits after the key commit_after.
+	mustExec(t, owner, `create procedure public.batch(tbl text, first int, last int, commit_after int) language plpgsql as $$
+		begin
+		  for i in first..last loop
+		    execute format('update %s set v = %L where id = %s', tbl, 'proc ' || i, i);
+		    if i = commit_after then
+		      commit;
+		    end if;
+		  end loop;
+		end $$`)
+	agent := agentIn(t, db)
+
+	// One CALL: keys 1 to 20 in one transaction, 21 to 60 in the next.
+	mustExec(t, agent, `call public.batch('public.called', 1, 60, 20)`)
+	first := txRecord{Skipped: make([]string, 20)}
+	for k := 1; k <= 20; k++ {
+		first.Keys = append(first.Keys, fmt.Sprint(k))
+	}
+	checkTransactions(t, pool, "called", first, capped(21))
+
+	// One pipeline: the CALL commits after key 1 and writes keys 2 to 30;
+	// the statements after it under the same Sync write 31 to 60 in that
+	// same transaction.
+	b := &pgx.Batch{}
+	b.Queue(`call public.batch('public.piped', 1, 30, 1)`)
+	for k := 31; k <= 60; k++ {
+		b.Queue(fmt.Sprintf(`update public.piped set v = 'piped %d' where id = %d`, k, k))
+	}
+	if err := agent.SendBatch(ctx, b).Close(); err != nil {
+		t.Fatal(err)
+	}
+	checkTransactions(t, pool, "piped", txRecord{Skipped: []string{""}, Keys: []string{"1"}}, capped(2))
+}
+
+// A capture that writes before the transaction has an id of its own (here a
+// refusal on a statement that changed no row) records the transaction's id
+// all the same, and counts: the transaction records 32 sets, the 32nd
+// too_many_statements.
+//
+// Whether the transaction has an id when the set's values are computed
+// depends on stet.change_sets' id sequence: nextval assigns one when it
+// WAL-logs (on a sequence's first use, every 32 values, after a checkpoint).
+// One capture beforehand moves the sequence past its first use, so that the
+// refusal's nextval does not, unless a checkpoint falls in between.
+func TestCaptureCountsAMarkerWrittenBeforeTheTransactionHadAnID(t *testing.T) {
+	pool, db := captureDB(t)
+	owner := superuserIn(t, db)
+	mustExec(t, owner,
+		`create table public.items (id int primary key, v text)`,
+		`insert into public.items select g, 'v' from generate_series(1, 40) g`)
+	installCapture(t, owner, "public.items", "items", "id")
+	dealsTable(t, owner)
+	mustExec(t, owner, `update public.deals set amount = 1 where id = 1`)
+	agent := agentIn(t, db)
+	// Every capture of this session is refused (42P07), before it counts rows.
+	mustExec(t, agent, `create temporary table stet_new (id int)`)
+	_, txid := writeEach(t, agent, 41, func(i int) string {
+		if i == 1 {
+			return `update public.items set v = 'none' where id = -1`
+		}
+		return fmt.Sprintf(`update public.items set v = 'w %d' where id = %d`, i, i-1)
+	})
+	want := txRecord{TxID: txid, Skipped: make([]string, 32)}
+	for i := range 31 {
+		want.Skipped[i] = "capture_failed"
+	}
+	want.Skipped[31] = "too_many_statements"
+	if got := byTransaction(changesOf(t, pool, "items")); !reflect.DeepEqual(got, []txRecord{want}) {
+		t.Errorf("recorded\n%+v\nwant\n%+v", got, []txRecord{want})
+	}
+	if n := writersOf(t, pool, txid); n > 32 {
+		t.Errorf("what capture recorded was written by %d subtransactions, want at most 32", n)
+	}
+}
+
 // The count is stet.captures, for the transaction: it counts each capture
 // that wrote, a failed one too, and nothing that wrote nothing (a write of no
 // row, a session that is not captured). What a savepoint rolls back is no
@@ -514,6 +704,7 @@ func TestAgentCannotBreakCaptureThroughSessionSettings(t *testing.T) {
 	}{
 		{"a counter that is not a number", []string{`set stet.captures = 'x'`}},
 		{"a counter too large for a number", []string{`set stet.captures = '999999999999'`}},
+		{"a counter of 100,000 digits", []string{`set stet.captures = '` + strings.Repeat("9", 100000) + `'`}},
 		{"a counter at the cap", []string{`set stet.captures = '32'`}},
 		{"a counter just below the cap", []string{`set stet.captures = '31'`}},
 		{"a counter at the cap for the transaction", []string{`begin`, `set local stet.captures = '32'`}},

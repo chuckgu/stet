@@ -314,7 +314,7 @@ CREATE TABLE IF NOT EXISTS stet.change_sets (
   id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   at            timestamptz NOT NULL,          -- 남긴 때. clock_timestamp()
   stmt_at       timestamptz NOT NULL,          -- 서버가 그 문장의 메시지를 받은 때. statement_timestamp()
-  txid          bigint,                        -- txid_current_if_assigned()
+  txid          bigint,                        -- txid_current(). 묶음을 쓰는 INSERT가 어차피 트랜잭션 id를 받는다
   pid           integer NOT NULL,              -- pg_backend_pid()
   login_role    text NOT NULL,                 -- session_user
   agent_role    text NOT NULL,                 -- 이 쓰기의 주인으로 보는 계정 (stet.capture()의 2)
@@ -327,7 +327,7 @@ CREATE TABLE IF NOT EXISTS stet.change_sets (
   query         text,                          -- current_query(). 클라이언트가 보낸 문장
   rows          bigint,                        -- 그 문장이 이 테이블에서 바꾼 행 수. truncate는 NULL
   skipped       text CHECK (skipped IN ('too_many_rows','too_many_statements','truncate','capture_failed')),  -- 값을 남기지 않은 이유
-  detail        text                           -- capture_failed의 SQLSTATE와 메시지
+  detail        text                           -- capture_failed의 SQLSTATE와 메시지. 실패한 32번째 캡처의 too_many_statements에도
 );
 -- 그 문장이 바꾼 행 하나. 키마다 한 줄이다
 CREATE TABLE IF NOT EXISTS stet.changes (
@@ -355,6 +355,10 @@ BEGIN
   END IF;
   IF to_regclass('stet.changes_set_idx') IS NULL THEN
     CREATE INDEX changes_set_idx ON stet.changes (set_id);
+  END IF;
+  -- 캡처가 한 트랜잭션에서 남긴 묶음을 세는 데 쓴다(stet.capture()의 상한)
+  IF to_regclass('stet.change_sets_txid_idx') IS NULL THEN
+    CREATE INDEX change_sets_txid_idx ON stet.change_sets (txid);
   END IF;
 END
 $$;
@@ -423,9 +427,15 @@ $$;
 -- 설정 stet.captures에 센다(계획의 보정 U9). 표에 쓸 때 같은 블록 안에서 세므로 되돌려진 쓰기는 세지 않는다. 31번 썼으면
 -- 다음에 쓰는 것은 too_many_statements 표지 하나이고, 그 뒤로는 아무것도 쓰지 않는다. 표에 쓰지 않는 길(캡처하지 않는 세션,
 -- 0행)은 세지 않고 쓰지 않는다.
--- 그 설정은 어느 세션이나 적을 수 있다. 아홉 자리까지의 숫자가 아니면 0으로 본다. 31 이상이라고 하면 그대로 믿지 않고 이
--- 트랜잭션이 남긴 묶음을 센다. 에이전트가 큰 값을 적어 자기 쓰기의 캡처를 끄지 못하게 하려는 것이다. 작은 값을 적어 상한을
--- 피하는 것은 막지 않는다(11장).
+-- 그 설정은 어느 세션이나 적을 수 있다. 그래서 쓴 횟수(done)는 큰 블록의 맨 앞, 실패할 수 있는 다른 어느 것보다 먼저 한
+-- 곳에서 정한다. 아홉 자리까지의 숫자가 아니면 0으로 보고, 31보다 작으면 그대로 쓴다. 31 이상이라고 하면 믿지 않고 이
+-- 트랜잭션의 id로 남은 묶음을 센다. 에이전트가 큰 값을 적어 자기 쓰기의 캡처를 끄지 못하게 하려는 것이다. 작은 값을 적어
+-- 상한을 피하는 것은 막지 않는다(11장). 묶음은 시각이 아니라 트랜잭션 id로 고른다. 프로시저가 COMMIT한 뒤의 트랜잭션에서는
+-- 문장의 statement_timestamp()가 그 트랜잭션의 now()보다 이르다(같은 Sync 아래 뒤따르는 문장도 그 트랜잭션에 든다).
+-- 묶음의 txid는 txid_current()다. 트랜잭션이 id를 받기 전에 쓰는 표지(0행 문장의 거절)도 그 id를 남기고 세어진다.
+-- 큰 블록이 done을 정하기 전에 실패했으면 done은 NULL이고, 표지를 쓰는 작은 블록이 같은 방법으로 센다.
+-- 블록 밖에서는 세션의 값을 읽지 않는다. 설정을 읽고 고르는 것도 큰 블록 안이다. 정규식은 앞의 열 글자에만 건다(정규식은
+-- 글자마다 4바이트로 넓혀 맞추므로, 아주 긴 값은 그것만으로 메모리 요청이 실패한다).
 CREATE OR REPLACE FUNCTION stet.capture() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
@@ -452,17 +462,29 @@ DECLARE
   img           text;
   keyval        text;
   counted       text;
-  done          integer := 0;   -- 이 트랜잭션에서 캡처가 표에 쓴 횟수
+  claimed       integer := 0;   -- stet.captures가 말하는 횟수
+  done          integer;        -- 이 트랜잭션에서 캡처가 표에 쓴 횟수. 정하기 전에는 NULL
+  tx            bigint;
   failure       text;
   code          text;
   message       text;
 BEGIN
-  counted := current_setting('stet.captures', true);
-  IF counted ~ '^[0-9]{1,9}$' THEN
-    done := counted::integer;
-  END IF;
-
   BEGIN
+    -- 한 트랜잭션의 상한. 쓴 횟수를 정한다(위의 주석). 셀 때는 읽기만 하므로 트랜잭션 id를 받지 않는다.
+    counted := current_setting('stet.captures', true);
+    IF left(counted, 10) ~ '^[0-9]{1,9}$' THEN
+      claimed := counted::integer;
+    END IF;
+    IF claimed < 31 THEN
+      done := claimed;
+    ELSE
+      tx := txid_current_if_assigned();
+      SELECT count(*) INTO done FROM stet.change_sets s WHERE s.txid = tx;
+    END IF;
+    IF done >= 32 THEN
+      RETURN NULL;
+    END IF;
+
     -- 2. 쓰기의 주인. SECURITY DEFINER 안에서 current_user는 이 함수의 소유자, 곧 Stet의 계정이다. Stet의 계정이
     --    SET LOCAL ROLE로 에이전트가 되어 실행한 승인된 쓰기는 그 에이전트의 것이다. 1보다 먼저 정해, 설정을 읽다가
     --    실패해도 표지에 맞는 주인이 남게 한다.
@@ -471,7 +493,7 @@ BEGIN
     IF session_user = current_user THEN
       agent := coalesce(nullif(current_setting('role'), 'none'), session_user);
       held_text := current_setting('stet.held_write', true);
-      IF held_text ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+      IF left(held_text, 37) ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
         held := held_text::uuid;
       END IF;
     END IF;
@@ -486,16 +508,6 @@ BEGIN
     -- 3. 캡처할 계정이 아니면 아무것도 하지 않는다.
     IF capture_roles IS NOT NULL AND (agent = ANY (capture_roles)) IS NOT TRUE THEN
       RETURN NULL;
-    END IF;
-
-    -- 한 트랜잭션의 상한. 설정이 31 이상이라고 하면 이 트랜잭션이 남긴 묶음을 센다(위의 주석). 이 트랜잭션의 묶음은 모두
-    -- 이 백엔드의 것이고 트랜잭션이 시작한 뒤의 문장이다(change_sets_backend_idx).
-    IF done >= 31 THEN
-      SELECT count(*) INTO done FROM stet.change_sets s
-       WHERE s.pid = pg_backend_pid() AND s.stmt_at >= now() AND s.txid = txid_current_if_assigned();
-      IF done >= 32 THEN
-        RETURN NULL;
-      END IF;
     END IF;
 
     -- 설치의 확인. 전이 테이블을 읽기 전, 키 인자를 문장에 넣기 전이다(위의 주석).
@@ -555,7 +567,7 @@ BEGIN
     -- 6. 묶음 하나
     INSERT INTO stet.change_sets (at, stmt_at, txid, pid, login_role, agent_role, app, held_write,
                                   target_table, key_column, relid, op, query, rows, skipped)
-    VALUES (clock_timestamp(), statement_timestamp(), txid_current_if_assigned(), pg_backend_pid(), session_user, agent,
+    VALUES (clock_timestamp(), statement_timestamp(), txid_current(), pg_backend_pid(), session_user, agent,
             current_setting('application_name'), held,
             TG_ARGV[0], TG_ARGV[1], TG_RELID, lower(TG_OP), current_query(), changed, skip)
     RETURNING id INTO set_id;
@@ -592,15 +604,25 @@ BEGIN
     failure := code || ': ' || message;
   END;
 
-  -- 캡처가 실패했다. 블록 안의 변수(agent, held, changed, done)는 되돌려지지 않고 남아 있다. 상한에 닿았으면 쓰지 않고,
-  -- 32번째면 too_many_statements 표지를 쓴다. 이 표지를 쓰는 작은 블록도 하위 트랜잭션이고, 실패하면 자리를 돌려준다.
-  IF done >= 32 THEN
+  -- 큰 블록 안의 길은 모두 RETURN으로 끝난다. 여기에 오는 것은 큰 블록이 실패했을 때뿐이다. 새 길을 더할 때도 RETURN으로
+  -- 끝낸다. 그렇지 않은 길이 생겨도 detail 없는 표지를 남기지 않게 failure를 본다.
+  IF failure IS NULL THEN
     RETURN NULL;
   END IF;
+  -- 캡처가 실패했다. 블록 안의 변수(agent, held, changed, done)는 되돌려지지 않고 남아 있다. done을 정하기 전에 실패했으면
+  -- 여기서 센다. 상한에 닿았으면 쓰지 않고, 32번째면 too_many_statements 표지를 쓴다. 이 표지를 쓰는 작은 블록도 하위
+  -- 트랜잭션이고, 실패하면 자리를 돌려준다.
   BEGIN
+    IF done IS NULL THEN
+      tx := txid_current_if_assigned();
+      SELECT count(*) INTO done FROM stet.change_sets s WHERE s.txid = tx;
+    END IF;
+    IF done >= 32 THEN
+      RETURN NULL;
+    END IF;
     INSERT INTO stet.change_sets (at, stmt_at, txid, pid, login_role, agent_role, app, held_write,
                                   target_table, key_column, relid, op, query, rows, skipped, detail)
-    VALUES (clock_timestamp(), statement_timestamp(), txid_current_if_assigned(), pg_backend_pid(), session_user, agent,
+    VALUES (clock_timestamp(), statement_timestamp(), txid_current(), pg_backend_pid(), session_user, agent,
             current_setting('application_name'), held,
             coalesce(TG_ARGV[0], ''), coalesce(TG_ARGV[1], ''), TG_RELID, lower(TG_OP), current_query(), changed,
             CASE WHEN done = 31 THEN 'too_many_statements' ELSE 'capture_failed' END, failure);

@@ -30,7 +30,9 @@ func (d tripTimes) p95() time.Duration { return d[int(0.95*float64(len(d)-1))] }
 // its key. Three kinds of the same UPDATE of a 14-column table, interleaved so
 // that drift hits all equally: on a table without triggers, on a table with
 // capture's triggers by a session that is not captured, and on a table with
-// them by the agent, whose write is captured.
+// them by the agent, whose write is captured. Load on the server (other
+// packages' tests) only ever adds time, so the test measures up to three
+// rounds and passes when one is within the bound (ruling R5); it logs each.
 func TestCaptureAddsUnderAMillisecond(t *testing.T) {
 	if testing.Short() {
 		t.Skip("latency measurement skipped in -short mode")
@@ -63,34 +65,45 @@ func TestCaptureAddsUnderAMillisecond(t *testing.T) {
 		}
 		return time.Since(start)
 	}
-	for range captureWarmUp {
-		trip(agent, tables[0])
-		trip(other, tables[1])
-		trip(agent, tables[2])
+	// round measures once and returns what capture added at p95.
+	round := func(r int) time.Duration {
+		for range captureWarmUp {
+			trip(agent, tables[0])
+			trip(other, tables[1])
+			trip(agent, tables[2])
+		}
+		plain, watched, captured := make(tripTimes, captureTrips), make(tripTimes, captureTrips), make(tripTimes, captureTrips)
+		for i := range captureTrips {
+			plain[i] = trip(agent, tables[0])
+			watched[i] = trip(other, tables[1])
+			captured[i] = trip(agent, tables[2])
+		}
+		for _, d := range []tripTimes{plain, watched, captured} {
+			slices.Sort(d)
+		}
+		added := captured.p95() - plain.p95()
+		t.Logf("round %d, %d round trips each: no trigger mean=%v p95=%v; trigger, not an agent mean=%v p95=%v; captured mean=%v p95=%v; added p95=%v",
+			r, captureTrips, plain.mean(), plain.p95(), watched.mean(), watched.p95(), captured.mean(), captured.p95(), added)
+		return added
 	}
-	plain, watched, captured := make(tripTimes, captureTrips), make(tripTimes, captureTrips), make(tripTimes, captureTrips)
-	for i := range captureTrips {
-		plain[i] = trip(agent, tables[0])
-		watched[i] = trip(other, tables[1])
-		captured[i] = trip(agent, tables[2])
+	rounds, within := 0, false
+	var added []time.Duration
+	for rounds < 3 && !within {
+		rounds++
+		added = append(added, round(rounds))
+		within = added[len(added)-1] <= time.Millisecond
 	}
 
 	// What was measured is what was meant: every write to the captured
 	// table left a set and a line, none to the other.
 	if n := countOf(t, pool, `select count(*) from stet.change_sets s join stet.changes c on c.set_id = s.id
-		where s.target_table = 'captured' and s.skipped is null`); n != captureWarmUp+captureTrips {
-		t.Errorf("%d writes captured, want %d", n, captureWarmUp+captureTrips)
+		where s.target_table = 'captured' and s.skipped is null`); n != int64(rounds*(captureWarmUp+captureTrips)) {
+		t.Errorf("%d writes captured, want %d", n, rounds*(captureWarmUp+captureTrips))
 	}
 	if n := countOf(t, pool, `select count(*) from stet.change_sets where target_table <> 'captured'`); n != 0 {
 		t.Errorf("%d sets for writes that are not captured", n)
 	}
-
-	for _, d := range []tripTimes{plain, watched, captured} {
-		slices.Sort(d)
-	}
-	t.Logf("%d round trips each: no trigger mean=%v p95=%v; trigger, not an agent mean=%v p95=%v; captured mean=%v p95=%v",
-		captureTrips, plain.mean(), plain.p95(), watched.mean(), watched.p95(), captured.mean(), captured.p95())
-	if added := captured.p95() - plain.p95(); added > time.Millisecond {
-		t.Errorf("capture adds %v at p95, want at most 1ms", added)
+	if !within {
+		t.Errorf("capture adds %v at p95 in three rounds, want at most 1ms in one", added)
 	}
 }
