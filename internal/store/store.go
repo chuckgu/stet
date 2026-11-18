@@ -189,10 +189,13 @@ const insertDecision = `
 // A connection in any other mode prepares nothing: a pool behind a
 // transaction-mode pooler runs the simple protocol, and a statement it
 // prepared may be gone from the server its next transaction reaches, or its
-// name taken there by another client's. Its insert runs as before the window
-// was recorded. In the modes that describe a statement before running it
-// (cache_describe, the first time; describe_exec), that round trip falls
-// after the measurement and makes the window later by its length.
+// name taken there by another client's. Its insert runs in one round trip,
+// as one implicit transaction: under the simple protocol as configured, and
+// otherwise in pgx's exec mode (the extended protocol with an unnamed
+// statement and untyped text values). The modes that describe a statement
+// before running it (cache_describe the first time, describe_exec each time)
+// would do that in a transaction of its own, after the measurement; a lock
+// wait there would make the window late by the whole wait.
 func (s *Store) Insert(ctx context.Context, d *Decision) error {
 	var pk any
 	if d.TargetPK != nil {
@@ -223,11 +226,16 @@ func (s *Store) Insert(ctx context.Context, d *Decision) error {
 	}
 	defer conn.Release()
 	query := insertDecision
-	if conn.Conn().Config().DefaultQueryExecMode == pgx.QueryExecModeCacheStatement {
+	var mode []any // the exec mode to run the insert in; none: the connection's own
+	switch conn.Conn().Config().DefaultQueryExecMode {
+	case pgx.QueryExecModeCacheStatement:
 		if _, err := conn.Conn().Prepare(ctx, insertDecisionName, insertDecision); err != nil {
 			return err
 		}
 		query = insertDecisionName
+	case pgx.QueryExecModeSimpleProtocol:
+	default:
+		mode = []any{pgx.QueryExecModeExec}
 	}
 	var pid, sentAgo, doneAgo any
 	if d.BackendPID != nil && !d.DoneAt.IsZero() {
@@ -235,14 +243,14 @@ func (s *Store) Insert(ctx context.Context, d *Decision) error {
 		pid = int32(*d.BackendPID)
 		sentAgo, doneAgo = microsecondsUp(time.Since(d.CreatedAt)), time.Since(d.DoneAt).Microseconds()
 	}
-	_, err = conn.Exec(ctx, query,
+	_, err = conn.Exec(ctx, query, append(mode,
 		d.ID, d.CreatedAt, d.Mode, d.AgentID, d.OnBehalfOf, d.SessionID,
 		d.Statement, d.StatementFP, params, d.Op, d.TargetTable, pk, proposed,
 		state, stateVersion, d.Model, d.ModelVersion, questions, answers, d.PolicyVersion,
 		d.Verdict, reasons, d.Executed, d.ExecError, d.LatencyMS, d.ModelLatencyMS, d.CostUSD, impact,
 		d.LoginRole, d.RowsAffected, cumulative, d.Refused,
 		pid, sentAgo, doneAgo,
-	)
+	)...)
 	return err
 }
 

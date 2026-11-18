@@ -716,11 +716,14 @@ func windowed(t *testing.T) *store.Decision {
 // the insert runs. In between it may wait for a lock on stet.decisions
 // (another Stet's migration, DDL by hand), and that wait would make
 // sent_after later than the write was sent: the unsafe direction, in which a
-// change the write made falls outside its window (plan ruling U12). Under
-// both protocols: the statement Insert prepared waits at Bind, the simple
-// protocol's while its query is read.
+// change the write made falls outside its window (plan ruling U12). In every
+// exec mode, for a connection's first insert and a later one: the statement
+// Insert prepared waits at Bind, the simple protocol's while its query is
+// read; and an insert must not describe its statement in a transaction of
+// its own after the measurement, as cache_describe (the first time) and
+// describe_exec (each time) would, since the lock is waited for there.
 func TestInsertWindowIsNotDelayedByALockWait(t *testing.T) {
-	for _, mode := range []string{"cache_statement", "simple_protocol"} {
+	for _, mode := range []string{"cache_statement", "cache_describe", "describe_exec", "exec", "simple_protocol"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			dsn := ownDatabase(t)
@@ -738,52 +741,53 @@ func TestInsertWindowIsNotDelayedByALockWait(t *testing.T) {
 			if err := s.Migrate(ctx); err != nil {
 				t.Fatal(err)
 			}
-			// The pool's one connection has run the insert, and prepared it if
-			// its mode does.
-			if err := s.Insert(ctx, sample(uniqueTable(t))); err != nil {
-				t.Fatal(err)
-			}
-
 			locker, err := pgx.Connect(ctx, dsn)
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { locker.Close(context.Background()) })
-			lock, err := locker.Begin(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer lock.Rollback(ctx)
-			if _, err := lock.Exec(ctx, "lock table stet.decisions in share mode"); err != nil {
-				t.Fatal(err)
-			}
-			began := dbClock(t, lock)
-			d := windowed(t)
-			inserted := make(chan error, 1)
-			go func() { inserted <- s.Insert(ctx, d) }()
-			deadline := time.Now().Add(5 * time.Second)
-			for {
-				var waiting int
-				if err := lock.QueryRow(ctx, `select count(*) from pg_locks
-					where locktype = 'relation' and relation = 'stet.decisions'::regclass and not granted`).Scan(&waiting); err != nil {
+
+			// The pool's one connection inserts first while the table is
+			// locked, then again: by then it has prepared or described the
+			// insert, if its mode does.
+			for _, round := range []string{"the connection's first insert", "a later insert"} {
+				lock, err := locker.Begin(ctx)
+				if err != nil {
 					t.Fatal(err)
 				}
-				if waiting > 0 {
-					break
+				if _, err := lock.Exec(ctx, "lock table stet.decisions in share mode"); err != nil {
+					t.Fatal(err)
 				}
-				if time.Now().After(deadline) {
-					t.Fatal("the insert never waited for the lock")
+				began := dbClock(t, lock)
+				d := windowed(t)
+				inserted := make(chan error, 1)
+				go func() { inserted <- s.Insert(ctx, d) }()
+				deadline := time.Now().Add(5 * time.Second)
+				for {
+					var waiting int
+					if err := lock.QueryRow(ctx, `select count(*) from pg_locks
+						where locktype = 'relation' and relation = 'stet.decisions'::regclass and not granted`).Scan(&waiting); err != nil {
+						t.Fatal(err)
+					}
+					if waiting > 0 {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("%s never waited for the lock", round)
+					}
+					time.Sleep(5 * time.Millisecond)
 				}
-				time.Sleep(5 * time.Millisecond)
+				time.Sleep(300 * time.Millisecond)
+				if err := lock.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if err := <-inserted; err != nil {
+					t.Fatalf("%s: %v", round, err)
+				}
+				t.Run(round, func(t *testing.T) {
+					wantWindowNear(t, windowOf(t, pool, d.ID), began, 300*time.Millisecond, 100*time.Millisecond, 50*time.Millisecond)
+				})
 			}
-			time.Sleep(400 * time.Millisecond)
-			if err := lock.Commit(ctx); err != nil {
-				t.Fatal(err)
-			}
-			if err := <-inserted; err != nil {
-				t.Fatal(err)
-			}
-			wantWindowNear(t, windowOf(t, pool, d.ID), began, 300*time.Millisecond, 100*time.Millisecond, 50*time.Millisecond)
 		})
 	}
 }
