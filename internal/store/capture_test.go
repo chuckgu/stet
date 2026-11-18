@@ -87,7 +87,8 @@ func captureDB(t *testing.T) (stet *pgxpool.Pool, db string) {
 }
 
 // installCapture creates the four triggers of spec 4 on table, its name as
-// SQL (quoted where it must be), as the table owner does. key is the
+// SQL (quoted where it must be), as the table owner does, with the
+// transition tables named stet_old and stet_new (ruling U11). key is the
 // configuration's table key and pk the key column's name, the two arguments
 // of stet.capture().
 func installCapture(t *testing.T, owner *pgx.Conn, table, key, pk string) {
@@ -95,11 +96,11 @@ func installCapture(t *testing.T, owner *pgx.Conn, table, key, pk string) {
 	call := "execute function stet.capture(" + quoteLiteral(key) + ", " + quoteLiteral(pk) + ")"
 	mustExec(t, owner,
 		"create trigger stet_capture_ins after insert on "+table+
-			" referencing new table as n for each statement "+call,
+			" referencing new table as stet_new for each statement "+call,
 		"create trigger stet_capture_upd after update on "+table+
-			" referencing old table as o new table as n for each statement "+call,
+			" referencing old table as stet_old new table as stet_new for each statement "+call,
 		"create trigger stet_capture_del after delete on "+table+
-			" referencing old table as o for each statement "+call,
+			" referencing old table as stet_old for each statement "+call,
 		"create trigger stet_capture_trunc after truncate on "+table+
 			" for each statement "+call)
 }
@@ -942,11 +943,11 @@ func wantRefused(t *testing.T, err error, code string) {
 }
 
 // A trigger that is not installed as spec 4 says (no transition tables, other
-// names, missing the old table, FOR EACH ROW, BEFORE) is refused before
-// capture reads o or n. Read through such a trigger, o and n would be any
-// relation of those names in the session's temporary schema, which a captured
-// session, the agent too, can make run its code as Stet's account and record
-// rows that were never written.
+// names, missing one of them, FOR EACH ROW, BEFORE) is refused before
+// capture reads stet_old or stet_new. Read through such a trigger, those names
+// would be any relation of those names in the session's temporary schema,
+// which a captured session, the agent too, can make run its code as Stet's
+// account and record rows that were never written.
 func TestCaptureRefusesATriggerNotInstalledAsPrinted(t *testing.T) {
 	pool, db := captureDB(t)
 	ctx := context.Background()
@@ -954,17 +955,20 @@ func TestCaptureRefusesATriggerNotInstalledAsPrinted(t *testing.T) {
 	runs := plantedCode(t, owner)
 	agent := agentIn(t, db)
 	mustExec(t, agent,
-		`create temporary view n as select public.planted() as id`,
-		`create temporary view o as select public.planted() as id`,
-		`grant select on n, o to stet_scram`)
+		`create temporary view stet_new as select public.planted() as id`,
+		`create temporary view stet_old as select public.planted() as id`,
+		`grant select on stet_new, stet_old to stet_scram`)
 	for _, c := range []struct{ name, trigger, write string }{
 		{"no transition table", `after insert on %s for each statement`, `insert into %s values (1)`},
 		{"another name", `after insert on %s referencing new table as new_rows for each statement`, `insert into %s values (1)`},
-		{"no old table", `after update on %s referencing new table as n for each statement`, `update %s set id = 2`},
+		{"the names before U11", `after insert on %s referencing new table as n for each statement`, `insert into %s values (1)`},
+		{"no old table", `after update on %s referencing new table as stet_new for each statement`, `update %s set id = 2`},
+		{"no new table", `after update on %s referencing old table as stet_old for each statement`, `update %s set id = 2`},
+		{"names swapped", `after update on %s referencing old table as stet_new new table as stet_old for each statement`, `update %s set id = 2`},
 		{"for each row", `after insert on %s for each row`, `insert into %s values (1)`},
-		// Not hijacked (n is the transition table), but each row's call would
-		// record the whole statement again.
-		{"for each row with the transition table", `after insert on %s referencing new table as n for each row`, `insert into %s values (1), (2)`},
+		// Not hijacked (stet_new is the transition table), but each row's call
+		// would record the whole statement again.
+		{"for each row with the transition table", `after insert on %s referencing new table as stet_new for each row`, `insert into %s values (1), (2)`},
 		{"before", `before insert on %s for each statement`, `insert into %s values (1)`},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -1007,6 +1011,7 @@ func TestCaptureRefusesArgumentsThatNameNoColumn(t *testing.T) {
 		{"row_to_json", `'t', 'row_to_json'`},
 		{"a system column", `'t', 'xmin'`},
 		{"no such column", `'t', 'nope'`},
+		{"no arguments", ``},
 		{"one argument", `'t'`},
 		{"three arguments", `'t', 'id', 'more'`},
 	} {
@@ -1015,7 +1020,7 @@ func TestCaptureRefusesArgumentsThatNameNoColumn(t *testing.T) {
 			mustExec(t, owner,
 				"create table "+table+" (id int primary key, m public.mood)",
 				"create trigger stet_capture_ins after insert on "+table+
-					" referencing new table as n for each statement execute function stet.capture("+c.args+")")
+					" referencing new table as stet_new for each statement execute function stet.capture("+c.args+")")
 			before := runs()
 			_, err := agent.Exec(ctx, "insert into "+table+" values (1, 'happy')")
 			wantRefused(t, err, "22023")
@@ -1027,4 +1032,88 @@ func TestCaptureRefusesArgumentsThatNameNoColumn(t *testing.T) {
 			}
 		})
 	}
+}
+
+// PostgreSQL fires the triggers it read when the statement began, while the
+// check of pg_trigger reads the row as it is when capture runs. A table owner
+// can swap the trigger that will fire, one without transition tables, for one
+// that has them under the same name in the middle of the statement, by
+// renaming or dropping it. The check then passes, and stet_new would be read
+// from the session's temporary schema. Capture refuses to read transition
+// tables while that schema holds a relation of either name.
+func TestCaptureRefusesATriggerSwappedDuringTheStatement(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	owner := superuserIn(t, db)
+	runs := plantedCode(t, owner)
+	agent := agentIn(t, db)
+	mustExec(t, agent,
+		`create temporary view stet_new as select public.planted() as id`,
+		`grant select on stet_new to stet_scram`)
+	for _, c := range []struct{ name, away string }{
+		{"renamed", `alter trigger stet_capture_ins on %s rename to stet_capture_before`},
+		{"dropped", `drop trigger stet_capture_ins on %s`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			table, swap := "public.swapped_"+c.name, "public.swap_"+c.name
+			mustExec(t, owner,
+				"create table "+table+" (id int primary key)",
+				"create trigger stet_capture_ins after insert on "+table+
+					" for each statement execute function stet.capture('t', 'id')",
+				"create function "+swap+"() returns int language plpgsql security definer as $$ begin "+
+					fmt.Sprintf(c.away, table)+"; "+
+					"create trigger stet_capture_ins after insert on "+table+
+					" referencing new table as stet_new for each statement execute function stet.capture('t', 'id'); "+
+					"return 1; end $$")
+			before := runs()
+			_, err := agent.Exec(ctx, "insert into "+table+" values ("+swap+"())")
+			wantRefused(t, err, "42P07")
+			if ran := runs() - before; ran != 0 {
+				t.Errorf("the planted code ran %d times", ran)
+			}
+			if n := linesOn(t, pool, relidOf(t, owner, table)); n != 0 {
+				t.Errorf("%d lines recorded, want none", n)
+			}
+		})
+	}
+}
+
+// An agent session that holds a temporary relation named like a transition
+// table gets no values recorded, only the refusal: the cost of the check
+// above (ruling U11 makes the names unlikely to be chosen by accident).
+func TestCaptureRefusesWhileTheSessionHoldsATransitionTableName(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	owner := superuserIn(t, db)
+	dealsTable(t, owner)
+	for _, name := range []string{"stet_new", "stet_old"} {
+		t.Run(name, func(t *testing.T) {
+			agent := agentIn(t, db)
+			mustExec(t, agent, "create temporary table "+name+" (id int)")
+			_, err := agent.Exec(ctx, `update public.deals set amount = amount + 1 where id = 1`)
+			wantRefused(t, err, "42P07")
+			if n := linesOn(t, pool, relidOf(t, owner, "public.deals")); n != 0 {
+				t.Errorf("%d lines recorded, want none", n)
+			}
+		})
+	}
+}
+
+// Temporary tables named o and n, the transition tables' names before ruling
+// U11, do not disturb capture.
+func TestCaptureIgnoresTemporaryTablesNamedOAndN(t *testing.T) {
+	pool, db := captureDB(t)
+	dealsTable(t, superuserIn(t, db))
+	agent := agentIn(t, db)
+	mustExec(t, agent, `create temporary table o (id int)`, `create temporary table n (id int)`)
+	const (
+		insert = `insert into public.deals values (4, 'Umbrella', 40)`
+		update = `update public.deals set amount = 11 where id = 1`
+		del    = `delete from public.deals where id = 2`
+	)
+	mustExec(t, agent, insert, update, del)
+	changes := changesOf(t, pool, "deals")
+	checkLines(t, changes, insert, changeLine{Op: "insert", Key: "4", After: deal("4", "Umbrella", "40")})
+	checkLines(t, changes, update, changeLine{Op: "update", Key: "1", Before: deal("1", "Acme", "10"), After: deal("1", "Acme", "11")})
+	checkLines(t, changes, del, changeLine{Op: "delete", Key: "2", Before: deal("2", "Globex", "20")})
 }

@@ -353,20 +353,21 @@ END
 $$;
 
 -- 캡처 트리거 함수. 테이블마다 트리거 넷이 이 함수를 부른다. 인자는 설정의 테이블 키와 키 컬럼의 이름이다:
---   CREATE TRIGGER stet_capture_ins AFTER INSERT ON public.deals REFERENCING NEW TABLE AS n
+--   CREATE TRIGGER stet_capture_ins AFTER INSERT ON public.deals REFERENCING NEW TABLE AS stet_new
 --     FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('deals', 'id');
---   CREATE TRIGGER stet_capture_upd AFTER UPDATE ON public.deals REFERENCING OLD TABLE AS o NEW TABLE AS n
---     FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('deals', 'id');
---   CREATE TRIGGER stet_capture_del AFTER DELETE ON public.deals REFERENCING OLD TABLE AS o
+--   CREATE TRIGGER stet_capture_upd AFTER UPDATE ON public.deals REFERENCING OLD TABLE AS stet_old
+--     NEW TABLE AS stet_new FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('deals', 'id');
+--   CREATE TRIGGER stet_capture_del AFTER DELETE ON public.deals REFERENCING OLD TABLE AS stet_old
 --     FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('deals', 'id');
 --   CREATE TRIGGER stet_capture_trunc AFTER TRUNCATE ON public.deals
 --     FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('deals', 'id');
 -- 소유자(Stet의 계정)의 권한으로 돈다. 값의 글자가 세션 설정에 따라 달라지지 않게 다섯 설정을 함수 안에서만 고정하고,
 -- client_min_messages로 함수가 남기는 로그가 클라이언트로 가지 않게 한다. 모델을 부르지 않는다(규칙 1).
 -- 남기는 값과 query, app은 에이전트가 쓴 데이터다(규칙 5).
--- 전이 테이블 o, n은 동적 SQL에서도 보인다. 컬럼이 테이블마다 다르므로 문장을 그때의 pg_attribute로 만든다.
--- 그 트리거에 없는 전이 테이블을 가리키는 문장은 실행하지 않는다.
--- 트리거가 위와 다르게 설치됐으면 o, n을 읽기 전에 에러를 낸다. 그 이름의 전이 테이블이 없으면 o, n은 세션의 임시
+-- 전이 테이블 stet_old, stet_new는 동적 SQL에서도 보인다. 컬럼이 테이블마다 다르므로 문장을 그때의 pg_attribute로
+-- 만든다. 그 트리거에 없는 전이 테이블을 가리키는 문장은 실행하지 않는다. 이름이 긴 것은 세션의 임시 릴레이션과 우연히
+-- 겹치지 않게 하려는 것이다(아래, 계획의 판정 U11).
+-- 트리거가 위와 다르게 설치됐으면 전이 테이블을 읽기 전에 에러를 낸다. 그 이름의 전이 테이블이 없으면 그 이름은 세션의 임시
 -- 스키마(pg_temp, 릴레이션을 찾을 때 빠지지 않는다)의 같은 이름의 릴레이션으로 읽힌다. 캡처되는 세션은 누구나, 에이전트도,
 -- 그런 뷰를 만들어 자기 코드를 Stet의 계정으로 돌리고 없던 행을 남기게 할 수 있다. 키 컬럼 인자도 그 테이블의 컬럼인지 본다.
 -- 컬럼이 아니면 r.<인자>가 행을 받는 함수로 읽힌다(to_jsonb(r)은 행의 타입에서 json으로 가는 캐스트를 부른다).
@@ -423,7 +424,7 @@ BEGIN
     RETURN NULL;
   END IF;
 
-  -- 설치의 확인. o, n을 읽기 전, 키 인자를 문장에 넣기 전이다(위의 주석).
+  -- 설치의 확인. 전이 테이블을 읽기 전, 키 인자를 문장에 넣기 전이다(위의 주석).
   IF TG_WHEN <> 'AFTER' OR TG_LEVEL <> 'STATEMENT' THEN
     RAISE EXCEPTION 'trigger % on %.% must be AFTER ... FOR EACH STATEMENT, as stet undo-sql prints it, not % ... FOR EACH %',
       TG_NAME, TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_WHEN, TG_LEVEL USING ERRCODE = 'trigger_protocol_violated';
@@ -432,9 +433,10 @@ BEGIN
     SELECT t.tgoldtable, t.tgnewtable INTO old_table, new_table
       FROM pg_catalog.pg_trigger t
      WHERE t.tgrelid = TG_RELID AND t.tgname = TG_NAME;
-    IF (TG_OP <> 'INSERT' AND old_table IS DISTINCT FROM 'o') OR (TG_OP <> 'DELETE' AND new_table IS DISTINCT FROM 'n') THEN
+    IF (TG_OP <> 'INSERT' AND old_table IS DISTINCT FROM 'stet_old') OR (TG_OP <> 'DELETE' AND new_table IS DISTINCT FROM 'stet_new') THEN
       RAISE EXCEPTION 'trigger % on %.% must say REFERENCING %, as stet undo-sql prints it', TG_NAME, TG_TABLE_SCHEMA, TG_TABLE_NAME,
-        CASE TG_OP WHEN 'INSERT' THEN 'NEW TABLE AS n' WHEN 'DELETE' THEN 'OLD TABLE AS o' ELSE 'OLD TABLE AS o NEW TABLE AS n' END
+        CASE TG_OP WHEN 'INSERT' THEN 'NEW TABLE AS stet_new' WHEN 'DELETE' THEN 'OLD TABLE AS stet_old'
+                   ELSE 'OLD TABLE AS stet_old NEW TABLE AS stet_new' END
         USING ERRCODE = 'trigger_protocol_violated';
     END IF;
   END IF;
@@ -451,7 +453,20 @@ BEGIN
   IF TG_OP = 'TRUNCATE' THEN
     skip := 'truncate';
   ELSE
-    EXECUTE CASE TG_OP WHEN 'DELETE' THEN 'SELECT count(*) FROM o' ELSE 'SELECT count(*) FROM n' END INTO changed;
+    -- 전이 테이블을 처음 읽기 바로 앞이다. 위의 pg_trigger 확인은 지금의 카탈로그를 읽지만, PostgreSQL은 문장이 시작할 때
+    -- 읽어 둔 트리거를 부른다. 테이블 소유자는 문장 도중에(그 문장이 부르는 함수에서) 불릴 트리거의 이름을 바꾸거나 지우고
+    -- 같은 이름으로 전이 테이블이 있는 트리거를 만들 수 있다. 그러면 위의 확인은 통과하고, 불린 트리거에는 전이 테이블이 없어
+    -- 그 이름이 pg_temp의 릴레이션으로 읽힌다. 그래서 세션의 임시 스키마에 그 이름의 릴레이션이 있으면 읽지 않는다.
+    -- 이 확인부터 전이 테이블을 마지막으로 읽는 문장까지는 고객의 코드가 돌 수 있는 것을 두지 않는다. 그 사이의 문장은
+    -- stet의 표에 넣는 것, 카탈로그를 읽는 것, 내장 함수와 타입의 출력 함수(C, superuser만 만든다)뿐이다.
+    -- 세는 문장과 값을 읽는 문장은 따로 이름을 찾지만, 그 사이에도 고객의 코드는 돌지 않는다.
+    IF EXISTS (SELECT FROM pg_catalog.pg_class c
+                WHERE c.relnamespace = pg_catalog.pg_my_temp_schema() AND c.relname IN ('stet_old', 'stet_new')) THEN
+      RAISE EXCEPTION 'this session has a temporary relation named stet_old or stet_new; stet.capture() does not read its '
+                      'transition tables while one exists, since a trigger without them would read that relation instead'
+        USING ERRCODE = 'duplicate_table';
+    END IF;
+    EXECUTE CASE TG_OP WHEN 'DELETE' THEN 'SELECT count(*) FROM stet_old' ELSE 'SELECT count(*) FROM stet_new' END INTO changed;
     IF changed = 0 THEN
       RETURN NULL;
     END IF;
@@ -479,17 +494,17 @@ BEGIN
    WHERE a.attrelid = TG_RELID AND a.attnum > 0 AND NOT a.attisdropped;
   keyval := format(text_of, TG_ARGV[1]);
   IF TG_OP = 'INSERT' THEN
-    EXECUTE format('INSERT INTO stet.changes (set_id, key, after) SELECT $1, %s, %s FROM n r', keyval, img)
+    EXECUTE format('INSERT INTO stet.changes (set_id, key, after) SELECT $1, %s, %s FROM stet_new r', keyval, img)
       USING set_id, names;
   ELSIF TG_OP = 'DELETE' THEN
-    EXECUTE format('INSERT INTO stet.changes (set_id, key, before) SELECT $1, %s, %s FROM o r', keyval, img)
+    EXECUTE format('INSERT INTO stet.changes (set_id, key, before) SELECT $1, %s, %s FROM stet_old r', keyval, img)
       USING set_id, names;
   ELSE
     -- 이전 행들과 이후 행들을 키로 묶는다. 키가 바뀐 행은 옛 키의 줄(before만)과 새 키의 줄(after만)이 된다.
     EXECUTE format('INSERT INTO stet.changes (set_id, key, before, after)
                     SELECT $1, k, b.img, a.img
-                      FROM (SELECT %1$s AS k, %2$s AS img FROM o r) b
-                      FULL JOIN (SELECT %1$s AS k, %2$s AS img FROM n r) a USING (k)', keyval, img)
+                      FROM (SELECT %1$s AS k, %2$s AS img FROM stet_old r) b
+                      FULL JOIN (SELECT %1$s AS k, %2$s AS img FROM stet_new r) a USING (k)', keyval, img)
       USING set_id, names;
   END IF;
   RETURN NULL;
