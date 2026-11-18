@@ -682,23 +682,22 @@ REVOKE EXECUTE ON FUNCTION stet.capture() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION stet.changes_guard() FROM PUBLIC;
 
 -- 검토자가 보는 것 (docs/spec-v0.2-undo.md 6장). 캡처한 변경마다 한 줄이고, 값을 남기지 않은 묶음(skipped)은 key 없이
--- 한 줄이다. 변경을 그 쓰기를 판단한 기록에 잇는다(5장의 "잇는 규칙", 좁히는 방법은 계획의 판정 U13).
--- 후보는 다음을 모두 만족하는 판단 기록이다: backend_pid가 묶음의 pid와 같고, executed가 참이고, 묶음의 stmt_at이
--- sent_after에서 10ms를 뺀 때부터 done_before까지(양 끝 포함)이고, statement가 묶음의 query와 같은 글자다.
--- 후보는 다른 쓰기를 판단했다는 증거가 있을 때만 뺀다. 넷이 모두 맞을 때다: target_pk가 있고, target_table이 묶음의 것과
--- 같고(NULL이면 빼지 않는다), 그 키의 글자가 이 묶음의 key 가운데 없고, pid와 target_table과 query가 같고 stmt_at이 그
--- 후보 자신의 창 안에 있는 다른 묶음의 key 가운데 있다. 나머지는 모두 남는다(이 묶음에 있는 키, 어디에도 없는 키, 키가
--- 없는 것, 다른 테이블의 것). 키의 글자는 에이전트가 쓴 그대로여서('007') 열의 출력 글자('7')와 다를 수 있다. 그래서
--- 이 묶음에 없다는 것만으로는 빼지 않는다. 빼는 것은 후보가 하나일 때도 한다. 남은 것이 하나일 때만 잇고,
--- decision_candidates는 남은 수다. 잘못 잇는 것보다 잇지 않는 쪽이다. 하나도 없으면 Stet이 판단하지 않은 변경이다.
+-- 한 줄이다. 변경을 그 쓰기를 판단한 기록에 잇는다(5장의 "잇는 규칙", 계획의 판정 U16).
+-- 묶음 하나는 다음을 모두 만족하는 판단 기록이 하나뿐일 때만 그것에 이어진다: backend_pid가 묶음의 pid와 같고,
+-- executed가 참이고, 묶음의 stmt_at이 sent_after에서 10ms를 뺀 때부터 done_before까지(양 끝 포함)이고, statement가
+-- 묶음의 query와 같은 글자다. 둘 이상이면 잇지 않고 그 수를 decision_candidates로 보여 준다. 키로 좁히지 않는다.
+-- target_pk와 캡처한 key는 잇는 데 쓰지 않는다. 키로 좁히는 규칙은 키를 다시 쓰는 트리거, 에이전트가 다르게 쓴 키, 값을
+-- 남기지 않은 묶음, 아무것도 바꾸지 않은 쓰기가 섞이면 다른 쓰기의 판단 기록에 이었다. 잘못 잇는 것보다 잇지 않는 쪽이다.
+-- 그래서 한 연결에서 같은 글자로 잇달아(한 Sync 아래, 파이프라인으로) 보낸 쓰기는 이어지지 않고 후보의 수만 보인다.
+-- 한 문장이 남긴 묶음들(연쇄로 바뀐 자식 테이블의 것 등)은 pid, stmt_at, query가 같으므로 같은 결과를 보인다.
+-- 하나도 없으면 Stet이 판단하지 않은 변경이다.
 -- held_write가 있는 묶음(승인으로 실행된 쓰기)은 이 규칙을 쓰지 않고 그 보류 줄의 decision_id로 잇는다. 보류 줄이나 그
 -- 판단 기록이 없으면 잇지 않는다.
 -- 잇는 것은 저장하지 않고 읽을 때 계산한다. 판단 기록은 쓰기가 끝난 뒤에 들어가고 묶음은 커밋돼야 보이므로 어느 쪽이 먼저인지
 -- 정해져 있지 않다. 후보는 묶음마다 한 번 모은다(LATERAL). decisions_window_idx로 찾는다: pid가 같고 done_before가
 -- stmt_at 이후인 범위를 훑고, sent_after는 인덱스 안에서 거른다. 최근의 묶음일수록 훑을 것이 적다. 반대쪽 끝(sent_after의
 -- 아래쪽)은 두지 않는다. 쓰기가 서버에 머문 시간에는 상한이 없어서, 끝을 두면 후보를 놓칠 수 있고 놓치면 잘못 이을 수 있다.
--- 키의 확인은 CASE의 순서대로 한다. 이 묶음의 줄은 changes_set_idx로, 다른 묶음은 change_sets_backend_idx (pid, stmt_at)와
--- changes_set_idx로 찾는다. 다른 묶음은 이 묶음에 없는 키를 가진 후보에서만 찾는다. 줄은 changes_set_idx로 붙인다.
+-- 줄은 changes_set_idx로 붙인다.
 -- 소유자(Stet의 계정)의 권한으로 읽는다. 검토자에게는 두 가지만 준다(운영자가 정한다). before와 after에는 그 테이블의 모든
 -- 컬럼이 있다:
 --   GRANT USAGE ON SCHEMA stet TO reviewer;
@@ -727,28 +726,14 @@ CROSS JOIN LATERAL (
        WHERE h.id = s.held_write
       UNION ALL
       -- 잇는 규칙
-      SELECT r.id
-        FROM (SELECT x.id, x.target_table, x.target_pk #>> '{}' AS pk, x.sent_after, x.done_before
-                FROM stet.decisions x
-               WHERE s.held_write IS NULL
-                 AND x.backend_pid = s.pid
-                 AND x.done_before >= s.stmt_at
-                 AND x.sent_after <= s.stmt_at + interval '10 milliseconds'
-                 AND x.executed
-                 AND x.statement = s.query) r
-       WHERE CASE WHEN r.pk IS NULL OR (r.target_table = s.target_table) IS NOT TRUE THEN true
-                  WHEN EXISTS (SELECT FROM stet.changes k WHERE k.set_id = s.id AND k.key = r.pk) THEN true
-                  ELSE NOT EXISTS (
-                    SELECT FROM stet.change_sets o
-                      JOIN stet.changes ok ON ok.set_id = o.id
-                     WHERE o.pid = s.pid
-                       AND o.stmt_at >= r.sent_after - interval '10 milliseconds'
-                       AND o.stmt_at <= r.done_before
-                       AND o.id <> s.id
-                       AND o.target_table = s.target_table
-                       AND o.query = s.query
-                       AND ok.key = r.pk)
-             END
+      SELECT x.id
+        FROM stet.decisions x
+       WHERE s.held_write IS NULL
+         AND x.backend_pid = s.pid
+         AND x.done_before >= s.stmt_at
+         AND x.sent_after <= s.stmt_at + interval '10 milliseconds'
+         AND x.executed
+         AND x.statement = s.query
     ) m
 ) link
 LEFT JOIN stet.changes c ON c.set_id = s.id

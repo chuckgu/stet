@@ -285,72 +285,94 @@ func TestWriteThroughAFunctionIsNotLinked(t *testing.T) {
 	}
 }
 
-// Two writes of the same text under one Sync (a pgx batch) to different rows
-// are each linked to their own decision: their windows overlap, and each set
-// holds the key of one decision and is evidence that the other judged another
-// write (plan ruling U13). Two to the same row cannot be told apart by key:
-// each is linked to the decision on the write that made it, or shows both as
-// candidates. Neither is linked to a decision on another row.
-func TestBatchedWritesLinkToTheirOwnDecisions(t *testing.T) {
+// Two writes of the same text under one Sync (a pgx batch) are not linked:
+// the proxy reports both once the Sync is answered, so each decision's window
+// holds the other's statement, and a change matched by two decisions is
+// linked to neither, whatever rows they wrote (plan ruling U16). Each change
+// shows 2 candidates and no decision, for different rows and for the same
+// row. The test counts the matching decisions itself, from what the decisions
+// and capture recorded: only if the second write reached the gate more than
+// 10ms after the server took the first would a change have one candidate, its
+// own decision, and be linked to it; that is logged.
+func TestBatchedSameTextWritesShowTheirCandidatesNotADecision(t *testing.T) {
 	pg := testPG(t)
 	ctx := context.Background()
 	db, table, _, pool := capturedTable(t, pg, 3)
 	r, agent := shadowOver(t, pg, db, table)
 	write := "update " + table + " set name = $1 where id = $2"
 
-	b := &pgx.Batch{}
-	b.Queue(write, "batch one", 1)
-	b.Queue(write, "batch two", 2)
-	if err := agent.SendBatch(ctx, b).Close(); err != nil {
-		t.Fatal(err)
-	}
-	ds := decisionsOn(t, pool, table, 2, r.log)
-	lines := historyOn(t, pool, table)
-	for _, key := range []string{"1", "2"} {
-		wantLinkedTo(t, "row "+key, lineFor(t, lines, key), decisionFor(t, ds, key))
-	}
-
-	b = &pgx.Batch{}
-	b.Queue(write, "first", 3)
-	b.Queue(write, "second", 3)
-	if err := agent.SendBatch(ctx, b).Close(); err != nil {
-		t.Fatal(err)
-	}
-	// Which write made a change, and which write a decision judged, is told by
-	// the name the write set: its first bind value.
-	byValue := map[string]decisionRow{}
-	for _, d := range decisionsOn(t, pool, table, 4, r.log) {
-		if d.TargetPK != nil && *d.TargetPK == "3" && d.FirstValue != nil {
-			byValue[*d.FirstValue] = d
-		}
-	}
-	var sets []historyLine
-	for _, l := range historyOn(t, pool, table) {
-		if l.Key != nil && *l.Key == "3" {
-			sets = append(sets, l)
-		}
-	}
-	if len(byValue) != 2 || len(sets) != 2 {
-		t.Fatalf("%d decisions and %d changes on row 3, want 2 and 2", len(byValue), len(sets))
-	}
-	for _, l := range sets {
-		name := orNull(l.Name)
-		own, ok := byValue[name]
-		switch {
-		case !ok:
-			t.Errorf("a change of row 3 left the name %s, which neither write set", name)
-		case l.DecisionID == nil:
-			if l.Candidates != 2 {
-				t.Errorf("the change by write %q is not linked and shows %d candidates, want 2", name, l.Candidates)
+	recorded := 0
+	for _, c := range []struct {
+		name  string
+		names [2]string
+		rows  [2]int
+	}{
+		{"different rows", [2]string{"batch one", "batch two"}, [2]int{1, 2}},
+		{"the same row", [2]string{"first", "second"}, [2]int{3, 3}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			b := &pgx.Batch{}
+			for i := range c.names {
+				b.Queue(write, c.names[i], c.rows[i])
 			}
-			t.Logf("the change by write %q: not linked, %d candidates", name, l.Candidates)
-		case *l.DecisionID != own.ID || l.Candidates != 1:
-			t.Errorf("the change by write %q is linked to %s (%d candidates); want that write's decision, %s",
-				name, *l.DecisionID, l.Candidates, own.ID)
-		default:
-			t.Logf("the change by write %q: linked to that write's decision", name)
+			if err := agent.SendBatch(ctx, b).Close(); err != nil {
+				t.Fatal(err)
+			}
+			recorded += 2
+			// Which write made a change, and which write a decision judged, is
+			// told by the name the write set: its first bind value.
+			ds := decisionsOn(t, pool, table, recorded, r.log)
+			byValue := map[string]decisionRow{}
+			for _, d := range ds {
+				if d.FirstValue != nil {
+					byValue[*d.FirstValue] = d
+				}
+			}
+			for _, name := range c.names {
+				var lines []historyLine
+				for _, l := range historyOn(t, pool, table) {
+					if orNull(l.Name) == name {
+						lines = append(lines, l)
+					}
+				}
+				own, ok := byValue[name]
+				if len(lines) != 1 || !ok {
+					t.Fatalf("write %q: %d changes and decision found %v, want one of each", name, len(lines), ok)
+				}
+				l := lines[0]
+				matching := matchingDecisions(ds, l)
+				switch {
+				case len(matching) >= 2:
+					if l.DecisionID != nil || int(l.Candidates) != len(matching) {
+						t.Errorf("the change by write %q shows decision %s with %d candidates; %d decisions match it, so want none and %d",
+							name, orNull(l.DecisionID), l.Candidates, len(matching), len(matching))
+					}
+				case len(matching) == 1 && matching[0].ID == own.ID:
+					t.Logf("the change by write %q is matched by its own decision alone: the windows did not overlap", name)
+					wantLinkedTo(t, "write "+name, l, own)
+				default:
+					t.Errorf("the change by write %q is matched by %d decisions, not by its own alone: %+v", name, len(matching), matching)
+				}
+			}
+		})
+	}
+}
+
+// matchingDecisions are those of ds that the rule matches with line's set:
+// the set's backend, an executed write, the set's statement text, and a
+// window (from 10ms before sent_after to done_before) holding its stmt_at.
+func matchingDecisions(ds []decisionRow, l historyLine) []decisionRow {
+	var m []decisionRow
+	for _, d := range ds {
+		if d.PID == nil || *d.PID != l.PID || !d.Executed || l.Query == nil || d.Statement != *l.Query ||
+			d.SentAfter == nil || d.DoneBefore == nil {
+			continue
+		}
+		if !l.StmtAt.Before(d.SentAfter.Add(-10*time.Millisecond)) && !l.StmtAt.After(*d.DoneBefore) {
+			m = append(m, d)
 		}
 	}
+	return m
 }
 
 // An approved held write, run by Stet's executor as the agent, is recorded

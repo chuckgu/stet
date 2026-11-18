@@ -336,159 +336,161 @@ func TestHistoryLinkBounds(t *testing.T) {
 	}
 }
 
-// Of the decisions that match a set, one is dropped only on positive
-// evidence that it judged another write (plan ruling U13, which replaces
-// spec 5's narrowing): it has a target_pk on the set's table, that key is not
-// among the set's keys, and it is among the keys of another set of the same
-// backend, table and statement that the server took inside the decision's
-// own window. Every other one stays, also when it is the only match. A set is
-// linked only when one stays, and shows how many stay.
-func TestHistoryNarrowsByTargetKey(t *testing.T) {
+// A set is linked only when exactly one decision matches it on backend,
+// executed, window and statement text; with several it is not linked,
+// whatever their keys say, and shows how many matched (plan ruling U16,
+// which withdraws spec 5's narrowing). Neither target_pk nor the recorded
+// keys take part. Every set of one statement (same backend, stmt_at and
+// query: a cascade's child sets, say) shows the same. The cases are the
+// arrangements in which a narrowing by keys linked a decision that did not
+// judge the write; each decision's window is from at to 20ms later unless
+// said otherwise.
+func TestHistoryLinksOnlyASingleMatch(t *testing.T) {
 	pool, _ := captureDB(t)
 	at := time.Date(2026, 11, 18, 2, 0, 0, 0, time.UTC)
 	const write = "update public.deals set name = $1 where id = $2"
 	pid := int32(2000)
 	next := func() int32 { pid++; return pid } // each case on a backend of its own
-	// decided records a decision on p whose window, from at to 20ms later,
-	// holds every set below but the late ones; pk "" means no target_pk.
-	decided := func(t *testing.T, p int32, pk string, change ...func(*handDecision)) string {
+	const ms = time.Millisecond
+	// decided records a decision on p for key pk ("" for none), whose window
+	// is from at+from to at+to.
+	decided := func(t *testing.T, p int32, pk string, from, to time.Duration) string {
 		t.Helper()
-		d := judged(p, at, at.Add(20*time.Millisecond), write)
+		d := judged(p, at.Add(from), at.Add(to), write)
 		if pk != "" {
 			d.PK = ptr(pk)
 		}
-		for _, c := range change {
-			c(&d)
-		}
 		return recordDecision(t, pool, d)
 	}
-	// set records a set of the write on p, taken after after at, with keys.
-	set := func(t *testing.T, p int32, after time.Duration, keys ...string) recordedSet {
+	// set records a set of the write on p that the server took at at+after,
+	// with keys.
+	set := func(t *testing.T, p int32, after time.Duration, table string, keys ...string) recordedSet {
 		t.Helper()
-		return recordSet(t, pool, handSet{PID: p, StmtAt: at.Add(after), Query: write, Table: "deals"}, keys...)
+		return recordSet(t, pool, handSet{PID: p, StmtAt: at.Add(after), Query: write, Table: table}, keys...)
 	}
-	const ms = time.Millisecond
+	// marker records a set of the write on p with no values, skipped as said.
+	marker := func(t *testing.T, p int32, after time.Duration, skipped string) recordedSet {
+		t.Helper()
+		var id int64
+		if err := pool.QueryRow(context.Background(), `
+			insert into stet.change_sets (at, stmt_at, txid, pid, login_role, agent_role, app, target_table, key_column,
+			                              relid, op, query, skipped)
+			values ($1::timestamptz + interval '1 millisecond', $1, 1, $2, 'stet_md5', 'stet_md5', 'enricher', 'deals', 'id',
+			        0, 'update', $3, $4)
+			returning id`, at.Add(after), p, write, skipped).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return recordedSet{ID: id}
+	}
 
-	t.Run("two writes to different rows: each set links to its own decision", func(t *testing.T) {
+	t.Run("one match is linked, whatever its key", func(t *testing.T) {
 		p := next()
-		one, two := decided(t, p, "1"), decided(t, p, "2")
-		set1, set2 := set(t, p, 1*ms, "1"), set(t, p, 2*ms, "2")
-		wantLinked(t, pool, "row 1", set1, one, 1)
-		wantLinked(t, pool, "row 2", set2, two, 1)
+		only := decided(t, p, "15", 0, 20*ms)
+		wantLinked(t, pool, "key 14", set(t, p, 1*ms, "deals", "14"), only, 1)
 	})
-	t.Run("a decision whose key another set of its statement holds goes", func(t *testing.T) {
+	t.Run("no match: not linked, 0", func(t *testing.T) {
 		p := next()
-		here, other := decided(t, p, "8"), decided(t, p, "80")
-		mine, theirs := set(t, p, 1*ms, "8", "9"), set(t, p, 2*ms, "80")
-		wantLinked(t, pool, "keys 8 and 9", mine, here, 1)
-		wantLinked(t, pool, "key 80", theirs, other, 1)
+		decided(t, p+100000, "1", 0, 20*ms)
+		wantLinked(t, pool, "key 1", set(t, p, 1*ms, "deals", "1"), "", 0)
 	})
-	t.Run("it goes also when it is the only match", func(t *testing.T) {
+	t.Run("a set without values and one match is linked", func(t *testing.T) {
 		p := next()
-		only := decided(t, p, "13")
-		mine, theirs := set(t, p, 1*ms, "12"), set(t, p, 2*ms, "13")
-		wantLinked(t, pool, "key 12", mine, "", 0)
-		wantLinked(t, pool, "key 13", theirs, only, 1)
+		only := decided(t, p, "1", 0, 20*ms)
+		wantLinked(t, pool, "capture_failed", marker(t, p, 1*ms, "capture_failed"), only, 1)
 	})
-	t.Run("one decision whose key no set holds is linked", func(t *testing.T) {
+	t.Run("a statement's sets share its one match", func(t *testing.T) {
+		// Q4: the delete of 5 cascades to 8 and 9 in the same table.
 		p := next()
-		only := decided(t, p, "15")
-		wantLinked(t, pool, "key 14", set(t, p, 1*ms, "14"), only, 1)
+		only := decided(t, p, "5", 0, 20*ms)
+		parent, children := set(t, p, 1*ms, "deals", "5"), set(t, p, 1*ms, "deals", "8", "9")
+		wantLinked(t, pool, "key 5", parent, only, 1)
+		wantLinked(t, pool, "keys 8 and 9", children, only, 1)
 	})
-	t.Run("the other row's write changed nothing: its decision stays, the link is lost", func(t *testing.T) {
+	t.Run("two writes to different rows: neither", func(t *testing.T) {
 		p := next()
-		decided(t, p, "1")
-		decided(t, p, "2")
-		wantLinked(t, pool, "row 1", set(t, p, 1*ms, "1"), "", 2)
+		decided(t, p, "1", 0, 20*ms)
+		decided(t, p, "2", 0, 20*ms)
+		one, two := set(t, p, 1*ms, "deals", "1"), set(t, p, 2*ms, "deals", "2")
+		wantLinked(t, pool, "row 1", one, "", 2)
+		wantLinked(t, pool, "row 2", two, "", 2)
 	})
-	t.Run("the write's own key written otherwise, beside another write's decision on the set's key", func(t *testing.T) {
-		// '007' is how the agent wrote key 7: no set holds that text.
+	t.Run("two writes to the same row: neither", func(t *testing.T) {
 		p := next()
-		decided(t, p, "007")
-		decided(t, p, "7")
-		wantLinked(t, pool, "key 7", set(t, p, 1*ms, "7"), "", 2)
-	})
-	t.Run("the write's own key written otherwise, beside another write's decision with no key", func(t *testing.T) {
-		p := next()
-		decided(t, p, "007")
-		decided(t, p, "")
-		wantLinked(t, pool, "key 7", set(t, p, 1*ms, "7"), "", 2)
-	})
-	t.Run("two decisions on the same row: neither", func(t *testing.T) {
-		p := next()
-		decided(t, p, "3")
-		decided(t, p, "3")
-		first, second := set(t, p, 1*ms, "3"), set(t, p, 2*ms, "3")
+		decided(t, p, "3", 0, 20*ms)
+		decided(t, p, "3", 0, 20*ms)
+		first, second := set(t, p, 1*ms, "deals", "3"), set(t, p, 2*ms, "deals", "3")
 		wantLinked(t, pool, "first", first, "", 2)
 		wantLinked(t, pool, "second", second, "", 2)
 	})
-	t.Run("a key this set and another set both hold stays", func(t *testing.T) {
+	t.Run("P1: the write's own key written otherwise, beside another write's on the set's key", func(t *testing.T) {
 		p := next()
-		decided(t, p, "")
-		decided(t, p, "22")
-		both, other := set(t, p, 1*ms, "21", "22"), set(t, p, 2*ms, "22")
-		wantLinked(t, pool, "keys 21 and 22", both, "", 2)
-		wantLinked(t, pool, "key 22", other, "", 2)
+		decided(t, p, "007", 0, 20*ms)
+		decided(t, p, "7", 0, 20*ms)
+		wantLinked(t, pool, "key 7", set(t, p, 1*ms, "deals", "7"), "", 2)
 	})
-	t.Run("two decisions without a target_pk: neither", func(t *testing.T) {
+	t.Run("P2: the write's own key written otherwise, beside another write's with no key", func(t *testing.T) {
 		p := next()
-		decided(t, p, "")
-		decided(t, p, "")
-		wantLinked(t, pool, "keys 4 and 5", set(t, p, 1*ms, "4", "5"), "", 2)
+		decided(t, p, "007", 0, 20*ms)
+		decided(t, p, "", 0, 20*ms)
+		wantLinked(t, pool, "key 7", set(t, p, 1*ms, "deals", "7"), "", 2)
 	})
-	t.Run("a decision without a target_pk stays beside one on the set's key", func(t *testing.T) {
+	t.Run("Q1: a delete cascading in its own table, and a write to the cascaded row that changed nothing", func(t *testing.T) {
 		p := next()
-		decided(t, p, "6")
-		decided(t, p, "")
-		wantLinked(t, pool, "key 6", set(t, p, 1*ms, "6"), "", 2)
+		decided(t, p, "5", 0, 20*ms)
+		decided(t, p, "8", 0, 20*ms)
+		parent, child := set(t, p, 1*ms, "deals", "5"), set(t, p, 1*ms, "deals", "8")
+		wantLinked(t, pool, "key 5", parent, "", 2)
+		wantLinked(t, pool, "key 8", child, "", 2)
 	})
-	t.Run("a decision on another table stays, though a set of the table holds its key", func(t *testing.T) {
+	t.Run("Q2: past the cap, a marker between two writes of one row", func(t *testing.T) {
+		// W31 recorded as {50}, W32 only as too_many_statements, W33 not at all.
 		p := next()
-		decided(t, p, "7")
-		decided(t, p, "99", func(d *handDecision) { d.Table = "accounts" })
-		mine := set(t, p, 1*ms, "7")
-		set(t, p, 2*ms, "99")
-		wantLinked(t, pool, "key 7", mine, "", 2)
+		decided(t, p, "50", 0, 20*ms)
+		decided(t, p, "50", 0, 20*ms)
+		decided(t, p, "50", 0, 20*ms)
+		values, mark := set(t, p, 1*ms, "deals", "50"), marker(t, p, 2*ms, "too_many_statements")
+		wantLinked(t, pool, "W31", values, "", 3)
+		wantLinked(t, pool, "W32's marker", mark, "", 3)
 	})
-	// What is not evidence: a set holding the other decision's key that is
-	// outside that decision's window, of another statement, of another
-	// table, or on another backend. The other decision stays.
-	for _, c := range []struct {
-		name  string
-		other func(p int32) handSet
-	}{
-		{"a set after the decision's window", func(p int32) handSet {
-			return handSet{PID: p, StmtAt: at.Add(20*ms + time.Microsecond), Query: write, Table: "deals"}
-		}},
-		{"a set before the decision's window", func(p int32) handSet {
-			return handSet{PID: p, StmtAt: at.Add(-10*ms - time.Microsecond), Query: write, Table: "deals"}
-		}},
-		{"a set of another statement", func(p int32) handSet {
-			return handSet{PID: p, StmtAt: at.Add(2 * ms), Query: write + " -- again", Table: "deals"}
-		}},
-		{"a set of another table", func(p int32) handSet {
-			return handSet{PID: p, StmtAt: at.Add(2 * ms), Query: write, Table: "accounts"}
-		}},
-		{"a set on another backend", func(p int32) handSet {
-			return handSet{PID: p + 100000, StmtAt: at.Add(2 * ms), Query: write, Table: "deals"}
-		}},
-	} {
-		t.Run("no evidence: "+c.name, func(t *testing.T) {
-			p := next()
-			decided(t, p, "30")
-			decided(t, p, "31")
-			recordSet(t, pool, c.other(p), "31")
-			wantLinked(t, pool, "key 30", set(t, p, 1*ms, "30"), "", 2)
-		})
-	}
-	t.Run("evidence at the decision's window's edges counts", func(t *testing.T) {
-		for i, after := range []time.Duration{-10 * ms, 20 * ms} {
-			p := next()
-			mine := decided(t, p, "30")
-			decided(t, p, "31")
-			recordSet(t, pool, handSet{PID: p, StmtAt: at.Add(after), Query: write, Table: "deals"}, "31")
-			wantLinked(t, pool, fmt.Sprintf("key 30, evidence at edge %d", i), set(t, p, 1*ms, "30"), mine, 1)
-		}
+	t.Run("Q2b: a capture_failed marker beside a write that changed nothing", func(t *testing.T) {
+		p := next()
+		decided(t, p, "1", 0, 20*ms)
+		decided(t, p, "2", 0, 20*ms)
+		decided(t, p, "999", 0, 20*ms)
+		values, mark := set(t, p, 1*ms, "deals", "1"), marker(t, p, 2*ms, "capture_failed")
+		wantLinked(t, pool, "W1", values, "", 3)
+		wantLinked(t, pool, "W2's marker", mark, "", 3)
+	})
+	t.Run("Q3: a trigger rewrites each key to the next", func(t *testing.T) {
+		// Given 5 the row becomes 6, given 6 it becomes 7.
+		p := next()
+		decided(t, p, "5", 0, 20*ms)
+		decided(t, p, "6", 0, 20*ms)
+		one, two := set(t, p, 1*ms, "deals", "6"), set(t, p, 2*ms, "deals", "7")
+		wantLinked(t, pool, "row 6", one, "", 2)
+		wantLinked(t, pool, "row 7", two, "", 2)
+	})
+	t.Run("a trigger rewrites a taken key, and a write of the new key changes nothing", func(t *testing.T) {
+		// W' inserts 5; Wg inserts 5, rewritten to 105; Wd inserts 105 and changes nothing.
+		p := next()
+		decided(t, p, "5", 0, 20*ms)
+		decided(t, p, "5", 0, 20*ms)
+		decided(t, p, "105", 0, 20*ms)
+		five, rewritten := set(t, p, 1*ms, "deals", "5"), set(t, p, 2*ms, "deals", "105")
+		wantLinked(t, pool, "row 5", five, "", 3)
+		wantLinked(t, pool, "row 105", rewritten, "", 3)
+	})
+	t.Run("the same, beside a key written otherwise whose window misses the rewritten write", func(t *testing.T) {
+		// Wx writes 5 as '05' (window 0..1ms, row 5 at 1ms); Wg writes 5,
+		// rewritten to 105 (0..30ms, row 105 at 25ms); Wd writes 105 and
+		// changes nothing (0..40ms).
+		p := next()
+		decided(t, p, "05", 0, 1*ms)
+		decided(t, p, "5", 0, 30*ms)
+		decided(t, p, "105", 0, 40*ms)
+		five, rewritten := set(t, p, 1*ms, "deals", "5"), set(t, p, 25*ms, "deals", "105")
+		wantLinked(t, pool, "row 5", five, "", 3)
+		wantLinked(t, pool, "row 105", rewritten, "", 2)
 	})
 }
 
