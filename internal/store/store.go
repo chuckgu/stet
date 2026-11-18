@@ -138,18 +138,23 @@ type Decision struct {
 	// outcome. Insert records them, as backend_pid and the window the write
 	// was on the server, only when both are set (spec-v0.2-undo 5).
 	BackendPID *uint32   // the session's server process; nil when unknown or the write was not sent
-	DoneAt     time.Time // when the gate was told the outcome; zero when the write was not sent
+	DoneAt     time.Time // when the gate was told the outcome; zero when the write was not sent or its session's pid is unknown
 }
 
-// insertDecisionName is the prepared statement Insert runs, on each
-// connection of the pool it has used.
+// insertDecisionName is the statement Insert prepares, on each connection of
+// the pool it has used whose mode caches statements.
 const insertDecisionName = "stet_insert_decision"
 
 // insertDecision records one decision. The window its write was on the
 // server is computed on the database's clock (spec-v0.2-undo 5): $34 and $35
 // are how many microseconds ago, as Stet measured just before sending the
 // insert, the write arrived and the gate was told its outcome. NULL leaves
-// them NULL.
+// them NULL. They are taken from transaction_timestamp(), the start of the
+// insert's own implicit transaction: it begins when the first message that
+// runs the insert (a Parse or Bind, or the Query of the simple protocol)
+// reaches the server, before the insert waits for any lock on
+// stet.decisions. clock_timestamp() would be read after such a wait, and the
+// wait would make the window later than the write was (plan ruling U12).
 const insertDecision = `
 	insert into stet.decisions (
 		id, created_at, mode, agent_id, on_behalf_of, session_id,
@@ -164,8 +169,8 @@ const insertDecision = `
 		$14::jsonb, $15::jsonb, $16, $17, $18::jsonb, $19::jsonb, $20,
 		$21, $22, $23, $24, $25, $26, $27, $28::jsonb,
 		$29, $30, $31::jsonb, $32,
-		$33, clock_timestamp() - $34::bigint * interval '1 microsecond',
-		clock_timestamp() - $35::bigint * interval '1 microsecond'
+		$33, transaction_timestamp() - $34::bigint * interval '1 microsecond',
+		transaction_timestamp() - $35::bigint * interval '1 microsecond'
 	)`
 
 // Insert records d. Its backend pid and the window its write was on the
@@ -173,10 +178,21 @@ const insertDecision = `
 // BackendPID is set and DoneAt is not zero; otherwise all three are NULL.
 // The two times are never Stet's clock: Insert measures how long ago
 // CreatedAt and DoneAt were (on the monotonic clock, for times taken with
-// time.Now) and the database subtracts that from its clock_timestamp(). So
-// that the insert's own trip to the server is all that falls between that
-// measurement and the server's clock, the connection is taken and the
-// statement prepared (once per connection) first.
+// time.Now) and the database subtracts that from the start of the insert's
+// transaction. So that the insert's own trip to the server is all that falls
+// between that measurement and the server's clock, every value is encoded,
+// the connection taken and, where the connection's mode caches statements,
+// the statement prepared (once per connection) first. The time since
+// CreatedAt is rounded up to the microsecond and the time since DoneAt down,
+// so that rounding only widens the window.
+//
+// A connection in any other mode prepares nothing: a pool behind a
+// transaction-mode pooler runs the simple protocol, and a statement it
+// prepared may be gone from the server its next transaction reaches, or its
+// name taken there by another client's. Its insert runs as before the window
+// was recorded. In the modes that describe a statement before running it
+// (cache_describe, the first time; describe_exec), that round trip falls
+// after the measurement and makes the window later by its length.
 func (s *Store) Insert(ctx context.Context, d *Decision) error {
 	var pk any
 	if d.TargetPK != nil {
@@ -196,6 +212,7 @@ func (s *Store) Insert(ctx context.Context, d *Decision) error {
 	if d.StateVersion != nil {
 		stateVersion = jsonArg(d.StateVersion)
 	}
+	questions, answers, impact, cumulative := jsonArg(d.Questions), jsonArg(d.Answers), jsonArg(d.Impact), jsonArg(d.Cumulative)
 	reasons := d.Reasons
 	if reasons == nil {
 		reasons = []string{}
@@ -205,24 +222,37 @@ func (s *Store) Insert(ctx context.Context, d *Decision) error {
 		return err
 	}
 	defer conn.Release()
-	if _, err := conn.Conn().Prepare(ctx, insertDecisionName, insertDecision); err != nil {
-		return err
+	query := insertDecision
+	if conn.Conn().Config().DefaultQueryExecMode == pgx.QueryExecModeCacheStatement {
+		if _, err := conn.Conn().Prepare(ctx, insertDecisionName, insertDecision); err != nil {
+			return err
+		}
+		query = insertDecisionName
 	}
 	var pid, sentAgo, doneAgo any
 	if d.BackendPID != nil && !d.DoneAt.IsZero() {
 		// The four bytes as the server's int4 reads them, as pg_backend_pid() does.
 		pid = int32(*d.BackendPID)
-		sentAgo, doneAgo = time.Since(d.CreatedAt).Microseconds(), time.Since(d.DoneAt).Microseconds()
+		sentAgo, doneAgo = microsecondsUp(time.Since(d.CreatedAt)), time.Since(d.DoneAt).Microseconds()
 	}
-	_, err = conn.Exec(ctx, insertDecisionName,
+	_, err = conn.Exec(ctx, query,
 		d.ID, d.CreatedAt, d.Mode, d.AgentID, d.OnBehalfOf, d.SessionID,
 		d.Statement, d.StatementFP, params, d.Op, d.TargetTable, pk, proposed,
-		state, stateVersion, d.Model, d.ModelVersion, jsonArg(d.Questions), jsonArg(d.Answers), d.PolicyVersion,
-		d.Verdict, reasons, d.Executed, d.ExecError, d.LatencyMS, d.ModelLatencyMS, d.CostUSD, jsonArg(d.Impact),
-		d.LoginRole, d.RowsAffected, jsonArg(d.Cumulative), d.Refused,
+		state, stateVersion, d.Model, d.ModelVersion, questions, answers, d.PolicyVersion,
+		d.Verdict, reasons, d.Executed, d.ExecError, d.LatencyMS, d.ModelLatencyMS, d.CostUSD, impact,
+		d.LoginRole, d.RowsAffected, cumulative, d.Refused,
 		pid, sentAgo, doneAgo,
 	)
 	return err
+}
+
+// microsecondsUp is d in whole microseconds, rounded up.
+func microsecondsUp(d time.Duration) int64 {
+	us := d / time.Microsecond
+	if us*time.Microsecond < d {
+		us++
+	}
+	return int64(us)
 }
 
 // Change is an executed write to one row, as recorded.

@@ -71,7 +71,8 @@ ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS refused text;
 CREATE INDEX IF NOT EXISTS decisions_role_idx ON stet.decisions (login_role, target_table, created_at DESC);
 -- 되돌리기의 변경을 판단 기록에 잇는다 (docs/spec-v0.2-undo.md 5장). 셋 다 줄을 넣을 때만 적는다(규칙 3).
 -- 서버로 보내지 않은 쓰기와 pid를 모르는 세션의 쓰기는 NULL이다. 두 시각은 DB의 시계다. Stet은 자기 시계의 시각을
--- 보내지 않고, 줄을 넣는 순간까지 흐른 시간을 보내 clock_timestamp()에서 뺀다.
+-- 보내지 않고, 줄을 넣는 순간까지 흐른 시간을 보내 transaction_timestamp()에서 뺀다. 넣는 문장의 트랜잭션은 그 문장의
+-- 메시지가 서버에 닿을 때 시작하므로, 그 뒤에 이 표의 잠금을 기다려도 시각이 늦어지지 않는다(계획의 판정 U12).
 ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS backend_pid integer;      -- 그 세션의 서버 쪽 백엔드 pid
 ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS sent_after  timestamptz;  -- DB 시계. 문장은 이보다 뒤에 서버로 갔다
 ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS done_before timestamptz;  -- DB 시계. 문장의 결과는 이보다 앞에 나왔다

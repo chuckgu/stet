@@ -827,6 +827,68 @@ func TestDecisionCarriesTheBackendWindow(t *testing.T) {
 	})
 }
 
+// The same over the extended protocol: the write comes with bind values, in
+// a Parse, Bind and Execute, and its window holds the time the server ran it.
+func TestDecisionCarriesTheBackendWindowOverTheExtendedProtocol(t *testing.T) {
+	const stamp = "update %s set title = statement_timestamp()::text where id = $1"
+	t.Run("shadow", func(t *testing.T) {
+		d := calm()
+		d.delay = 500 * time.Millisecond
+		e := setup(t, d)
+		e.seed(t)
+		conn := e.connect(t, "enricher")
+		pid := serverPID(t, conn)
+		mustExec(t, conn, fmt.Sprintf(stamp, e.table), 1)
+
+		if r := e.decisions(t, 1)[0]; !r.Executed || len(r.Params) != 1 {
+			t.Fatalf("the write was not recorded as executed with its bind value: %+v", r)
+		}
+		wantWindowAround(t, e.windows(t)[0], pid, e.stampedAt(t, 1), 250*time.Millisecond)
+	})
+	t.Run("enforce", func(t *testing.T) {
+		e := setupEnforce(t, calm())
+		e.seed(t)
+		conn := e.agent(t, "a")
+		pid := serverPID(t, conn)
+		mustExec(t, conn, fmt.Sprintf(stamp, e.table), 1)
+
+		wantEnforced(t, 0, e.enforced(t, 1)[0], "commit")
+		wantWindowAround(t, e.windows(t)[0], pid, e.stampedAt(t, 1), 250*time.Millisecond)
+	})
+}
+
+// A session whose backend pid the proxy does not know (0: the server has not
+// sent its BackendKeyData) records no window, though its write ran:
+// backend_pid, sent_after and done_before are all NULL (spec-v0.2-undo 5).
+func TestDecisionWithoutABackendPIDHasNoWindow(t *testing.T) {
+	for _, mode := range []string{"shadow", "enforce"} {
+		t.Run(mode, func(t *testing.T) {
+			var e *env
+			if mode == "shadow" {
+				e = setup(t, calm())
+			} else {
+				e = setupEnforce(t, calm())
+			}
+			e.seed(t)
+			info := proxy.SessionInfo{ID: "no-pid", User: "stet_md5", Database: "stet_test", ApplicationName: "a"}
+			info.TimeZone, info.DateStyle, info.IntervalStyle = "UTC", "ISO, MDY", "postgres"
+			h, refuse := e.gate.Begin(info, e.gate.Inspect("update "+e.table+" set title = 'VP' where id = 1"), nil)
+			if refuse != nil {
+				t.Fatalf("the write was refused: %+v", refuse)
+			}
+			e.gate.End(h, proxy.Outcome{Executed: true, Rows: ptr(int64(1))})
+
+			if r := e.decisions(t, 1)[0]; !r.Executed {
+				t.Fatalf("the write was not recorded as executed: %+v", r)
+			}
+			if w := e.windows(t)[0]; w.PID != nil || w.SentAfter != nil || w.DoneBefore != nil {
+				t.Errorf("backend_pid %v, sent_after %v, done_before %v; want all NULL for a session whose pid is not known",
+					deref(w.PID), deref(w.SentAfter), deref(w.DoneBefore))
+			}
+		})
+	}
+}
+
 func TestShadowAsksConflictOnlyWhenARecentChangeCouldBeUndone(t *testing.T) {
 	e := setup(t, calm())
 	e.seed(t)

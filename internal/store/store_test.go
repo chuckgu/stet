@@ -652,6 +652,261 @@ func TestInsertRecordsTheBackendWindow(t *testing.T) {
 	}
 }
 
+// recordedWindow is what a decision records of its write's backend and of the
+// window the write was on the server.
+type recordedWindow struct {
+	pid        *int64
+	sent, done *time.Time
+}
+
+// windowOf is what decision id records of its write's backend and window.
+func windowOf(t *testing.T, pool *pgxpool.Pool, id string) recordedWindow {
+	t.Helper()
+	var w recordedWindow
+	if err := pool.QueryRow(context.Background(), "select backend_pid, sent_after, done_before from stet.decisions where id = $1", id).
+		Scan(&w.pid, &w.sent, &w.done); err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
+
+// dbClock is the database's clock_timestamp(), read on conn.
+func dbClock(t *testing.T, conn interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}) time.Time {
+	t.Helper()
+	var at time.Time
+	if err := conn.QueryRow(context.Background(), "select clock_timestamp()").Scan(&at); err != nil {
+		t.Fatal(err)
+	}
+	return at
+}
+
+// wantWindowNear checks that w names pid 4242 and that its two times are
+// sentAgo and doneAgo before at, on the database's clock, within slack.
+func wantWindowNear(t *testing.T, w recordedWindow, at time.Time, sentAgo, doneAgo, slack time.Duration) {
+	t.Helper()
+	if w.pid == nil || *w.pid != 4242 {
+		t.Errorf("backend_pid = %v, want 4242", deref(w.pid))
+	}
+	for _, c := range []struct {
+		name string
+		got  *time.Time
+		ago  time.Duration
+	}{{"sent_after", w.sent, sentAgo}, {"done_before", w.done, doneAgo}} {
+		lo, hi := at.Add(-c.ago-slack), at.Add(-c.ago+slack)
+		if c.got == nil || c.got.Before(lo) || c.got.After(hi) {
+			t.Errorf("%s = %v, want between %v and %v: %v before the database's clock when the insert began",
+				c.name, deref(c.got), lo, hi, c.ago)
+		}
+	}
+}
+
+// windowed is a sample decision whose write arrived 300ms ago and was done
+// 100ms ago, on backend 4242.
+func windowed(t *testing.T) *store.Decision {
+	d := sample(uniqueTable(t))
+	now := time.Now()
+	d.CreatedAt, d.DoneAt, d.BackendPID = now.Add(-300*time.Millisecond), now.Add(-100*time.Millisecond), ptr(uint32(4242))
+	return d
+}
+
+// The window is taken from the start of the insert's transaction, which
+// begins when the insert's first message reaches the server, not from when
+// the insert runs. In between it may wait for a lock on stet.decisions
+// (another Stet's migration, DDL by hand), and that wait would make
+// sent_after later than the write was sent: the unsafe direction, in which a
+// change the write made falls outside its window (plan ruling U12). Under
+// both protocols: the statement Insert prepared waits at Bind, the simple
+// protocol's while its query is read.
+func TestInsertWindowIsNotDelayedByALockWait(t *testing.T) {
+	for _, mode := range []string{"cache_statement", "simple_protocol"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			dsn := ownDatabase(t)
+			cfg, err := pgxpool.ParseConfig(dsn + "&default_query_exec_mode=" + mode)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.MaxConns = 1
+			pool, err := pgxpool.NewWithConfig(ctx, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(pool.Close)
+			s := store.New(pool)
+			if err := s.Migrate(ctx); err != nil {
+				t.Fatal(err)
+			}
+			// The pool's one connection has run the insert, and prepared it if
+			// its mode does.
+			if err := s.Insert(ctx, sample(uniqueTable(t))); err != nil {
+				t.Fatal(err)
+			}
+
+			locker, err := pgx.Connect(ctx, dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { locker.Close(context.Background()) })
+			lock, err := locker.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lock.Rollback(ctx)
+			if _, err := lock.Exec(ctx, "lock table stet.decisions in share mode"); err != nil {
+				t.Fatal(err)
+			}
+			began := dbClock(t, lock)
+			d := windowed(t)
+			inserted := make(chan error, 1)
+			go func() { inserted <- s.Insert(ctx, d) }()
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				var waiting int
+				if err := lock.QueryRow(ctx, `select count(*) from pg_locks
+					where locktype = 'relation' and relation = 'stet.decisions'::regclass and not granted`).Scan(&waiting); err != nil {
+					t.Fatal(err)
+				}
+				if waiting > 0 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("the insert never waited for the lock")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			time.Sleep(400 * time.Millisecond)
+			if err := lock.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-inserted; err != nil {
+				t.Fatal(err)
+			}
+			wantWindowNear(t, windowOf(t, pool, d.ID), began, 300*time.Millisecond, 100*time.Millisecond, 50*time.Millisecond)
+		})
+	}
+}
+
+// slowJSON takes its time to encode, as a large state or set of answers may.
+type slowJSON time.Duration
+
+func (d slowJSON) MarshalJSON() ([]byte, error) {
+	time.Sleep(time.Duration(d))
+	return []byte(`["slow"]`), nil
+}
+
+// Insert encodes every value before it measures how long ago the write
+// arrived and was done: what runs between that measurement and the server's
+// clock makes the window late.
+func TestInsertMeasuresTheWindowAfterEncoding(t *testing.T) {
+	s, pool := testStore(t)
+	for _, field := range []string{"questions", "answers", "impact", "cumulative"} {
+		t.Run(field, func(t *testing.T) {
+			began := dbClock(t, pool)
+			d := windowed(t)
+			slow := slowJSON(300 * time.Millisecond)
+			switch field {
+			case "questions":
+				d.Questions = slow
+			case "answers":
+				d.Answers = slow
+			case "impact":
+				d.Impact = slow
+			case "cumulative":
+				d.Cumulative = slow
+			}
+			if err := s.Insert(context.Background(), d); err != nil {
+				t.Fatal(err)
+			}
+			wantWindowNear(t, windowOf(t, pool, d.ID), began, 300*time.Millisecond, 100*time.Millisecond, 50*time.Millisecond)
+		})
+	}
+}
+
+// Rounding the time since the write arrived up, never down, keeps sent_after
+// from being later than the truth by a fraction of a microsecond.
+func TestMicrosecondsRoundUp(t *testing.T) {
+	for _, c := range []struct {
+		d    time.Duration
+		want int64
+	}{
+		{0, 0}, {1, 1}, {999, 1}, {time.Microsecond, 1}, {time.Microsecond + 1, 2},
+		{1500 * time.Nanosecond, 2}, {300 * time.Millisecond, 300000}, {-1500 * time.Nanosecond, -1},
+	} {
+		if got := store.MicrosecondsUp(c.d); got != c.want {
+			t.Errorf("MicrosecondsUp(%v) = %d, want %d", c.d, got, c.want)
+		}
+	}
+}
+
+// A pool configured for the simple protocol, as one behind a transaction-mode
+// pooler is, records decisions as it did before the window was recorded:
+// Insert prepares nothing on it. Behind such a pooler the server a connection
+// reaches may change between transactions, so a statement the connection
+// prepared may be gone, and the name it would prepare under may be taken by
+// another client's. Both are emulated on the pool's one connection.
+func TestInsertUnderTheSimpleProtocol(t *testing.T) {
+	ctx := context.Background()
+	pool := func(t *testing.T) (*store.Store, *pgxpool.Pool) {
+		t.Helper()
+		cfg, err := pgxpool.ParseConfig(testDSN(t) + "&default_query_exec_mode=simple_protocol")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.MaxConns = 1
+		p, err := pgxpool.NewWithConfig(ctx, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(p.Close)
+		s := store.New(p)
+		if err := s.Migrate(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return s, p
+	}
+	// onServer runs sql on the pool's one connection, behind pgx's back, as
+	// a pooler's server would have it.
+	onServer := func(t *testing.T, p *pgxpool.Pool, sql string) {
+		t.Helper()
+		conn, err := p.Acquire(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Release()
+		if _, err := conn.Conn().PgConn().Exec(ctx, sql).ReadAll(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record := func(t *testing.T, s *store.Store, p *pgxpool.Pool) {
+		t.Helper()
+		began := dbClock(t, p)
+		d := windowed(t)
+		if err := s.Insert(ctx, d); err != nil {
+			t.Fatalf("the decision was not recorded: %v", err)
+		}
+		wantWindowNear(t, windowOf(t, p, d.ID), began, 300*time.Millisecond, 100*time.Millisecond, 50*time.Millisecond)
+	}
+
+	t.Run("records", func(t *testing.T) {
+		s, p := pool(t)
+		record(t, s, p)
+		record(t, s, p)
+	})
+	t.Run("after the server dropped its prepared statements", func(t *testing.T) {
+		s, p := pool(t)
+		record(t, s, p)
+		onServer(t, p, "deallocate all")
+		record(t, s, p)
+	})
+	t.Run("where another client prepared its statement's name", func(t *testing.T) {
+		s, p := pool(t)
+		onServer(t, p, "prepare "+store.InsertDecisionName+" as select 1")
+		record(t, s, p)
+	})
+}
+
 func TestInsertLeavesNewColumnsNull(t *testing.T) {
 	s, pool := testStore(t)
 	d := sample(uniqueTable(t))
