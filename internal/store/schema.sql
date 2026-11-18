@@ -650,3 +650,61 @@ REVOKE EXECUTE ON FUNCTION stet.approve(uuid, text, bigint), stet.reject(uuid, t
 REVOKE EXECUTE ON FUNCTION stet.capture() FROM PUBLIC;
 -- 기록을 지키는 트리거의 함수는 아무에게도 주지 않는다. 트리거는 함수의 권한 없이도 불린다.
 REVOKE EXECUTE ON FUNCTION stet.changes_guard() FROM PUBLIC;
+
+-- 검토자가 보는 것 (docs/spec-v0.2-undo.md 6장). 캡처한 변경마다 한 줄이고, 값을 남기지 않은 묶음(skipped)은 key 없이
+-- 한 줄이다. 변경을 그 쓰기를 판단한 기록에 잇는다(5장의 "잇는 규칙"). 묶음 하나는 다음을 모두 만족하는 판단 기록이
+-- 하나뿐일 때 그것에 이어진다: backend_pid가 묶음의 pid와 같고, executed가 참이고, 묶음의 stmt_at이 sent_after에서
+-- 10ms를 뺀 때부터 done_before까지(양 끝 포함)이고, statement가 묶음의 query와 같은 글자다. 둘 이상이면 대상 키로 좁힌다.
+-- target_pk가 있고 target_table이 묶음의 것과 같은 기록은 그 키가 묶음의 key 가운데 있을 때만 남고, target_pk가 없거나
+-- 다른 테이블의 기록은 그대로 남는다. 그래도 둘 이상이면 잇지 않고 후보의 수만 보여 준다. 잘못 잇는 것보다 잇지 않는
+-- 쪽이다. 하나도 없으면 Stet이 판단하지 않은 변경이다.
+-- held_write가 있는 묶음(승인으로 실행된 쓰기)은 이 규칙을 쓰지 않고 그 보류 줄의 decision_id로 잇는다. 보류 줄이나 그
+-- 판단 기록이 없으면 잇지 않는다.
+-- 잇는 것은 저장하지 않고 읽을 때 계산한다. 판단 기록은 쓰기가 끝난 뒤에 들어가고 묶음은 커밋돼야 보이므로 어느 쪽이 먼저인지
+-- 정해져 있지 않다. 후보는 묶음마다 한 번 모은다(LATERAL). decisions_backend_idx로 찾는다: pid가 같고 sent_after가
+-- stmt_at에서 10ms 뒤까지인 범위다. 아래쪽 끝은 두지 않는다. 쓰기가 서버에 머문 시간에는 상한이 없어서, 끝을 두면 후보를
+-- 놓칠 수 있고 놓치면 잘못 이을 수 있다. 그래서 그 pid의 앞선 판단 기록을 모두 훑고, 오래 쓰인 연결일수록 느려진다.
+-- 줄은 changes_set_idx로 붙인다.
+-- 소유자(Stet의 계정)의 권한으로 읽는다. 검토자에게는 두 가지만 준다(운영자가 정한다). before와 after에는 그 테이블의 모든
+-- 컬럼이 있다:
+--   GRANT USAGE ON SCHEMA stet TO reviewer;
+--   GRANT SELECT ON stet.history TO reviewer;
+-- 캡처가 남긴 값과 query, app은 에이전트가 쓴 데이터다(규칙 5). 보여 주기만 한다.
+-- undo_id와 undone_at은 되돌리기(7장)가 채운다. CREATE OR REPLACE VIEW는 컬럼을 끝에 더하는 것만 받으므로 컬럼의 순서와
+-- 타입은 6장의 표 그대로 둔다.
+CREATE OR REPLACE VIEW stet.history AS
+SELECT c.id AS change_id, s.id AS set_id, s.at,
+       s.agent_role, s.login_role, s.app,
+       s.target_table, s.op, c.key, c.before, c.after,
+       s.rows, s.skipped, s.detail, s.query,
+       s.held_write,
+       d.id AS decision_id, link.candidates AS decision_candidates,
+       d.verdict, d.reasons,
+       NULL::bigint AS undo_id, NULL::timestamptz AS undone_at
+FROM stet.change_sets s
+CROSS JOIN LATERAL (
+  SELECT CASE WHEN count(*) = 1 THEN (array_agg(m.id))[1] END AS decision_id,
+         count(*)::integer AS candidates
+    FROM (
+      -- 승인으로 실행된 쓰기: 보류 줄의 판단 기록
+      SELECT hd.id
+        FROM stet.held_writes h
+        JOIN stet.decisions hd ON hd.id = h.decision_id
+       WHERE h.id = s.held_write
+      UNION ALL
+      -- 잇는 규칙. 맞는 것이 하나뿐이면 키를 보지 않는다
+      SELECT r.id
+        FROM (SELECT x.id, x.target_table, x.target_pk #>> '{}' AS pk, count(*) OVER () AS matched
+                FROM stet.decisions x
+               WHERE s.held_write IS NULL
+                 AND x.backend_pid = s.pid
+                 AND x.sent_after <= s.stmt_at + interval '10 milliseconds'
+                 AND x.done_before >= s.stmt_at
+                 AND x.executed
+                 AND x.statement = s.query) r
+       WHERE CASE WHEN r.matched = 1 OR r.pk IS NULL OR r.target_table <> s.target_table THEN true
+                  ELSE EXISTS (SELECT FROM stet.changes k WHERE k.set_id = s.id AND k.key = r.pk) END
+    ) m
+) link
+LEFT JOIN stet.changes c ON c.set_id = s.id
+LEFT JOIN stet.decisions d ON d.id = link.decision_id;
