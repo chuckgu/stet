@@ -124,10 +124,10 @@ func TestCaptureFailureWhileReadingSettings(t *testing.T) {
 	}
 }
 
-// A failure before anything else, reading stet.capture_settings, still
-// leaves one capture_failed set when the agent has set the counter at or
-// near the cap or past it: the count is checked against the transaction's
-// own sets before anything that can fail, not taken from the agent.
+// A failure before the count, reading stet.capture_settings, still leaves
+// one capture_failed set when the agent has set stet.captures at or near the
+// cap or past it: the failure path counts the transaction's own sets, and
+// capture reads nothing the agent sets (ruling R7).
 func TestCaptureFailureIgnoresTheAgentsCounter(t *testing.T) {
 	pool, db := captureDB(t)
 	ctx := context.Background()
@@ -268,6 +268,50 @@ func TestCaptureLeavesTimeoutsAlone(t *testing.T) {
 		t.Errorf("the timed out write left %d sets", len(sets))
 	}
 	wantSkipped(t, changes, gaveUp, "capture_failed", "55P03")
+}
+
+// When the count itself cannot be made (stet.change_sets is locked, and the
+// agent's lock_timeout runs out), capture gives up after that one wait. It
+// neither counts again nor tries to write a marker behind the same lock: with
+// the count unknown a marker might be the 33rd write. The write succeeds and
+// the failure goes to the server's log.
+func TestCaptureWaitsOnceWhenItCannotCount(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	owner := superuserIn(t, db)
+	dealsTable(t, owner)
+	locker, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Release()
+	lock, err := locker.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Rollback(ctx)
+	mustExec(t, lock, `lock table stet.change_sets in access exclusive mode`)
+	agent := agentIn(t, db)
+	mustExec(t, agent, `set lock_timeout = '1s'`)
+
+	start := time.Now()
+	_, err = agent.Exec(ctx, `update public.deals set amount = 11 where id = 1`)
+	waited := time.Since(start)
+	if err != nil {
+		t.Fatalf("the write failed: %v", err)
+	}
+	if err := lock.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if waited < time.Second || waited > 1600*time.Millisecond {
+		t.Errorf("the write took %v, want one lock_timeout of 1s", waited)
+	}
+	if n := countOf(t, owner, `select count(*) from public.deals where id = 1 and amount = 11`); n != 1 {
+		t.Error("the write did not take effect")
+	}
+	if n := countOf(t, pool, `select count(*) from stet.change_sets`); n != 0 {
+		t.Errorf("%d sets recorded, want none", n)
+	}
 }
 
 // A statement that changes more rows than max_rows leaves one too_many_rows
@@ -611,57 +655,125 @@ func TestCaptureCountsAMarkerWrittenBeforeTheTransactionHadAnID(t *testing.T) {
 	}
 }
 
-// The count is stet.captures, for the transaction: it counts each capture
-// that wrote, a failed one too, and nothing that wrote nothing (a write of no
-// row, a session that is not captured). What a savepoint rolls back is no
-// longer counted, as the subtransactions it rolled back no longer hold an id.
-func TestCaptureCountsOnlyWhatItWrites(t *testing.T) {
+// The count is the transaction's own sets. A write of no row takes no
+// transaction id and is not counted; a failed capture's set is; what a
+// savepoint rolls back is not, as the subtransactions it rolled back no
+// longer hold an id. 20 writes (one capture failing), a savepoint with 20
+// more (its 12th is the 32nd set, too_many_statements), rolled back, then 20
+// more: 19 values and the failure, 11 values, the marker.
+func TestCaptureCountFollowsSavepoints(t *testing.T) {
 	pool, db := captureDB(t)
 	ctx := context.Background()
 	owner := superuserIn(t, db)
-	dealsTable(t, owner)
+	mustExec(t, owner,
+		`create table public.items (id int primary key, v text)`,
+		`insert into public.items select g, 'v' from generate_series(1, 60) g`)
+	installCapture(t, owner, "public.items", "items", "id")
 	setCapture(t, pool, []string{"stet_md5"}, 10000)
-	mustExec(t, pool, noBadNames)
-	count := func(tx pgx.Tx) string {
+	mustExec(t, pool, `alter table stet.changes add constraint no_failing check (after->>'v' not like 'fail%')`)
+	write := func(tx pgx.Tx, from, to int, v func(i int) string) {
 		t.Helper()
-		var n *string
-		if err := tx.QueryRow(ctx, `select current_setting('stet.captures', true)`).Scan(&n); err != nil {
-			t.Fatal(err)
+		for i := from; i <= to; i++ {
+			mustExec(t, tx, fmt.Sprintf(`update public.items set v = '%s' where id = %d`, v(i), i))
 		}
-		return fmt.Sprint(deref(n))
 	}
 
 	err := pgx.BeginFunc(ctx, agentIn(t, db), func(tx pgx.Tx) error {
-		for _, c := range []struct{ sql, want string }{
-			{`update public.deals set amount = 0 where id = -1`, "NULL"},
-			{`delete from public.deals where id = -1`, "NULL"},
-			{`update public.deals set amount = 11 where id = 1`, "1"},
-			{`insert into public.deals values (4, 'bad', 40)`, "2"},
-			{`savepoint s`, "2"},
-			{`update public.deals set amount = 22 where id = 2`, "3"},
-			{`insert into public.deals values (5, 'bad', 50)`, "4"},
-			{`rollback to savepoint s`, "2"},
-			{`update public.deals set amount = 33 where id = 3`, "3"},
-		} {
-			mustExec(t, tx, c.sql)
-			if got := count(tx); got != c.want {
-				t.Errorf("after %s stet.captures is %s, want %s", c.sql, got, c.want)
-			}
+		mustExec(t, tx, `update public.items set v = 'none' where id = -1`)
+		var id *int64
+		if err := tx.QueryRow(ctx, `select txid_current_if_assigned()`).Scan(&id); err != nil {
+			return err
 		}
+		if id != nil {
+			t.Errorf("a captured write of no row gave the transaction the id %d", *id)
+		}
+		write(tx, 1, 20, func(i int) string {
+			if i == 10 {
+				return "fail 10"
+			}
+			return fmt.Sprint("a ", i)
+		})
+		mustExec(t, tx, `savepoint s`)
+		write(tx, 21, 40, func(i int) string { return fmt.Sprint("b ", i) })
+		mustExec(t, tx, `rollback to savepoint s`)
+		write(tx, 41, 60, func(i int) string { return fmt.Sprint("c ", i) })
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = pgx.BeginFunc(ctx, owner, func(tx pgx.Tx) error {
-		mustExec(t, tx, `update public.deals set amount = amount + 1`)
-		if got := count(tx); got != "NULL" {
-			t.Errorf("after a write of a session that is not captured stet.captures is %s, want NULL", got)
+
+	want := txRecord{Skipped: make([]string, 31)}
+	want.Skipped[9] = "capture_failed"
+	for k := 1; k <= 20; k++ {
+		if k != 10 {
+			want.Keys = append(want.Keys, fmt.Sprint(k))
 		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
+	}
+	for k := 41; k <= 51; k++ {
+		want.Keys = append(want.Keys, fmt.Sprint(k))
+	}
+	want.Skipped = append(want.Skipped, "too_many_statements")
+	checkTransactions(t, pool, "items", want)
+}
+
+// stet.captures, the setting capture counted in before ruling R7, means
+// nothing to it now. A session that sets it, to any value, before its
+// transaction or in the middle of it, leaves the same records as one that
+// never did: values for 31 writes, too_many_statements for the 32nd, nothing
+// after. Among them is lowering it after 31 writes, which once let capture go
+// on past the cap and leave no marker.
+func TestCaptureIgnoresStetCaptures(t *testing.T) {
+	pool, db := captureDB(t)
+	owner := superuserIn(t, db)
+	mustExec(t, owner,
+		`create table public.items (id int primary key, v text)`,
+		`insert into public.items select g, 'v' from generate_series(1, 40) g`)
+	installCapture(t, owner, "public.items", "items", "id")
+	setCapture(t, pool, []string{"stet_md5"}, 10000)
+	agent := agentIn(t, db)
+
+	// run writes keys 1 to 40 in one transaction. With value set, it sets
+	// stet.captures to it for the session before the transaction (after 0)
+	// or for the transaction after the write after.
+	run := func(t *testing.T, value string, after int) {
+		t.Helper()
+		if value != "" && after == 0 {
+			mustExec(t, agent, "set stet.captures = "+quoteLiteral(value))
+			defer mustExec(t, agent, "reset stet.captures")
+		}
+		n := 40
+		if value != "" && after > 0 {
+			n = 41
+		}
+		_, txid := writeEach(t, agent, n, func(i int) string {
+			switch {
+			case n == 41 && i == after+1:
+				return "set local stet.captures = " + quoteLiteral(value)
+			case n == 41 && i > after+1:
+				i--
+			}
+			return fmt.Sprintf(`update public.items set v = '%s %d' where id = %d`, value, i, i)
+		})
+		want := capped(1)
+		want.TxID = txid
+		if got := byTransaction(changesWhere(t, pool, `s.txid = $1`, txid)); !reflect.DeepEqual(got, []txRecord{want}) {
+			t.Errorf("recorded\n%+v\nwant\n%+v", got, []txRecord{want})
+		}
+		if n := writersOf(t, pool, txid); n > 32 {
+			t.Errorf("what capture recorded was written by %d subtransactions, want at most 32", n)
+		}
+	}
+
+	t.Run("never set", func(t *testing.T) { run(t, "", 0) })
+	for _, value := range []string{"0", "30", "31", "32", "x", strings.Repeat("9", 100000)} {
+		for _, after := range []int{0, 10, 31} {
+			name := value
+			if len(name) > 10 {
+				name = "100,000 digits"
+			}
+			t.Run(fmt.Sprintf("%s after write %d", name, after), func(t *testing.T) { run(t, value, after) })
+		}
 	}
 }
 
@@ -685,10 +797,10 @@ func otherRole(t *testing.T, database string) string {
 }
 
 // Nothing the agent can set in its session breaks capture or changes whose
-// write it is: a counter that is not a number, one too large for a number,
-// one at or just below the cap (32 writes counted only by the setting would
-// otherwise stop capture), a held write that is not a uuid. Each write
-// succeeds and leaves its values. A write after SET ROLE is still stet_md5's.
+// write it is: stet.captures, which capture no longer reads (ruling R7; see
+// TestCaptureIgnoresStetCaptures for every value), a held write that is not a
+// uuid. Each write succeeds and leaves its values. A write after SET ROLE is
+// still stet_md5's.
 func TestAgentCannotBreakCaptureThroughSessionSettings(t *testing.T) {
 	pool, db := captureDB(t)
 	ctx := context.Background()
@@ -704,10 +816,6 @@ func TestAgentCannotBreakCaptureThroughSessionSettings(t *testing.T) {
 	}{
 		{"a counter that is not a number", []string{`set stet.captures = 'x'`}},
 		{"a counter too large for a number", []string{`set stet.captures = '999999999999'`}},
-		{"a counter of 100,000 digits", []string{`set stet.captures = '` + strings.Repeat("9", 100000) + `'`}},
-		{"a counter at the cap", []string{`set stet.captures = '32'`}},
-		{"a counter just below the cap", []string{`set stet.captures = '31'`}},
-		{"a counter at the cap for the transaction", []string{`begin`, `set local stet.captures = '32'`}},
 		{"a held write that is not a uuid", []string{`set stet.held_write = 'not-a-uuid'`}},
 		{"a held write that is a uuid", []string{`set stet.held_write = '` + store.NewID() + `'`}},
 		{"another role", []string{"set role " + other}},
