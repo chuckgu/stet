@@ -68,9 +68,15 @@ type handSet struct {
 	HeldWrite *string
 }
 
+// recordedSet is a change set a test wrote, and how many keys it holds.
+type recordedSet struct {
+	ID   int64
+	Keys int
+}
+
 // recordSet stores s in stet.change_sets, an update, with one line in
-// stet.changes for each of keys, and returns its id.
-func recordSet(t *testing.T, pool *pgxpool.Pool, s handSet, keys ...string) int64 {
+// stet.changes for each of keys.
+func recordSet(t *testing.T, pool *pgxpool.Pool, s handSet, keys ...string) recordedSet {
 	t.Helper()
 	ctx := context.Background()
 	var id int64
@@ -90,7 +96,7 @@ func recordSet(t *testing.T, pool *pgxpool.Pool, s handSet, keys ...string) int6
 			t.Fatal(err)
 		}
 	}
-	return id
+	return recordedSet{ID: id, Keys: len(keys)}
 }
 
 // historyLine is what stet.history shows of a change and its decision.
@@ -123,13 +129,13 @@ func historyOf(t *testing.T, conn interface {
 	return lines
 }
 
-// wantLinked checks that every line of set setID shows decision id (or none,
-// for "") and candidates.
-func wantLinked(t *testing.T, pool *pgxpool.Pool, what string, setID int64, id string, candidates int32) {
+// wantLinked checks that set shows one line per key (one line when it has
+// none), each with decision id (or none, for "") and candidates.
+func wantLinked(t *testing.T, pool *pgxpool.Pool, what string, set recordedSet, id string, candidates int32) {
 	t.Helper()
-	lines := historyOf(t, pool, setID)
-	if len(lines) == 0 {
-		t.Errorf("%s: stet.history shows nothing of set %d", what, setID)
+	lines := historyOf(t, pool, set.ID)
+	if want := max(set.Keys, 1); len(lines) != want {
+		t.Errorf("%s: stet.history shows %d lines of set %d, want %d", what, len(lines), set.ID, want)
 	}
 	for _, l := range lines {
 		if deref(l.DecisionID) != idOrNull(id) || l.Candidates != candidates {
@@ -174,6 +180,41 @@ func TestHistoryHasTheColumnsOfSpec6(t *testing.T) {
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("stet.history has columns\n%v\nwant\n%v", got, want)
+	}
+}
+
+// The view looks candidates up through decisions_window_idx, whose keys hold
+// both ends of a decision's window. A database migrated by the schema.sql of
+// the step before has the two-key decisions_backend_idx in its place, which
+// CREATE INDEX IF NOT EXISTS would not have replaced under the same name: it
+// is dropped, and the new index made.
+func TestMigrateReplacesTheBackendIndex(t *testing.T) {
+	pool := newPool(t, ownDatabase(t))
+	ctx := context.Background()
+	s := store.New(pool)
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, pool,
+		"drop index stet.decisions_window_idx",
+		"create index decisions_backend_idx on stet.decisions (backend_pid, sent_after)",
+		"update stet.schema_version set sha256 = 'the schema of the step before'")
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := pool.Query(ctx, `
+		select indexdef from pg_indexes
+		where schemaname = 'stet' and indexname in ('decisions_backend_idx', 'decisions_window_idx')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"CREATE INDEX decisions_window_idx ON stet.decisions USING btree (backend_pid, done_before, sent_after)"}
+	if !slices.Equal(got, want) {
+		t.Errorf("after migrating, the indexes are %q, want %q", got, want)
 	}
 }
 
@@ -285,109 +326,169 @@ func TestHistoryLinkBounds(t *testing.T) {
 				c.dec(&d)
 			}
 			id := recordDecision(t, pool, d)
-			setID := recordSet(t, pool, s, "1")
+			set := recordSet(t, pool, s, "1")
 			if c.links {
-				wantLinked(t, pool, c.name, setID, id, 1)
+				wantLinked(t, pool, c.name, set, id, 1)
 			} else {
-				wantLinked(t, pool, c.name, setID, "", 0)
+				wantLinked(t, pool, c.name, set, "", 0)
 			}
 		})
 	}
 }
 
-// When several decisions match a set, those with a target_pk on the set's
-// table stay only if that key is among the set's keys; those without a key,
-// or on another table, stay as they are. A set is linked only when one
-// stays; otherwise it shows how many did (spec 5).
+// Of the decisions that match a set, one is dropped only on positive
+// evidence that it judged another write (plan ruling U13, which replaces
+// spec 5's narrowing): it has a target_pk on the set's table, that key is not
+// among the set's keys, and it is among the keys of another set of the same
+// backend, table and statement that the server took inside the decision's
+// own window. Every other one stays, also when it is the only match. A set is
+// linked only when one stays, and shows how many stay.
 func TestHistoryNarrowsByTargetKey(t *testing.T) {
 	pool, _ := captureDB(t)
 	at := time.Date(2026, 11, 18, 2, 0, 0, 0, time.UTC)
 	const write = "update public.deals set name = $1 where id = $2"
 	pid := int32(2000)
-	// Each case on a backend of its own; both decisions' windows hold both
-	// sets' statements.
-	both := func() (time.Time, time.Time) { return at, at.Add(20 * time.Millisecond) }
-	next := func() int32 { pid++; return pid }
+	next := func() int32 { pid++; return pid } // each case on a backend of its own
+	// decided records a decision on p whose window, from at to 20ms later,
+	// holds every set below but the late ones; pk "" means no target_pk.
+	decided := func(t *testing.T, p int32, pk string, change ...func(*handDecision)) string {
+		t.Helper()
+		d := judged(p, at, at.Add(20*time.Millisecond), write)
+		if pk != "" {
+			d.PK = ptr(pk)
+		}
+		for _, c := range change {
+			c(&d)
+		}
+		return recordDecision(t, pool, d)
+	}
+	// set records a set of the write on p, taken after after at, with keys.
+	set := func(t *testing.T, p int32, after time.Duration, keys ...string) recordedSet {
+		t.Helper()
+		return recordSet(t, pool, handSet{PID: p, StmtAt: at.Add(after), Query: write, Table: "deals"}, keys...)
+	}
+	const ms = time.Millisecond
 
-	t.Run("two decisions on different rows: each set links to its own", func(t *testing.T) {
+	t.Run("two writes to different rows: each set links to its own decision", func(t *testing.T) {
 		p := next()
-		from, to := both()
-		one, two := judged(p, from, to, write), judged(p, from, to, write)
-		one.PK, two.PK = ptr("1"), ptr("2")
-		oneID, twoID := recordDecision(t, pool, one), recordDecision(t, pool, two)
-		set1 := recordSet(t, pool, handSet{PID: p, StmtAt: at.Add(time.Millisecond), Query: write, Table: "deals"}, "1")
-		set2 := recordSet(t, pool, handSet{PID: p, StmtAt: at.Add(2 * time.Millisecond), Query: write, Table: "deals"}, "2")
-		wantLinked(t, pool, "row 1", set1, oneID, 1)
-		wantLinked(t, pool, "row 2", set2, twoID, 1)
+		one, two := decided(t, p, "1"), decided(t, p, "2")
+		set1, set2 := set(t, p, 1*ms, "1"), set(t, p, 2*ms, "2")
+		wantLinked(t, pool, "row 1", set1, one, 1)
+		wantLinked(t, pool, "row 2", set2, two, 1)
+	})
+	t.Run("a decision whose key another set of its statement holds goes", func(t *testing.T) {
+		p := next()
+		here, other := decided(t, p, "8"), decided(t, p, "80")
+		mine, theirs := set(t, p, 1*ms, "8", "9"), set(t, p, 2*ms, "80")
+		wantLinked(t, pool, "keys 8 and 9", mine, here, 1)
+		wantLinked(t, pool, "key 80", theirs, other, 1)
+	})
+	t.Run("it goes also when it is the only match", func(t *testing.T) {
+		p := next()
+		only := decided(t, p, "13")
+		mine, theirs := set(t, p, 1*ms, "12"), set(t, p, 2*ms, "13")
+		wantLinked(t, pool, "key 12", mine, "", 0)
+		wantLinked(t, pool, "key 13", theirs, only, 1)
+	})
+	t.Run("one decision whose key no set holds is linked", func(t *testing.T) {
+		p := next()
+		only := decided(t, p, "15")
+		wantLinked(t, pool, "key 14", set(t, p, 1*ms, "14"), only, 1)
+	})
+	t.Run("the other row's write changed nothing: its decision stays, the link is lost", func(t *testing.T) {
+		p := next()
+		decided(t, p, "1")
+		decided(t, p, "2")
+		wantLinked(t, pool, "row 1", set(t, p, 1*ms, "1"), "", 2)
+	})
+	t.Run("the write's own key written otherwise, beside another write's decision on the set's key", func(t *testing.T) {
+		// '007' is how the agent wrote key 7: no set holds that text.
+		p := next()
+		decided(t, p, "007")
+		decided(t, p, "7")
+		wantLinked(t, pool, "key 7", set(t, p, 1*ms, "7"), "", 2)
+	})
+	t.Run("the write's own key written otherwise, beside another write's decision with no key", func(t *testing.T) {
+		p := next()
+		decided(t, p, "007")
+		decided(t, p, "")
+		wantLinked(t, pool, "key 7", set(t, p, 1*ms, "7"), "", 2)
 	})
 	t.Run("two decisions on the same row: neither", func(t *testing.T) {
 		p := next()
-		from, to := both()
-		one, two := judged(p, from, to, write), judged(p, from, to, write)
-		one.PK, two.PK = ptr("3"), ptr("3")
-		recordDecision(t, pool, one)
-		recordDecision(t, pool, two)
-		set1 := recordSet(t, pool, handSet{PID: p, StmtAt: at.Add(time.Millisecond), Query: write, Table: "deals"}, "3")
-		set2 := recordSet(t, pool, handSet{PID: p, StmtAt: at.Add(2 * time.Millisecond), Query: write, Table: "deals"}, "3")
-		wantLinked(t, pool, "first", set1, "", 2)
-		wantLinked(t, pool, "second", set2, "", 2)
+		decided(t, p, "3")
+		decided(t, p, "3")
+		first, second := set(t, p, 1*ms, "3"), set(t, p, 2*ms, "3")
+		wantLinked(t, pool, "first", first, "", 2)
+		wantLinked(t, pool, "second", second, "", 2)
+	})
+	t.Run("a key this set and another set both hold stays", func(t *testing.T) {
+		p := next()
+		decided(t, p, "")
+		decided(t, p, "22")
+		both, other := set(t, p, 1*ms, "21", "22"), set(t, p, 2*ms, "22")
+		wantLinked(t, pool, "keys 21 and 22", both, "", 2)
+		wantLinked(t, pool, "key 22", other, "", 2)
 	})
 	t.Run("two decisions without a target_pk: neither", func(t *testing.T) {
 		p := next()
-		from, to := both()
-		recordDecision(t, pool, judged(p, from, to, write))
-		recordDecision(t, pool, judged(p, from, to, write))
-		set := recordSet(t, pool, handSet{PID: p, StmtAt: at.Add(time.Millisecond), Query: write, Table: "deals"}, "4", "5")
-		wantLinked(t, pool, "keys 4 and 5", set, "", 2)
+		decided(t, p, "")
+		decided(t, p, "")
+		wantLinked(t, pool, "keys 4 and 5", set(t, p, 1*ms, "4", "5"), "", 2)
 	})
 	t.Run("a decision without a target_pk stays beside one on the set's key", func(t *testing.T) {
 		p := next()
-		from, to := both()
-		keyed := judged(p, from, to, write)
-		keyed.PK = ptr("6")
-		recordDecision(t, pool, keyed)
-		recordDecision(t, pool, judged(p, from, to, write))
-		set := recordSet(t, pool, handSet{PID: p, StmtAt: at.Add(time.Millisecond), Query: write, Table: "deals"}, "6")
-		wantLinked(t, pool, "key 6", set, "", 2)
+		decided(t, p, "6")
+		decided(t, p, "")
+		wantLinked(t, pool, "key 6", set(t, p, 1*ms, "6"), "", 2)
 	})
-	t.Run("a decision on another table stays, whatever its key", func(t *testing.T) {
+	t.Run("a decision on another table stays, though a set of the table holds its key", func(t *testing.T) {
 		p := next()
-		from, to := both()
-		here, there := judged(p, from, to, write), judged(p, from, to, write)
-		here.PK, there.PK, there.Table = ptr("7"), ptr("99"), "accounts"
-		recordDecision(t, pool, here)
-		recordDecision(t, pool, there)
-		set := recordSet(t, pool, handSet{PID: p, StmtAt: at.Add(time.Millisecond), Query: write, Table: "deals"}, "7")
-		wantLinked(t, pool, "key 7", set, "", 2)
+		decided(t, p, "7")
+		decided(t, p, "99", func(d *handDecision) { d.Table = "accounts" })
+		mine := set(t, p, 1*ms, "7")
+		set(t, p, 2*ms, "99")
+		wantLinked(t, pool, "key 7", mine, "", 2)
 	})
-	t.Run("a decision on another key of the set's table goes", func(t *testing.T) {
-		p := next()
-		from, to := both()
-		here, other := judged(p, from, to, write), judged(p, from, to, write)
-		here.PK, other.PK = ptr("8"), ptr("80")
-		hereID := recordDecision(t, pool, here)
-		recordDecision(t, pool, other)
-		set := recordSet(t, pool, handSet{PID: p, StmtAt: at.Add(time.Millisecond), Query: write, Table: "deals"}, "8", "9")
-		wantLinked(t, pool, "keys 8 and 9", set, hereID, 1)
-	})
-	t.Run("one decision is linked without its key being looked at", func(t *testing.T) {
-		p := next()
-		from, to := both()
-		only := judged(p, from, to, write)
-		only.PK = ptr("13")
-		id := recordDecision(t, pool, only)
-		set := recordSet(t, pool, handSet{PID: p, StmtAt: at.Add(time.Millisecond), Query: write, Table: "deals"}, "14")
-		wantLinked(t, pool, "key 14", set, id, 1)
-	})
-	t.Run("when every decision goes, none is left", func(t *testing.T) {
-		p := next()
-		from, to := both()
-		one, two := judged(p, from, to, write), judged(p, from, to, write)
-		one.PK, two.PK = ptr("10"), ptr("11")
-		recordDecision(t, pool, one)
-		recordDecision(t, pool, two)
-		set := recordSet(t, pool, handSet{PID: p, StmtAt: at.Add(time.Millisecond), Query: write, Table: "deals"}, "12")
-		wantLinked(t, pool, "key 12", set, "", 0)
+	// What is not evidence: a set holding the other decision's key that is
+	// outside that decision's window, of another statement, of another
+	// table, or on another backend. The other decision stays.
+	for _, c := range []struct {
+		name  string
+		other func(p int32) handSet
+	}{
+		{"a set after the decision's window", func(p int32) handSet {
+			return handSet{PID: p, StmtAt: at.Add(20*ms + time.Microsecond), Query: write, Table: "deals"}
+		}},
+		{"a set before the decision's window", func(p int32) handSet {
+			return handSet{PID: p, StmtAt: at.Add(-10*ms - time.Microsecond), Query: write, Table: "deals"}
+		}},
+		{"a set of another statement", func(p int32) handSet {
+			return handSet{PID: p, StmtAt: at.Add(2 * ms), Query: write + " -- again", Table: "deals"}
+		}},
+		{"a set of another table", func(p int32) handSet {
+			return handSet{PID: p, StmtAt: at.Add(2 * ms), Query: write, Table: "accounts"}
+		}},
+		{"a set on another backend", func(p int32) handSet {
+			return handSet{PID: p + 100000, StmtAt: at.Add(2 * ms), Query: write, Table: "deals"}
+		}},
+	} {
+		t.Run("no evidence: "+c.name, func(t *testing.T) {
+			p := next()
+			decided(t, p, "30")
+			decided(t, p, "31")
+			recordSet(t, pool, c.other(p), "31")
+			wantLinked(t, pool, "key 30", set(t, p, 1*ms, "30"), "", 2)
+		})
+	}
+	t.Run("evidence at the decision's window's edges counts", func(t *testing.T) {
+		for i, after := range []time.Duration{-10 * ms, 20 * ms} {
+			p := next()
+			mine := decided(t, p, "30")
+			decided(t, p, "31")
+			recordSet(t, pool, handSet{PID: p, StmtAt: at.Add(after), Query: write, Table: "deals"}, "31")
+			wantLinked(t, pool, fmt.Sprintf("key 30, evidence at edge %d", i), set(t, p, 1*ms, "30"), mine, 1)
+		}
 	})
 }
 
@@ -415,7 +516,7 @@ func TestHistoryLinksAnApprovedWriteThroughItsHeldWrite(t *testing.T) {
 
 	set := recordSet(t, pool, handSet{PID: 3001, StmtAt: at.Add(time.Millisecond), Query: write, Table: "deals", HeldWrite: &h.ID}, "1")
 	wantLinked(t, pool, "approved write", set, heldID, 1)
-	lines := historyOf(t, pool, set)
+	lines := historyOf(t, pool, set.ID)
 	if len(lines) != 1 || deref(lines[0].Verdict) != "hold" || !slices.Equal(lines[0].Reasons, []string{"model:conflict"}) {
 		t.Errorf("approved write shows %+v; want the held decision's verdict hold and reasons [model:conflict]", lines)
 	}
@@ -506,7 +607,7 @@ func TestHistoryIsReadWithTheOwnersRights(t *testing.T) {
 	reviewer := loginRole(t, "reviewer")
 	grant(t, db, reviewer, "grant usage on schema stet to "+reviewer, "grant select on stet.history to "+reviewer)
 	rv := connectAs(t, db, reviewer)
-	lines := historyOf(t, rv, set)
+	lines := historyOf(t, rv, set.ID)
 	if len(lines) != 1 || deref(lines[0].DecisionID) != id || deref(lines[0].Verdict) != "hold" {
 		t.Errorf("the reviewer reads %+v, want the change linked to %s with verdict hold", lines, id)
 	}

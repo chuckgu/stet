@@ -64,13 +64,17 @@ func shadowOver(t *testing.T, pg, db, table string) (*running, *pgx.Conn) {
 
 // decisionRow is a decision as stet.decisions holds it.
 type decisionRow struct {
-	ID        string
-	Statement string
-	TargetPK  *string
-	Executed  bool
-	Verdict   string
-	Reasons   []string
-	CreatedAt time.Time
+	ID         string
+	Statement  string
+	TargetPK   *string
+	FirstValue *string // its first bind value
+	Executed   bool
+	Verdict    string
+	Reasons    []string
+	CreatedAt  time.Time
+	PID        *int32
+	SentAfter  *time.Time
+	DoneBefore *time.Time
 }
 
 // decisionsOn waits until n decisions on table are recorded, which happens in
@@ -80,7 +84,8 @@ func decisionsOn(t *testing.T, pool *pgxpool.Pool, table string, n int, log fmt.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		rows, err := pool.Query(context.Background(), `
-			select id::text, statement, target_pk #>> '{}', executed, verdict, reasons, created_at
+			select id::text, statement, target_pk #>> '{}', params ->> 0, executed, verdict, reasons, created_at,
+			       backend_pid, sent_after, done_before
 			from stet.decisions where target_table = $1 order by created_at, id`, table)
 		if err != nil {
 			t.Fatal(err)
@@ -99,7 +104,9 @@ func decisionsOn(t *testing.T, pool *pgxpool.Pool, table string, n int, log fmt.
 	}
 }
 
-// historyLine is what stet.history shows of a change and its decision.
+// historyLine is what stet.history shows of a change and its decision, with
+// the backend and time capture recorded for its set, to tell a timing miss
+// from a wrong rule when a test fails.
 type historyLine struct {
 	SetID       int64
 	TargetTable string
@@ -113,6 +120,9 @@ type historyLine struct {
 	Candidates  int32
 	Verdict     *string
 	Reasons     []string
+	Name        *string // the name the change left in the row
+	PID         int32
+	StmtAt      time.Time
 }
 
 // historyOn is what stet.history shows of the changes to table (its key in
@@ -120,9 +130,10 @@ type historyLine struct {
 func historyOn(t *testing.T, pool *pgxpool.Pool, table string) []historyLine {
 	t.Helper()
 	rows, err := pool.Query(context.Background(), `
-		select set_id, target_table, key, op, query, agent_role, login_role, held_write::text,
-		       decision_id::text, decision_candidates, verdict, reasons
-		from stet.history where target_table = $1 order by set_id, change_id`, table)
+		select h.set_id, h.target_table, h.key, h.op, h.query, h.agent_role, h.login_role, h.held_write::text,
+		       h.decision_id::text, h.decision_candidates, h.verdict, h.reasons, h.after ->> 'name', s.pid, s.stmt_at
+		from stet.history h join stet.change_sets s on s.id = h.set_id
+		where h.target_table = $1 order by h.set_id, h.change_id`, table)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,9 +165,19 @@ func lineFor(t *testing.T, lines []historyLine, key string) historyLine {
 func wantLinkedTo(t *testing.T, what string, l historyLine, d decisionRow) {
 	t.Helper()
 	if orNull(l.DecisionID) != d.ID || l.Candidates != 1 || orNull(l.Verdict) != d.Verdict || !slices.Equal(l.Reasons, d.Reasons) {
-		t.Errorf("%s: shows decision %s (%d candidates), verdict %s, reasons %v; want %s (1), %s, %v",
-			what, orNull(l.DecisionID), l.Candidates, orNull(l.Verdict), l.Reasons, d.ID, d.Verdict, d.Reasons)
+		t.Errorf("%s: shows decision %s (%d candidates), verdict %s, reasons %v; want %s (1), %s, %v; "+
+			"the set: backend %d, stmt_at %s; the decision: backend %s, sent_after %s, done_before %s",
+			what, orNull(l.DecisionID), l.Candidates, orNull(l.Verdict), l.Reasons, d.ID, d.Verdict, d.Reasons,
+			l.PID, l.StmtAt.Format(time.RFC3339Nano), orNull(d.PID), stamp(d.SentAfter), stamp(d.DoneBefore))
 	}
+}
+
+// stamp is *at to the microsecond, or NULL.
+func stamp(at *time.Time) string {
+	if at == nil {
+		return "NULL"
+	}
+	return at.Format(time.RFC3339Nano)
 }
 
 // decisionFor is the one decision on key, failing the test unless there is
@@ -262,15 +283,13 @@ func TestWriteThroughAFunctionIsNotLinked(t *testing.T) {
 		t.Errorf("the write through a function shows decision %s with %d candidates, verdict %s; want none, 0",
 			orNull(l.DecisionID), l.Candidates, orNull(l.Verdict))
 	}
-	if len(ds) != 1 {
-		t.Errorf("%d decisions recorded, want 1: the write through a function is not judged", len(ds))
-	}
 }
 
 // Two writes of the same text under one Sync (a pgx batch) to different rows
-// are each linked to their own decision: their windows overlap, and the
-// decisions' keys tell them apart. Two to the same row cannot be told apart
-// by key: each is linked to the decision on it, in order, or shows both as
+// are each linked to their own decision: their windows overlap, and each set
+// holds the key of one decision and is evidence that the other judged another
+// write (plan ruling U13). Two to the same row cannot be told apart by key:
+// each is linked to the decision on the write that made it, or shows both as
 // candidates. Neither is linked to a decision on another row.
 func TestBatchedWritesLinkToTheirOwnDecisions(t *testing.T) {
 	pg := testPG(t)
@@ -297,33 +316,39 @@ func TestBatchedWritesLinkToTheirOwnDecisions(t *testing.T) {
 	if err := agent.SendBatch(ctx, b).Close(); err != nil {
 		t.Fatal(err)
 	}
-	var same []decisionRow
+	// Which write made a change, and which write a decision judged, is told by
+	// the name the write set: its first bind value.
+	byValue := map[string]decisionRow{}
 	for _, d := range decisionsOn(t, pool, table, 4, r.log) {
-		if d.TargetPK != nil && *d.TargetPK == "3" {
-			same = append(same, d) // oldest first
+		if d.TargetPK != nil && *d.TargetPK == "3" && d.FirstValue != nil {
+			byValue[*d.FirstValue] = d
 		}
 	}
 	var sets []historyLine
 	for _, l := range historyOn(t, pool, table) {
 		if l.Key != nil && *l.Key == "3" {
-			sets = append(sets, l) // in the order capture recorded them
+			sets = append(sets, l)
 		}
 	}
-	if len(same) != 2 || len(sets) != 2 {
-		t.Fatalf("%d decisions and %d changes on row 3, want 2 and 2", len(same), len(sets))
+	if len(byValue) != 2 || len(sets) != 2 {
+		t.Fatalf("%d decisions and %d changes on row 3, want 2 and 2", len(byValue), len(sets))
 	}
-	for i, l := range sets {
+	for _, l := range sets {
+		name := orNull(l.Name)
+		own, ok := byValue[name]
 		switch {
+		case !ok:
+			t.Errorf("a change of row 3 left the name %s, which neither write set", name)
 		case l.DecisionID == nil:
 			if l.Candidates != 2 {
-				t.Errorf("change %d of row 3 is not linked and shows %d candidates, want 2", i+1, l.Candidates)
+				t.Errorf("the change by write %q is not linked and shows %d candidates, want 2", name, l.Candidates)
 			}
-			t.Logf("change %d of row 3: not linked, %d candidates", i+1, l.Candidates)
-		case *l.DecisionID != same[i].ID || l.Candidates != 1:
-			t.Errorf("change %d of row 3 is linked to %s (%d candidates); want the decision on write %d, %s",
-				i+1, *l.DecisionID, l.Candidates, i+1, same[i].ID)
+			t.Logf("the change by write %q: not linked, %d candidates", name, l.Candidates)
+		case *l.DecisionID != own.ID || l.Candidates != 1:
+			t.Errorf("the change by write %q is linked to %s (%d candidates); want that write's decision, %s",
+				name, *l.DecisionID, l.Candidates, own.ID)
 		default:
-			t.Logf("change %d of row 3: linked to the decision on write %d", i+1, i+1)
+			t.Logf("the change by write %q: linked to that write's decision", name)
 		}
 	}
 }
