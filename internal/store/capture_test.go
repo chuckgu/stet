@@ -3,6 +3,7 @@ package store_test
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -56,8 +57,9 @@ func agentIn(t *testing.T, database string) *pgx.Conn {
 // captureDB creates a database of the test's own (ownDatabase) with the stet
 // schema, and returns Stet's pool to it and its name. The superuser stands for
 // the table owner there: the agent (stet_md5) may use every schema and write
-// every table the superuser creates in it. The agent gets nothing on the stet
-// schema. stet.capture_settings has no row.
+// every table the superuser creates in it. The agent has no right on the stet
+// schema and cannot execute stet.capture(); captureDB checks that.
+// stet.capture_settings has no row.
 func captureDB(t *testing.T) (stet *pgxpool.Pool, db string) {
 	t.Helper()
 	dsn := ownDatabase(t)
@@ -66,10 +68,21 @@ func captureDB(t *testing.T) (stet *pgxpool.Pool, db string) {
 	if err := store.New(stet).Migrate(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	mustExec(t, superuserIn(t, db),
+	su := superuserIn(t, db)
+	mustExec(t, su,
 		"alter default privileges for role postgres grant usage on schemas to stet_md5",
 		"alter default privileges for role postgres grant select, insert, update, delete, truncate on tables to stet_md5",
 		"alter default privileges for role postgres grant usage on sequences to stet_md5")
+	var usage, create, execute bool
+	if err := su.QueryRow(context.Background(), `
+		select has_schema_privilege('stet_md5', 'stet', 'usage'), has_schema_privilege('stet_md5', 'stet', 'create'),
+		       has_function_privilege('stet_md5', 'stet.capture()', 'execute')`).Scan(&usage, &create, &execute); err != nil {
+		t.Fatal(err)
+	}
+	if usage || create || execute {
+		t.Fatalf("the agent has rights it must not: usage on stet %v, create on stet %v, execute on stet.capture() %v",
+			usage, create, execute)
+	}
 	return stet, db
 }
 
@@ -437,8 +450,9 @@ func TestCaptureSkipsRolledBackAndEmptyWrites(t *testing.T) {
 	}
 }
 
-// With roles set, only the writes of those roles are recorded. With roles
-// NULL, or no row in stet.capture_settings, every session's are.
+// With roles set, only the writes of those roles are recorded; a NULL among
+// them names no role. With roles NULL, or no row in stet.capture_settings,
+// every session's are.
 func TestCaptureOnlyForAgentRoles(t *testing.T) {
 	pool, db := captureDB(t)
 	ctx := context.Background()
@@ -452,24 +466,48 @@ func TestCaptureOnlyForAgentRoles(t *testing.T) {
 		return sql
 	}
 
+	// setRoles stores roles as an SQL array literal, which may hold NULL.
+	setRoles := func(roles string) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, `
+			insert into stet.capture_settings (roles, max_rows) values ($1::text[], 10000)
+			on conflict (one) do update set roles = excluded.roles`, roles); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	setCapture(t, pool, []string{"stet_md5"}, 10000)
 	byOwner := write(owner, 1)
 	byAgent := write(agent, 2)
+	setRoles("{NULL}")
+	byOwnerWithANullRole := write(owner, 3)
+	byAgentWithANullRole := write(agent, 4)
+	setRoles("{stet_md5,NULL}")
+	byOwnerWithTheAgentAndANullRole := write(owner, 5)
+	byAgentWithTheAgentAndANullRole := write(agent, 6)
 	setCapture(t, pool, nil, 10000)
-	byOwnerWithRolesNull := write(owner, 3)
+	byOwnerWithRolesNull := write(owner, 7)
 	if _, err := pool.Exec(ctx, `delete from stet.capture_settings`); err != nil {
 		t.Fatal(err)
 	}
-	byOwnerWithoutSettings := write(owner, 4)
+	byOwnerWithoutSettings := write(owner, 8)
 
 	changes := changesOf(t, pool, "deals")
-	if sets := setsOf(changes, byOwner); len(sets) != 0 {
-		t.Errorf("roles {stet_md5}: the owner's write was recorded")
+	for sql, what := range map[string]string{
+		byOwner:                         "roles {stet_md5}: the owner's write",
+		byOwnerWithANullRole:            "roles {NULL}: the owner's write",
+		byAgentWithANullRole:            "roles {NULL}: the agent's write",
+		byOwnerWithTheAgentAndANullRole: "roles {stet_md5,NULL}: the owner's write",
+	} {
+		if sets := setsOf(changes, sql); len(sets) != 0 {
+			t.Errorf("%s was recorded", what)
+		}
 	}
 	for _, c := range []struct {
 		sql, role, what string
 	}{
 		{byAgent, "stet_md5", "roles {stet_md5}: the agent's write"},
+		{byAgentWithTheAgentAndANullRole, "stet_md5", "roles {stet_md5,NULL}: the agent's write"},
 		{byOwnerWithRolesNull, "postgres", "roles NULL: the owner's write"},
 		{byOwnerWithoutSettings, "postgres", "no settings: the owner's write"},
 	} {
@@ -522,33 +560,36 @@ func TestCaptureOfStetActingAsTheAgent(t *testing.T) {
 	const (
 		approved = `update public.deals set name = 'approved' where id = 1`
 		unnamed  = `update public.deals set name = 'approved, no held write' where id = 1`
+		notAUUID = `update public.deals set name = 'approved, not a uuid' where id = 1`
 		byAgent  = `update public.deals set name = 'by the agent' where id = 2`
 	)
-	err = pgx.BeginFunc(ctx, stet, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `set local role stet_md5`); err != nil {
+	// asTheAgent runs sql in a transaction of Stet's session as stet_md5,
+	// with stet.held_write set to held for the transaction unless held is "".
+	asTheAgent := func(sql, held string) {
+		t.Helper()
+		err := pgx.BeginFunc(ctx, stet, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, `set local role stet_md5`); err != nil {
+				return err
+			}
+			if held != "" {
+				if _, err := tx.Exec(ctx, `select set_config('stet.held_write', $1, true)`, held); err != nil {
+					return err
+				}
+			}
+			_, err := tx.Exec(ctx, sql)
 			return err
+		})
+		if err != nil {
+			t.Fatalf("%s: %v", sql, err)
 		}
-		if _, err := tx.Exec(ctx, `select set_config('stet.held_write', $1, true)`, held); err != nil {
-			return err
-		}
-		_, err := tx.Exec(ctx, approved)
-		return err
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
+	asTheAgent(approved, held)
 	// The same session again: stet.held_write was set for the transaction
 	// only, and is now empty.
-	err = pgx.BeginFunc(ctx, stet, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `set local role stet_md5`); err != nil {
-			return err
-		}
-		_, err := tx.Exec(ctx, unnamed)
-		return err
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	asTheAgent(unnamed, "")
+	// The approved statement is the agent's and can set stet.held_write
+	// itself (spec 11). A value that is not a uuid is stored as NULL.
+	asTheAgent(notAUUID, "not-a-uuid")
 	agent := agentIn(t, db)
 	err = pgx.BeginFunc(ctx, agent, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `select set_config('stet.held_write', $1, true)`, store.NewID()); err != nil {
@@ -568,6 +609,7 @@ func TestCaptureOfStetActingAsTheAgent(t *testing.T) {
 	}{
 		{approved, "stet_scram", held},
 		{unnamed, "stet_scram", "NULL"},
+		{notAUUID, "stet_scram", "NULL"},
 		{byAgent, "stet_md5", "NULL"},
 	} {
 		sets := setsOf(changes, c.sql)
@@ -830,9 +872,9 @@ func TestCaptureKeepsOddKeysApart(t *testing.T) {
 		changeLine{Op: "insert", Key: "9223372036854775807", After: image("id", "9223372036854775807", "v", "b")})
 }
 
-// stet.capture() runs as Stet's account. It turns values into text with
-// their type's output function, not with a cast: a cast to text is code the
-// type's owner wrote, which would run as Stet's account.
+// stet.capture() runs as Stet's account. It turns values, the key's too, into
+// text with their type's output function, not with a cast: a cast to text is
+// code the type's owner wrote, which would run as Stet's account.
 func TestCaptureRunsNoCastToText(t *testing.T) {
 	pool, db := captureDB(t)
 	owner := superuserIn(t, db)
@@ -841,9 +883,148 @@ func TestCaptureRunsNoCastToText(t *testing.T) {
 		`create function public.mood_text(public.mood) returns text language plpgsql
 		 as $$ begin return 'cast ran as ' || current_user; end $$`,
 		`create cast (public.mood as text) with function public.mood_text(public.mood)`,
-		`create table public.moods (id int primary key, m public.mood)`)
+		`create table public.moods (id int primary key, m public.mood)`,
+		`create table public.moods_by_mood (m public.mood primary key, note text)`)
 	installCapture(t, owner, "public.moods", "moods", "id")
-	const insert = `insert into public.moods values (1, 'happy')`
-	mustExec(t, agentIn(t, db), insert)
+	installCapture(t, owner, "public.moods_by_mood", "moods_by_mood", "m")
+	const (
+		insert       = `insert into public.moods values (1, 'happy')`
+		insertByMood = `insert into public.moods_by_mood values ('sad', 'n1')`
+	)
+	mustExec(t, agentIn(t, db), insert, insertByMood)
 	checkLines(t, changesOf(t, pool, "moods"), insert, changeLine{Op: "insert", Key: "1", After: image("id", "1", "m", "happy")})
+	checkLines(t, changesOf(t, pool, "moods_by_mood"), insertByMood,
+		changeLine{Op: "insert", Key: "sad", After: image("m", "sad", "note", "n1")})
+}
+
+// plantedCode creates public.planted(), code that is not Stet's, which returns
+// 7. Every call takes a number from a sequence, which a rollback does not give
+// back, so runs reports how many times it has run even inside a write that
+// failed.
+func plantedCode(t *testing.T, owner *pgx.Conn) (runs func() int64) {
+	t.Helper()
+	mustExec(t, owner,
+		`create sequence public.planted_runs`,
+		`grant usage on sequence public.planted_runs to stet_scram`,
+		`create function public.planted() returns int language plpgsql
+		 as $$ begin perform nextval('public.planted_runs'); return 7; end $$`)
+	return func() int64 {
+		t.Helper()
+		var n int64
+		if err := owner.QueryRow(context.Background(),
+			`select case when is_called then last_value else 0 end from public.planted_runs`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+}
+
+// linesOn is how many lines of stet.changes were recorded for the table relid.
+func linesOn(t *testing.T, pool *pgxpool.Pool, relid uint32) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(context.Background(), `
+		select count(*) from stet.changes c join stet.change_sets s on s.id = c.set_id where s.relid = $1`, relid).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// wantRefused checks that the write err reports was refused by capture with
+// code, or succeeded: capture raises code, which fails the write until capture
+// swallows its own failures.
+func wantRefused(t *testing.T, err error, code string) {
+	t.Helper()
+	var pgErr *pgconn.PgError
+	if err != nil && (!errors.As(err, &pgErr) || pgErr.Code != code) {
+		t.Errorf("err = %v, want none or SQLSTATE %s", err, code)
+	}
+}
+
+// A trigger that is not installed as spec 4 says (no transition tables, other
+// names, missing the old table, FOR EACH ROW, BEFORE) is refused before
+// capture reads o or n. Read through such a trigger, o and n would be any
+// relation of those names in the session's temporary schema, which a captured
+// session, the agent too, can make run its code as Stet's account and record
+// rows that were never written.
+func TestCaptureRefusesATriggerNotInstalledAsPrinted(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	owner := superuserIn(t, db)
+	runs := plantedCode(t, owner)
+	agent := agentIn(t, db)
+	mustExec(t, agent,
+		`create temporary view n as select public.planted() as id`,
+		`create temporary view o as select public.planted() as id`,
+		`grant select on n, o to stet_scram`)
+	for _, c := range []struct{ name, trigger, write string }{
+		{"no transition table", `after insert on %s for each statement`, `insert into %s values (1)`},
+		{"another name", `after insert on %s referencing new table as new_rows for each statement`, `insert into %s values (1)`},
+		{"no old table", `after update on %s referencing new table as n for each statement`, `update %s set id = 2`},
+		{"for each row", `after insert on %s for each row`, `insert into %s values (1)`},
+		// Not hijacked (n is the transition table), but each row's call would
+		// record the whole statement again.
+		{"for each row with the transition table", `after insert on %s referencing new table as n for each row`, `insert into %s values (1), (2)`},
+		{"before", `before insert on %s for each statement`, `insert into %s values (1)`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			table := "public." + strings.ReplaceAll(c.name, " ", "_")
+			mustExec(t, owner,
+				"create table "+table+" (id int primary key)",
+				"insert into "+table+" values (0)",
+				"create trigger stet_capture "+fmt.Sprintf(c.trigger, table)+" execute function stet.capture('t', 'id')")
+			before := runs()
+			_, err := agent.Exec(ctx, fmt.Sprintf(c.write, table))
+			wantRefused(t, err, "39P01")
+			if ran := runs() - before; ran != 0 {
+				t.Errorf("the planted code ran %d times", ran)
+			}
+			if n := linesOn(t, pool, relidOf(t, owner, table)); n != 0 {
+				t.Errorf("%d lines recorded, want none", n)
+			}
+		})
+	}
+}
+
+// The arguments are refused unless they are two and the second names a
+// column of the table. A name that is no column would put r.<name> into the
+// statement capture builds, which reads as a function of the row:
+// to_jsonb(r) runs the casts to json of the row's types, code that is not
+// Stet's, as Stet's account; row_to_json(r) records the row as its key.
+func TestCaptureRefusesArgumentsThatNameNoColumn(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	owner := superuserIn(t, db)
+	runs := plantedCode(t, owner)
+	mustExec(t, owner,
+		`create type public.mood as enum ('happy', 'sad')`,
+		`create function public.mood_json(public.mood) returns json language plpgsql
+		 as $$ begin perform public.planted(); return '"x"'; end $$`,
+		`create cast (public.mood as json) with function public.mood_json(public.mood)`)
+	agent := agentIn(t, db)
+	for _, c := range []struct{ name, args string }{
+		{"to_jsonb", `'t', 'to_jsonb'`},
+		{"row_to_json", `'t', 'row_to_json'`},
+		{"a system column", `'t', 'xmin'`},
+		{"no such column", `'t', 'nope'`},
+		{"one argument", `'t'`},
+		{"three arguments", `'t', 'id', 'more'`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			table := "public." + strings.ReplaceAll(c.name, " ", "_")
+			mustExec(t, owner,
+				"create table "+table+" (id int primary key, m public.mood)",
+				"create trigger stet_capture_ins after insert on "+table+
+					" referencing new table as n for each statement execute function stet.capture("+c.args+")")
+			before := runs()
+			_, err := agent.Exec(ctx, "insert into "+table+" values (1, 'happy')")
+			wantRefused(t, err, "22023")
+			if ran := runs() - before; ran != 0 {
+				t.Errorf("code that is not Stet's ran %d times", ran)
+			}
+			if n := linesOn(t, pool, relidOf(t, owner, table)); n != 0 {
+				t.Errorf("%d lines recorded, want none", n)
+			}
+		})
+	}
 }

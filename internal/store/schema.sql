@@ -299,7 +299,7 @@ $$;
 -- 되돌리기의 캡처 (docs/spec-v0.2-undo.md 4장). 테이블 소유자가 설치한 문장 단위 트리거가 stet.capture()를 부르고,
 -- 이 함수가 에이전트의 쓰기가 바꾼 행의 이전·이후 값을 쓰기와 같은 트랜잭션에서 남긴다. 롤백된 쓰기는 남지 않는다.
 -- 이 세 표에는 캡처한 에이전트의 트랜잭션이 끝날 때까지 약한 잠금이 걸린다. 표가 이미 있으면 이 파일은 그 표에 잠금을
--- 잡는 문장을 실행하지 않는다(11장의 "스키마의 잠금"). 인덱스와 트리거는 없는지 먼저 보고 만든다. 컬럼을 더할 때는
+-- 잡는 문장을 실행하지 않는다(11장의 "스키마의 잠금"). 인덱스는 없는지 먼저 보고 만든다. 컬럼을 더할 때는
 -- 이것을 다시 본다.
 
 -- 문장 하나가 한 테이블에 한 일
@@ -366,6 +366,10 @@ $$;
 -- 남기는 값과 query, app은 에이전트가 쓴 데이터다(규칙 5).
 -- 전이 테이블 o, n은 동적 SQL에서도 보인다. 컬럼이 테이블마다 다르므로 문장을 그때의 pg_attribute로 만든다.
 -- 그 트리거에 없는 전이 테이블을 가리키는 문장은 실행하지 않는다.
+-- 트리거가 위와 다르게 설치됐으면 o, n을 읽기 전에 에러를 낸다. 그 이름의 전이 테이블이 없으면 o, n은 세션의 임시
+-- 스키마(pg_temp, 릴레이션을 찾을 때 빠지지 않는다)의 같은 이름의 릴레이션으로 읽힌다. 캡처되는 세션은 누구나, 에이전트도,
+-- 그런 뷰를 만들어 자기 코드를 Stet의 계정으로 돌리고 없던 행을 남기게 할 수 있다. 키 컬럼 인자도 그 테이블의 컬럼인지 본다.
+-- 컬럼이 아니면 r.<인자>가 행을 받는 함수로 읽힌다(to_jsonb(r)은 행의 타입에서 json으로 가는 캐스트를 부른다).
 -- 값의 글자는 타입의 출력 함수로 만든다(format의 %s). ::text는 그 타입에서 text로 가는 캐스트가 있으면 그 함수를 부른다.
 -- 캐스트는 타입의 소유자가 만든 함수일 수 있고, 여기서는 Stet의 계정으로 돈다. 출력 함수는 C로만 만들 수 있다(superuser).
 -- NULL은 num_nulls로 가린다. 복합 타입의 IS NULL은 모든 필드가 NULL인 값에도 참이다.
@@ -384,7 +388,10 @@ DECLARE
   capture_roles text[];
   cap           bigint;
   agent         text := session_user;
+  held_text     text;
   held          uuid;
+  old_table     name;
+  new_table     name;
   changed       bigint;
   skip          text;
   set_id        bigint;
@@ -401,15 +408,43 @@ BEGIN
 
   -- 2. 쓰기의 주인. SECURITY DEFINER 안에서 current_user는 이 함수의 소유자, 곧 Stet의 계정이다. Stet의 계정이
   --    SET LOCAL ROLE로 에이전트가 되어 실행한 승인된 쓰기는 그 에이전트의 것이다.
-  --    7. 그때만 stet.held_write를 읽는다. 다른 계정의 세션에서는 에이전트가 스스로 적을 수 있는 값이다.
+  --    7. 그때만 stet.held_write를 읽는다. 다른 계정의 세션에서는 에이전트가 스스로 적을 수 있는 값이다. Stet의 세션에서도
+  --    승인된 문장(에이전트가 쓴 것)이 바꿀 수 있으므로(11장), uuid의 모양이 아니면 NULL로 남긴다.
   IF session_user = current_user THEN
     agent := coalesce(nullif(current_setting('role'), 'none'), session_user);
-    held := nullif(current_setting('stet.held_write', true), '')::uuid;
+    held_text := current_setting('stet.held_write', true);
+    IF held_text ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+      held := held_text::uuid;
+    END IF;
   END IF;
 
   -- 3. 캡처할 계정이 아니면 아무것도 하지 않는다.
   IF capture_roles IS NOT NULL AND (agent = ANY (capture_roles)) IS NOT TRUE THEN
     RETURN NULL;
+  END IF;
+
+  -- 설치의 확인. o, n을 읽기 전, 키 인자를 문장에 넣기 전이다(위의 주석).
+  IF TG_WHEN <> 'AFTER' OR TG_LEVEL <> 'STATEMENT' THEN
+    RAISE EXCEPTION 'trigger % on %.% must be AFTER ... FOR EACH STATEMENT, as stet undo-sql prints it, not % ... FOR EACH %',
+      TG_NAME, TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_WHEN, TG_LEVEL USING ERRCODE = 'trigger_protocol_violated';
+  END IF;
+  IF TG_OP <> 'TRUNCATE' THEN
+    SELECT t.tgoldtable, t.tgnewtable INTO old_table, new_table
+      FROM pg_catalog.pg_trigger t
+     WHERE t.tgrelid = TG_RELID AND t.tgname = TG_NAME;
+    IF (TG_OP <> 'INSERT' AND old_table IS DISTINCT FROM 'o') OR (TG_OP <> 'DELETE' AND new_table IS DISTINCT FROM 'n') THEN
+      RAISE EXCEPTION 'trigger % on %.% must say REFERENCING %, as stet undo-sql prints it', TG_NAME, TG_TABLE_SCHEMA, TG_TABLE_NAME,
+        CASE TG_OP WHEN 'INSERT' THEN 'NEW TABLE AS n' WHEN 'DELETE' THEN 'OLD TABLE AS o' ELSE 'OLD TABLE AS o NEW TABLE AS n' END
+        USING ERRCODE = 'trigger_protocol_violated';
+    END IF;
+  END IF;
+  IF TG_NARGS <> 2 OR NOT EXISTS (SELECT FROM pg_catalog.pg_attribute a
+                                   WHERE a.attrelid = TG_RELID AND a.attname = TG_ARGV[1]
+                                     AND a.attnum > 0 AND NOT a.attisdropped) THEN
+    RAISE EXCEPTION 'trigger % on %.% must pass stet.capture() two arguments, the table''s key in the configuration and '
+                    'the name of one of its columns; it passes %, the second %',
+      TG_NAME, TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_NARGS, coalesce(quote_literal(TG_ARGV[1]), 'missing')
+      USING ERRCODE = 'invalid_parameter_value';
   END IF;
 
   -- 4. TRUNCATE는 표지만 남긴다. 5. 바뀐 행을 센다. 0이면 아무것도 남기지 않고, 상한을 넘으면 표지만 남긴다.
@@ -440,7 +475,7 @@ BEGIN
   SELECT array_agg(a.attname::text ORDER BY a.attnum),
          'jsonb_object($2, ARRAY[' || string_agg(format(text_of, a.attname), ', ' ORDER BY a.attnum) || '])'
     INTO names, img
-    FROM pg_attribute a
+    FROM pg_catalog.pg_attribute a
    WHERE a.attrelid = TG_RELID AND a.attnum > 0 AND NOT a.attisdropped;
   keyval := format(text_of, TG_ARGV[1]);
   IF TG_OP = 'INSERT' THEN
