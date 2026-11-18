@@ -296,9 +296,179 @@ BEGIN
 END
 $$;
 
+-- 되돌리기의 캡처 (docs/spec-v0.2-undo.md 4장). 테이블 소유자가 설치한 문장 단위 트리거가 stet.capture()를 부르고,
+-- 이 함수가 에이전트의 쓰기가 바꾼 행의 이전·이후 값을 쓰기와 같은 트랜잭션에서 남긴다. 롤백된 쓰기는 남지 않는다.
+-- 이 세 표에는 캡처한 에이전트의 트랜잭션이 끝날 때까지 약한 잠금이 걸린다. 표가 이미 있으면 이 파일은 그 표에 잠금을
+-- 잡는 문장을 실행하지 않는다(11장의 "스키마의 잠금"). 인덱스와 트리거는 없는지 먼저 보고 만든다. 컬럼을 더할 때는
+-- 이것을 다시 본다.
+
+-- 문장 하나가 한 테이블에 한 일
+CREATE TABLE IF NOT EXISTS stet.change_sets (
+  id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  at            timestamptz NOT NULL,          -- 남긴 때. clock_timestamp()
+  stmt_at       timestamptz NOT NULL,          -- 서버가 그 문장의 메시지를 받은 때. statement_timestamp()
+  txid          bigint,                        -- txid_current_if_assigned()
+  pid           integer NOT NULL,              -- pg_backend_pid()
+  login_role    text NOT NULL,                 -- session_user
+  agent_role    text NOT NULL,                 -- 이 쓰기의 주인으로 보는 계정 (stet.capture()의 2)
+  app           text,                          -- application_name. 스스로 적는 값
+  held_write    uuid,                          -- 승인으로 실행된 쓰기면 그 보류 줄의 id
+  target_table  text NOT NULL,                 -- 설정의 테이블 키 (트리거의 첫 인자)
+  key_column    text NOT NULL,                 -- 키 컬럼의 이름 (트리거의 둘째 인자). 되돌리기가 행을 이 컬럼으로 찾는다
+  relid         oid NOT NULL,
+  op            text NOT NULL CHECK (op IN ('insert','update','delete','truncate')),
+  query         text,                          -- current_query(). 클라이언트가 보낸 문장
+  rows          bigint,                        -- 그 문장이 이 테이블에서 바꾼 행 수. truncate는 NULL
+  skipped       text CHECK (skipped IN ('too_many_rows','too_many_statements','truncate','capture_failed')),  -- 값을 남기지 않은 이유
+  detail        text                           -- capture_failed의 SQLSTATE와 메시지
+);
+-- 그 문장이 바꾼 행 하나. 키마다 한 줄이다
+CREATE TABLE IF NOT EXISTS stet.changes (
+  id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  set_id  bigint NOT NULL REFERENCES stet.change_sets (id) ON DELETE CASCADE,
+  key     text NOT NULL,                       -- 키 컬럼 값의 글자
+  before  jsonb,                               -- 문장 전에 그 키의 행. 없었으면 NULL
+  after   jsonb                                -- 문장 뒤에 그 키의 행. 없어졌으면 NULL
+);
+-- 캡처 함수가 읽는 설정. 한 줄뿐이고 Stet이 시작할 때 설정 파일에서 맞춘다
+CREATE TABLE IF NOT EXISTS stet.capture_settings (
+  one       boolean PRIMARY KEY DEFAULT true CHECK (one),
+  roles     text[],                            -- 캡처할 계정. NULL이면 모든 세션
+  max_rows  bigint NOT NULL                    -- 한 문장이 이보다 많은 행을 바꾸면 값을 남기지 않는다
+);
+
+-- CREATE INDEX IF NOT EXISTS는 인덱스가 있는지 보기 전에 표에 잠금을 잡는다. to_regclass는 잠금을 잡지 않는다.
+DO $$
+BEGIN
+  IF to_regclass('stet.change_sets_role_idx') IS NULL THEN
+    CREATE INDEX change_sets_role_idx ON stet.change_sets (agent_role, at);
+  END IF;
+  IF to_regclass('stet.change_sets_backend_idx') IS NULL THEN
+    CREATE INDEX change_sets_backend_idx ON stet.change_sets (pid, stmt_at);
+  END IF;
+  IF to_regclass('stet.changes_set_idx') IS NULL THEN
+    CREATE INDEX changes_set_idx ON stet.changes (set_id);
+  END IF;
+END
+$$;
+
+-- 캡처 트리거 함수. 테이블마다 트리거 넷이 이 함수를 부른다. 인자는 설정의 테이블 키와 키 컬럼의 이름이다:
+--   CREATE TRIGGER stet_capture_ins AFTER INSERT ON public.deals REFERENCING NEW TABLE AS n
+--     FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('deals', 'id');
+--   CREATE TRIGGER stet_capture_upd AFTER UPDATE ON public.deals REFERENCING OLD TABLE AS o NEW TABLE AS n
+--     FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('deals', 'id');
+--   CREATE TRIGGER stet_capture_del AFTER DELETE ON public.deals REFERENCING OLD TABLE AS o
+--     FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('deals', 'id');
+--   CREATE TRIGGER stet_capture_trunc AFTER TRUNCATE ON public.deals
+--     FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('deals', 'id');
+-- 소유자(Stet의 계정)의 권한으로 돈다. 값의 글자가 세션 설정에 따라 달라지지 않게 다섯 설정을 함수 안에서만 고정하고,
+-- client_min_messages로 함수가 남기는 로그가 클라이언트로 가지 않게 한다. 모델을 부르지 않는다(규칙 1).
+-- 남기는 값과 query, app은 에이전트가 쓴 데이터다(규칙 5).
+-- 전이 테이블 o, n은 동적 SQL에서도 보인다. 컬럼이 테이블마다 다르므로 문장을 그때의 pg_attribute로 만든다.
+-- 그 트리거에 없는 전이 테이블을 가리키는 문장은 실행하지 않는다.
+-- 값의 글자는 타입의 출력 함수로 만든다(format의 %s). ::text는 그 타입에서 text로 가는 캐스트가 있으면 그 함수를 부른다.
+-- 캐스트는 타입의 소유자가 만든 함수일 수 있고, 여기서는 Stet의 계정으로 돈다. 출력 함수는 C로만 만들 수 있다(superuser).
+-- NULL은 num_nulls로 가린다. 복합 타입의 IS NULL은 모든 필드가 NULL인 값에도 참이다.
+CREATE OR REPLACE FUNCTION stet.capture() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+SET DateStyle = 'ISO, MDY'
+SET IntervalStyle = 'postgres'
+SET extra_float_digits = 1
+SET TimeZone = 'UTC'
+SET bytea_output = 'hex'
+SET client_min_messages = warning
+AS $$
+DECLARE
+  text_of       CONSTANT text := 'CASE WHEN num_nulls(r.%1$I) = 0 THEN format(''%%s'', r.%1$I) END';
+  capture_roles text[];
+  cap           bigint;
+  agent         text := session_user;
+  held          uuid;
+  changed       bigint;
+  skip          text;
+  set_id        bigint;
+  names         text[];
+  img           text;
+  keyval        text;
+BEGIN
+  -- 1. 설정. 줄이 없으면 모든 세션을 캡처하고 상한은 10,000이다.
+  SELECT s.roles, s.max_rows INTO capture_roles, cap FROM stet.capture_settings s;
+  IF NOT FOUND THEN
+    capture_roles := NULL;
+    cap := 10000;
+  END IF;
+
+  -- 2. 쓰기의 주인. SECURITY DEFINER 안에서 current_user는 이 함수의 소유자, 곧 Stet의 계정이다. Stet의 계정이
+  --    SET LOCAL ROLE로 에이전트가 되어 실행한 승인된 쓰기는 그 에이전트의 것이다.
+  --    7. 그때만 stet.held_write를 읽는다. 다른 계정의 세션에서는 에이전트가 스스로 적을 수 있는 값이다.
+  IF session_user = current_user THEN
+    agent := coalesce(nullif(current_setting('role'), 'none'), session_user);
+    held := nullif(current_setting('stet.held_write', true), '')::uuid;
+  END IF;
+
+  -- 3. 캡처할 계정이 아니면 아무것도 하지 않는다.
+  IF capture_roles IS NOT NULL AND (agent = ANY (capture_roles)) IS NOT TRUE THEN
+    RETURN NULL;
+  END IF;
+
+  -- 4. TRUNCATE는 표지만 남긴다. 5. 바뀐 행을 센다. 0이면 아무것도 남기지 않고, 상한을 넘으면 표지만 남긴다.
+  IF TG_OP = 'TRUNCATE' THEN
+    skip := 'truncate';
+  ELSE
+    EXECUTE CASE TG_OP WHEN 'DELETE' THEN 'SELECT count(*) FROM o' ELSE 'SELECT count(*) FROM n' END INTO changed;
+    IF changed = 0 THEN
+      RETURN NULL;
+    END IF;
+    IF changed > cap THEN
+      skip := 'too_many_rows';
+    END IF;
+  END IF;
+
+  -- 6. 묶음 하나
+  INSERT INTO stet.change_sets (at, stmt_at, txid, pid, login_role, agent_role, app, held_write,
+                                target_table, key_column, relid, op, query, rows, skipped)
+  VALUES (clock_timestamp(), statement_timestamp(), txid_current_if_assigned(), pg_backend_pid(), session_user, agent,
+          current_setting('application_name'), held,
+          TG_ARGV[0], TG_ARGV[1], TG_RELID, lower(TG_OP), current_query(), changed, skip)
+  RETURNING id INTO set_id;
+  IF skip IS NOT NULL THEN
+    RETURN NULL;
+  END IF;
+
+  -- 6. 행마다 한 줄. 값은 jsonb_object(컬럼 이름의 배열, 값의 글자의 배열)이다. 지워진 컬럼은 뺀다.
+  SELECT array_agg(a.attname::text ORDER BY a.attnum),
+         'jsonb_object($2, ARRAY[' || string_agg(format(text_of, a.attname), ', ' ORDER BY a.attnum) || '])'
+    INTO names, img
+    FROM pg_attribute a
+   WHERE a.attrelid = TG_RELID AND a.attnum > 0 AND NOT a.attisdropped;
+  keyval := format(text_of, TG_ARGV[1]);
+  IF TG_OP = 'INSERT' THEN
+    EXECUTE format('INSERT INTO stet.changes (set_id, key, after) SELECT $1, %s, %s FROM n r', keyval, img)
+      USING set_id, names;
+  ELSIF TG_OP = 'DELETE' THEN
+    EXECUTE format('INSERT INTO stet.changes (set_id, key, before) SELECT $1, %s, %s FROM o r', keyval, img)
+      USING set_id, names;
+  ELSE
+    -- 이전 행들과 이후 행들을 키로 묶는다. 키가 바뀐 행은 옛 키의 줄(before만)과 새 키의 줄(after만)이 된다.
+    EXECUTE format('INSERT INTO stet.changes (set_id, key, before, after)
+                    SELECT $1, k, b.img, a.img
+                      FROM (SELECT %1$s AS k, %2$s AS img FROM o r) b
+                      FULL JOIN (SELECT %1$s AS k, %2$s AS img FROM n r) a USING (k)', keyval, img)
+      USING set_id, names;
+  END IF;
+  RETURN NULL;
+END
+$$;
+
 -- 새로 만든 함수는 PUBLIC이 실행할 수 있다. 이 파일을 실행할 때마다 거둔다. Migrate는 한 트랜잭션이므로 PUBLIC이
 -- 부를 수 있는 틈이 없고, CREATE OR REPLACE는 이미 준 권한을 지우지 않는다. 누가 승인할 수 있는지는 운영자가 정한다:
 --   GRANT USAGE ON SCHEMA stet TO reviewer;
 --   GRANT SELECT ON stet.review TO reviewer;
 --   GRANT EXECUTE ON FUNCTION stet.approve(uuid, text, bigint), stet.reject(uuid, text) TO reviewer;
 REVOKE EXECUTE ON FUNCTION stet.approve(uuid, text, bigint), stet.reject(uuid, text) FROM PUBLIC;
+-- 캡처 트리거를 만들 테이블 소유자에게는 이 둘을 준다(stet undo-sql이 출력한다). 트리거 함수는 직접 부를 수 없으므로
+-- 이 권한으로 할 수 있는 일은 트리거를 만드는 것뿐이다. 쓰는 계정에는 아무것도 주지 않는다:
+--   GRANT USAGE ON SCHEMA stet TO table_owner;
+--   GRANT EXECUTE ON FUNCTION stet.capture() TO table_owner;
+REVOKE EXECUTE ON FUNCTION stet.capture() FROM PUBLIC;
