@@ -39,6 +39,9 @@ type Config struct {
 	MaxInflight int
 	// Held bounds the approval of held writes.
 	Held Held
+	// Undo turns on capture for tables. nil: no undo clause; nothing of the
+	// undo stage runs.
+	Undo *Undo
 
 	// Hash identifies the config file's bytes. Decisions record it as
 	// policy_version.
@@ -51,6 +54,20 @@ type Held struct {
 	ExpireAfter  time.Duration // held.expire_after: how long a held write can be approved; default 24h
 	ApplyTimeout time.Duration // held.apply_timeout: the bound on running one approved write; default 30s
 }
+
+// Undo turns on capture for tables (spec-v0.2-undo 9). The same in both modes.
+type Undo struct {
+	Tables  map[string]string // table key (a key of Config.Tables, or a table name) -> its key column
+	MaxRows int64             // undo.max_rows: default 10000
+	Keep    time.Duration     // undo.keep: default 30d
+}
+
+const (
+	defaultUndoMaxRows = 10000
+	maxUndoMaxRows     = 1_000_000
+	defaultUndoKeep    = 30 * 24 * time.Hour
+	minUndoKeep        = time.Hour
+)
 
 const (
 	defaultExpireAfter  = 24 * time.Hour
@@ -144,6 +161,16 @@ type rawConfig struct {
 		ExpireAfter  string `yaml:"expire_after"`
 		ApplyTimeout string `yaml:"apply_timeout"`
 	} `yaml:"held"`
+	Undo *rawUndo `yaml:"undo"`
+}
+
+// rawUndo is the undo clause. A table's value may be null (`contacts:`).
+type rawUndo struct {
+	Tables map[string]*struct {
+		PK string `yaml:"pk"`
+	} `yaml:"tables"`
+	MaxRows *int64 `yaml:"max_rows"`
+	Keep    string `yaml:"keep"`
 }
 
 type rawModel struct {
@@ -324,6 +351,10 @@ func Parse(b []byte) (*Config, error) {
 		c.Tables[name] = t
 	}
 
+	if raw.Undo != nil {
+		c.Undo = resolveUndo(raw.Undo, c.Tables, fail)
+	}
+
 	if len(errs) > 0 {
 		return nil, errors.Join(errs...)
 	}
@@ -344,6 +375,49 @@ func heldDuration(field, s string, lo, hi time.Duration, dst *time.Duration, fai
 	default:
 		*dst = d
 	}
+}
+
+// resolveUndo checks the undo clause. A table that is also a key of tables
+// takes its key column from there; any other must give pk.
+func resolveUndo(ru *rawUndo, tables map[string]Table, fail func(string, ...any)) *Undo {
+	u := &Undo{Tables: map[string]string{}, MaxRows: defaultUndoMaxRows, Keep: defaultUndoKeep}
+	if len(ru.Tables) == 0 {
+		fail("undo.tables: required; list the tables to capture")
+	}
+	for name, rt := range ru.Tables {
+		var pk string
+		if rt != nil {
+			pk = rt.PK
+		}
+		if gated, ok := tables[name]; ok {
+			if pk != "" && pk != gated.PK {
+				fail("undo.tables.%s: pk %q differs from tables.%s.pk %q", name, pk, name, gated.PK)
+			}
+			pk = gated.PK
+		} else if pk == "" {
+			fail("undo.tables.%s: pk required; the table is not a key of tables", name)
+		}
+		u.Tables[name] = pk
+	}
+	if m := ru.MaxRows; m != nil {
+		if *m < 1 || *m > maxUndoMaxRows {
+			fail("undo.max_rows: %d must be between 1 and %d", *m, maxUndoMaxRows)
+		} else {
+			u.MaxRows = *m
+		}
+	}
+	if ru.Keep != "" {
+		d, err := parseDuration(ru.Keep)
+		switch {
+		case err != nil:
+			fail("undo.keep: %v", err)
+		case d < minUndoKeep:
+			fail("undo.keep: %s must be at least %s", ru.Keep, minUndoKeep)
+		default:
+			u.Keep = d
+		}
+	}
+	return u
 }
 
 // maxRoleName is Postgres's identifier limit in bytes.

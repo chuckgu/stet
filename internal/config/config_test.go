@@ -139,6 +139,16 @@ func TestInvalidConfigs(t *testing.T) {
 		"apply_timeout too short":                     {minimal + "held: {apply_timeout: 999ms}\n", "held.apply_timeout"},
 		"apply_timeout too long":                      {minimal + "held: {apply_timeout: 10m1s}\n", "held.apply_timeout"},
 		"held unknown key":                            {minimal + "held: {expire: 1h}\n", "expire"},
+		"undo without tables":                         {minimal + "undo: {max_rows: 5}\n", "undo.tables"},
+		"undo empty tables":                           {minimal + "undo: {tables: {}}\n", "undo.tables"},
+		"undo pk differs":                             {undoGate + "undo: {tables: {contacts: {pk: other}}}\n", "undo.tables.contacts"},
+		"undo pk missing":                             {minimal + "undo: {tables: {public.notes: }}\n", "undo.tables.public.notes"},
+		"undo max_rows zero":                          {minimal + "undo: {tables: {a: {pk: id}}, max_rows: 0}\n", "undo.max_rows"},
+		"undo max_rows too big":                       {minimal + "undo: {tables: {a: {pk: id}}, max_rows: 1000001}\n", "undo.max_rows"},
+		"undo keep too short":                         {minimal + "undo: {tables: {a: {pk: id}}, keep: 59m}\n", "undo.keep"},
+		"undo keep not a duration":                    {minimal + "undo: {tables: {a: {pk: id}}, keep: forever}\n", "undo.keep"},
+		"undo unknown key":                            {minimal + "undo: {table: {}}\n", "table"},
+		"undo table unknown key":                      {minimal + "undo: {tables: {contacts: {key: id}}}\n", "key"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -541,5 +551,75 @@ func TestHeldSettings(t *testing.T) {
 		if c.Held != tc.want {
 			t.Errorf("%s: Held = %+v, want %+v", tc.held, c.Held, tc.want)
 		}
+	}
+}
+
+// undoGate configures contacts and deals as gated tables, with distinct keys.
+const undoGate = minimal + `model: {adapter: jev, version: jev-1.13.0}
+tables:
+  contacts: {pk: id, send_fields: [a]}
+  deals: {pk: deal_id, send_fields: [a]}
+`
+
+func TestUndoAbsent(t *testing.T) {
+	c, err := Parse([]byte(minimal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Undo != nil {
+		t.Errorf("Undo = %+v, want nil", c.Undo)
+	}
+}
+
+func TestUndoSettings(t *testing.T) {
+	c, err := Parse([]byte(undoGate + `undo:
+  tables:
+    contacts:
+    deals:
+    public.deal_notes:
+      pk: id
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"contacts": "id", "deals": "deal_id", "public.deal_notes": "id"}
+	if c.Undo == nil || len(c.Undo.Tables) != len(want) {
+		t.Fatalf("Undo = %+v, want tables %v", c.Undo, want)
+	}
+	for k, v := range want {
+		if c.Undo.Tables[k] != v {
+			t.Errorf("Tables[%q] = %q, want %q", k, c.Undo.Tables[k], v)
+		}
+	}
+	if c.Undo.MaxRows != 10000 || c.Undo.Keep != 720*time.Hour {
+		t.Errorf("defaults: MaxRows = %d, Keep = %s", c.Undo.MaxRows, c.Undo.Keep)
+	}
+
+	for _, tc := range []struct {
+		undo    string
+		maxRows int64
+		keep    time.Duration
+	}{
+		{"{tables: {a: {pk: id}}, max_rows: 1}", 1, 720 * time.Hour},
+		{"{tables: {a: {pk: id}}, max_rows: 1000000}", 1000000, 720 * time.Hour},
+		{"{tables: {a: {pk: id}}, keep: 1h}", 10000, time.Hour},
+		{"{tables: {a: {pk: id}}, keep: 2d}", 10000, 48 * time.Hour},
+	} {
+		c, err := Parse([]byte(minimal + "undo: " + tc.undo + "\n"))
+		if err != nil {
+			t.Fatalf("%s: %v", tc.undo, err)
+		}
+		if c.Undo.MaxRows != tc.maxRows || c.Undo.Keep != tc.keep {
+			t.Errorf("%s: MaxRows = %d, Keep = %s", tc.undo, c.Undo.MaxRows, c.Undo.Keep)
+		}
+	}
+
+	// The same pk as the gated table is fine.
+	c, err = Parse([]byte(undoGate + "undo: {tables: {contacts: {pk: id}}}\n"))
+	if err != nil {
+		t.Fatalf("same pk: %v", err)
+	}
+	if c.Undo.Tables["contacts"] != "id" {
+		t.Errorf("Tables = %v", c.Undo.Tables)
 	}
 }
