@@ -649,6 +649,37 @@ func TestGateSeesAStatementParsedUnderOtherSettings(t *testing.T) {
 	}
 }
 
+// The gate is handed the session's server process, from the server's
+// BackendKeyData: the one pg_backend_pid() names in that session, in shadow
+// and enforce mode alike. The client still gets the message as it came
+// (spec-v0.2-undo 5).
+func TestGateIsToldTheBackendPID(t *testing.T) {
+	for _, mode := range closedPointModes {
+		t.Run(mode.name, func(t *testing.T) {
+			table := watchedTable(t)
+			g := newRecordingGate(watches(table))
+			addr, _ := startProxyWith(t, upstream(t), g, mode.policy)
+			conn := connect(t, addr, "stet_scram", nil)
+			var pid int64
+			if err := conn.QueryRow(testCtx(t), "select pg_backend_pid()").Scan(&pid); err != nil {
+				t.Fatal(err)
+			}
+			mustExec(t, conn, "insert into "+table+" values (1, 'a')")
+
+			bs, os := g.outcomes(t, 1)
+			if !os[0].Executed {
+				t.Errorf("write: %+v, want executed", os[0])
+			}
+			if got := bs[0].info.BackendPID; int64(got) != pid || pid == 0 {
+				t.Errorf("Begin was handed backend pid %d, want %d, the session's pg_backend_pid()", got, pid)
+			}
+			if got := conn.PgConn().PID(); int64(got) != pid {
+				t.Errorf("the client's BackendKeyData names process %d, want %d", got, pid)
+			}
+		})
+	}
+}
+
 // Only the sessions of the listed login roles are shown to the gate. Another
 // role's session is relayed without it: nothing is inspected or begun.
 func TestSessionsOfOtherRolesAreNotSeen(t *testing.T) {

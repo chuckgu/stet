@@ -6,6 +6,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/stetdb/stet/internal/store"
 )
 
@@ -33,6 +35,13 @@ func FailMarks(a *Applier, n int) {
 // it. Call it before a is applying.
 func BeforeStatement(a *Applier, f func()) {
 	a.beforeStatement = f
+}
+
+// AfterCommit has a call f, with the held write's connection, once a held
+// write was applied and its transaction committed, before the connection is
+// closed; nil removes it. Call it before a is applying.
+func AfterCommit(a *Applier, f func(ctx context.Context, conn *pgx.Conn)) {
+	a.afterCommit = f
 }
 
 // SetGrace changes applyGrace until restore is called. Tests that use it

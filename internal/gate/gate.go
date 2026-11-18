@@ -261,6 +261,7 @@ type pending struct {
 	candidateIDs []string // the keys of the candidates in state, the duplicate question's choices
 	stateErr     error
 	added        time.Duration // time the client waited on Begin
+	done         time.Time     // when End was told the outcome
 
 	// Set by Begin in enforce mode, which judges the write before it is
 	// sent; judge records them and asks the model nothing.
@@ -416,8 +417,13 @@ func rowsAffected(r sqlparse.Result, o proxy.Outcome) *int64 {
 // the worst of its defects, so End logs an error and records what the proxy
 // reported rather than its own refusal: a write that ran is recorded so, and
 // its rows count against the cumulative limit.
+//
+// The time End is called closes the window the write was on the server,
+// which the decision records (spec-v0.2-undo 5): the proxy calls it once the
+// server has answered the write, or its connection ended first.
 func (g *Gate) End(h any, o proxy.Outcome) {
 	p := h.(*pending)
+	p.done = time.Now()
 	switch {
 	case p.refused == nil:
 	case o.Executed || o.Lost:
@@ -522,6 +528,14 @@ func (g *Gate) judge(p *pending, o proxy.Outcome) {
 	d.RowsAffected = rowsAffected(p.res, o)
 	if p.cumulative != nil {
 		d.Cumulative = p.cumulative
+	}
+	// Where and when the write was on the server, for linking what it
+	// changed (spec-v0.2-undo 5): from its arrival (p.at) to when End was
+	// told the outcome. Only for a write that was sent, on a session whose
+	// backend the proxy knows; Insert computes the times on the database's
+	// clock.
+	if p.refused == nil && p.session.BackendPID != 0 {
+		d.BackendPID, d.DoneAt = ptr(p.session.BackendPID), p.done
 	}
 
 	switch {

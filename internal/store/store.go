@@ -133,8 +133,50 @@ type Decision struct {
 	Cumulative   any     // stored as jsonb; nil is NULL
 
 	Refused *string // the SQLSTATE Stet answered with instead of sending the statement; nil when it was sent
+
+	// The session's server process and when the gate was told the write's
+	// outcome. Insert records them, as backend_pid and the window the write
+	// was on the server, only when both are set (spec-v0.2-undo 5).
+	BackendPID *uint32   // the session's server process; nil when unknown or the write was not sent
+	DoneAt     time.Time // when the gate was told the outcome; zero when the write was not sent
 }
 
+// insertDecisionName is the prepared statement Insert runs, on each
+// connection of the pool it has used.
+const insertDecisionName = "stet_insert_decision"
+
+// insertDecision records one decision. The window its write was on the
+// server is computed on the database's clock (spec-v0.2-undo 5): $34 and $35
+// are how many microseconds ago, as Stet measured just before sending the
+// insert, the write arrived and the gate was told its outcome. NULL leaves
+// them NULL.
+const insertDecision = `
+	insert into stet.decisions (
+		id, created_at, mode, agent_id, on_behalf_of, session_id,
+		statement, statement_fp, params, op, target_table, target_pk, proposed,
+		state, state_version, model, model_version, questions, answers, policy_version,
+		verdict, reasons, executed, exec_error, latency_ms, model_latency_ms, cost_usd, impact,
+		login_role, rows_affected, cumulative, refused,
+		backend_pid, sent_after, done_before
+	) values (
+		$1, $2, $3, $4, $5, $6,
+		$7, $8, $9::jsonb, $10, $11, $12::jsonb, $13::jsonb,
+		$14::jsonb, $15::jsonb, $16, $17, $18::jsonb, $19::jsonb, $20,
+		$21, $22, $23, $24, $25, $26, $27, $28::jsonb,
+		$29, $30, $31::jsonb, $32,
+		$33, clock_timestamp() - $34::bigint * interval '1 microsecond',
+		clock_timestamp() - $35::bigint * interval '1 microsecond'
+	)`
+
+// Insert records d. Its backend pid and the window its write was on the
+// server (backend_pid, sent_after, done_before) are recorded only when
+// BackendPID is set and DoneAt is not zero; otherwise all three are NULL.
+// The two times are never Stet's clock: Insert measures how long ago
+// CreatedAt and DoneAt were (on the monotonic clock, for times taken with
+// time.Now) and the database subtracts that from its clock_timestamp(). So
+// that the insert's own trip to the server is all that falls between that
+// measurement and the server's clock, the connection is taken and the
+// statement prepared (once per connection) first.
 func (s *Store) Insert(ctx context.Context, d *Decision) error {
 	var pk any
 	if d.TargetPK != nil {
@@ -158,25 +200,27 @@ func (s *Store) Insert(ctx context.Context, d *Decision) error {
 	if reasons == nil {
 		reasons = []string{}
 	}
-	_, err := s.pool.Exec(ctx, `
-		insert into stet.decisions (
-			id, created_at, mode, agent_id, on_behalf_of, session_id,
-			statement, statement_fp, params, op, target_table, target_pk, proposed,
-			state, state_version, model, model_version, questions, answers, policy_version,
-			verdict, reasons, executed, exec_error, latency_ms, model_latency_ms, cost_usd, impact,
-			login_role, rows_affected, cumulative, refused
-		) values (
-			$1, $2, $3, $4, $5, $6,
-			$7, $8, $9::jsonb, $10, $11, $12::jsonb, $13::jsonb,
-			$14::jsonb, $15::jsonb, $16, $17, $18::jsonb, $19::jsonb, $20,
-			$21, $22, $23, $24, $25, $26, $27, $28::jsonb,
-			$29, $30, $31::jsonb, $32
-		)`,
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	if _, err := conn.Conn().Prepare(ctx, insertDecisionName, insertDecision); err != nil {
+		return err
+	}
+	var pid, sentAgo, doneAgo any
+	if d.BackendPID != nil && !d.DoneAt.IsZero() {
+		// The four bytes as the server's int4 reads them, as pg_backend_pid() does.
+		pid = int32(*d.BackendPID)
+		sentAgo, doneAgo = time.Since(d.CreatedAt).Microseconds(), time.Since(d.DoneAt).Microseconds()
+	}
+	_, err = conn.Exec(ctx, insertDecisionName,
 		d.ID, d.CreatedAt, d.Mode, d.AgentID, d.OnBehalfOf, d.SessionID,
 		d.Statement, d.StatementFP, params, d.Op, d.TargetTable, pk, proposed,
 		state, stateVersion, d.Model, d.ModelVersion, jsonArg(d.Questions), jsonArg(d.Answers), d.PolicyVersion,
 		d.Verdict, reasons, d.Executed, d.ExecError, d.LatencyMS, d.ModelLatencyMS, d.CostUSD, jsonArg(d.Impact),
 		d.LoginRole, d.RowsAffected, jsonArg(d.Cumulative), d.Refused,
+		pid, sentAgo, doneAgo,
 	)
 	return err
 }

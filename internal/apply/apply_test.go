@@ -634,6 +634,41 @@ func TestApplyFailsWhenStetCannotBecomeTheRole(t *testing.T) {
 	e.wantName(2, "next")
 }
 
+// The approved statement runs with stet.held_write set to the id of its held
+// write, which the capture trigger records (spec-v0.2-undo 4, step 7). The
+// setting is the transaction's own: the connection's next transaction does
+// not have it.
+func TestApprovedStatementSeesItsHeldWrite(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	e.exec("alter table " + table + " add column note text")
+	var next *string
+	called := false
+	apply.AfterCommit(e.a, func(ctx context.Context, conn *pgx.Conn) {
+		called = true
+		if err := conn.QueryRow(ctx, "select current_setting('stet.held_write', true)").Scan(&next); err != nil {
+			t.Errorf("read stet.held_write in the next transaction: %v", err)
+		}
+	})
+
+	h := e.update("update contacts set note = current_setting('stet.held_write', true) where id = 1", 1)
+	e.apply(e.approved(h, nil))
+	e.wantApplied(h.ID, 1)
+	var note *string
+	if err := e.pool.QueryRow(ctx, "select note from contacts where id = 1").Scan(&note); err != nil {
+		t.Fatal(err)
+	}
+	if note == nil || *note != h.ID {
+		t.Errorf("the statement saw stet.held_write %v, want %s, its held write's id", deref(note), h.ID)
+	}
+	if !called {
+		t.Fatal("the connection's next transaction was not reached")
+	}
+	if next != nil && *next != "" {
+		t.Errorf("the connection's next transaction has stet.held_write %q, want it empty", *next)
+	}
+}
+
 // An untyped text value is read under the agent session's DateStyle and
 // TimeZone, not under Stet's ("ISO, MDY" would read 2 January).
 func TestApplyReadsValuesUnderTheAgentsSettings(t *testing.T) {

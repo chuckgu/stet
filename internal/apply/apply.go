@@ -75,8 +75,9 @@ type Applier struct {
 
 	// Test seams.
 	markApplied     func(ctx context.Context, q store.Querier, id string, rows int64) error
-	beforeStatement func()                       // called once the checks pass, before the row's role and settings
-	applyOne        func(w store.Approved) error // what the loop calls for each write: Apply
+	beforeStatement func()                                    // called once the checks pass, before the row's role and settings
+	afterCommit     func(ctx context.Context, conn *pgx.Conn) // called once an applied write committed, with its connection
+	applyOne        func(w store.Approved) error              // what the loop calls for each write: Apply
 }
 
 func New(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, log *slog.Logger) *Applier {
@@ -178,6 +179,9 @@ func (a *Applier) apply(ctx context.Context, conn *pgx.Conn, w store.Approved) e
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit: %w", err)
+	}
+	if a.afterCommit != nil {
+		a.afterCommit(ctx, conn)
 	}
 	a.log.Info("held write applied", "id", c.ID, "login_role", c.LoginRole, "table", c.TargetTable, "rows", rows)
 	return nil
@@ -327,9 +331,14 @@ func (a *Applier) run(ctx context.Context, tx pgx.Tx, c *store.Claimed) (int64, 
 
 // become takes the row's role and its session's settings, which check found
 // all there, and the bounds of held.apply_timeout, for the rest of the
-// transaction (step 4).
+// transaction (step 4). It also sets stet.held_write to the row's id for the
+// transaction, which the capture trigger records with what the statement
+// changes (spec-v0.2-undo 4, step 7).
 func (a *Applier) become(ctx context.Context, tx pgx.Tx, c *store.Claimed) error {
 	if _, err := tx.Exec(ctx, "set local role "+pgx.Identifier{c.LoginRole}.Sanitize()); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, "select set_config('stet.held_write', $1, true)", c.ID); err != nil {
 		return err
 	}
 	for _, name := range sessionSettings {

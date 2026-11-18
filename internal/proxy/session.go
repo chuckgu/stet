@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
@@ -163,6 +164,9 @@ type SessionInfo struct {
 	// the server reported a change of one of the three, or while such a SET
 	// was not answered. Like them, followed on enforced sessions only.
 	SetPending bool
+	// BackendPID is the server process of the session, from its BackendKeyData;
+	// 0 until the server sent it.
+	BackendPID uint32
 }
 
 type Outcome struct {
@@ -450,10 +454,12 @@ func (s *session) clientTap() *tap {
 	return &tap{want: want, see: s.fromClient}
 }
 
+// serverTap follows the server's completions, errors and ReadyForQuery, and
+// its one BackendKeyData (see backendKey), in both modes.
 func (s *session) serverTap() *tap {
 	want := func(t byte) bool {
 		switch t {
-		case 'C', 'I', 's', 'E', 'Z':
+		case 'C', 'I', 's', 'E', 'Z', 'K':
 			return true
 		}
 		return false
@@ -463,7 +469,7 @@ func (s *session) serverTap() *tap {
 		// CopyBothResponse (see copyIn). Rows are still not shown.
 		want = func(t byte) bool {
 			switch t {
-			case 'C', 'I', 's', 'E', 'Z', 'S', 'G', 'W':
+			case 'C', 'I', 's', 'E', 'Z', 'K', 'S', 'G', 'W':
 				return true
 			}
 			return false
@@ -1271,6 +1277,8 @@ func (s *session) fromServer(t byte, body []byte) ([]byte, error) {
 		}
 	case 'Z':
 		done = s.readyForQuery(head, body, done)
+	case 'K':
+		s.backendKey(body)
 	case 'S': // enforced sessions only
 		err = s.parameter(head, body)
 	case 'G', 'W': // enforced sessions only
@@ -1279,6 +1287,19 @@ func (s *session) fromServer(t byte, body []byte) ([]byte, error) {
 	s.mu.Unlock()
 	s.finishAll(done)
 	return out, err
+}
+
+// backendKey notes the session's server process from the body of the
+// server's BackendKeyData, which it sends once, before its first
+// ReadyForQuery: the gate records it so that what a write changed can be
+// linked to its decision (spec-v0.2-undo 5). The body starts with the
+// process id (Int32), followed by the secret key; the message is forwarded
+// as it came, in either mode (rule 6). A body too short to hold an id leaves
+// the pid unknown. It runs on the server side with s.mu held.
+func (s *session) backendKey(body []byte) {
+	if len(body) >= 4 {
+		s.info.BackendPID = binary.BigEndian.Uint32(body)
+	}
 }
 
 // readyForQuery follows a ReadyForQuery with body body, which answers head

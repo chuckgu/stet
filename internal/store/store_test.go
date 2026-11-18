@@ -580,6 +580,78 @@ func TestInsertRecordsLoginRoleAndRows(t *testing.T) {
 	}
 }
 
+// A decision records its session's backend pid and the window its write was
+// on the server, both times on the database's clock: Insert sends how long
+// ago CreatedAt and DoneAt were, never a time of Stet's own clock
+// (spec-v0.2-undo 5). Without a pid or a DoneAt all three are NULL.
+func TestInsertRecordsTheBackendWindow(t *testing.T) {
+	s, pool := testStore(t)
+	ctx := context.Background()
+	clock := func() time.Time {
+		t.Helper()
+		var at time.Time
+		if err := pool.QueryRow(ctx, "select clock_timestamp()").Scan(&at); err != nil {
+			t.Fatal(err)
+		}
+		return at
+	}
+	type window struct {
+		pid        *int64
+		sent, done *time.Time
+	}
+	read := func(id string) window {
+		t.Helper()
+		var w window
+		if err := pool.QueryRow(ctx, "select backend_pid, sent_after, done_before from stet.decisions where id = $1", id).
+			Scan(&w.pid, &w.sent, &w.done); err != nil {
+			t.Fatal(err)
+		}
+		return w
+	}
+
+	d := sample(uniqueTable(t))
+	before := clock()
+	now := time.Now()
+	d.CreatedAt, d.DoneAt, d.BackendPID = now.Add(-300*time.Millisecond), now.Add(-100*time.Millisecond), ptr(uint32(4242))
+	if err := s.Insert(ctx, d); err != nil {
+		t.Fatal(err)
+	}
+	after := clock()
+	w := read(d.ID)
+	if w.pid == nil || *w.pid != 4242 {
+		t.Errorf("backend_pid = %v, want 4242", deref(w.pid))
+	}
+	const slack = 50 * time.Millisecond
+	for _, c := range []struct {
+		name string
+		got  *time.Time
+		ago  time.Duration
+	}{{"sent_after", w.sent, 300 * time.Millisecond}, {"done_before", w.done, 100 * time.Millisecond}} {
+		lo, hi := before.Add(-c.ago-slack), after.Add(-c.ago+slack)
+		if c.got == nil || c.got.Before(lo) || c.got.After(hi) {
+			t.Errorf("%s = %v, want between %v and %v: the database's clock around the insert, less %v",
+				c.name, deref(c.got), lo, hi, c.ago)
+		}
+	}
+	if w.sent != nil && w.done != nil && !w.sent.Before(*w.done) {
+		t.Errorf("sent_after %v is not before done_before %v", *w.sent, *w.done)
+	}
+
+	noPID := sample(uniqueTable(t))
+	noPID.DoneAt = time.Now()
+	notDone := sample(uniqueTable(t))
+	notDone.BackendPID = ptr(uint32(4242))
+	for name, d := range map[string]*store.Decision{"no backend pid": noPID, "no DoneAt": notDone} {
+		if err := s.Insert(ctx, d); err != nil {
+			t.Fatal(err)
+		}
+		if w := read(d.ID); w.pid != nil || w.sent != nil || w.done != nil {
+			t.Errorf("%s: backend_pid %v, sent_after %v, done_before %v; want all NULL",
+				name, deref(w.pid), deref(w.sent), deref(w.done))
+		}
+	}
+}
+
 func TestInsertLeavesNewColumnsNull(t *testing.T) {
 	s, pool := testStore(t)
 	d := sample(uniqueTable(t))

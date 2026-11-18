@@ -711,6 +711,122 @@ func TestShadowHoldsOnTheBrokenRule(t *testing.T) {
 
 func ptr[T any](v T) *T { return &v }
 
+// backendWindow is what a decision records of the backend that ran its write
+// and when the write was on the server (spec-v0.2-undo 5).
+type backendWindow struct {
+	PID        *int64
+	SentAfter  *time.Time
+	DoneBefore *time.Time
+}
+
+// windows is the backend window of each decision on the env's table, oldest
+// first. Wait for the decisions first (decisions, enforced).
+func (e *env) windows(t *testing.T) []backendWindow {
+	t.Helper()
+	rows, err := e.admin.Query(context.Background(), `
+		select backend_pid, sent_after, done_before
+		from stet.decisions where target_table = $1 order by created_at`, e.table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws, err := pgx.CollectRows(rows, pgx.RowToStructByPos[backendWindow])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ws
+}
+
+// serverPID is the backend pid of conn's session, as the server names it.
+func serverPID(t *testing.T, conn *pgx.Conn) int64 {
+	t.Helper()
+	var pid int64
+	if err := conn.QueryRow(context.Background(), "select pg_backend_pid()").Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	return pid
+}
+
+// stampedAt is when the server took the statement that wrote its
+// statement_timestamp() into the title of row id.
+func (e *env) stampedAt(t *testing.T, id int) time.Time {
+	t.Helper()
+	var at time.Time
+	if err := e.admin.QueryRow(context.Background(),
+		"select title::timestamptz from "+e.table+" where id = $1", id).Scan(&at); err != nil {
+		t.Fatal(err)
+	}
+	return at
+}
+
+// wantWindowAround checks that w names the backend pid and holds ran, when the
+// server took the write, as the linking rule reads the window: from 10ms
+// before sent_after to done_before (spec-v0.2-undo 5). done_before is when
+// the gate was told the outcome, which follows the write by far less than
+// within.
+func wantWindowAround(t *testing.T, w backendWindow, pid int64, ran time.Time, within time.Duration) {
+	t.Helper()
+	if w.PID == nil || *w.PID != pid {
+		t.Errorf("backend_pid = %v, want %d, the session's pg_backend_pid()", deref(w.PID), pid)
+	}
+	if w.SentAfter == nil || w.DoneBefore == nil {
+		t.Fatalf("sent_after %v, done_before %v; want both set for a write that was sent", deref(w.SentAfter), deref(w.DoneBefore))
+	}
+	if !w.SentAfter.Before(*w.DoneBefore) {
+		t.Errorf("sent_after %v is not before done_before %v", *w.SentAfter, *w.DoneBefore)
+	}
+	if ran.Before(w.SentAfter.Add(-10*time.Millisecond)) || ran.After(*w.DoneBefore) {
+		t.Errorf("the write ran at %v, outside the window from %v (sent_after less 10ms) to %v (done_before)",
+			ran, w.SentAfter.Add(-10*time.Millisecond), *w.DoneBefore)
+	}
+	if gap := w.DoneBefore.Sub(ran); gap > within {
+		t.Errorf("done_before is %v after the write ran, want at most %v", gap, within)
+	}
+}
+
+// A decision on a write that was sent records the backend pid of its session
+// and the window the write was on the server, on the database's clock: in
+// shadow mode too, where the model is asked after the write, so the decision
+// is recorded long after the write ended. A write enforce mode refused was
+// not sent: all three are NULL (spec-v0.2-undo 5).
+func TestDecisionCarriesTheBackendWindow(t *testing.T) {
+	const stamp = "update %s set title = statement_timestamp()::text where id = %d"
+	t.Run("shadow", func(t *testing.T) {
+		d := calm()
+		d.delay = 500 * time.Millisecond // asked after the write; the decision is recorded once it answers
+		e := setup(t, d)
+		e.seed(t)
+		conn := e.connect(t, "enricher")
+		pid := serverPID(t, conn)
+		mustExec(t, conn, fmt.Sprintf(stamp, e.table, 1))
+
+		if r := e.decisions(t, 1)[0]; !r.Executed {
+			t.Fatalf("the write was not executed: %+v", r)
+		}
+		wantWindowAround(t, e.windows(t)[0], pid, e.stampedAt(t, 1), 250*time.Millisecond)
+	})
+	t.Run("enforce", func(t *testing.T) {
+		d := calm()
+		e := setupEnforce(t, d)
+		e.seed(t)
+		conn := e.agent(t, "a")
+		pid := serverPID(t, conn)
+		mustExec(t, conn, fmt.Sprintf(stamp, e.table, 1))
+		d.setAnswers(holding().answers)
+		_, err := conn.Exec(context.Background(), "update "+e.table+" set status = 'churned' where id = 2")
+		wantRefused(t, err, "ST001", "write held by stet: ")
+
+		rs := e.enforced(t, 2)
+		wantEnforced(t, 0, rs[0], "commit")
+		wantRefusedRecord(t, 1, rs[1], "ST001")
+		ws := e.windows(t)
+		wantWindowAround(t, ws[0], pid, e.stampedAt(t, 1), 250*time.Millisecond)
+		if w := ws[1]; w.PID != nil || w.SentAfter != nil || w.DoneBefore != nil {
+			t.Errorf("refused write: backend_pid %v, sent_after %v, done_before %v; want all NULL",
+				deref(w.PID), deref(w.SentAfter), deref(w.DoneBefore))
+		}
+	})
+}
+
 func TestShadowAsksConflictOnlyWhenARecentChangeCouldBeUndone(t *testing.T) {
 	e := setup(t, calm())
 	e.seed(t)
