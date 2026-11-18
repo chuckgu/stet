@@ -425,13 +425,23 @@ $$;
 -- skipped = 'capture_failed'와 detail의 SQLSTATE, 메시지로 남긴다. 그것도 실패하면 서버 로그(RAISE LOG)에만 남긴다.
 -- client_min_messages가 warning이므로 클라이언트에게는 아무것도 가지 않는다. WHEN OTHERS는 시간 초과와 취소(57014)를
 -- 잡지 않으므로 그때는 쓰기가 실패한다. lock_timeout(55P03)은 잡는다.
+-- 삼키면 에이전트가 일으켜 쓰기를 기록도 표지도 없이 커밋시킬 수 있는 에러는 쓰기로 되돌려 보낸다(계획의 판정 R8). 쓰기가
+-- 실패해 다시 보내지는 것은 안전하고, 기록 없이 커밋되는 것은 안전하지 않다.
+-- - serialization_failure(40001)는 두 블록 모두 되돌려 보낸다. SERIALIZABLE에서는 캡처가 stet의 표를 읽고 쓰는 것이 세션
+--   사이에 충돌하고, 에이전트는 두 세션으로 이것을 일으킨다. 표지를 쓰는 블록도 같은 충돌에 걸린다.
+-- - 자원과 한도(53, 54 부류, 예를 들어 깊은 함수 호출 끝에서 캡처만 스택이 모자라는 54001)는 아무것도 남길 수 없을 때,
+--   곧 표지를 쓰는 블록이 실패했거나 세는 것이 실패했을 때만 되돌려 보낸다. 큰 블록만 실패하면 표지가 남는다.
+-- - 교착(40P01)은 삼킨다. 캡처는 stet의 표의 잠금만 기다리고, 에이전트는 그 표를 잠글 수 없으므로 캡처가 낀 교착을 만들 수
+--   없다. REPEATABLE READ의 40001도 같은 코드라 되돌려 보내지만, 캡처의 문장(삽입과 잠그지 않는 읽기)은 그것을 내지 않는다.
 -- 한 트랜잭션의 상한. EXCEPTION 블록은 하위 트랜잭션이고, 표에 쓸 때만 자기 트랜잭션 id를 받는다. 커밋된 하위 트랜잭션의
 -- id는 트랜잭션이 끝날 때까지 백엔드의 캐시(64개)에 남고, 넘치면 서버 전체의 스냅숏 확인이 느려진다. 되돌려진 하위
 -- 트랜잭션은 자리를 돌려준다. 표에 쓰는 캡처 하나는 id 하나만 남긴다: 값이나 표지를 남기면 큰 블록의 것, 실패하면 큰 블록은
 -- 되돌려지고 표지를 쓴 작은 블록의 것이다. 그래서 한 트랜잭션에서 표에 쓰는 것은 32번까지다. 31번 썼으면 다음에 쓰는 것은
 -- too_many_statements 표지 하나이고, 그 뒤로는 아무것도 쓰지 않는다.
--- 쓴 횟수(done)는 이 트랜잭션의 id로 남은 묶음의 수다(change_sets_txid_idx). 캡처할 때마다 센다. 세션의 값(설정)으로 세지
--- 않는다. 에이전트가 적을 수 있는 값이어서, 낮추면 상한을 넘어 표지 없이 남기지 않게 되고 높이면 캡처가 꺼졌다(계획의 판정
+-- 쓴 횟수(done)는 이 백엔드가 이 트랜잭션의 id로 남긴 묶음의 수다(change_sets_txid_idx). 한 트랜잭션의 묶음은 모두 한
+-- 백엔드의 것이다. pid도 보는 것은 다른 클러스터에서 옮겨 온 묶음(pg_dump, 논리 복제)이 같은 txid를 가질 수 있어서다.
+-- 겹칠 수는 여전히 있지만 드물다(계획의 판정 R9).
+-- 캡처할 때마다 센다. 세션의 값(설정)으로 세지 않는다. 에이전트가 적을 수 있는 값이어서, 낮추면 상한을 넘어 표지 없이 남기지 않게 되고 높이면 캡처가 꺼졌다(계획의 판정
 -- R7, 보정 U9를 대신한다). 되돌려진 쓰기의 묶음은 보이지 않으므로 세지 않는다. 그 하위 트랜잭션도 자리를 돌려주었다.
 -- 시각으로 고르지 않는다. 프로시저가 COMMIT한 뒤의 트랜잭션에서는 문장의 statement_timestamp()가 그 트랜잭션의 now()보다
 -- 이르다(같은 Sync 아래 뒤따르는 문장도 그 트랜잭션에 든다). 묶음의 txid는 txid_current()다. 트랜잭션이 id를 받기 전에
@@ -508,7 +518,7 @@ BEGIN
     IF tx IS NULL THEN
       done := 0;
     ELSE
-      SELECT count(*) INTO done FROM stet.change_sets s WHERE s.txid = tx;
+      SELECT count(*) INTO done FROM stet.change_sets s WHERE s.txid = tx AND s.pid = pg_backend_pid();
     END IF;
     IF done >= 32 THEN
       RETURN NULL;
@@ -601,9 +611,12 @@ BEGIN
     END IF;
 
     RETURN NULL;
-  EXCEPTION WHEN OTHERS THEN
-    GET STACKED DIAGNOSTICS code = RETURNED_SQLSTATE, message = MESSAGE_TEXT;
-    failure := code || ': ' || message;
+  EXCEPTION
+    WHEN serialization_failure THEN
+      RAISE;
+    WHEN OTHERS THEN
+      GET STACKED DIAGNOSTICS code = RETURNED_SQLSTATE, message = MESSAGE_TEXT;
+      failure := code || ': ' || message;
   END;
 
   -- 큰 블록 안의 길은 모두 RETURN으로 끝난다. 여기에 오는 것은 큰 블록이 실패했을 때뿐이다. 새 길을 더할 때도 RETURN으로
@@ -613,9 +626,13 @@ BEGIN
   END IF;
   -- 캡처가 실패했다. 블록 안의 변수(agent, held, changed, counting, done)는 되돌려지지 않고 남아 있다. 세는 것 자체가
   -- 실패했으면 다시 세지 않고 쓰지도 않는다(위의 주석).
+  -- 자원이나 한도 때문이면(53, 54) 쓰기를 실패시킨다(위의 주석).
   IF counting AND done IS NULL THEN
-    RAISE LOG 'stet.capture() on %.% (trigger %, pid %): could not count what this transaction recorded (%), so recorded nothing',
-      TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_NAME, pg_backend_pid(), failure;
+    IF left(code, 2) IN ('53', '54') THEN
+      RAISE EXCEPTION USING ERRCODE = code, MESSAGE = message;
+    END IF;
+    RAISE LOG 'stet.capture() on %.% (trigger %, pid %, txid %, agent %): could not count what this transaction recorded (%), so recorded nothing',
+      TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_NAME, pg_backend_pid(), tx, agent, failure;
     RETURN NULL;
   END IF;
   -- 세기 전에 실패했으면 여기서 센다. 상한에 닿았으면 쓰지 않고, 32번째면 too_many_statements 표지를 쓴다. 이 표지를 쓰는
@@ -626,7 +643,7 @@ BEGIN
       IF tx IS NULL THEN
         done := 0;
       ELSE
-        SELECT count(*) INTO done FROM stet.change_sets s WHERE s.txid = tx;
+        SELECT count(*) INTO done FROM stet.change_sets s WHERE s.txid = tx AND s.pid = pg_backend_pid();
       END IF;
     END IF;
     IF done >= 32 THEN
@@ -638,10 +655,13 @@ BEGIN
             current_setting('application_name'), held,
             coalesce(TG_ARGV[0], ''), coalesce(TG_ARGV[1], ''), TG_RELID, lower(TG_OP), current_query(), changed,
             CASE WHEN done = 31 THEN 'too_many_statements' ELSE 'capture_failed' END, failure);
-  EXCEPTION WHEN OTHERS THEN
-    GET STACKED DIAGNOSTICS code = RETURNED_SQLSTATE, message = MESSAGE_TEXT;
-    RAISE LOG 'stet.capture() on %.% (trigger %, pid %): capture failed with %, and recording that failed with %: %',
-      TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_NAME, pg_backend_pid(), failure, code, message;
+  EXCEPTION
+    WHEN serialization_failure OR insufficient_resources OR program_limit_exceeded THEN
+      RAISE;
+    WHEN OTHERS THEN
+      GET STACKED DIAGNOSTICS code = RETURNED_SQLSTATE, message = MESSAGE_TEXT;
+      RAISE LOG 'stet.capture() on %.% (trigger %, pid %): capture failed with %, and recording that failed with %: %',
+        TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_NAME, pg_backend_pid(), failure, code, message;
   END;
   RETURN NULL;
 END

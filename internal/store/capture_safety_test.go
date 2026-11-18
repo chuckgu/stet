@@ -990,3 +990,254 @@ func TestMigrateDoesNotWaitForAnOpenCapture(t *testing.T) {
 	}
 	checkLines(t, changesOf(t, pool, "deals"), open, changeLine{Op: "update", Key: "1", Before: deal("1", "Acme", "10"), After: deal("1", "Acme", "11")})
 }
+
+// sessionStep is one step of twoSessions: session who (0 or 1) writes the row
+// id of its table, or commits when id is 0.
+type sessionStep struct{ who, id int }
+
+// twoSessions runs steps on two agent connections, each in one transaction at
+// isolation, session 0 writing public.<prefix>_a and session 1
+// public.<prefix>_b (rows 1 and 2, v 0). It checks that every write either
+// committed with its row written and something recorded for it (a set or a
+// marker), or failed (its statement or its commit) with 40001 and left its
+// row as it was. It returns how many 40001 errors the sessions saw.
+func twoSessions(t *testing.T, pool *pgxpool.Pool, db, prefix, isolation string, steps []sessionStep) int {
+	t.Helper()
+	ctx := context.Background()
+	owner := superuserIn(t, db)
+	tables := [2]string{"public." + prefix + "_a", "public." + prefix + "_b"}
+	for _, table := range tables {
+		mustExec(t, owner, "create table "+table+" (id int primary key, v int)", "insert into "+table+" values (1, 0), (2, 0)")
+		installCapture(t, owner, table, table, "id")
+	}
+	conns := [2]*pgx.Conn{agentIn(t, db), agentIn(t, db)}
+	for _, c := range conns {
+		mustExec(t, c, "begin isolation level "+isolation)
+	}
+	type write struct {
+		who, id, v int
+		sql        string
+		failed     bool
+	}
+	var writes []write
+	var failed, committed [2]bool
+	serialization := 0
+	codeOf := func(err error) string {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			return pgErr.Code
+		}
+		return err.Error()
+	}
+	for _, s := range steps {
+		c := conns[s.who]
+		if s.id == 0 {
+			if failed[s.who] {
+				mustExec(t, c, "rollback")
+				continue
+			}
+			if _, err := c.Exec(ctx, "commit"); err != nil {
+				if code := codeOf(err); code != "40001" {
+					t.Errorf("session %d: commit failed with %s, want 40001 or none", s.who, code)
+				}
+				t.Logf("session %d: commit failed: %v", s.who, err)
+				serialization++
+				continue
+			}
+			committed[s.who] = true
+			continue
+		}
+		if failed[s.who] {
+			continue
+		}
+		w := write{who: s.who, id: s.id, v: 100*(s.who+1) + s.id}
+		w.sql = fmt.Sprintf("update %s set v = %d where id = %d", tables[s.who], w.v, s.id)
+		if _, err := c.Exec(ctx, w.sql); err != nil {
+			if code := codeOf(err); code != "40001" {
+				t.Errorf("session %d: %s failed with %s, want 40001 or none", s.who, w.sql, code)
+			}
+			t.Logf("session %d: %s failed: %v", s.who, w.sql, err)
+			serialization++
+			failed[s.who], w.failed = true, true
+		}
+		writes = append(writes, w)
+	}
+	for _, w := range writes {
+		v := countOf(t, owner, "select v from "+tables[w.who]+" where id = $1", w.id)
+		recorded := countOf(t, pool, `select count(*) from stet.change_sets where query = $1`, w.sql)
+		if committed[w.who] && !w.failed {
+			if v != int64(w.v) || recorded == 0 {
+				t.Errorf("%s committed: row v %d, %d sets for it; want v %d and its record", w.sql, v, recorded, w.v)
+			}
+		} else if v != 0 || recorded != 0 {
+			t.Errorf("%s did not commit: row v %d, %d sets for it; want the row as it was and no record", w.sql, v, recorded)
+		}
+	}
+	return serialization
+}
+
+// Under SERIALIZABLE, capture's own reads and writes of Stet's tables
+// conflict across sessions: two agent sessions, each writing its own captured
+// table, make one of them fail with 40001. Capture does not swallow that
+// (ruling R8): a write that capture could not record because of it fails, and
+// is retried, instead of committing with no set and no marker. Both orders,
+// for captures that record values and for captures that record only a marker
+// (max_rows 0). READ COMMITTED sessions do the same and are unaffected: every
+// write commits with its record.
+func TestCaptureLetsSerializationFailuresThrough(t *testing.T) {
+	interleaved := []sessionStep{{0, 1}, {1, 1}, {0, 2}, {1, 2}, {0, 0}, {1, 0}}
+	secondCommitsFirst := []sessionStep{{0, 1}, {1, 1}, {1, 0}, {0, 2}, {0, 0}}
+	for _, mode := range []struct {
+		name    string
+		maxRows int64
+	}{{"values", 10000}, {"markers only", 0}} {
+		for _, order := range []struct {
+			name  string
+			steps []sessionStep
+		}{{"interleaved writes", interleaved}, {"second commits first", secondCommitsFirst}} {
+			t.Run(mode.name+", "+order.name, func(t *testing.T) {
+				pool, db := captureDB(t)
+				setCapture(t, pool, nil, mode.maxRows)
+				if n := twoSessions(t, pool, db, "ser", "serializable", order.steps); n == 0 {
+					t.Error("no session saw 40001; the test shows nothing")
+				}
+			})
+		}
+	}
+	t.Run("read committed", func(t *testing.T) {
+		pool, db := captureDB(t)
+		if n := twoSessions(t, pool, db, "rc", "read committed", secondCommitsFirst); n != 0 {
+			t.Errorf("%d serialization failures under read committed, want none", n)
+		}
+	})
+}
+
+// A write made deep in nested calls can leave capture, which runs on top of
+// it, without stack: one level deeper fails the write itself, and at the
+// right depth capture runs out (54001) where nothing can be recorded while the
+// write fits. Such a write fails rather than committing unrecorded, at every
+// depth near the limit: each call either fails with 54001 and changes
+// nothing, or commits with its record (values or a capture_failed marker).
+// Plainly, the count is what runs out. With inserts into stet.change_sets
+// made deeper on purpose (a BEFORE INSERT trigger that recurses, in this
+// test's own database), the count fits and both the set and the marker run
+// out.
+func TestCaptureFailsAWriteItHasNoStackToRecord(t *testing.T) {
+	t.Run("the count runs out", func(t *testing.T) {
+		pool, db := captureDB(t)
+		noStackToRecord(t, pool, db)
+	})
+	t.Run("the marker runs out", func(t *testing.T) {
+		pool, db := captureDB(t)
+		mustExec(t, pool,
+			`create function stet.deeper(n int) returns int language plpgsql as $$
+			 begin
+			   if n > 0 then
+			     return stet.deeper(n - 1);
+			   end if;
+			   return 0;
+			 end $$`,
+			`create function stet.deeper_insert() returns trigger language plpgsql as $$
+			 begin
+			   perform stet.deeper(60);
+			   return new;
+			 end $$`,
+			`create trigger deeper_insert before insert on stet.change_sets for each row execute function stet.deeper_insert()`)
+		noStackToRecord(t, pool, db)
+	})
+}
+
+// noStackToRecord makes the calls of TestCaptureFailsAWriteItHasNoStackToRecord
+// in db and checks them.
+func noStackToRecord(t *testing.T, pool *pgxpool.Pool, db string) {
+	t.Helper()
+	ctx := context.Background()
+	owner := superuserIn(t, db)
+	mustExec(t, owner,
+		`create table public.plain (id int primary key, v int)`,
+		`insert into public.plain select g, 0 from generate_series(1, 100) g`,
+		`create table public.items (id int primary key, v int)`,
+		`insert into public.items select g, 0 from generate_series(1, 100) g`,
+		// dive calls itself n times, then adds 1 to the row k of tbl.
+		`create function public.dive(tbl text, n int, k int) returns int language plpgsql as $$
+		 begin
+		   if n > 0 then
+		     return public.dive(tbl, n - 1, k);
+		   end if;
+		   execute format('update %s set v = v + 1 where id = %s', tbl, k);
+		   return 0;
+		 end $$`)
+	installCapture(t, owner, "public.items", "items", "id")
+	agent := agentIn(t, db)
+	call := func(table string, n, k int) (string, error) {
+		sql := fmt.Sprintf(`select public.dive('%s', %d, %d)`, table, n, k)
+		_, err := agent.Exec(ctx, sql)
+		return sql, err
+	}
+
+	// The deepest call that succeeds on a table without capture.
+	lo, hi := 1, 100000
+	for lo < hi {
+		if mid := (lo + hi + 1) / 2; func() error { _, err := call("public.plain", mid, 1); return err }() == nil {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	captureFailed := 0
+	for i := range 80 {
+		n, k := lo-i, i+1
+		sql, err := call("public.items", n, k)
+		v := countOf(t, owner, `select v from public.items where id = $1`, k)
+		changes := changesWhere(t, pool, `s.query = $1`, sql)
+		var pgErr *pgconn.PgError
+		switch {
+		case err != nil && errors.As(err, &pgErr) && pgErr.Code == "54001":
+			if captureFailed == 0 || v != 0 || len(changes) != 0 {
+				t.Logf("depth %d (deepest without capture %d): the write failed with 54001", n, lo)
+			}
+			captureFailed++
+			if v != 0 || len(changes) != 0 {
+				t.Errorf("depth %d failed with 54001 but row v is %d and %d lines recorded", n, v, len(changes))
+			}
+		case err != nil:
+			t.Errorf("depth %d: %v, want 54001 or none", n, err)
+		case len(changes) == 0:
+			t.Errorf("depth %d: the write committed (row v %d) with nothing recorded", n, v)
+		case deref(changes[0].Skipped) == "capture_failed":
+			t.Logf("depth %d: committed with a capture_failed set: %v", n, deref(changes[0].Detail))
+			captureFailed++
+		}
+	}
+	if captureFailed == 0 {
+		t.Errorf("capture never ran out of stack near depth %d; the test shows nothing", lo)
+	}
+}
+
+// The count takes only this backend's sets of this transaction id. Sets with
+// the same txid from another cluster (restored by pg_dump or replicated) are
+// not this transaction's (ruling R9).
+func TestCaptureCountsOnlyThisBackendsSets(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	dealsTable(t, superuserIn(t, db))
+	const write = `update public.deals set amount = 11 where id = 1`
+	err := pgx.BeginFunc(ctx, agentIn(t, db), func(tx pgx.Tx) error {
+		var txid int64
+		if err := tx.QueryRow(ctx, `select txid_current()`).Scan(&txid); err != nil {
+			return err
+		}
+		if _, err := pool.Exec(ctx, `insert into stet.change_sets (at, stmt_at, txid, pid, login_role, agent_role,
+			target_table, key_column, relid, op, rows)
+			select now(), now(), $1, 0, 'restored', 'restored', 'restored', 'id', 0, 'update', 1 from generate_series(1, 40)`, txid); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, write)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkLines(t, changesOf(t, pool, "deals"), write,
+		changeLine{Op: "update", Key: "1", Before: deal("1", "Acme", "10"), After: deal("1", "Acme", "11")})
+}
