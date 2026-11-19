@@ -786,14 +786,14 @@ BEGIN
   IF current_setting('transaction_isolation') <> 'read committed' THEN
     RAISE EXCEPTION 'undo runs only in a READ COMMITTED transaction; this one is %',
       upper(current_setting('transaction_isolation'))
-      USING ERRCODE = 'ST006', HINT = 'Use BEGIN ISOLATION LEVEL READ COMMITTED, or call it outside a transaction block.';
+      USING ERRCODE = 'ST006', HINT = 'Call it inside BEGIN ISOLATION LEVEL READ COMMITTED; ... COMMIT.';
   END IF;
 END
 $$;
 
 -- 고르기 (7장 "고르기"). 검토자는 stet.change_sets와 stet.changes를 읽을 권한이 없으므로, 기록을 읽는 것은 이 함수뿐이고
 -- 소유자(Stet의 계정)의 권한으로 돈다(SECURITY DEFINER). 그래서 이 함수로 읽을 수 있는 것을 좁힌다.
--- - 먼저 stet.undo_refuse로 네 거절을 한다. 에이전트가 이 함수의 권한을 받았어도 자기 기록은 읽지 못한다.
+-- - 먼저 stet.undo_refuse로 다섯 거절을 한다. 에이전트가 이 함수의 권한을 받았어도 자기 기록은 읽지 못한다.
 -- - 인자로 고른 것만 돌려준다: agent_role의 묶음 가운데 at이 since 이상 until 미만(until이 NULL이면 지금까지)이고, tables가
 --   있으면 target_table이 그 안에 있는 것. 돌려주는 컬럼은 아래의 열셋뿐이다. 부른 쪽의 식이나 이름을 평가하지 않는다.
 -- - 부른 세션이 읽을 수 없는 테이블은 키를 하나도 보이지 않는다(계획의 판정 R11). 키도 데이터다(이메일 같은 자연 키).
@@ -947,32 +947,80 @@ BEGIN
 END
 $$;
 
+-- 잠그고 컬럼을 읽기. stet.undo_judge와 stet.undo_row가 테이블을 잠그고 그 컬럼을 읽는 한 곳이다. 둘의 비교는 모두 이
+-- 함수가 잠근 뒤에 읽은 컬럼으로 한다. 부른 계정의 권한으로 돈다(SECURITY INVOKER). READ COMMITTED 트랜잭션에서만 돈다
+-- (stet.undo_refuse와 같은 ST006. 판정 R15). 돌려주는 것은 한 줄이다: table_name(지금의 이름, SQL에 그대로 쓸 수 있게
+-- 인용된 것)과 column_names(지워지지 않은 컬럼, attnum 순).
+-- 순서. READ COMMITTED에서는 문장마다 그 문장이 시작할 때의 카탈로그를 읽는다. 다른 세션이 두 문장 사이에 테이블의 이름을
+-- 바꾸거나, 테이블을 지우고 다시 만들거나, 컬럼을 바꿀 수 있으므로:
+-- 1. relid가 보통 테이블이 아니면 undefined_table이다.
+-- 2. 이름은 relid의 regclass 출력이다(바꾼 이름도 따라간다). 1 뒤에 테이블이 지워졌으면 출력이 oid의 숫자이므로
+--    undefined_table이다.
+-- 3. 그 이름으로 테이블을 ACCESS SHARE로 잠근다(SELECT 권한이 없으면 여기서 42501이다). 잠금을 기다리는 동안 이름이 다른
+--    테이블을 가리키게 됐으면 PostgreSQL은 그 테이블을 잠그므로, 잠근 뒤 이름이 아직 relid인지 본다. 다르면
+--    object_not_in_prerequisite_state다. 잠근 뒤에는 트랜잭션이 끝날 때까지 그 테이블의 이름, 컬럼, 행 수준 보안을 바꾸는
+--    ALTER TABLE이 기다린다.
+-- 4. 행 수준 보안이 부른 역할에게 적용되면 42501이다(판정 R16). 숨긴 행을 "없는 행"으로 읽으면 insert가 될 수 있다.
+--    stet.undo_selection은 고를 때의 카탈로그와, 지금의 역할이 아니라 세션이 될 수 있는 역할로 판단하기 때문이다.
+-- 5. 잠근 뒤에 시작하는 문장으로 컬럼을 읽는다. 그래서 지금의 컬럼이고, 트랜잭션이 끝날 때까지 바뀌지 않는다.
+CREATE OR REPLACE FUNCTION stet.undo_lock(relid oid) RETURNS TABLE (table_name text, column_names text[])
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+SET DateStyle = 'ISO, MDY'
+SET IntervalStyle = 'postgres'
+SET extra_float_digits = 1
+SET TimeZone = 'UTC'
+SET bytea_output = 'hex'
+SET client_min_messages = warning
+AS $$
+DECLARE
+  tbl text;
+BEGIN
+  IF current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'undo runs only in a READ COMMITTED transaction; this one is %',
+      upper(current_setting('transaction_isolation'))
+      USING ERRCODE = 'ST006', HINT = 'Call it inside BEGIN ISOLATION LEVEL READ COMMITTED; ... COMMIT.';
+  END IF;
+  IF NOT EXISTS (SELECT FROM pg_catalog.pg_class cl WHERE cl.oid = undo_lock.relid AND cl.relkind = 'r') THEN
+    RAISE EXCEPTION 'no table has the oid %', undo_lock.relid USING ERRCODE = 'undefined_table';
+  END IF;
+  tbl := format('%s', undo_lock.relid::pg_catalog.regclass);
+  IF tbl ~ '^[0-9]+$' THEN
+    RAISE EXCEPTION 'no table has the oid %', undo_lock.relid USING ERRCODE = 'undefined_table';
+  END IF;
+  EXECUTE format('LOCK TABLE ONLY %s IN ACCESS SHARE MODE', tbl);
+  IF pg_catalog.to_regclass(tbl) IS DISTINCT FROM undo_lock.relid THEN
+    RAISE EXCEPTION 'the table with oid % was renamed or replaced while it was read', undo_lock.relid
+      USING ERRCODE = 'object_not_in_prerequisite_state';
+  END IF;
+  IF pg_catalog.row_security_active(undo_lock.relid) THEN
+    RAISE EXCEPTION 'row-level security on % applies to %', tbl, current_user USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  table_name := tbl;
+  SELECT array_agg(att.attname::text ORDER BY att.attnum) INTO column_names
+    FROM pg_catalog.pg_attribute att
+   WHERE att.attrelid = undo_lock.relid AND att.attnum > 0 AND NOT att.attisdropped;
+  RETURN NEXT;
+END
+$$;
+
 -- 지금 그 키의 행 (7장 "비교는 남길 때와 같은 방법으로 만든 글자끼리 한다"). 행이 없으면 NULL이다. lock이면 FOR UPDATE로
--- 읽고(stet.undo), 아니면 아무것도 잠그지 않는다(stet.undo_plan). 부른 계정의 권한으로 읽는다(SECURITY INVOKER).
--- READ COMMITTED 트랜잭션에서만 돈다(stet.undo_refuse와 같은 ST006. 판정 R15).
--- 그림은 stet.capture()와 같은 식, 같은 일곱 설정으로 만든다. 컬럼은 pg_attribute에서 attnum 순으로 읽고(지워진 컬럼은
--- 뺀다), 값은 CASE WHEN num_nulls(v) = 0 THEN format('%s', v) END다. 타입의 출력 함수(C, superuser만 만든다)이고 캐스트가
--- 아니다(계획의 판정 U10). 그래서 같은 행이 캡처가 남긴 것과 같은 jsonb가 된다. 캡처의 함수와 코드를 나누지 않으므로 둘이
--- 같다는 것은 테스트(TestUndoRowMatchesCapture)가 지킨다. 한쪽을 바꾸면 다른 쪽도 바꾼다.
+-- 읽고(stet.undo), 아니면 행을 잠그지 않는다(stet.undo_plan). 부른 계정의 권한으로 읽는다(SECURITY INVOKER). 먼저
+-- stet.undo_lock으로 테이블을 잠그고 컬럼을 읽는다(그래서 READ COMMITTED에서만 돈다).
+-- 그림은 stet.capture()와 같은 식, 같은 일곱 설정으로 만든다. 컬럼은 stet.undo_lock이 잠근 뒤에 읽은 것(attnum 순, 지워진
+-- 컬럼은 뺀다)이고, 값은 CASE WHEN num_nulls(v) = 0 THEN format('%s', v) END다. 타입의 출력 함수(C, superuser만 만든다)이고
+-- 캐스트가 아니다(계획의 판정 U10). 그래서 같은 행이 캡처가 남긴 것과 같은 jsonb가 된다. 캡처의 함수와 코드를 나누지 않으므로
+-- 둘이 같다는 것은 테스트(TestUndoRowMatchesCapture)가 지킨다. 한쪽을 바꾸면 다른 쪽도 바꾼다. 컬럼 이름은 그대로 SQL에
+-- 들어가므로(r.<이름>) 컬럼이 아닌 이름은 r을 받는 함수로 읽힐 것이나, 잠근 뒤에 읽은 이름이고 잠근 뒤에는 바뀌지 않는다.
 -- 행은 키로 찾는다. 키 컬럼의 값이 키의 글자와 OPERATOR(pg_catalog.=)로 같은 행이다. 키의 글자는 타입이 정해지지 않은
 -- 리터럴로 넣으므로 PostgreSQL이 그 컬럼의 지금 타입(도메인이면 기본 타입)의 입력 함수로 읽는다. 타입 이름을 적지 않고, 글자에서
 -- 그 타입으로 가는 캐스트도 도메인의 CHECK도 돌지 않는다. 키의 인덱스를 쓰고, 유일 제약과 복구 문장이 보는 것과 같은
 -- 같음이다. 글자는 다르지만 타입으로는 같은 값의 행(키 1.50 자리에 1.5)도 그 키의 행이다. 그 행의 그림은 키 컬럼의 글자가
 -- a와 달라 changed_since가 된다. 두 행 이상이 나오면 키 컬럼이 유일하지 않다는 에러다(cardinality_violation).
--- 순서. 문장마다 그 문장이 시작할 때의 카탈로그와 행을 읽는다(READ COMMITTED). 다른 세션이 이 함수의 두 문장 사이에
--- 테이블의 이름을 바꾸거나 테이블을 지우고 다시 만들 수 있으므로:
--- 1. relid가 보통 테이블이 아니면 undefined_table이다.
--- 2. 이름은 relid의 regclass 출력이다(바꾼 이름도 따라간다). 1 뒤에 테이블이 지워졌으면 출력이 oid의 숫자이므로
---    undefined_table이다.
--- 3. 그 이름으로 테이블을 ACCESS SHARE로 잠근다(SELECT 권한이 없으면 여기서 42501이다). 이름이 2와 3 사이에 다른 테이블을
---    가리키게 됐을 수 있으므로, 잠근 뒤 이름이 아직 relid인지 본다. 다르면 object_not_in_prerequisite_state다. 잠근 뒤에는
---    트랜잭션이 끝날 때까지 그 테이블의 이름, 컬럼, 행 수준 보안을 바꾸는 ALTER TABLE이 기다린다.
--- 4. 행 수준 보안이 부른 역할에게 적용되면 42501이다(판정 R16). 숨긴 행을 "없는 행"으로 읽으면 insert가 될 수 있다.
---    stet.undo_selection은 고를 때의 카탈로그와, 지금의 역할이 아니라 세션이 될 수 있는 역할로 판단하기 때문이다.
--- 5. 잠근 뒤에 시작하는 문장으로 컬럼을 읽는다. 그래서 지금의 컬럼이다. 컬럼 이름은 그대로 SQL에 들어가므로(r.<이름>) 컬럼이
---    아닌 이름은 r을 받는 함수로 읽힐 것이나, 잠근 뒤에는 컬럼이 바뀌지 않는다.
--- 6. 행을 읽는다. tableoid가 relid인 행만 읽고, 읽은 뒤에 이름을 다시 본다. 스키마의 이름은 테이블을 잠가도 바뀔 수
---    있으므로, 3과 행을 읽는 문장 사이에 이름이 다른 테이블을 가리켰다면 그 테이블의 행은 돌려주지도 잠그지도 않고 에러다.
+-- 행은 tableoid가 relid인 것만 읽고, 읽은 뒤에 이름과 행 수준 보안을 다시 본다. 스키마의 이름은 테이블을 잠가도 바뀔 수
+-- 있으므로, 잠근 뒤와 행을 읽는 문장 사이에 이름이 다른 테이블을 가리켰다면 그 테이블의 행은 돌려주지도 잠그지도 않고
+-- 에러다. 역할의 속성이나 소유자의 멤버십이 그 사이에 바뀌어 행 수준 보안이 적용됐다면 있는 행을 "없는 행"으로 읽었을 수
+-- 있으므로 42501이다.
 CREATE OR REPLACE FUNCTION stet.undo_row(relid oid, key_column text, key text, lock boolean) RETURNS jsonb
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
@@ -988,41 +1036,16 @@ DECLARE
   tbl       text;
   names     text[];
   img       text;
-  has_key   boolean;
   hit       record;
   hits      integer := 0;
   found_row jsonb;
 BEGIN
-  IF current_setting('transaction_isolation') <> 'read committed' THEN
-    RAISE EXCEPTION 'undo runs only in a READ COMMITTED transaction; this one is %',
-      upper(current_setting('transaction_isolation'))
-      USING ERRCODE = 'ST006', HINT = 'Use BEGIN ISOLATION LEVEL READ COMMITTED, or call it outside a transaction block.';
-  END IF;
-  IF NOT EXISTS (SELECT FROM pg_catalog.pg_class cl WHERE cl.oid = undo_row.relid AND cl.relkind = 'r') THEN
-    RAISE EXCEPTION 'no table has the oid %', undo_row.relid USING ERRCODE = 'undefined_table';
-  END IF;
-  tbl := format('%s', undo_row.relid::pg_catalog.regclass);
-  IF tbl ~ '^[0-9]+$' THEN
-    RAISE EXCEPTION 'no table has the oid %', undo_row.relid USING ERRCODE = 'undefined_table';
-  END IF;
-  EXECUTE format('LOCK TABLE ONLY %s IN ACCESS SHARE MODE', tbl);
-  IF pg_catalog.to_regclass(tbl) IS DISTINCT FROM undo_row.relid THEN
-    RAISE EXCEPTION 'the table with oid % was renamed or replaced while it was read', undo_row.relid
-      USING ERRCODE = 'object_not_in_prerequisite_state';
-  END IF;
-  IF pg_catalog.row_security_active(undo_row.relid) THEN
-    RAISE EXCEPTION 'row-level security on % applies to %', tbl, current_user USING ERRCODE = 'insufficient_privilege';
-  END IF;
-
-  SELECT array_agg(att.attname::text ORDER BY att.attnum),
-         'jsonb_object($1, ARRAY[' || string_agg(format(text_of, att.attname), ', ' ORDER BY att.attnum) || '])',
-         bool_or(att.attname = undo_row.key_column)
-    INTO names, img, has_key
-    FROM pg_catalog.pg_attribute att
-   WHERE att.attrelid = undo_row.relid AND att.attnum > 0 AND NOT att.attisdropped;
-  IF has_key IS NOT TRUE THEN
+  SELECT lk.table_name, lk.column_names INTO tbl, names FROM stet.undo_lock(undo_row.relid) lk;
+  IF (undo_row.key_column = ANY (names)) IS NOT TRUE THEN
     RAISE EXCEPTION 'table % has no column %', tbl, quote_ident(undo_row.key_column) USING ERRCODE = 'undefined_column';
   END IF;
+  SELECT 'jsonb_object($1, ARRAY[' || string_agg(format(text_of, c.name), ', ' ORDER BY c.n) || '])' INTO img
+    FROM unnest(names) WITH ORDINALITY AS c(name, n);
 
   FOR hit IN EXECUTE format(
       'SELECT %s AS img FROM ONLY %s r WHERE r.%I OPERATOR(pg_catalog.=) %L AND r.tableoid OPERATOR(pg_catalog.=) $2'
@@ -1041,6 +1064,9 @@ BEGIN
     RAISE EXCEPTION 'the table with oid % was renamed or replaced while it was read', undo_row.relid
       USING ERRCODE = 'object_not_in_prerequisite_state';
   END IF;
+  IF pg_catalog.row_security_active(undo_row.relid) THEN
+    RAISE EXCEPTION 'row-level security on % applies to %', tbl, current_user USING ERRCODE = 'insufficient_privilege';
+  END IF;
   RETURN found_row;
 END
 $$;
@@ -1050,10 +1076,15 @@ $$;
 -- 키 컬럼이 없다. 계획의 보정 U1), key_changed, interleaved(둘은 stet.undo_selection이 남은 변경으로 정한다),
 -- changed_since(지금 행이 a와 다르다. 없는 행은 NULL), no_net_change(b와 a가 같다). 하나도 걸리지 않으면 reason은 NULL이고
 -- action이 b가 없으면 delete, a가 없으면 insert, 둘 다 있으면 update다. 걸리면 action은 NULL이다.
--- 지금 행은 stet.undo_row로 읽는다. lock은 그대로 넘긴다. 부른 계정의 권한으로 돈다(SECURITY INVOKER). READ COMMITTED
--- 트랜잭션에서만 돈다(stet.undo_refuse와 같은 ST006. 판정 R15). 테이블과 컬럼은 각 문장이 시작할 때의 카탈로그로 본다.
--- 컬럼을 본 뒤 stet.undo_row가 잠그기 전에 다른 세션이 컬럼을 바꾸면, stet.undo_row가 잠근 뒤의 컬럼으로 그림을 만들어 a와
--- 달라지므로 changed_since가 된다.
+-- 부른 계정의 권한으로 돈다(SECURITY INVOKER). READ COMMITTED 트랜잭션에서만 돈다(stet.undo_refuse와 같은 ST006. 판정
+-- R15). 순서:
+-- 1. 거절. 2. table_gone: relid가 이 문장의 카탈로그에서 보통 테이블이 아니다. 잠글 테이블이 없으므로 잠그기 전이다.
+-- 3. stet.undo_lock으로 테이블을 잠그고 컬럼을 읽는다. 그 뒤로 이 트랜잭션이 끝날 때까지 컬럼은 바뀌지 않는다. 2와 3 사이에
+--    테이블이 지워지거나 이름이 다른 테이블로 넘어갔으면 stet.undo_lock의 에러가 그대로 나간다(계획에서는 skipped).
+-- 4. columns_changed는 3이 읽은 컬럼과 비교한다. 잠그기 전에 읽은 컬럼과 비교하면, 잠금을 기다리는 동안 커밋된 컬럼의 변경을
+--    놓쳐 지워진 행(a가 NULL)을 옛 컬럼으로 insert하라고 할 수 있다.
+-- 5. key_changed, interleaved는 행을 읽지 않지만 4가 스펙의 순서에서 앞서므로 잠근 뒤에 본다.
+-- 6. changed_since는 stet.undo_row(같은 잠금과 같은 컬럼, lock이면 FOR UPDATE)로 지금 행을 읽어 a와 비교한다. 7. no_net_change.
 CREATE OR REPLACE FUNCTION stet.undo_judge(relid oid, key_column text, key text, b jsonb, a jsonb,
                                            key_changed boolean, interleaved boolean, lock boolean)
 RETURNS TABLE (action text, reason text)
@@ -1073,14 +1104,12 @@ BEGIN
   IF current_setting('transaction_isolation') <> 'read committed' THEN
     RAISE EXCEPTION 'undo runs only in a READ COMMITTED transaction; this one is %',
       upper(current_setting('transaction_isolation'))
-      USING ERRCODE = 'ST006', HINT = 'Use BEGIN ISOLATION LEVEL READ COMMITTED, or call it outside a transaction block.';
+      USING ERRCODE = 'ST006', HINT = 'Call it inside BEGIN ISOLATION LEVEL READ COMMITTED; ... COMMIT.';
   END IF;
   IF NOT EXISTS (SELECT FROM pg_catalog.pg_class cl WHERE cl.oid = undo_judge.relid AND cl.relkind = 'r') THEN
     reason := 'table_gone';
   ELSE
-    SELECT array_agg(att.attname::text) INTO cols
-      FROM pg_catalog.pg_attribute att
-     WHERE att.attrelid = undo_judge.relid AND att.attnum > 0 AND NOT att.attisdropped;
+    SELECT lk.column_names INTO cols FROM stet.undo_lock(undo_judge.relid) lk;
     IF (undo_judge.key_column = ANY (cols)) IS NOT TRUE THEN
       reason := 'columns_changed';
     END IF;
@@ -1160,8 +1189,9 @@ $$;
 -- 값을 남기지 않은 묶음은 key와 action이 NULL이고 reason이 그 skipped다. 부른 세션이 읽을 수 없는 테이블과 없어진 테이블은
 -- key, action, change_ids가 NULL인 한 줄이고 outcome이 skipped, reason이 stet.undo_selection의 withheld다(계획의 판정 R11).
 -- 경고는 되돌릴 줄(would_restore)에만 붙는다.
--- 에러를 내는 것은 네 거절(ST006)과 이 함수와 도우미의 권한이 없는 것(42501)뿐이다. 키마다의 판단은 블록 안에서 하고,
--- 거기서 난 에러(지금의 역할에 그 테이블의 SELECT가 없다, 키가 유일하지 않다, 스냅숏 뒤에 컬럼이 바뀌었다 등)는 그 키를
+-- 에러를 내는 것은 다섯 거절(ST006)과 이 함수와 도우미의 권한이 없는 것(42501)뿐이다. 키마다의 판단은 블록 안에서 하고,
+-- 거기서 난 에러(지금의 역할에 그 테이블의 SELECT가 없거나 행 수준 보안이 적용된다, 키가 유일하지 않다, 판단하는 동안
+-- 테이블의 이름이 다른 테이블을 가리키게 됐다 등)는 그 키를
 -- skipped로, reason을 'SQLSTATE <코드>: <메시지>'로 돌려준다. 블록은 하위 트랜잭션이지만 아무것도 쓰지 않으므로 트랜잭션
 -- id를 받지 않는다. 시간 초과와 취소는 잡지 않는다.
 CREATE OR REPLACE FUNCTION stet.undo_plan(agent_role text, since timestamptz, until timestamptz DEFAULT NULL,
@@ -1223,6 +1253,7 @@ $$;
 --   GRANT USAGE ON SCHEMA stet TO reviewer;
 --   GRANT EXECUTE ON FUNCTION stet.undo_plan(text, timestamptz, timestamptz, text[]),
 --                             stet.undo_selection(text, timestamptz, timestamptz, text[]),
+--                             stet.undo_lock(oid),
 --                             stet.undo_row(oid, text, text, boolean),
 --                             stet.undo_judge(oid, text, text, jsonb, jsonb, boolean, boolean, boolean),
 --                             stet.undo_warning(oid, text, text[]),
@@ -1234,6 +1265,7 @@ $$;
 -- stet.change_sets와 stet.changes의 권한은 주지 않는다. 이 함수들은 아무것도 바꾸거나 적지 않는다.
 REVOKE EXECUTE ON FUNCTION stet.undo_plan(text, timestamptz, timestamptz, text[]),
                            stet.undo_selection(text, timestamptz, timestamptz, text[]),
+                           stet.undo_lock(oid),
                            stet.undo_row(oid, text, text, boolean),
                            stet.undo_judge(oid, text, text, jsonb, jsonb, boolean, boolean, boolean),
                            stet.undo_warning(oid, text, text[]),

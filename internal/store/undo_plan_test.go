@@ -28,6 +28,7 @@ import (
 var planFunctions = []string{
 	"stet.undo_plan(text, timestamptz, timestamptz, text[])",
 	"stet.undo_selection(text, timestamptz, timestamptz, text[])",
+	"stet.undo_lock(oid)",
 	"stet.undo_row(oid, text, text, boolean)",
 	"stet.undo_judge(oid, text, text, jsonb, jsonb, boolean, boolean, boolean)",
 	"stet.undo_warning(oid, text, text[])",
@@ -1024,6 +1025,19 @@ func TestPlanIgnoresTheCallersSearchPath(t *testing.T) {
 			t.Errorf("stet.undo_row for key %s: %v without the trap, %v with it", *s.Key, deref(a), deref(b))
 		}
 	}
+	lock := func(conn *pgx.Conn) string {
+		t.Helper()
+		var table string
+		var columns []string
+		if err := conn.QueryRow(ctx, `select table_name, column_names from stet.undo_lock($1)`, sel[0].RelID).
+			Scan(&table, &columns); err != nil {
+			t.Fatal(err)
+		}
+		return table + " " + strings.Join(columns, ",")
+	}
+	if a, b := lock(plain), lock(trapped); a != b || a != "public.deals id,note,n" {
+		t.Errorf("stet.undo_lock: %q without the trap, %q with it; want %q", a, b, "public.deals id,note,n")
+	}
 	for _, action := range []string{"update", "insert"} {
 		warning := func(conn *pgx.Conn) *string {
 			t.Helper()
@@ -1206,13 +1220,22 @@ func TestPlanRunsOnlyUnderReadCommitted(t *testing.T) {
 			_, err := tx.Exec(ctx, `select stet.undo_refuse('stet_md5', $1, null)`, since)
 			return err
 		},
+		"stet.undo_lock": func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `select * from stet.undo_lock($1)`, relid)
+			return err
+		},
 		"stet.undo_row": func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, `select stet.undo_row($1, 'id', '1', false)`, relid)
 			return err
 		},
-		// key_changed: the judge answers without reading the row, so its own refusal is what is tested.
 		"stet.undo_judge": func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, `select * from stet.undo_judge($1, 'id', '1', null, null, true, false, false)`, relid)
+			return err
+		},
+		// A relid that names no table: the judge answers table_gone without stet.undo_lock, so its own refusal is
+		// what is tested.
+		"stet.undo_judge, table gone": func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `select * from stet.undo_judge(0, 'id', '1', null, null, false, false, false)`)
 			return err
 		},
 	}
@@ -1249,7 +1272,7 @@ func TestPlanRunsOnlyUnderReadCommitted(t *testing.T) {
 //   - a table renamed, and another given its name: the table relid names is
 //     read, under its new name;
 //   - a table dropped and made again: gone;
-//   - a column added, added, dropped and added again, or dropped:
+//   - a column added; one added, dropped and added again; one dropped:
 //     columns_changed;
 //   - row-level security enabled: the key's read is refused with 42501
 //     (ruling R16), not read as a missing row; the plan then withholds the
@@ -1427,6 +1450,102 @@ func TestUndoRowWaitsForDDLAndSeesIt(t *testing.T) {
 			t.Errorf("stet.undo_row on a table that gained a column while it waited: %v, %v; want the row with y", deref(row), err)
 		}
 	})
+}
+
+// Column DDL that commits while the judgement of a key waits for the table's
+// lock, under READ COMMITTED: another session adds, drops or renames a column
+// in a transaction still open; the judge (with lock false, with lock true in
+// a transaction, and through the plan) reaches the table and waits; the other
+// session commits. The key's row was deleted by the agent (a is NULL), so
+// there is no row whose image would differ: the judge compares b with the
+// columns read after the lock and says columns_changed, never insert.
+func TestUndoJudgeWaitsForColumnDDLAndSeesIt(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	owner := superuserIn(t, db)
+	setCapture(t, pool, []string{"stet_md5"}, 10000)
+	ddls := []struct{ name, alter string }{
+		{"added", "add column y int"},
+		{"dropped", "drop column note"},
+		{"renamed", "rename column note to memo"},
+	}
+	modes := []string{"judge", "judge_lock", "plan"}
+	var tables []string
+	for _, d := range ddls {
+		for _, m := range modes {
+			name := d.name + "_" + m
+			mustExec(t, owner,
+				"create table public."+name+" (id int primary key, n int, note text)",
+				"insert into public."+name+" values (1, 1, 'x')")
+			installCapture(t, owner, "public."+name, name, "id")
+			tables = append(tables, "public."+name)
+		}
+	}
+	since := dbClock(t, pool)
+	agent := agentIn(t, db)
+	for _, table := range tables {
+		mustExec(t, agent, "delete from "+table+" where id = 1")
+	}
+	rv := undoReviewer(t, db, tables...)
+	// FOR UPDATE, which the judgement with lock true takes, needs UPDATE; stet.undo's reviewer has it.
+	for _, d := range ddls {
+		mustExec(t, owner, "grant update on public."+d.name+"_judge_lock to "+roleOf(t, rv))
+	}
+	b := map[string]any{"id": "1", "n": "1", "note": "x"}
+
+	for _, d := range ddls {
+		for _, m := range modes {
+			name := d.name + "_" + m
+			t.Run(name, func(t *testing.T) {
+				relid := relidOf(t, owner, "public."+name)
+				other, err := superuserIn(t, db).Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer other.Rollback(ctx)
+				mustExec(t, other, "alter table public."+name+" "+d.alter)
+				var got string
+				done := make(chan error, 1)
+				go func() {
+					const judge = `select coalesce(action, '-') || ' ' || coalesce(reason, '-')
+						from stet.undo_judge($1, 'id', '1', $2, null, false, false, $3)`
+					switch m {
+					case "judge":
+						done <- rv.QueryRow(ctx, judge, relid, b, false).Scan(&got)
+					case "judge_lock":
+						tx, err := rv.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+						if err != nil {
+							done <- err
+							return
+						}
+						err = tx.QueryRow(ctx, judge, relid, b, true).Scan(&got)
+						tx.Rollback(ctx)
+						done <- err
+					case "plan":
+						rows, err := tryPlan(rv, "stet_md5", since, nil, []string{name})
+						got = strings.Join(shown(rows), "; ")
+						done <- err
+					}
+				}()
+				if !waitsForALock(t, owner, rv.PgConn().PID(), done) {
+					t.Fatalf("the %s did not wait for the table's lock: %v", m, <-done)
+				}
+				if err := other.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if err := <-done; err != nil {
+					t.Fatal(err)
+				}
+				want := "- columns_changed"
+				if m == "plan" {
+					want = name + ` "1" - skipped columns_changed -`
+				}
+				if got != want {
+					t.Errorf("after the column DDL committed during the wait: %s, want %s", got, want)
+				}
+			})
+		}
+	}
 }
 
 // A plan over 5,000 keys of one table, among 20,000 rows, takes seconds: each
