@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -393,5 +394,154 @@ func TestRunStartsWhenTheUndoStepsFail(t *testing.T) {
 	}
 	if s := captureSettingsIn(t, admin); s.ok {
 		t.Errorf("stet.capture_settings has a row, %+v, though the time to set it was up", s)
+	}
+}
+
+// undoFunctions are the functions a reviewer needs EXECUTE on to plan and
+// undo (the comment above the REVOKE at the end of schema.sql).
+var undoFunctions = []string{
+	"stet.undo_plan(text, timestamptz, timestamptz, text[])",
+	"stet.undo_selection(text, timestamptz, timestamptz, text[])",
+	"stet.undo_lock(oid)",
+	"stet.undo_row(oid, text, text, boolean)",
+	"stet.undo_judge(oid, text, text, jsonb, jsonb, boolean, boolean, boolean)",
+	"stet.undo_warning(oid, text, text[])",
+	"stet.undo_refuse(text, timestamptz, timestamptz)",
+	"stet.undo(text, timestamptz, timestamptz, text[], text)",
+	"stet.undo_lines(text, timestamptz, timestamptz, text[])",
+	"stet.undo_next(jsonb, integer[], text[], text[], text[], integer)",
+	"stet.undo_referenced(oid, text, jsonb, jsonb)",
+	"stet.undo_statement(oid, text, text, text, jsonb, jsonb)",
+	"stet.undo_outcome(oid, text, text, jsonb, bigint, oid)",
+	"stet.undo_failure(text, text)",
+	"stet.undo_result(jsonb, integer[], text[], text[], text[], text[])",
+	"stet.undo_unpack(jsonb)",
+	"stet.undo_record(text, timestamptz, timestamptz, text[], text, jsonb)",
+}
+
+// The whole flow of spec-v0.2-undo 3, with Stet in shadow mode and no model:
+// an agent inserts, updates and deletes through Stet on a table with capture
+// installed; a reviewer reads stet.history and sees each change linked to the
+// decision on its write, plans the undo and undoes it in its own READ
+// COMMITTED transaction, commits, and the table holds what it held before the
+// agent wrote; stet.history then shows each change undone (plan ruling R14).
+func TestUndoEndToEnd(t *testing.T) {
+	pg := testPG(t)
+	ctx := context.Background()
+	reviewer := newReviewer(t, pg)
+	db, table, admin, pool := capturedTable(t, pg, 3)
+	content := func() string {
+		t.Helper()
+		var s string
+		if err := admin.QueryRow(ctx, `select string_agg(r::text, ' ' order by r.id) from `+table+` r`).Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	before := content()
+	r := start(t, parseConfig(t, undoYAML, pg, db, table, "shadow"))
+	waitListening(t, r)
+	var since time.Time
+	if err := admin.QueryRow(ctx, `select clock_timestamp()`).Scan(&since); err != nil {
+		t.Fatal(err)
+	}
+	agent := connectTo(t, r.addr, db, "stet_md5", "md5-pw")
+	writes := []string{
+		"insert into " + table + " values (4, 'new')",
+		"update " + table + " set name = 'changed' where id = 1",
+		"delete from " + table + " where id = 2",
+	}
+	for _, w := range writes {
+		mustExec(t, agent, w)
+	}
+	ds := decisionsOn(t, pool, table, len(writes), r.log)
+	if err := r.stop(t); err != nil {
+		t.Fatalf("run = %v, want nil", err)
+	}
+
+	in := connectTo(t, pg, db, "postgres", "postgres-pw")
+	for _, sql := range []string{
+		"grant usage on schema stet to " + reviewer,
+		"grant select on stet.history to " + reviewer,
+		"grant execute on function " + strings.Join(undoFunctions, ", ") + " to " + reviewer,
+		"grant select, insert, update, delete on " + table + " to " + reviewer,
+	} {
+		mustExec(t, in, sql)
+	}
+	rv := connectTo(t, pg, db, reviewer, reviewerPassword)
+	type line struct {
+		Key        string
+		Op         string
+		Query      string
+		DecisionID *string
+		UndoID     *int64
+	}
+	history := func() []line {
+		t.Helper()
+		rows, err := rv.Query(ctx, `select key, op, query, decision_id::text, undo_id from stet.history
+			where target_table = $1 order by change_id`, table)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines, err := pgx.CollectRows(rows, pgx.RowToStructByPos[line])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return lines
+	}
+	decided := map[string]string{}
+	for _, d := range ds {
+		decided[d.ID] = d.Statement
+	}
+	seen := history()
+	if len(seen) != len(writes) {
+		t.Fatalf("stet.history shows %+v, want a change for each of the %d writes", seen, len(writes))
+	}
+	for i, l := range seen {
+		if l.Query != writes[i] || l.DecisionID == nil || decided[*l.DecisionID] != writes[i] || l.UndoID != nil {
+			t.Errorf("stet.history line %d: %+v, want the change of %q linked to its decision, not undone; decisions %v",
+				i, l, writes[i], decided)
+		}
+	}
+
+	shown := func(rows pgx.Rows, err error) []string {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (string, error) {
+			var key, action *string
+			var outcome string
+			err := r.Scan(&key, &action, &outcome)
+			return fmt.Sprintf("%s %s %s", orNull(key), orNull(action), outcome), err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return lines
+	}
+	tx, err := rv.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	plan := shown(tx.Query(ctx, `select key, action, outcome from stet.undo_plan('stet_md5', $1)`, since))
+	if want := []string{"4 delete would_restore", "1 update would_restore", "2 insert would_restore"}; !slices.Equal(plan, want) {
+		t.Errorf("stet.undo_plan says %q, want %q", plan, want)
+	}
+	undone := shown(tx.Query(ctx, `select key, action, outcome from stet.undo('stet_md5', $1, note => 'end to end')`, since))
+	if want := []string{"4 delete restored", "1 update restored", "2 insert restored"}; !slices.Equal(undone, want) {
+		t.Errorf("stet.undo says %q, want %q", undone, want)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if after := content(); after != before {
+		t.Errorf("after the undo the table holds %q, want %q", after, before)
+	}
+	for i, l := range history() {
+		if l.UndoID == nil {
+			t.Errorf("stet.history line %d shows no undo after the commit: %+v", i, l)
+		}
 	}
 }

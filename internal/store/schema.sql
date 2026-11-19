@@ -681,6 +681,49 @@ REVOKE EXECUTE ON FUNCTION stet.capture() FROM PUBLIC;
 -- 기록을 지키는 트리거의 함수는 아무에게도 주지 않는다. 트리거는 함수의 권한 없이도 불린다.
 REVOKE EXECUTE ON FUNCTION stet.changes_guard() FROM PUBLIC;
 
+-- 되돌리기의 기록 (docs/spec-v0.2-undo.md 7장 "기록"). stet.undo가 부를 때마다 stet.undos에 한 줄, 결과의 줄마다
+-- stet.undo_items에 한 줄, 되돌린 변경마다 stet.undone_changes에 한 줄을 검토자의 트랜잭션 안에서 남긴다
+-- (stet.undo_record). 롤백하면 함께 사라진다. 아래의 stet.history가 읽으므로 뷰보다 먼저 만든다. 적는 함수는 아래의
+-- "되돌리기: stet.undo" 절에 있다.
+-- 세 표는 stet.change_sets와 stet.changes를 외래 키로 가리키지 않는다. 보존 기간(9장)이 오래된 변경을 지울 때 이 표들을
+-- 확인하거나 잠그지 않고, 지운 변경의 되돌리기 기록도 남는다. change_ids와 change_id는 기록할 때의 변경 id일 뿐이다.
+-- 소유자(Stet의 계정) 말고는 아무 권한도 없다. 검토자는 stet.history로 본다.
+CREATE TABLE IF NOT EXISTS stet.undos (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  at          timestamptz NOT NULL,          -- 기록한 때. clock_timestamp()
+  by          text NOT NULL,                 -- 부른 접속 계정(session_user). 인자로 받지 않는다
+  agent_role  text NOT NULL,                 -- 고른 조건: 계정, 시간 범위, 테이블
+  since       timestamptz NOT NULL,
+  until       timestamptz,
+  tables      text[],
+  note        text,                          -- 검토자가 적은 말
+  restored    integer NOT NULL,              -- restored와 restored_differs의 수 (계획의 보정 U5)
+  skipped     integer NOT NULL,              -- skipped와 not_captured의 수
+  failed      integer NOT NULL
+);
+-- 결과의 줄 하나. line은 결과에서의 차례(1부터)다
+CREATE TABLE IF NOT EXISTS stet.undo_items (
+  undo_id       bigint NOT NULL REFERENCES stet.undos (id) ON DELETE CASCADE,
+  line          integer NOT NULL,
+  target_table  text NOT NULL,
+  key           text,
+  action        text CHECK (action IN ('delete','insert','update')),
+  outcome       text NOT NULL CHECK (outcome IN ('restored','restored_differs','skipped','failed','not_captured')),
+  reason        text,
+  warning       text,
+  change_ids    bigint[],
+  PRIMARY KEY (undo_id, line)
+);
+-- 되돌린 변경. 되돌린 줄(restored, restored_differs)의 change_ids를 변경 하나에 한 줄로 펼친 것이고 stet.undo_record가
+-- 함께 적는다. stet.history가 변경마다 그것을 되돌린 마지막 되돌리기를 기본 키(change_id, undo_id)의 한 번의 역방향 탐색으로
+-- 찾게 하려는 것이다. undo_items의 change_ids에 GIN 인덱스를 두면 플래너가 ORDER BY undo_id DESC LIMIT 1 때문에
+-- undo_items의 기본 키를 거꾸로 훑으며 줄마다 change_ids를 거르는 계획을 골라, 변경마다 줄을 거의 다 읽었다(테스트 서버).
+CREATE TABLE IF NOT EXISTS stet.undone_changes (
+  change_id  bigint NOT NULL,
+  undo_id    bigint NOT NULL REFERENCES stet.undos (id) ON DELETE CASCADE,
+  PRIMARY KEY (change_id, undo_id)
+);
+
 -- 검토자가 보는 것 (docs/spec-v0.2-undo.md 6장). 캡처한 변경마다 한 줄이고, 값을 남기지 않은 묶음(skipped)은 key 없이
 -- 한 줄이다. 변경을 그 쓰기를 판단한 기록에 잇는다(5장의 "잇는 규칙", 계획의 판정 U16).
 -- 묶음 하나는 다음을 모두 만족하는 판단 기록이 하나뿐일 때만 그것에 이어진다: backend_pid가 묶음의 pid와 같고,
@@ -703,8 +746,10 @@ REVOKE EXECUTE ON FUNCTION stet.changes_guard() FROM PUBLIC;
 --   GRANT USAGE ON SCHEMA stet TO reviewer;
 --   GRANT SELECT ON stet.history TO reviewer;
 -- 캡처가 남긴 값과 query, app은 에이전트가 쓴 데이터다(규칙 5). 보여 주기만 한다.
--- undo_id와 undone_at은 되돌리기(7장)가 채운다. CREATE OR REPLACE VIEW는 컬럼을 끝에 더하는 것만 받으므로 컬럼의 순서와
--- 타입은 6장의 표 그대로 둔다.
+-- undo_id와 undone_at은 그 변경을 restored나 restored_differs로 되돌린 마지막 되돌리기(7장)의 id와 기록한 때다. 변경마다
+-- stet.undone_changes의 기본 키로 그 change_id의 가장 큰 undo_id 하나를 찾는다(LATERAL). 건너뛰거나 실패한 줄은 되돌린
+-- 것이 아니므로 거기에 없다. 값을 남기지 않은 묶음의 줄(change_id가 NULL)은 아무것도 찾지 않는다.
+-- CREATE OR REPLACE VIEW는 컬럼을 끝에 더하는 것만 받으므로 컬럼의 순서와 타입은 6장의 표 그대로 둔다.
 CREATE OR REPLACE VIEW stet.history AS
 SELECT c.id AS change_id, s.id AS set_id, s.at,
        s.agent_role, s.login_role, s.app,
@@ -713,7 +758,7 @@ SELECT c.id AS change_id, s.id AS set_id, s.at,
        s.held_write,
        d.id AS decision_id, link.candidates AS decision_candidates,
        d.verdict, d.reasons,
-       NULL::bigint AS undo_id, NULL::timestamptz AS undone_at
+       ud.id AS undo_id, ud.at AS undone_at
 FROM stet.change_sets s
 CROSS JOIN LATERAL (
   SELECT CASE WHEN count(*) = 1 THEN (array_agg(m.id))[1] END AS decision_id,
@@ -737,7 +782,15 @@ CROSS JOIN LATERAL (
     ) m
 ) link
 LEFT JOIN stet.changes c ON c.set_id = s.id
-LEFT JOIN stet.decisions d ON d.id = link.decision_id;
+LEFT JOIN stet.decisions d ON d.id = link.decision_id
+LEFT JOIN LATERAL (
+  SELECT u.id, u.at
+    FROM stet.undone_changes uc
+    JOIN stet.undos u ON u.id = uc.undo_id
+   WHERE uc.change_id = c.id
+   ORDER BY uc.undo_id DESC
+   LIMIT 1
+) ud ON true;
 
 -- 되돌리기 (docs/spec-v0.2-undo.md 7장): stet.undo_plan과, 그것이 stet.undo와 함께 쓰는 도우미. 모델을 부르지 않는다
 -- (규칙 1). 캡처가 남긴 값과 키는 에이전트가 쓴 데이터다(규칙 5). 비교와 복구의 재료로만 쓰고, SQL의 글자로 넣을 때는
@@ -1247,6 +1300,552 @@ BEGIN
 END
 $$;
 
+-- 되돌리기: stet.undo (docs/spec-v0.2-undo.md 7장 "stet.undo"). 고른 변경을 검토자의 트랜잭션 안에서, 검토자의 권한으로
+-- 되돌린다. 모델을 부르지 않는다(규칙 1). 캡처가 남긴 값과 키는 에이전트가 쓴 데이터다(규칙 5). 위의 도우미(고르기,
+-- 잠그기, 지금 행, 판단, 경고)를 그대로 쓰고, 아래의 도우미를 더한다.
+-- 복구 문장은 부른 세션의 설정으로 돈다. 그래서 stet.undo에는 SET 절이 없고, 고객의 트리거가 평소의 search_path,
+-- TimeZone 따위로 돈다. 대신 stet.undo의 몸통은 이름을 푸는 일을 하지 않는다: 연산자를 쓰지 않고, 함수는 스키마까지
+-- 적고(stet., pg_catalog.), 변수의 타입도 pg_catalog.까지 적는다. 부른 세션의 임시 스키마는 릴레이션과 타입의 이름을
+-- pg_catalog보다 먼저 찾으므로, 예를 들어 text나 record라는 임시 테이블이 있으면 스키마 없는 text와 record는 그 행
+-- 타입이 된다(테스트 서버에서 확인했다). 판단과 글자 만들기는 모두 일곱 설정을 고정한 도우미가 한다. 몸통이 하는 일은
+-- 도우미를 부르고, 도우미가 돌려준 문장을 EXECUTE하고, 키마다의 블록에서 에러를 잡는 것뿐이다.
+-- 복구 문장의 값(계획의 판정 U10). 값은 타입을 적지 않은 글자 리터럴(%L)이다. INSERT의 VALUES와 UPDATE의 SET에서 타입이
+-- 정해지지 않은 리터럴은 PostgreSQL이 그 컬럼의 타입(도메인이면 기본 타입의 입력 뒤 도메인의 제약)의 입력 함수로 바로
+-- 읽는다. 글자에서 그 타입으로 가는 캐스트(테이블 소유자가 만든 함수일 수 있다)는 돌지 않는다. %L::<타입>으로 적지 않는
+-- 것은, format_type이 pg_catalog의 타입을 스키마 없이(text, date) 적어 그 이름이 부른 세션의 search_path와 임시 테이블로
+-- 풀리기 때문이다. 또 'abcd'::varchar(3)은 말없이 자르지만 타입 없는 리터럴은 컬럼에 맞지 않으면 에러다.
+-- 컬럼 이름은 지금의 카탈로그에서(판단이 남긴 값의 컬럼과 같음을 이미 확인했다) %I로, 테이블은 relid의 regclass 출력을
+-- 고정한 search_path 아래에서 얻어(스키마까지) 적는다. 행은 키 컬럼과 tableoid로 찾고, 연산자는 OPERATOR(pg_catalog.=)다.
+
+-- 고른 줄들 (stet.undo_selection의 결과, 그 순서대로). stet.undo가 한 번 읽어 jsonb 배열로 들고 다닌다. 다시 해 보는
+-- 바퀴마다 다시 고르지 않는다: 그 사이에 커밋된 캡처나 보존 기간이 고른 것을 바꾸지 못하게 하려는 것이다. 줄 하나는
+-- 고르기의 열세 컬럼을 그 이름으로 가진 객체다. 행이 없는 쪽(b, a)은 JSON null이다(남긴 그림은 언제나 객체다).
+-- 부른 계정의 권한으로 돈다. 기록은 SECURITY DEFINER인 stet.undo_selection으로만 읽는다(그것이 거절도 한다).
+CREATE OR REPLACE FUNCTION stet.undo_lines(agent_role text, since timestamptz, until timestamptz, tables text[])
+RETURNS jsonb
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+SET DateStyle = 'ISO, MDY'
+SET IntervalStyle = 'postgres'
+SET extra_float_digits = 1
+SET TimeZone = 'UTC'
+SET bytea_output = 'hex'
+SET client_min_messages = warning
+AS $$
+BEGIN
+  RETURN (
+    SELECT coalesce(jsonb_agg(jsonb_build_object(
+             'target_table', s.target_table, 'relid', s.relid, 'key_column', s.key_column, 'key', s.key,
+             'b', s.b, 'a', s.a, 'change_ids', to_jsonb(s.change_ids), 'first_change', s.first_change,
+             'key_changed', s.key_changed, 'interleaved', s.interleaved, 'skipped', s.skipped,
+             'also_changed', to_jsonb(s.also_changed), 'withheld', s.withheld) ORDER BY s.ordinality), '[]'::jsonb)
+      FROM stet.undo_selection(undo_lines.agent_role, undo_lines.since, undo_lines.until, undo_lines.tables)
+           WITH ORDINALITY AS s);
+END
+$$;
+
+-- 이번 바퀴에 해 볼 키들 (7장 "순서와 다시 해 보기"). lines는 stet.undo_lines의 것이고, tried, outcomes, codes, reasons는
+-- 지금까지 해 본 차례대로의 키의 자리(lines에서 1부터), 결과, 실패의 SQLSTATE, 이유다. done은 지난 바퀴 전까지 해 본 수다.
+-- - 아직 아무것도 해 보지 않았으면 첫 바퀴다. key가 있는 줄을 모두 돌려준다. 순서는 delete(b가 없다)를 그 키의 첫 변경이
+--   나중인 것부터, 그다음 나머지를 결과의 순서대로, insert(a가 없다)를 그 키의 마지막 변경이 앞선 것부터다. 함께 만든
+--   부모와 자식은 자식부터 지우고, 연쇄로 함께 지워진 부모와 자식은 부모부터 넣는다(부모의 트리거가 먼저 불려 부모의 변경
+--   id가 작다). 다시 해 보기를 줄이려는 것이고, 맞는지는 다시 해 보기가 보장한다.
+-- - 아니면 지난 바퀴(done 다음부터)를 본다. 그 바퀴에서 restored나 restored_differs가 하나도 없으면 아무것도 돌려주지 않고
+--   끝난다. 있으면 그 바퀴에서 23503이나 23505로 failed가 된 키와 referenced로 skipped가 된 키를 그 바퀴의 순서대로
+--   돌려준다. 바퀴마다 해 볼 키가 줄어들므로 끝난다.
+-- 줄마다 판단에 넘길 값을 타입을 갖춰 돌려준다. 고정한 설정 아래의 계산뿐이고 아무것도 읽지 않는다.
+CREATE OR REPLACE FUNCTION stet.undo_next(lines jsonb, tried integer[], outcomes text[], codes text[], reasons text[],
+                                          done integer)
+RETURNS TABLE (pos integer, relid oid, key_column text, key text, b jsonb, a jsonb, key_changed boolean,
+               interleaved boolean, also_changed text[])
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+SET DateStyle = 'ISO, MDY'
+SET IntervalStyle = 'postgres'
+SET extra_float_digits = 1
+SET TimeZone = 'UTC'
+SET bytea_output = 'hex'
+SET client_min_messages = warning
+AS $$
+DECLARE
+  todo integer[];
+BEGIN
+  IF coalesce(cardinality(undo_next.tried), 0) = 0 THEN
+    SELECT array_agg(l.i ORDER BY l.grp, CASE WHEN l.grp = 1 THEN l.first_id END DESC,
+                                         CASE WHEN l.grp = 3 THEN l.last_id END, l.i)
+      INTO todo
+      FROM (SELECT e.i::integer AS i,
+                   CASE WHEN e.x->'b' = 'null' AND e.x->'a' <> 'null' THEN 1
+                        WHEN e.x->'a' = 'null' AND e.x->'b' <> 'null' THEN 3
+                        ELSE 2 END AS grp,
+                   (e.x->'change_ids'->>0)::bigint AS first_id,
+                   (e.x->'change_ids'->>-1)::bigint AS last_id
+              FROM jsonb_array_elements(undo_next.lines) WITH ORDINALITY AS e(x, i)
+             WHERE jsonb_typeof(e.x->'key') = 'string') l;
+  ELSIF EXISTS (SELECT FROM unnest(undo_next.tried, undo_next.outcomes) WITH ORDINALITY AS t(p, o, j)
+                 WHERE t.j > coalesce(undo_next.done, 0) AND t.o IN ('restored', 'restored_differs')) THEN
+    SELECT array_agg(t.p ORDER BY t.j) INTO todo
+      FROM unnest(undo_next.tried, undo_next.outcomes, undo_next.codes, undo_next.reasons) WITH ORDINALITY AS t(p, o, c, r, j)
+     WHERE t.j > coalesce(undo_next.done, 0)
+       AND ((t.o = 'failed' AND t.c IN ('23503', '23505'))
+            OR (t.o = 'skipped' AND starts_with(t.r, 'referenced: ')));
+  END IF;
+  RETURN QUERY
+  SELECT d.p, (d.x->>'relid')::oid, d.x->>'key_column', d.x->>'key', nullif(d.x->'b', 'null'), nullif(d.x->'a', 'null'),
+         (d.x->>'key_changed')::boolean, (d.x->>'interleaved')::boolean,
+         CASE WHEN jsonb_typeof(d.x->'also_changed') = 'array'
+              THEN ARRAY(SELECT n.v FROM jsonb_array_elements_text(d.x->'also_changed') WITH ORDINALITY AS n(v, o)
+                          ORDER BY n.o) END
+    FROM (SELECT t.p, t.n, undo_next.lines -> (t.p - 1) AS x FROM unnest(todo) WITH ORDINALITY AS t(p, n)) d
+   ORDER BY d.n;
+END
+$$;
+
+-- 되돌리기는 연쇄를 일으키지 않는다 (7장 "referenced"). 복구 문장이 없애거나 바꾸는 값을, 연쇄하는 외래 키로 가리키는 행이
+-- 있는 테이블들이다. 없으면 NULL이고, 있으면 'referenced: <테이블들>'이다(스키마까지 %I.%I, 바이트 순, ", "로 잇는다).
+-- - delete는 relid를 가리키는 외래 키 가운데 ON DELETE가 CASCADE, SET NULL, SET DEFAULT인 것을 본다. update는 ON UPDATE가
+--   그런 것 가운데 가리키는 컬럼의 값이 a와 b에서 다른 것만 본다(그 컬럼은 복구 문장이 바꾼다. 생성 컬럼도 따라 바뀐다).
+--   insert는 아무것도 없애거나 바꾸지 않는다.
+-- - 없애거나 바꾸는 값은 a의 것이다. stet.undo는 이 함수를 키의 행을 잠그고(FOR UPDATE) 지금 행이 a임을 확인한 뒤에
+--   부른다. 그 값 가운데 NULL이 있으면 그 외래 키로는 아무 행도 가리키지 않는다.
+-- - 자식 테이블에서 외래 키의 컬럼들이 모두 그 값인 행이 하나라도 있으면 그 테이블을 이름에 넣는다. 여러 컬럼의 외래 키는
+--   모든 컬럼을 맞춘다. 자기를 가리키는 외래 키에서는 그 행 자신을 빼고 본다(가리키는 컬럼들은 유일하므로 그 값을 가진
+--   행은 그 행뿐이다). 값은 타입 없는 리터럴로 자식 컬럼의 타입으로 읽히고, 비교는 OPERATOR(pg_catalog.=)다. 파티션 테이블인
+--   자식은 파티션까지, 아니면 ONLY로 읽는다(PostgreSQL의 외래 키 동작과 같다). 파티션마다 복제된 외래 키는 보지 않는다.
+-- - 자식 테이블은 부른 계정의 권한으로 읽는다(SECURITY INVOKER). 읽을 권한이 없으면 42501이고, 그 키는 failed가 된다.
+--   행 수준 보안이 부른 역할에게 적용되면 숨은 자식을 놓칠 수 있으므로 42501이다(외래 키의 연쇄는 행 수준 보안을 지나간다).
+-- - 잠근 뒤에 보므로 그 사이에 새 자식이 생기지 않는다. 자식을 넣거나 그 행을 가리키게 고치는 쪽은 부모 행에 FOR KEY
+--   SHARE를 잡아야 하는데, 그것은 FOR UPDATE를 기다린다. 이미 그 잠금을 쥔 쪽이 있었다면 FOR UPDATE가 그쪽을 기다렸다.
+-- NO ACTION과 RESTRICT는 보지 않는다. 서버가 23503으로 막고, stet.undo가 다시 해 본다.
+-- READ COMMITTED에서만 돈다(판정 R15, stet.undo_lock과 같은 거절).
+CREATE OR REPLACE FUNCTION stet.undo_referenced(relid oid, action text, b jsonb, a jsonb) RETURNS text
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+SET DateStyle = 'ISO, MDY'
+SET IntervalStyle = 'postgres'
+SET extra_float_digits = 1
+SET TimeZone = 'UTC'
+SET bytea_output = 'hex'
+SET client_min_messages = warning
+AS $$
+DECLARE
+  fk         record;
+  pcols      text[];
+  ccols      text[];
+  vals       text[];
+  cond       text;
+  hit        boolean;
+  children   text[] := '{}';
+BEGIN
+  IF current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'undo runs only in a READ COMMITTED transaction; this one is %',
+      upper(current_setting('transaction_isolation'))
+      USING ERRCODE = 'ST006', HINT = 'Call it inside BEGIN ISOLATION LEVEL READ COMMITTED; ... COMMIT.';
+  END IF;
+  IF undo_referenced.action IS NULL OR undo_referenced.action NOT IN ('delete', 'update') THEN
+    RETURN NULL;
+  END IF;
+  FOR fk IN
+    SELECT con.conrelid, con.confkey, con.conkey, cl.relkind, format('%I.%I', ns.nspname, cl.relname) AS name
+      FROM pg_catalog.pg_constraint con
+      JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid
+      JOIN pg_catalog.pg_namespace ns ON ns.oid = cl.relnamespace
+     WHERE con.contype = 'f' AND con.confrelid = undo_referenced.relid AND con.conparentid = 0
+       AND CASE undo_referenced.action WHEN 'delete' THEN con.confdeltype ELSE con.confupdtype END IN ('c', 'n', 'd')
+     ORDER BY format('%I.%I', ns.nspname, cl.relname) COLLATE pg_catalog."C", con.oid
+  LOOP
+    SELECT array_agg(pa.attname::text ORDER BY k.n), array_agg(ca.attname::text ORDER BY k.n),
+           array_agg(undo_referenced.a ->> pa.attname::text ORDER BY k.n)
+      INTO pcols, ccols, vals
+      FROM unnest(fk.confkey, fk.conkey) WITH ORDINALITY AS k(pk, ck, n)
+      JOIN pg_catalog.pg_attribute pa ON pa.attrelid = undo_referenced.relid AND pa.attnum = k.pk
+      JOIN pg_catalog.pg_attribute ca ON ca.attrelid = fk.conrelid AND ca.attnum = k.ck;
+    IF undo_referenced.action = 'update'
+       AND NOT EXISTS (SELECT FROM unnest(pcols) AS p(name)
+                        WHERE (undo_referenced.a -> p.name) IS DISTINCT FROM (undo_referenced.b -> p.name)) THEN
+      CONTINUE;
+    END IF;
+    IF array_position(vals, NULL) IS NOT NULL THEN
+      CONTINUE;
+    END IF;
+    IF row_security_active(fk.conrelid) THEN
+      RAISE EXCEPTION 'row-level security on % applies to %', fk.name, current_user USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    SELECT string_agg(format('x.%I OPERATOR(pg_catalog.=) %L', c.col, c.val), ' AND ' ORDER BY c.n) INTO cond
+      FROM unnest(ccols, vals) WITH ORDINALITY AS c(col, val, n);
+    IF fk.conrelid = undo_referenced.relid THEN
+      SELECT cond || ' AND NOT (' || string_agg(format('x.%I OPERATOR(pg_catalog.=) %L', c.col, c.val), ' AND ' ORDER BY c.n)
+             || ')' INTO cond
+        FROM unnest(pcols, vals) WITH ORDINALITY AS c(col, val, n);
+    END IF;
+    EXECUTE format('SELECT EXISTS (SELECT FROM %s%s x WHERE %s)',
+                   CASE WHEN fk.relkind = 'p' THEN '' ELSE 'ONLY ' END, fk.conrelid::regclass, cond) INTO hit;
+    IF hit AND NOT fk.name = ANY (children) THEN
+      children := children || fk.name;
+    END IF;
+  END LOOP;
+  IF cardinality(children) = 0 THEN
+    RETURN NULL;
+  END IF;
+  RETURN 'referenced: ' || array_to_string(children, ', ');
+END
+$$;
+
+-- 복구 문장의 글자 (7장 "stet.undo"의 3). action이 delete면 그 키의 행을 지우고, update면 a와 b가 다른 컬럼만 b의 값으로
+-- 바꾸고(계획의 보정 U3), insert면 b의 행을 넣는다. 값을 적는 법과 이름을 적는 법은 이 절의 머리 주석에 있다.
+-- - 생성 컬럼(GENERATED ALWAYS AS ... STORED)에는 값을 주지 않는다. GENERATED ALWAYS AS IDENTITY 컬럼은 UPDATE로는 값을 줄
+--   수 없으므로 insert에서만 주고, 그래서 insert는 OVERRIDING SYSTEM VALUE를 쓴다(테이블 소유자가 아니어도 된다).
+--   update에서 바꿀 컬럼이 그런 것뿐이면 문장이 없다(NULL). 그때 그 행은 b가 될 수 없어 restored_differs가 된다.
+-- - delete와 update는 ONLY로, 키 컬럼과 tableoid로 그 행만 고른다. 세 문장 모두 RETURNING r.tableoid로 바꾼 행이 어느
+--   테이블의 것인지 돌려준다. stet.undo가 바꾼 행 수와 함께 stet.undo_outcome에 넘긴다.
+-- 먼저 stet.undo_lock으로 테이블을 잠그고 이름을 확인한다(이미 판단이 잠갔으므로 대개 아무것도 기다리지 않는다). 컬럼은
+-- 그 뒤에 지금의 카탈로그에서 읽는다. 글자를 만들 뿐 아무것도 실행하지 않는다. 부른 계정의 권한으로 돈다.
+CREATE OR REPLACE FUNCTION stet.undo_statement(relid oid, key_column text, key text, action text, b jsonb, a jsonb)
+RETURNS text
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+SET DateStyle = 'ISO, MDY'
+SET IntervalStyle = 'postgres'
+SET extra_float_digits = 1
+SET TimeZone = 'UTC'
+SET bytea_output = 'hex'
+SET client_min_messages = warning
+AS $$
+DECLARE
+  tbl    text;
+  target text;
+  sets   text;
+  cols   text;
+  vals   text;
+BEGIN
+  SELECT lk.table_name INTO tbl FROM stet.undo_lock(undo_statement.relid) lk;
+  target := format('r.%I OPERATOR(pg_catalog.=) %L AND r.tableoid OPERATOR(pg_catalog.=) %L',
+                   undo_statement.key_column, undo_statement.key, undo_statement.relid);
+  IF undo_statement.action = 'delete' THEN
+    RETURN format('DELETE FROM ONLY %s r WHERE %s RETURNING r.tableoid', tbl, target);
+  ELSIF undo_statement.action = 'update' THEN
+    SELECT string_agg(format('%I = %L', att.attname, undo_statement.b ->> att.attname::text), ', ' ORDER BY att.attnum)
+      INTO sets
+      FROM pg_catalog.pg_attribute att
+     WHERE att.attrelid = undo_statement.relid AND att.attnum > 0 AND NOT att.attisdropped
+       AND att.attgenerated = '' AND att.attidentity <> 'a'
+       AND (undo_statement.b -> att.attname::text) IS DISTINCT FROM (undo_statement.a -> att.attname::text);
+    IF sets IS NULL THEN
+      RETURN NULL;
+    END IF;
+    RETURN format('UPDATE ONLY %s r SET %s WHERE %s RETURNING r.tableoid', tbl, sets, target);
+  ELSIF undo_statement.action = 'insert' THEN
+    SELECT string_agg(format('%I', att.attname), ', ' ORDER BY att.attnum),
+           string_agg(format('%L', undo_statement.b ->> att.attname::text), ', ' ORDER BY att.attnum)
+      INTO cols, vals
+      FROM pg_catalog.pg_attribute att
+     WHERE att.attrelid = undo_statement.relid AND att.attnum > 0 AND NOT att.attisdropped AND att.attgenerated = '';
+    RETURN format('INSERT INTO %s AS r (%s) OVERRIDING SYSTEM VALUE VALUES (%s) RETURNING r.tableoid', tbl, cols, vals);
+  END IF;
+  RAISE EXCEPTION 'action must be delete, insert or update, not %', coalesce(quote_literal(undo_statement.action), 'NULL')
+    USING ERRCODE = 'invalid_parameter_value';
+END
+$$;
+
+-- 복구한 뒤의 결과 (7장 "stet.undo"의 4). 그 키의 지금 행을 stet.undo_row로 다시 읽어(같은 그림, 같은 설정) b와 같으면
+-- restored, 다르면 restored_differs다(고객의 트리거나 기본값이 값을 바꿨다, 값을 줄 수 없는 컬럼이 b와 달랐다, 트리거가
+-- 쓰기를 막아 delete인데 행이 남았다). changed와 written은 복구 문장이 바꾼 행 수와 그 행의 tableoid다(문장이 없었으면
+-- NULL). 두 행 이상을 바꿨거나 다른 테이블에 썼으면 에러를 내어, stet.undo가 그 키의 블록을 되돌리게 한다. 키 컬럼이
+-- 유일하지 않은데 그 사이에 같은 키의 행이 생겼거나, 스키마의 이름이 그 사이에 다른 테이블을 가리키게 된 경우다.
+CREATE OR REPLACE FUNCTION stet.undo_outcome(relid oid, key_column text, key text, b jsonb, changed bigint, written oid)
+RETURNS text
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+SET DateStyle = 'ISO, MDY'
+SET IntervalStyle = 'postgres'
+SET extra_float_digits = 1
+SET TimeZone = 'UTC'
+SET bytea_output = 'hex'
+SET client_min_messages = warning
+AS $$
+BEGIN
+  IF undo_outcome.changed > 1 THEN
+    RAISE EXCEPTION 'restoring % of % changed % rows, not one', quote_literal(undo_outcome.key), undo_outcome.relid::regclass,
+      undo_outcome.changed USING ERRCODE = 'cardinality_violation';
+  END IF;
+  IF undo_outcome.changed = 1 AND undo_outcome.written IS DISTINCT FROM undo_outcome.relid THEN
+    RAISE EXCEPTION 'restoring % of the table with oid % wrote to the table with oid %', quote_literal(undo_outcome.key),
+      undo_outcome.relid, undo_outcome.written USING ERRCODE = 'object_not_in_prerequisite_state';
+  END IF;
+  IF stet.undo_row(undo_outcome.relid, undo_outcome.key_column, undo_outcome.key, false) IS NOT DISTINCT FROM undo_outcome.b THEN
+    RETURN 'restored';
+  END IF;
+  RETURN 'restored_differs';
+END
+$$;
+
+-- 실패의 이유 (7장 "stet.undo"의 5): 'SQLSTATE <코드>: <메시지>'.
+CREATE OR REPLACE FUNCTION stet.undo_failure(sqlstate text, message text) RETURNS text
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+SET DateStyle = 'ISO, MDY'
+SET IntervalStyle = 'postgres'
+SET extra_float_digits = 1
+SET TimeZone = 'UTC'
+SET bytea_output = 'hex'
+SET client_min_messages = warning
+AS $$
+BEGIN
+  RETURN 'SQLSTATE ' || undo_failure.sqlstate || ': ' || undo_failure.message;
+END
+$$;
+
+-- 결과의 줄들. lines(stet.undo_lines)의 순서, 곧 계획의 순서로 한 줄씩이다. key가 있는 줄은 그 키를 마지막으로 해 본 결과다
+-- (tried, actions, outcomes, reasons, warnings는 해 본 차례대로다). 보이지 않거나 없어진 테이블의 줄은 skipped와 그
+-- withheld, 값을 남기지 않은 묶음의 줄은 not_captured와 그 skipped다. 줄마다 stet.undo의 일곱 컬럼을 그 이름으로 가진
+-- 객체이고, 결과는 그 배열이다. stet.undo_record에 그대로 넘기고, stet.undo_unpack으로 결과의 행이 된다.
+CREATE OR REPLACE FUNCTION stet.undo_result(lines jsonb, tried integer[], actions text[], outcomes text[], reasons text[],
+                                            warnings text[])
+RETURNS jsonb
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+SET DateStyle = 'ISO, MDY'
+SET IntervalStyle = 'postgres'
+SET extra_float_digits = 1
+SET TimeZone = 'UTC'
+SET bytea_output = 'hex'
+SET client_min_messages = warning
+AS $$
+BEGIN
+  RETURN (
+    SELECT coalesce(jsonb_agg(
+             CASE WHEN jsonb_typeof(e.x->'withheld') = 'string' THEN
+                    jsonb_build_object('target_table', e.x->'target_table', 'key', NULL, 'action', NULL,
+                                       'outcome', 'skipped', 'reason', e.x->'withheld', 'warning', NULL, 'change_ids', NULL)
+                  WHEN jsonb_typeof(e.x->'skipped') = 'string' THEN
+                    jsonb_build_object('target_table', e.x->'target_table', 'key', NULL, 'action', NULL,
+                                       'outcome', 'not_captured', 'reason', e.x->'skipped', 'warning', NULL,
+                                       'change_ids', NULL)
+                  ELSE
+                    jsonb_build_object('target_table', e.x->'target_table', 'key', e.x->'key', 'action', l.act,
+                                       'outcome', l.outc, 'reason', l.why, 'warning', l.wrn,
+                                       'change_ids', e.x->'change_ids')
+             END ORDER BY e.i), '[]'::jsonb)
+      FROM jsonb_array_elements(undo_result.lines) WITH ORDINALITY AS e(x, i)
+      LEFT JOIN (SELECT DISTINCT ON (t.p) t.p, t.act, t.outc, t.why, t.wrn
+                   FROM unnest(undo_result.tried, undo_result.actions, undo_result.outcomes, undo_result.reasons,
+                               undo_result.warnings) WITH ORDINALITY AS t(p, act, outc, why, wrn, j)
+                  ORDER BY t.p, t.j DESC) l ON l.p = e.i);
+END
+$$;
+
+-- 결과의 줄들을 행으로 (stet.undo의 결과, stet.undo_record의 기록). items가 stet.undo_result가 만드는 꼴이 아니면 무엇이든
+-- 22023으로 거절한다: JSON 배열이고, 줄마다 정확히 일곱 키(target_table, key, action, outcome, reason, warning,
+-- change_ids)를 가진 객체이며, target_table은 글자, key, reason, warning은 글자나 null, action은 null이나 delete, insert,
+-- update, outcome은 restored, restored_differs, skipped, failed, not_captured, change_ids는 null이나 bigint의 범위에 드는
+-- 정수의 배열이다. stet.undo_record(SECURITY DEFINER)가 받은 것을 믿지 않고 이 함수로 확인한다. 식이나 이름을 평가하지 않는다.
+CREATE OR REPLACE FUNCTION stet.undo_unpack(items jsonb)
+RETURNS TABLE (target_table text, key text, action text, outcome text, reason text, warning text, change_ids bigint[])
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+SET DateStyle = 'ISO, MDY'
+SET IntervalStyle = 'postgres'
+SET extra_float_digits = 1
+SET TimeZone = 'UTC'
+SET bytea_output = 'hex'
+SET client_min_messages = warning
+AS $$
+DECLARE
+  e   jsonb;
+  n   bigint;
+  bad boolean;
+BEGIN
+  IF jsonb_typeof(undo_unpack.items) IS DISTINCT FROM 'array' THEN
+    RAISE EXCEPTION 'the lines of an undo must be a JSON array' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  FOR e, n IN SELECT x.v, x.n FROM jsonb_array_elements(undo_unpack.items) WITH ORDINALITY AS x(v, n) ORDER BY x.n LOOP
+    bad := jsonb_typeof(e) <> 'object';
+    IF NOT bad THEN
+      bad := (SELECT array_agg(k.name ORDER BY k.name COLLATE pg_catalog."C") FROM jsonb_object_keys(e) AS k(name))
+             IS DISTINCT FROM '{action,change_ids,key,outcome,reason,target_table,warning}'::text[];
+    END IF;
+    IF NOT bad THEN
+      bad := jsonb_typeof(e->'target_table') <> 'string'
+             OR jsonb_typeof(e->'key') NOT IN ('string', 'null')
+             OR e->'action' NOT IN ('null', '"delete"', '"insert"', '"update"')
+             OR e->'outcome' NOT IN ('"restored"', '"restored_differs"', '"skipped"', '"failed"', '"not_captured"')
+             OR jsonb_typeof(e->'reason') NOT IN ('string', 'null')
+             OR jsonb_typeof(e->'warning') NOT IN ('string', 'null')
+             OR jsonb_typeof(e->'change_ids') NOT IN ('array', 'null');
+    END IF;
+    IF NOT bad AND jsonb_typeof(e->'change_ids') = 'array' THEN
+      bad := EXISTS (SELECT FROM jsonb_array_elements(e->'change_ids') AS c(v)
+                      WHERE jsonb_typeof(c.v) <> 'number' OR c.v::text !~ '^-?[0-9]{1,19}$'
+                         OR c.v::text::numeric NOT BETWEEN -9223372036854775808 AND 9223372036854775807);
+    END IF;
+    IF bad THEN
+      RAISE EXCEPTION 'line % of the undo is not a line stet.undo makes: %', n, left(e::text, 200)
+        USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    target_table := e->>'target_table';
+    key := e->>'key';
+    action := e->>'action';
+    outcome := e->>'outcome';
+    reason := e->>'reason';
+    warning := e->>'warning';
+    change_ids := CASE WHEN jsonb_typeof(e->'change_ids') = 'array'
+                       THEN ARRAY(SELECT (c.v #>> '{}')::bigint FROM jsonb_array_elements(e->'change_ids') WITH ORDINALITY AS c(v, o)
+                                   ORDER BY c.o) END;
+    RETURN NEXT;
+  END LOOP;
+END
+$$;
+
+-- 기록 (7장 "기록"). stet.undos에 한 줄, stet.undo_items에 줄마다 한 줄, stet.undone_changes에 되돌린 줄(restored,
+-- restored_differs)의 변경마다 한 줄을 부른 쪽의 트랜잭션 안에서 적고 그 id를 돌려준다.
+-- 검토자는 세 표의 권한이 없으므로 소유자(Stet의 계정)의 권한으로 돈다(SECURITY DEFINER). 그래서 받은 것을 믿지 않는다.
+-- - by는 session_user다. 인자로 받지 않는다. SET ROLE이나 남의 SECURITY DEFINER 함수를 거쳐도 접속 계정이 남는다. 남의
+--   이름으로 기록을 만들 수 없다. 자기 이름으로 지어낸 기록은 만들 수 있다(스펙 11장의 한계).
+-- - stet.undo_refuse의 다섯 거절을 똑같이 한다(자기 쓰기의 되돌리기를 기록할 수 없다).
+-- - items는 stet.undo_unpack으로 꼴을 확인하고 행으로 읽는다(22023). 세 수는 이 함수가 줄에서 센다: restored는 restored와
+--   restored_differs, skipped는 skipped와 not_captured, failed는 failed다(계획의 보정 U5).
+-- 부른 쪽의 식이나 이름을 평가하지 않고, 동적 SQL이 없으며, 고객의 코드를 부르지 않는다. 쓰는 곳은 세 표뿐이다.
+CREATE OR REPLACE FUNCTION stet.undo_record(agent_role text, since timestamptz, until timestamptz, tables text[],
+                                            note text, items jsonb)
+RETURNS bigint
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+SET DateStyle = 'ISO, MDY'
+SET IntervalStyle = 'postgres'
+SET extra_float_digits = 1
+SET TimeZone = 'UTC'
+SET bytea_output = 'hex'
+SET client_min_messages = warning
+AS $$
+DECLARE
+  new_id bigint;
+BEGIN
+  PERFORM stet.undo_refuse(undo_record.agent_role, undo_record.since, undo_record.until);
+  INSERT INTO stet.undos AS u (at, by, agent_role, since, until, tables, note, restored, skipped, failed)
+  SELECT clock_timestamp(), session_user, undo_record.agent_role, undo_record.since, undo_record.until,
+         undo_record.tables, undo_record.note,
+         count(*) FILTER (WHERE r.outcome IN ('restored', 'restored_differs')),
+         count(*) FILTER (WHERE r.outcome IN ('skipped', 'not_captured')),
+         count(*) FILTER (WHERE r.outcome = 'failed')
+    FROM stet.undo_unpack(undo_record.items) AS r
+  RETURNING u.id INTO new_id;
+  INSERT INTO stet.undo_items (undo_id, line, target_table, key, action, outcome, reason, warning, change_ids)
+  SELECT new_id, r.n, r.target_table, r.key, r.action, r.outcome, r.reason, r.warning, r.change_ids
+    FROM stet.undo_unpack(undo_record.items) WITH ORDINALITY AS r(target_table, key, action, outcome, reason, warning,
+                                                                  change_ids, n);
+  INSERT INTO stet.undone_changes (change_id, undo_id)
+  SELECT DISTINCT c.id, new_id
+    FROM stet.undo_unpack(undo_record.items) AS r
+   CROSS JOIN LATERAL unnest(r.change_ids) AS c(id)
+   WHERE r.outcome IN ('restored', 'restored_differs');
+  RETURN new_id;
+END
+$$;
+
+-- 되돌리기 (7장 "stet.undo"). 결과는 stet.undo_plan과 같은 일곱 컬럼, 같은 순서(target_table, 그 키의 첫 변경)의 줄이다.
+-- outcome은 restored, restored_differs, skipped, failed, not_captured다. action은 stet.undo가 하기로 정한 것이고, 건너뛴
+-- 줄과 정하기 전에 실패한 줄은 NULL이다. warning은 되돌린 줄(restored, restored_differs)에만 붙는다.
+-- 부른 계정의 권한으로 돌고(SECURITY INVOKER) SET 절이 없다. 몸통에 대해서는 이 절의 머리 주석을 본다.
+-- 1. 거절(stet.undo_refuse, ST006): 인자가 틀렸거나 트랜잭션이 READ COMMITTED가 아니다(판정 R15). 에러를 내는 것은
+--    이것과, 이 함수와 키마다의 블록 밖에서 부르는 도우미의 EXECUTE가 없는 것(42501), 시간 초과와 취소(57014), 읽기
+--    전용 트랜잭션(25006, 기록을 적을 때. 그 전에 모든 키가 failed다)뿐이다. 미룬 제약(DEFERRABLE INITIALLY DEFERRED의
+--    NO ACTION 외래 키, 검토자의 SET CONSTRAINTS)은 커밋할 때 확인되므로 그 실패는 검토자의 COMMIT에서 나온다.
+-- 2. 고른 줄들을 한 번 읽는다(stet.undo_lines).
+-- 3. 바퀴마다 stet.undo_next가 정한 키들을 차례로 해 본다. 키 하나는 예외 블록(하위 트랜잭션, 계획의 보정 U2) 하나다:
+--    a. stet.undo_judge(..., lock => true): 테이블을 잠그고(ACCESS SHARE) 그 행을 FOR UPDATE로 잠근 뒤 여섯 확인을 다시
+--       한다. 걸리면 skipped와 그 이유다.
+--    b. stet.undo_referenced: 연쇄하는 외래 키로 가리키는 행이 있으면 skipped와 'referenced: <테이블들>'이다.
+--    c. stet.undo_statement가 돌려준 문장을 EXECUTE한다. 바꾼 행 수(ROW_COUNT)와 그 행의 tableoid를 받는다.
+--    d. stet.undo_outcome: 그 키의 행을 다시 읽어 B와 비교한다. restored 또는 restored_differs이고, 경고
+--       (stet.undo_warning)를 붙인다.
+--    블록 안의 에러는 그 키의 블록만 되돌리고(잡은 행 잠금과 쓴 것이 함께 풀린다) failed와 'SQLSTATE <코드>: <메시지>'다.
+--    WHEN OTHERS가 잡지 않는 assert_failure(고객 트리거의 ASSERT)도 잡는다. 잡지 않는 것은 취소와 시간 초과(57014)뿐이고,
+--    그때는 이 함수가 에러로 끝나 아무것도 기록되지 않는다. READ COMMITTED에서는 교착(40P01)도 직렬화 실패(40001, 이
+--    격리 수준에서는 고객의 코드만 낸다)도 하위 트랜잭션을 되돌리면 트랜잭션이 계속 쓸 수 있으므로 failed로 적는다.
+--    교착이면 서버가 그 키의 잠금 대기를 끝낸 것이다. 그 키의 블록이 잡은 것은 함께 풀리고, 앞서 되돌린 키의 잠금을
+--    기다리던 상대는 검토자의 트랜잭션이 끝나면 나아간다. 23503, 23505, referenced 말고는 다시 해 보지 않는다.
+-- 4. 바퀴는 stet.undo_next가 더 해 볼 키를 내지 않을 때 끝난다.
+-- 5. 결과의 줄을 만들고(stet.undo_result), 기록하고(stet.undo_record), 돌려준다(stet.undo_unpack).
+-- 건너뛴 키도 a에서 잡은 행 잠금을 트랜잭션이 끝날 때까지 쥔다(FOR UPDATE의 보통의 동작이다).
+CREATE OR REPLACE FUNCTION stet.undo(agent_role text, since timestamptz, until timestamptz DEFAULT NULL,
+                                     tables text[] DEFAULT NULL, note text DEFAULT NULL)
+RETURNS TABLE (target_table text, key text, action text, outcome text, reason text, warning text, change_ids bigint[])
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  lines    pg_catalog.jsonb;
+  k        pg_catalog.record;
+  tried    pg_catalog.int4[] := '{}';
+  actions  pg_catalog.text[] := '{}';
+  outcomes pg_catalog.text[] := '{}';
+  codes    pg_catalog.text[] := '{}';
+  reasons  pg_catalog.text[] := '{}';
+  warnings pg_catalog.text[] := '{}';
+  done     pg_catalog.int4 := 0;
+  started  pg_catalog.int4;
+  act      pg_catalog.text;
+  outc     pg_catalog.text;
+  why      pg_catalog.text;
+  wrn      pg_catalog.text;
+  code     pg_catalog.text;
+  msg      pg_catalog.text;
+  stmt     pg_catalog.text;
+  written  pg_catalog.oid;
+  changed  pg_catalog.int8;
+  items    pg_catalog.jsonb;
+BEGIN
+  PERFORM stet.undo_refuse(undo.agent_role, undo.since, undo.until);
+  lines := stet.undo_lines(undo.agent_role, undo.since, undo.until, undo.tables);
+  LOOP
+    started := pg_catalog.cardinality(tried);
+    FOR k IN SELECT nx.* FROM stet.undo_next(lines, tried, outcomes, codes, reasons, done) AS nx LOOP
+      act := NULL;
+      outc := NULL;
+      why := NULL;
+      wrn := NULL;
+      code := NULL;
+      BEGIN
+        SELECT j.action, j.reason INTO act, why
+          FROM stet.undo_judge(k.relid, k.key_column, k.key, k.b, k.a, k.key_changed, k.interleaved, true) AS j;
+        IF why IS NULL THEN
+          why := stet.undo_referenced(k.relid, act, k.b, k.a);
+        END IF;
+        IF why IS NULL THEN
+          stmt := stet.undo_statement(k.relid, k.key_column, k.key, act, k.b, k.a);
+          written := NULL;
+          changed := NULL;
+          IF stmt IS NOT NULL THEN
+            EXECUTE stmt INTO written;
+            GET DIAGNOSTICS changed = ROW_COUNT;
+          END IF;
+          outc := stet.undo_outcome(k.relid, k.key_column, k.key, k.b, changed, written);
+          wrn := stet.undo_warning(k.relid, act, k.also_changed);
+        ELSE
+          act := NULL;
+          outc := 'skipped';
+        END IF;
+      EXCEPTION WHEN OTHERS OR assert_failure THEN
+        GET STACKED DIAGNOSTICS code = RETURNED_SQLSTATE, msg = MESSAGE_TEXT;
+        outc := 'failed';
+        why := stet.undo_failure(code, msg);
+        wrn := NULL;
+      END;
+      tried := pg_catalog.array_append(tried, k.pos);
+      actions := pg_catalog.array_append(actions, act);
+      outcomes := pg_catalog.array_append(outcomes, outc);
+      codes := pg_catalog.array_append(codes, code);
+      reasons := pg_catalog.array_append(reasons, why);
+      warnings := pg_catalog.array_append(warnings, wrn);
+    END LOOP;
+    EXIT WHEN NOT FOUND;
+    done := started;
+  END LOOP;
+  items := stet.undo_result(lines, tried, actions, outcomes, reasons, warnings);
+  PERFORM stet.undo_record(undo.agent_role, undo.since, undo.until, undo.tables, undo.note, items);
+  RETURN QUERY SELECT r.* FROM stet.undo_unpack(items) AS r;
+END
+$$;
+
 -- 되돌리기의 함수들은 PUBLIC이 부를 수 없다(7장 "권한"). 테이블 소유자도 stet 스키마의 USAGE를 가지므로(4장) 열어 두면
 -- stet.undo_selection으로 남긴 값을 읽을 수 있다. 누가 계획을 볼 수 있는지는 운영자가 정한다. stet.undo_plan을 쓰는
 -- 검토자에게는 이것을 준다. 도우미는 계획이 검토자의 권한으로 부르므로 그 EXECUTE도 있어야 한다:
@@ -1263,10 +1862,41 @@ $$;
 -- 있는 역할들로 판단한다. 그래서 여러 역할로 바꿀 수 있는 로그인은 그 가운데 어느 역할이든 읽을 수 있는 것을 본다.
 -- 계획과 도우미는 READ COMMITTED 트랜잭션에서만 돈다(ST006).
 -- stet.change_sets와 stet.changes의 권한은 주지 않는다. 이 함수들은 아무것도 바꾸거나 적지 않는다.
+-- 되돌릴 수도 있는 검토자에게는 위의 것에 더해 이것을 준다. stet.undo가 검토자의 권한으로 이 도우미들을 부른다:
+--   GRANT EXECUTE ON FUNCTION stet.undo(text, timestamptz, timestamptz, text[], text),
+--                             stet.undo_lines(text, timestamptz, timestamptz, text[]),
+--                             stet.undo_next(jsonb, integer[], text[], text[], text[], integer),
+--                             stet.undo_referenced(oid, text, jsonb, jsonb),
+--                             stet.undo_statement(oid, text, text, text, jsonb, jsonb),
+--                             stet.undo_outcome(oid, text, text, jsonb, bigint, oid),
+--                             stet.undo_failure(text, text),
+--                             stet.undo_result(jsonb, integer[], text[], text[], text[], text[]),
+--                             stet.undo_unpack(jsonb),
+--                             stet.undo_record(text, timestamptz, timestamptz, text[], text, jsonb) TO reviewer;
+-- 그리고 되돌릴 테이블마다 SELECT, INSERT, UPDATE, DELETE다(GRANT SELECT, INSERT, UPDATE, DELETE ON public.deals TO
+-- reviewer). 행을 FOR UPDATE로 잠그는 데 UPDATE가 든다. 없는 것이 있으면 그 키는 failed(42501)다. 그 테이블을 ON DELETE나
+-- ON UPDATE의 CASCADE, SET NULL, SET DEFAULT로 가리키는 자식 테이블에는 SELECT가 든다(referenced를 보려고 읽는다). 없으면
+-- 그런 키도 failed(42501)다. 고객의 트리거가 쓰는 다른 테이블의 권한도 검토자의 것으로 확인된다.
+-- 기록은 stet.undo_record(SECURITY DEFINER)만 적는다. stet.undos, stet.undo_items, stet.undone_changes의 권한은 주지
+-- 않는다. 기록은
+-- stet.history의 undo_id와 undone_at으로 보인다. stet.undo_plan의 것만 받은 계정은 stet.undo도 stet.undo_record도 부를 수
+-- 없으므로 아무것도 바꾸거나 적지 못한다. stet.undo_record를 직접 부르면 자기 이름(session_user)의 기록만 만들 수 있다.
+-- 되돌리기도 READ COMMITTED 트랜잭션에서만 돈다:
+--   BEGIN ISOLATION LEVEL READ COMMITTED; SELECT * FROM stet.undo('agent', '2026-11-18 09:00+09'); ... COMMIT;
 REVOKE EXECUTE ON FUNCTION stet.undo_plan(text, timestamptz, timestamptz, text[]),
                            stet.undo_selection(text, timestamptz, timestamptz, text[]),
                            stet.undo_lock(oid),
                            stet.undo_row(oid, text, text, boolean),
                            stet.undo_judge(oid, text, text, jsonb, jsonb, boolean, boolean, boolean),
                            stet.undo_warning(oid, text, text[]),
-                           stet.undo_refuse(text, timestamptz, timestamptz) FROM PUBLIC;
+                           stet.undo_refuse(text, timestamptz, timestamptz),
+                           stet.undo(text, timestamptz, timestamptz, text[], text),
+                           stet.undo_lines(text, timestamptz, timestamptz, text[]),
+                           stet.undo_next(jsonb, integer[], text[], text[], text[], integer),
+                           stet.undo_referenced(oid, text, jsonb, jsonb),
+                           stet.undo_statement(oid, text, text, text, jsonb, jsonb),
+                           stet.undo_outcome(oid, text, text, jsonb, bigint, oid),
+                           stet.undo_failure(text, text),
+                           stet.undo_result(jsonb, integer[], text[], text[], text[], text[]),
+                           stet.undo_unpack(jsonb),
+                           stet.undo_record(text, timestamptz, timestamptz, text[], text, jsonb) FROM PUBLIC;
