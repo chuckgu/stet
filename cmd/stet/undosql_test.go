@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // undoSQLConfig writes a config file whose upstream is Stet's account in
@@ -65,7 +67,7 @@ func TestUndoSQLCommand(t *testing.T) {
 		"GRANT EXECUTE ON FUNCTION stet.capture() TO " + owner + ";\n",
 		"-- 2. Run as " + owner + " (the owner of public.deals).\n",
 		"SET LOCAL lock_timeout = '5s';\n",
-		"CREATE TRIGGER stet_capture_trunc AFTER TRUNCATE ON public.deals\n",
+		"CREATE OR REPLACE TRIGGER stet_capture_trunc AFTER TRUNCATE ON public.deals\n",
 		"FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('public.deals', 'id');\n",
 	} {
 		if !strings.Contains(out.String(), p) {
@@ -106,5 +108,31 @@ func TestUndoSQLCommand(t *testing.T) {
 	var schema *string
 	if err := connectTo(t, pg, bare, "postgres", "postgres-pw").QueryRow(ctx, `select to_regnamespace('stet')::text`).Scan(&schema); err != nil || schema != nil {
 		t.Errorf("stet undo-sql created schema %v (%v)", schema, err)
+	}
+}
+
+// On a server older than PostgreSQL 14 stet undo-sql refuses to print the
+// install SQL (ruling R12) and prints nothing; -drop still prints. The test
+// server is 14, so the version read is faked.
+func TestUndoSQLRefusesAServerBefore14(t *testing.T) {
+	pg := testPG(t)
+	db := cleanDatabase(t, pg)
+	stetPoolIn(t, pg, db)
+	mustExec(t, connectTo(t, pg, db, "postgres", "postgres-pw"), "create table public.deals (id int primary key)")
+	path := undoSQLConfig(t, pg, db, "  tables:\n    public.deals: {pk: id}\n")
+
+	real := serverVersionNum
+	t.Cleanup(func() { serverVersionNum = real })
+	serverVersionNum = func(context.Context, pgx.Tx) (int, error) { return 130011, nil }
+
+	var out bytes.Buffer
+	err := runUndoSQL([]string{"-config", path}, &out)
+	if err == nil || !strings.Contains(err.Error(), "PostgreSQL 14 or later") || out.Len() != 0 {
+		t.Errorf("on PostgreSQL 13: %v, printed %q; want an error saying PostgreSQL 14 or later, and nothing printed", err, out.String())
+	}
+	out.Reset()
+	if err := runUndoSQL([]string{"-config", path, "-drop"}, &out); err != nil ||
+		!strings.Contains(out.String(), "DROP TRIGGER IF EXISTS stet_capture_ins ON public.deals;\n") {
+		t.Errorf("-drop on PostgreSQL 13: %v, printed:\n%s", err, out.String())
 	}
 }

@@ -27,7 +27,7 @@ type Table struct {
 	OID                 uint32
 	Problem             string   // why capture cannot be installed on it; "" when it can
 	Triggers            []string // what is wrong with its capture triggers, one line each; empty when all four are right
-	Children            []string // schema-qualified tables that reference it with a cascading foreign key and are not in undo.tables
+	Children            []string // schema-qualified tables that reference it with ON DELETE CASCADE, SET NULL or SET DEFAULT and are not in undo.tables
 
 	// noTriggers: the relation is of a kind that cannot have triggers (an
 	// index, a sequence, a materialized view, a system table), so DropSQL
@@ -100,7 +100,7 @@ func Inspect(ctx context.Context, q store.Querier, cfg *config.Config) ([]Table,
 	for i, key := range keys {
 		ts[i] = Table{Key: key, PK: cfg.Undo.Tables[key]}
 		if err := look(ctx, q, &ts[i]); err != nil {
-			return nil, fmt.Errorf("undo.tables.%s: %w", key, err)
+			return nil, fmt.Errorf("undo.tables.%s: %w", oneLine(key), err)
 		}
 	}
 	sameTable(ts)
@@ -117,10 +117,10 @@ func Inspect(ctx context.Context, q store.Querier, cfg *config.Config) ([]Table,
 			continue
 		}
 		if err := inspectTriggers(ctx, q, t); err != nil {
-			return nil, fmt.Errorf("undo.tables.%s: %w", t.Key, err)
+			return nil, fmt.Errorf("undo.tables.%s: %w", oneLine(t.Key), err)
 		}
 		if err := inspectChildren(ctx, q, t, oids); err != nil {
-			return nil, fmt.Errorf("undo.tables.%s: %w", t.Key, err)
+			return nil, fmt.Errorf("undo.tables.%s: %w", oneLine(t.Key), err)
 		}
 	}
 	return ts, nil
@@ -139,6 +139,7 @@ func look(ctx context.Context, q store.Querier, t *Table) error {
 		parent                  *string
 		inheritors              []string
 		hasColumn, isKey        bool
+		deferrablePK            bool
 	)
 	// No column has a name the server cannot take as text; "" matches none.
 	pk := t.PK
@@ -160,12 +161,15 @@ func look(ctx context.Context, q store.Querier, t *Table) error {
 		                where x.indrelid = c.oid and x.indisunique and x.indisvalid and x.indimmediate
 		                  and x.indnkeyatts = 1 and x.indkey[0] = a.attnum
 		                  and x.indpred is null and x.indexprs is null
-		                  and (x.indisprimary or a.attnotnull))
+		                  and (x.indisprimary or a.attnotnull)),
+		       exists (select from pg_index x
+		                where x.indrelid = c.oid and x.indisprimary and not x.indimmediate
+		                  and x.indnkeyatts = 1 and x.indkey[0] = a.attnum)
 		  from pg_class c
 		  join pg_namespace n on n.oid = c.relnamespace
 		  left join pg_attribute a on a.attrelid = c.oid and a.attname = $2 and a.attnum > 0 and not a.attisdropped
 		 where c.oid = $1`, oid, pk).Scan(
-		&t.Schema, &t.Name, &t.Owner, &relkind, &partition, &temp, &system, &parent, &inheritors, &hasColumn, &isKey)
+		&t.Schema, &t.Name, &t.Owner, &relkind, &partition, &temp, &system, &parent, &inheritors, &hasColumn, &isKey, &deferrablePK)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Dropped between the two reads.
 		t.Problem = "Stet's account finds no table " + ident(t.Key)
@@ -195,11 +199,20 @@ func look(ctx context.Context, q store.Querier, t *Table) error {
 		t.Problem = fmt.Sprintf("%s %s, not an ordinary table", qual, relkindName(relkind))
 	case temp:
 		t.Problem = qual + " is a temporary table, not an ordinary table"
+	case parent != nil:
+		// Ruling R13: a write through the parent fires only the parent's
+		// statement triggers.
+		t.Problem = fmt.Sprintf("%s is an inheritance child of %s; capture takes no inheritance child, since a write "+
+			"through %s changes its rows without firing its statement triggers", qual, *parent, *parent)
 	case len(inheritors) > 0:
 		t.Problem = fmt.Sprintf("%s has inheritance children (%s); capture takes no table with inheritance children, "+
 			"since a write to it also changes their rows, which its triggers do not capture", qual, strings.Join(inheritors, ", "))
 	case !hasColumn:
 		t.Problem = fmt.Sprintf("%s has no column %s", qual, quoteIdent(t.PK))
+	case !isKey && deferrablePK:
+		t.Problem = fmt.Sprintf("column %s of %s is the table's primary key, but a deferrable one: with its check "+
+			"deferred, a statement can leave two rows with one key, and capture records rows by key; "+
+			"make the primary key NOT DEFERRABLE", quoteIdent(t.PK), qual)
 	case !isKey:
 		t.Problem = fmt.Sprintf("column %s of %s is not a key: it must be the table's primary key, or NOT NULL with "+
 			"a unique constraint or index on it alone that is not partial, not on an expression and not deferrable",
@@ -340,7 +353,7 @@ func inspectTriggers(ctx context.Context, q store.Querier, t *Table) error {
 			args          []byte
 			old, new      *string
 			columns       int32
-			when          bool
+			when, constr  bool
 		)
 		err := q.QueryRow(ctx, `
 			select t.tgtype, t.tgenabled::text,
@@ -349,10 +362,10 @@ func inspectTriggers(ctx context.Context, q store.Querier, t *Table) error {
 			       (select format('%I.%I(%s)', n.nspname, p.proname, pg_get_function_identity_arguments(p.oid))
 			          from pg_proc p join pg_namespace n on n.oid = p.pronamespace where p.oid = t.tgfoid),
 			       t.tgnargs, t.tgargs, t.tgoldtable::text, t.tgnewtable::text,
-			       cardinality(t.tgattr::int2[]), t.tgqual is not null
+			       cardinality(t.tgattr::int2[]), t.tgqual is not null, t.tgconstraint <> 0
 			  from pg_trigger t
 			 where t.tgrelid = $1 and t.tgname = $2`, t.OID, tr.name).Scan(
-			&tgtype, &enabled, &isCapture, &fn, &nargs, &args, &old, &new, &columns, &when)
+			&tgtype, &enabled, &isCapture, &fn, &nargs, &args, &old, &new, &columns, &when, &constr)
 		if errors.Is(err, pgx.ErrNoRows) {
 			t.Triggers = append(t.Triggers, tr.name+" is missing")
 			continue
@@ -362,6 +375,10 @@ func inspectTriggers(ctx context.Context, q store.Querier, t *Table) error {
 		}
 		wrong := func(format string, a ...any) {
 			t.Triggers = append(t.Triggers, tr.name+" "+fmt.Sprintf(format, a...))
+		}
+		if constr {
+			// CREATE OR REPLACE TRIGGER refuses to replace one.
+			wrong("is a constraint trigger, which the output of stet undo-sql cannot replace; the table's owner must drop it")
 		}
 		switch enabled {
 		case "D":
@@ -403,7 +420,40 @@ func inspectTriggers(ctx context.Context, q store.Querier, t *Table) error {
 			wrong("passes (%s) rather than (%s)", literals(got), literals(want))
 		}
 	}
+
+	// Any other trigger that calls stet.capture() records writes again. Only
+	// reported: stet undo-sql drops no trigger it does not print.
+	names := make([]string, len(captureTriggers))
+	for i, tr := range captureTriggers {
+		names[i] = tr.name
+	}
+	var others []string
+	if err := q.QueryRow(ctx, `
+		select array(select t.tgname::text
+		               from pg_trigger t
+		               join pg_proc p on p.oid = t.tgfoid
+		               join pg_namespace n on n.oid = p.pronamespace
+		              where t.tgrelid = $1 and n.nspname = 'stet' and p.proname = 'capture' and p.pronargs = 0
+		                and t.tgname <> all ($2::text[]))`, t.OID, names).Scan(&others); err != nil {
+		return err
+	}
+	slices.Sort(others)
+	for _, name := range others {
+		t.Triggers = append(t.Triggers, quoteIdent(name)+" "+otherCapture)
+	}
 	return nil
+}
+
+// otherCapture follows the name of a trigger, other than the four, that
+// calls stet.capture().
+const otherCapture = "also calls stet.capture(), so a write it fires on is recorded twice"
+
+// isCaptureTrigger reports whether line, one of Table.Triggers, is about one
+// of the four capture triggers. Each line starts with its trigger's name, and
+// the name of any other trigger is quoted unless it is a bare identifier, so
+// it cannot start with one of the four names and a space.
+func isCaptureTrigger(line string) bool {
+	return slices.ContainsFunc(captureTriggers[:], func(tr trigger) bool { return strings.HasPrefix(line, tr.name+" ") })
 }
 
 func deref(s *string) string {
@@ -444,10 +494,12 @@ func literals(args []string) string {
 }
 
 // inspectChildren fills in the tables that reference t with a foreign key
-// whose ON DELETE or ON UPDATE action changes their rows (CASCADE, SET NULL,
-// SET DEFAULT) and that are not in undo.tables (oids). A partition's copy
-// of its partitioned table's foreign key is left out: the partitioned table
-// is listed.
+// whose ON DELETE action changes their rows (CASCADE deletes them, SET NULL
+// and SET DEFAULT change their reference), as stet.undo_warning's
+// children_not_captured, and that are not in undo.tables (oids). An ON UPDATE
+// action does not count: undoing the parent's update cascades back. A
+// partition's copy of its partitioned table's foreign key is left out: the
+// partitioned table is listed.
 func inspectChildren(ctx context.Context, q store.Querier, t *Table, oids []uint32) error {
 	var children []string
 	if err := q.QueryRow(ctx, `
@@ -456,7 +508,7 @@ func inspectChildren(ctx context.Context, q store.Querier, t *Table, oids []uint
 		               join pg_class c on c.oid = fk.conrelid
 		               join pg_namespace n on n.oid = c.relnamespace
 		              where fk.contype = 'f' and fk.confrelid = $1 and fk.conparentid = 0
-		                and (fk.confdeltype in ('c', 'n', 'd') or fk.confupdtype in ('c', 'n', 'd'))
+		                and fk.confdeltype in ('c', 'n', 'd')
 		                and fk.conrelid <> all ($2::oid[]))`, t.OID, oids).Scan(&children); err != nil {
 		return err
 	}
@@ -472,8 +524,10 @@ const fix = "run stet undo-sql and have the table's owner run its output"
 
 // Warnings are the lines Stet logs at startup (spec 9): for each table, in
 // order, the problem that keeps it from being captured, or else what is
-// wrong with its capture triggers, and the tables its cascades change
-// uncaptured. Each line names the table's key.
+// wrong with its four capture triggers (one line, whose fix is the output of
+// stet undo-sql), each other trigger that calls stet.capture() (one line
+// each, whose fix is for the owner to drop it), and the tables whose rows its
+// deletes change uncaptured. Each line names the table's key.
 func Warnings(ts []Table) []string {
 	var out []string
 	add := func(format string, a ...any) { out = append(out, oneLine(fmt.Sprintf(format, a...))) }
@@ -488,13 +542,26 @@ func Warnings(ts []Table) []string {
 				"with a single-column key", t.Key, t.Problem)
 			continue
 		}
-		if len(t.Triggers) > 0 {
+		var four, others []string
+		for _, line := range t.Triggers {
+			if isCaptureTrigger(line) {
+				four = append(four, line)
+			} else {
+				others = append(others, line)
+			}
+		}
+		if len(four) > 0 {
 			add("undo.tables.%s: its capture triggers are not as stet undo-sql prints them (%s), so its writes are "+
-				"not all captured; fix: %s", t.Key, strings.Join(t.Triggers, "; "), fix)
+				"not all captured; fix: %s", t.Key, strings.Join(four, "; "), fix)
+		}
+		for _, line := range others {
+			add("undo.tables.%s: trigger %s; fix: have the table's owner drop it; the output of stet undo-sql does not",
+				t.Key, line)
 		}
 		if len(t.Children) > 0 {
-			add("undo.tables.%s: tables that reference it with a foreign key that cascades are not in undo.tables "+
-				"(%s): their rows deleted or changed along with its rows are not captured and will not come back; "+
+			add("undo.tables.%s: tables that reference it with ON DELETE CASCADE, SET NULL or SET DEFAULT are not in "+
+				"undo.tables (%s): when one of its rows is deleted, their rows that reference it are deleted or have "+
+				"their reference changed, which is not captured, and undoing the delete does not restore them; "+
 				"fix: add them to undo.tables with their key columns", t.Key, strings.Join(t.Children, ", "))
 		}
 	}

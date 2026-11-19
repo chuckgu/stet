@@ -21,10 +21,11 @@ const undoSQLTimeout = 30 * time.Second
 // account with the config's upstream, looks up the tables of undo.tables,
 // and writes to out the SQL that installs their capture triggers, or with
 // -drop the SQL that removes them. It executes none of it: it only reads the
-// catalogs, in a read-only transaction. When the database has no
-// stet.capture() it says to start Stet once, which creates the stet schema,
-// and creates nothing itself (ruling U8). On any failure it writes nothing
-// to out.
+// catalogs, in a read-only transaction. The install SQL needs PostgreSQL 14
+// or later, and on an older server it refuses (ruling R12); -drop does not.
+// When the database has no stet.capture() it says to start Stet once, which
+// creates the stet schema, and creates nothing itself (ruling U8). On any
+// failure it writes nothing to out.
 func runUndoSQL(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("undo-sql", flag.ContinueOnError)
 	path := fs.String("config", "stet.yaml", "config file")
@@ -53,9 +54,19 @@ func runUndoSQL(args []string, out io.Writer) error {
 	var (
 		role    string
 		capture bool
+		version int
 		ts      []undo.Table
 	)
 	err = readOnly(ctx, pool, func(tx pgx.Tx) error {
+		if !*drop {
+			v, err := serverVersionNum(ctx, tx)
+			if err != nil {
+				return err
+			}
+			if version = v; undo.RequireServer(version) != nil {
+				return nil // refused below; nothing more to read
+			}
+		}
 		if err := tx.QueryRow(ctx, `
 			select session_user, exists (select from pg_proc p join pg_namespace n on n.oid = p.pronamespace
 			                              where n.nspname = 'stet' and p.proname = 'capture' and p.pronargs = 0)`).
@@ -71,6 +82,11 @@ func runUndoSQL(args []string, out io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("undo-sql: looking up undo.tables: %w", err)
 	}
+	if !*drop {
+		if err := undo.RequireServer(version); err != nil {
+			return fmt.Errorf("undo-sql: %w", err)
+		}
+	}
 	if !capture && !*drop {
 		return errors.New("undo-sql: this database has no stet.capture(), which the triggers call: start Stet once " +
 			"with this config so that it creates its stet schema, then run stet undo-sql again")
@@ -84,4 +100,12 @@ func runUndoSQL(args []string, out io.Writer) error {
 	}
 	_, err = io.WriteString(out, sql)
 	return err
+}
+
+// serverVersionNum reads the server's server_version_num. A variable so a
+// test can stand in for a server older than the test server.
+var serverVersionNum = func(ctx context.Context, tx pgx.Tx) (int, error) {
+	var v int
+	err := tx.QueryRow(ctx, `select current_setting('server_version_num')::int`).Scan(&v)
+	return v, err
 }

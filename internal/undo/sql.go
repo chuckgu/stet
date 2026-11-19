@@ -13,7 +13,8 @@ import (
 
 // lockTimeout bounds how long an owner's transaction waits for the locks of
 // its tables: an open transaction that writes one of them holds a lock that
-// CREATE TRIGGER and DROP TRIGGER wait for (spec 9).
+// CREATE OR REPLACE TRIGGER waits for (spec 9), and DROP TRIGGER waits for
+// readers too.
 const lockTimeout = "5s"
 
 // InstallSQL is what `stet undo-sql` prints: the grants for stetRole to run, then one transaction per table owner.
@@ -22,9 +23,13 @@ const lockTimeout = "5s"
 // The grants give each owner, once, what creating the triggers takes (USAGE
 // on the stet schema, EXECUTE on stet.capture()); an owner that is stetRole
 // has them. Each owner's part is one transaction that first sets
-// lock_timeout, then, table by table, drops and creates each of the four
-// triggers, so it can be run again; after it, notes name the tables whose
-// cascades change rows that are not captured. Owners and tables are in
+// lock_timeout, then, table by table, creates or replaces each of the four
+// triggers, so it can be run again (ruling R12). CREATE OR REPLACE TRIGGER
+// takes a lock that waits for, and blocks, writes to the table, not reads;
+// DROP TRIGGER would block reads too, so the SQL drops nothing, and a
+// trigger of another name is left alone. It needs PostgreSQL 14 or later
+// (RequireServer). After the transaction, notes name the tables whose rows
+// the table's deletes change uncaptured. Owners and tables are in
 // byte order of owner and key. Identifiers are quoted where they must be and
 // the arguments are string literals, so no name can end the identifier or
 // literal it is in, and comments hold no line break.
@@ -79,8 +84,7 @@ func InstallSQL(stetRole string, ts []Table) (string, error) {
 			table := t.qualified()
 			args := quoteLiteral(t.Key) + ", " + quoteLiteral(t.PK)
 			for _, tr := range captureTriggers {
-				fmt.Fprintf(&b, "DROP TRIGGER IF EXISTS %s ON %s;\n", tr.name, table)
-				fmt.Fprintf(&b, "CREATE TRIGGER %s AFTER %s ON %s\n", tr.name, tr.event, table)
+				fmt.Fprintf(&b, "CREATE OR REPLACE TRIGGER %s AFTER %s ON %s\n", tr.name, tr.event, table)
 				if ref := referencing(tr.old, tr.new); ref != "" {
 					fmt.Fprintf(&b, "  %s\n", ref)
 				}
@@ -90,10 +94,11 @@ func InstallSQL(stetRole string, ts []Table) (string, error) {
 		b.WriteString("COMMIT;\n")
 		for _, t := range g.tables {
 			for _, child := range t.Children {
-				fmt.Fprintf(&b, "-- note: %s references %s with a foreign key that cascades and is not under undo.tables:\n",
+				fmt.Fprintf(&b, "-- note: %s references %s with ON DELETE CASCADE, SET NULL or SET DEFAULT and is not under undo.tables:\n",
 					comment(child), comment(t.qualified()))
-				fmt.Fprintf(&b, "--       its rows deleted or changed along with a row of %s are not captured and will not come back.\n",
-					comment(t.qualified()))
+				fmt.Fprintf(&b, "--       when a row of %s is deleted, the rows of %s that reference it are deleted or have their\n",
+					comment(t.qualified()), comment(child))
+				b.WriteString("--       reference changed, which is not captured: undoing the delete does not restore them.\n")
 			}
 		}
 	}
@@ -257,4 +262,24 @@ func oneLine(s string) string {
 
 func hasNUL(ss ...string) bool {
 	return slices.ContainsFunc(ss, func(s string) bool { return strings.ContainsRune(s, 0) })
+}
+
+// minServer is the first PostgreSQL version undo takes: its install SQL
+// replaces triggers with CREATE OR REPLACE TRIGGER, new in 14, and 14 is the
+// only version tested.
+const minServer = 140000
+
+// RequireServer refuses a server older than PostgreSQL 14; versionNum is its
+// server_version_num. The install SQL needs it (ruling R12); the SQL of
+// DropSQL does not.
+func RequireServer(versionNum int) error {
+	if versionNum >= minServer {
+		return nil
+	}
+	version := fmt.Sprint(versionNum / 10000)
+	if versionNum < 100000 {
+		version = fmt.Sprintf("%d.%d", versionNum/10000, versionNum/100%100)
+	}
+	return fmt.Errorf("undo needs PostgreSQL 14 or later (its install SQL uses CREATE OR REPLACE TRIGGER, and 14 is "+
+		"the only version it is tested on); this server is PostgreSQL %s", version)
 }

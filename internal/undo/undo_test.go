@@ -89,8 +89,11 @@ func newOwner(t *testing.T, prefix string) string {
 	mustExec(t, su, "create role "+id+" login password '"+ownerPassword+"'")
 	t.Cleanup(func() {
 		ctx := context.Background()
-		su.Exec(ctx, "drop owned by "+id)
-		su.Exec(ctx, "drop role "+id)
+		for _, sql := range []string{"drop owned by " + id, "drop role " + id} {
+			if _, err := su.Exec(ctx, sql); err != nil {
+				t.Errorf("cleanup: %s: %v", sql, err)
+			}
+		}
 	})
 	return name
 }
@@ -106,7 +109,11 @@ func ownDatabase(t *testing.T) (string, *pgxpool.Pool) {
 	name := fmt.Sprintf("stet_undo_db_%d", time.Now().UnixNano())
 	su := superuser(t, "stet_test")
 	mustExec(t, su, "create database "+name+" template template0 owner "+stetRole)
-	t.Cleanup(func() { su.Exec(context.Background(), "drop database if exists "+name+" with (force)") })
+	t.Cleanup(func() {
+		if _, err := su.Exec(context.Background(), "drop database if exists "+name+" with (force)"); err != nil {
+			t.Errorf("cleanup: drop database %s: %v", name, err)
+		}
+	})
 	pool, err := pgxpool.New(ctx, "postgres://"+stetRole+":"+stetPassword+"@"+testAddr(t)+"/"+name+"?sslmode=disable")
 	if err != nil {
 		t.Fatal(err)
@@ -313,6 +320,7 @@ func TestInspectFindsTablesAndProblems(t *testing.T) {
 		`create foreign table public.a_foreign (id int) server undo_test_server`,
 		`create table public.inh_parent (id int primary key)`,
 		`create table public.inh_child () inherits (public.inh_parent)`,
+		`alter table public.inh_child add primary key (id)`,
 		`create table public.missing_column (id int primary key)`,
 		`create table public.no_key (id int, name text)`,
 		`create table public.nullable_unique (code text unique)`,
@@ -356,6 +364,7 @@ func TestInspectFindsTablesAndProblems(t *testing.T) {
 		"parted_1":                 "id",
 		"a_foreign":                "id",
 		"inh_parent":               "id",
+		"inh_child":                "id",
 		"missing_column":           "idx",
 		"no_key":                   "id",
 		"nullable_unique":          "code",
@@ -420,6 +429,7 @@ func TestInspectFindsTablesAndProblems(t *testing.T) {
 		"parted_1":             {"public.parted_1", "is a partition of public.parted"},
 		"a_foreign":            {"public.a_foreign", "is a foreign table"},
 		"inh_parent":           {"public.inh_parent", "inheritance children", "public.inh_child"},
+		"inh_child":            {"public.inh_child", "is an inheritance child of public.inh_parent"},
 		"missing_column":       {"public.missing_column", "no column idx"},
 		"pk_with_nul":          {"public.pk_with_nul", "no column"},
 		tempSchema + ".a_temp": {tempSchema + ".a_temp", "is a temporary table"},
@@ -428,7 +438,7 @@ func TestInspectFindsTablesAndProblems(t *testing.T) {
 		"partial_unique":       {"public.partial_unique", "column code", "is not a key"},
 		"expr_unique":          {"public.expr_unique", "column code", "is not a key"},
 		"deferrable_unique":    {"public.deferrable_unique", "column code", "is not a key"},
-		"deferrable_pk":        {"public.deferrable_pk", "column id", "is not a key"},
+		"deferrable_pk":        {"public.deferrable_pk", "column id", "is the table's primary key", "deferrable"},
 		"two_column_pk":        {"public.two_column_pk", "column a", "is not a key"},
 		"dup":                  {"public.dup", "undo.tables.public.dup", "the same table"},
 		"public.dup":           {"public.dup", "undo.tables.dup", "the same table"},
@@ -445,6 +455,9 @@ func TestInspectFindsTablesAndProblems(t *testing.T) {
 		if len(tb.Triggers) != 0 || len(tb.Children) != 0 {
 			t.Errorf("%q: triggers %v, children %v; want none looked at for a table with a problem", key, tb.Triggers, tb.Children)
 		}
+	}
+	if p := got["deferrable_pk"].Problem; strings.Contains(p, "must be the table's primary key") {
+		t.Errorf("deferrable_pk: problem %q asks for the primary key it is", p)
 	}
 }
 
@@ -527,9 +540,27 @@ func TestInspectReportsTriggerState(t *testing.T) {
 		{"when", "stet_capture_ins", []string{`drop trigger stet_capture_ins on public.deals`,
 			`create trigger stet_capture_ins after insert on public.deals referencing new table as stet_new
 			 for each statement when (false)` + capture}, "has a WHEN condition"},
+		// CREATE OR REPLACE TRIGGER cannot replace a constraint trigger.
+		{"constraint trigger", "stet_capture_ins", []string{`drop trigger stet_capture_ins on public.deals`,
+			`create constraint trigger stet_capture_ins after insert on public.deals for each row` + capture},
+			"stet_capture_ins is a constraint trigger, which the output of stet undo-sql cannot replace; the table's owner must drop it"},
+		// Another trigger that calls stet.capture() would record each write again.
+		{"another capture trigger", "old_capture", []string{
+			`create trigger old_capture after insert on public.deals referencing new table as stet_new for each statement` + capture},
+			"old_capture also calls stet.capture(), so a write it fires on is recorded twice"},
+		{"another capture trigger, quoted", `"Old Capture"`, []string{
+			`create trigger "Old Capture" after delete on public.deals for each row` + capture},
+			`"Old Capture" also calls stet.capture()`},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			installByHand(t, su, "public.deals", "deals", "id")
+			// What installByHand does not undo.
+			if drop, ok := map[string]string{
+				"another capture trigger":         `drop trigger old_capture on public.deals`,
+				"another capture trigger, quoted": `drop trigger "Old Capture" on public.deals`,
+			}[c.name]; ok {
+				t.Cleanup(func() { mustExec(t, su, drop) })
+			}
 			mustExec(t, su, c.sqls...)
 			got := triggers()
 			if len(got) == 0 {
@@ -547,11 +578,31 @@ func TestInspectReportsTriggerState(t *testing.T) {
 			}
 		})
 	}
+
+	// Another trigger that calls stet.capture() is only reported: the
+	// install output names only the four, and leaves it in place.
+	installByHand(t, su, "public.deals", "deals", "id")
+	mustExec(t, su, `create trigger old_capture after insert on public.deals referencing new table as stet_new for each statement`+capture)
+	sql, err := undo.InstallSQL(stetRole, inspect(t, stet, tables))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(sql, "old_capture") {
+		t.Errorf("the install SQL names another trigger:\n%s", sql)
+	}
+	for _, sec := range sections(t, sql) {
+		runAs(t, db, sec, map[string]string{stetRole: stetPassword, "postgres": "postgres-pw"})
+	}
+	if got := triggers(); len(got) != 1 || !strings.HasPrefix(got[0], "old_capture also calls stet.capture()") {
+		t.Errorf("after installing: %q, want old_capture still reported", got)
+	}
 }
 
-// Children are the tables that reference the table with a foreign key that
-// cascades (CASCADE, SET NULL, SET DEFAULT on delete or update) and are not
-// in undo.tables, compared by table, not by name.
+// Children are the tables that reference the table with a foreign key whose
+// ON DELETE action changes their rows (CASCADE, SET NULL, SET DEFAULT), as
+// stet.undo_warning's children_not_captured, and are not in undo.tables,
+// compared by table, not by name. An ON UPDATE action does not count: undoing
+// the parent's update cascades back.
 func TestInspectFindsUncapturedChildren(t *testing.T) {
 	db, stet := ownDatabase(t)
 	su := superuser(t, db)
@@ -564,11 +615,14 @@ func TestInspectFindsUncapturedChildren(t *testing.T) {
 		`create table public.deal_defaults (deal_id int default 0 references public.deals on delete set default)`,
 		`create table public.deal_refs (deal_id int references public.deals)`,
 		`create table public.deal_restricts (deal_id int references public.deals on delete restrict on update restrict)`,
+		`create table public.deal_updates (deal_id int references public.deals on update cascade)`,
+		`create table public.deal_update_nulls (deal_id int references public.deals on update set null on delete no action)`,
+		`create table public.deal_nulls (deal_id int references public.deals on delete set null)`,
 		`create schema archive`,
 		`create table archive.deals_seen (deal_id int references public.deals on delete cascade)`)
 
 	got := byKey(inspect(t, stet, map[string]string{"deals": "id", "public.deal_notes": "id"}))
-	want := []string{"archive.deals_seen", `public."Deal Tags"`, "public.deal_defaults", "public.deal_links"}
+	want := []string{"archive.deals_seen", `public."Deal Tags"`, "public.deal_defaults", "public.deal_links", "public.deal_nulls"}
 	if !slices.Equal(got["deals"].Children, want) {
 		t.Errorf("children of deals: %q, want %q", got["deals"].Children, want)
 	}
@@ -577,7 +631,7 @@ func TestInspectFindsUncapturedChildren(t *testing.T) {
 	}
 
 	got = byKey(inspect(t, stet, map[string]string{"deals": "id"}))
-	want = []string{"archive.deals_seen", `public."Deal Tags"`, "public.deal_defaults", "public.deal_links", "public.deal_notes"}
+	want = []string{"archive.deals_seen", `public."Deal Tags"`, "public.deal_defaults", "public.deal_links", "public.deal_notes", "public.deal_nulls"}
 	if !slices.Equal(got["deals"].Children, want) {
 		t.Errorf("children of deals without deal_notes in undo.tables: %q, want %q", got["deals"].Children, want)
 	}
@@ -605,82 +659,70 @@ GRANT EXECUTE ON FUNCTION stet.capture() TO crm_owner;
 -- 2. Run as "Sales Owner" (the owner of sales.contacts).
 BEGIN;
 SET LOCAL lock_timeout = '5s';
-DROP TRIGGER IF EXISTS stet_capture_ins ON sales.contacts;
-CREATE TRIGGER stet_capture_ins AFTER INSERT ON sales.contacts
+CREATE OR REPLACE TRIGGER stet_capture_ins AFTER INSERT ON sales.contacts
   REFERENCING NEW TABLE AS stet_new
   FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('contacts', 'email');
-DROP TRIGGER IF EXISTS stet_capture_upd ON sales.contacts;
-CREATE TRIGGER stet_capture_upd AFTER UPDATE ON sales.contacts
+CREATE OR REPLACE TRIGGER stet_capture_upd AFTER UPDATE ON sales.contacts
   REFERENCING OLD TABLE AS stet_old NEW TABLE AS stet_new
   FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('contacts', 'email');
-DROP TRIGGER IF EXISTS stet_capture_del ON sales.contacts;
-CREATE TRIGGER stet_capture_del AFTER DELETE ON sales.contacts
+CREATE OR REPLACE TRIGGER stet_capture_del AFTER DELETE ON sales.contacts
   REFERENCING OLD TABLE AS stet_old
   FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('contacts', 'email');
-DROP TRIGGER IF EXISTS stet_capture_trunc ON sales.contacts;
-CREATE TRIGGER stet_capture_trunc AFTER TRUNCATE ON sales.contacts
+CREATE OR REPLACE TRIGGER stet_capture_trunc AFTER TRUNCATE ON sales.contacts
   FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('contacts', 'email');
 COMMIT;
 
 -- 3. Run as crm_owner (the owner of public.deals, public.deal_notes).
 BEGIN;
 SET LOCAL lock_timeout = '5s';
-DROP TRIGGER IF EXISTS stet_capture_ins ON public.deals;
-CREATE TRIGGER stet_capture_ins AFTER INSERT ON public.deals
+CREATE OR REPLACE TRIGGER stet_capture_ins AFTER INSERT ON public.deals
   REFERENCING NEW TABLE AS stet_new
   FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('deals', 'id');
-DROP TRIGGER IF EXISTS stet_capture_upd ON public.deals;
-CREATE TRIGGER stet_capture_upd AFTER UPDATE ON public.deals
+CREATE OR REPLACE TRIGGER stet_capture_upd AFTER UPDATE ON public.deals
   REFERENCING OLD TABLE AS stet_old NEW TABLE AS stet_new
   FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('deals', 'id');
-DROP TRIGGER IF EXISTS stet_capture_del ON public.deals;
-CREATE TRIGGER stet_capture_del AFTER DELETE ON public.deals
+CREATE OR REPLACE TRIGGER stet_capture_del AFTER DELETE ON public.deals
   REFERENCING OLD TABLE AS stet_old
   FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('deals', 'id');
-DROP TRIGGER IF EXISTS stet_capture_trunc ON public.deals;
-CREATE TRIGGER stet_capture_trunc AFTER TRUNCATE ON public.deals
+CREATE OR REPLACE TRIGGER stet_capture_trunc AFTER TRUNCATE ON public.deals
   FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('deals', 'id');
-DROP TRIGGER IF EXISTS stet_capture_ins ON public.deal_notes;
-CREATE TRIGGER stet_capture_ins AFTER INSERT ON public.deal_notes
+CREATE OR REPLACE TRIGGER stet_capture_ins AFTER INSERT ON public.deal_notes
   REFERENCING NEW TABLE AS stet_new
   FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('public.deal_notes', 'id');
-DROP TRIGGER IF EXISTS stet_capture_upd ON public.deal_notes;
-CREATE TRIGGER stet_capture_upd AFTER UPDATE ON public.deal_notes
+CREATE OR REPLACE TRIGGER stet_capture_upd AFTER UPDATE ON public.deal_notes
   REFERENCING OLD TABLE AS stet_old NEW TABLE AS stet_new
   FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('public.deal_notes', 'id');
-DROP TRIGGER IF EXISTS stet_capture_del ON public.deal_notes;
-CREATE TRIGGER stet_capture_del AFTER DELETE ON public.deal_notes
+CREATE OR REPLACE TRIGGER stet_capture_del AFTER DELETE ON public.deal_notes
   REFERENCING OLD TABLE AS stet_old
   FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('public.deal_notes', 'id');
-DROP TRIGGER IF EXISTS stet_capture_trunc ON public.deal_notes;
-CREATE TRIGGER stet_capture_trunc AFTER TRUNCATE ON public.deal_notes
+CREATE OR REPLACE TRIGGER stet_capture_trunc AFTER TRUNCATE ON public.deal_notes
   FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('public.deal_notes', 'id');
 COMMIT;
--- note: public.deal_tags references public.deals with a foreign key that cascades and is not under undo.tables:
---       its rows deleted or changed along with a row of public.deals are not captured and will not come back.
+-- note: public.deal_tags references public.deals with ON DELETE CASCADE, SET NULL or SET DEFAULT and is not under undo.tables:
+--       when a row of public.deals is deleted, the rows of public.deal_tags that reference it are deleted or have their
+--       reference changed, which is not captured: undoing the delete does not restore them.
 
 -- 4. Run as stet_scram (the owner of public."user").
 BEGIN;
 SET LOCAL lock_timeout = '5s';
-DROP TRIGGER IF EXISTS stet_capture_ins ON public."user";
-CREATE TRIGGER stet_capture_ins AFTER INSERT ON public."user"
+CREATE OR REPLACE TRIGGER stet_capture_ins AFTER INSERT ON public."user"
   REFERENCING NEW TABLE AS stet_new
   FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('stet_log', 'id');
-DROP TRIGGER IF EXISTS stet_capture_upd ON public."user";
-CREATE TRIGGER stet_capture_upd AFTER UPDATE ON public."user"
+CREATE OR REPLACE TRIGGER stet_capture_upd AFTER UPDATE ON public."user"
   REFERENCING OLD TABLE AS stet_old NEW TABLE AS stet_new
   FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('stet_log', 'id');
-DROP TRIGGER IF EXISTS stet_capture_del ON public."user";
-CREATE TRIGGER stet_capture_del AFTER DELETE ON public."user"
+CREATE OR REPLACE TRIGGER stet_capture_del AFTER DELETE ON public."user"
   REFERENCING OLD TABLE AS stet_old
   FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('stet_log', 'id');
-DROP TRIGGER IF EXISTS stet_capture_trunc ON public."user";
-CREATE TRIGGER stet_capture_trunc AFTER TRUNCATE ON public."user"
+CREATE OR REPLACE TRIGGER stet_capture_trunc AFTER TRUNCATE ON public."user"
   FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('stet_log', 'id');
 COMMIT;
 `
 	if got != want {
 		t.Errorf("InstallSQL printed:\n%s\nwant:\n%s", got, want)
+	}
+	if strings.Contains(got, "DROP") {
+		t.Errorf("the install SQL drops a trigger, which waits for readers of the table (ruling R12)")
 	}
 
 	// When Stet's account owns every table there is nothing to grant.
@@ -923,20 +965,22 @@ func TestInstallSQLQuotesNames(t *testing.T) {
 	}
 }
 
-// The owner's part waits for a lock at most as long as lock_timeout says (5s
-// as printed; 1s here, to keep the test short) and then fails with 55P03,
-// changing nothing.
-func TestInstallSQLTimesOutOnALockedTable(t *testing.T) {
-	owner := newOwner(t, "stet_undo_lock")
-	db, stet := ownDatabase(t)
-	ctx := context.Background()
-	su := superuser(t, db)
+// lockFixture makes public.contacts and public.deals, owned by a new owner,
+// gives the agent rights on deals, runs the grants of the install SQL, and
+// returns the database, Stet's pool, a superuser connection, the owner, and
+// the owner's part with lock_timeout 1s in place of the printed 5s (which it
+// checks), to keep the waits short.
+func lockFixture(t *testing.T) (db string, stet *pgxpool.Pool, su *pgx.Conn, owner, ownerSQL string) {
+	t.Helper()
+	owner = newOwner(t, "stet_undo_lock")
+	db, stet = ownDatabase(t)
+	su = superuser(t, db)
 	mustExec(t, su,
 		`create table public.deals (id int primary key)`,
 		`create table public.contacts (id int primary key)`,
 		`alter table public.deals owner to `+owner,
 		`alter table public.contacts owner to `+owner,
-		`grant insert on public.deals to `+agentRole)
+		`grant select, insert on public.deals to `+agentRole)
 	sql, err := undo.InstallSQL(stetRole, inspect(t, stet, map[string]string{"contacts": "id", "deals": "id"}))
 	if err != nil {
 		t.Fatal(err)
@@ -950,19 +994,30 @@ func TestInstallSQLTimesOutOnALockedTable(t *testing.T) {
 	if strings.Count(secs[1].sql, printed) != 1 {
 		t.Fatalf("the owner's part does not say %q once:\n%s", printed, secs[1].sql)
 	}
-	ownerSQL := strings.Replace(secs[1].sql, printed, "SET LOCAL lock_timeout = '1s';\n", 1)
+	return db, stet, su, owner, strings.Replace(secs[1].sql, printed, "SET LOCAL lock_timeout = '1s';\n", 1)
+}
 
-	writer := connectAs(t, db, agentRole, agentPassword)
-	tx, err := writer.Begin(ctx)
+// openTx begins a transaction as the agent and runs sql in it; it is rolled
+// back when the test ends unless the caller ends it first.
+func openTx(t *testing.T, db, sql string) pgx.Tx {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := connectAs(t, db, agentRole, agentPassword).Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(ctx)
-	mustExec(t, tx, `insert into public.deals values (1)`)
+	t.Cleanup(func() { tx.Rollback(context.Background()) })
+	mustExec(t, tx, sql)
+	return tx
+}
 
+// wantTimeout runs the owner's part and checks it fails with 55P03 after
+// about 1s.
+func wantTimeout(t *testing.T, db, owner, ownerSQL string) {
+	t.Helper()
 	conn := connectAs(t, db, owner, ownerPassword)
 	start := time.Now()
-	_, err = conn.Exec(ctx, ownerSQL)
+	_, err := conn.Exec(context.Background(), ownerSQL)
 	waited := time.Since(start)
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
@@ -971,35 +1026,113 @@ func TestInstallSQLTimesOutOnALockedTable(t *testing.T) {
 	if waited < 900*time.Millisecond || waited > 4*time.Second {
 		t.Errorf("waited %s, want about 1s", waited)
 	}
+}
+
+// triggerState is what Inspect says of each table's triggers.
+func triggerState(t *testing.T, stet *pgxpool.Pool) map[string][]string {
+	t.Helper()
+	m := map[string][]string{}
+	for _, tb := range inspect(t, stet, map[string]string{"contacts": "id", "deals": "id"}) {
+		m[tb.Key] = tb.Triggers
+	}
+	return m
+}
+
+// The owner's part waits for a lock at most as long as lock_timeout says (5s
+// as printed; 1s here) while a transaction that wrote to one of its tables is
+// open, then fails with 55P03 and changes nothing: on a first install no
+// trigger is created, and on a rerun the triggers stay as they were, also on
+// the table whose triggers were replaced before the wait.
+func TestInstallSQLTimesOutOnALockedTable(t *testing.T) {
+	db, stet, su, owner, ownerSQL := lockFixture(t)
+	ctx := context.Background()
+
+	writer := openTx(t, db, `insert into public.deals values (1)`)
+	wantTimeout(t, db, owner, ownerSQL)
 	for _, table := range []string{"public.contacts", "public.deals"} {
 		if n := captureTriggers(t, su, relidOf(t, su, table)); n != 0 {
-			t.Errorf("%s has %d capture triggers, want none", table, n)
+			t.Errorf("first install: %s has %d capture triggers, want none", table, n)
 		}
+	}
+	if err := writer.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Installed, then one trigger of each table disabled.
+	mustExec(t, connectAs(t, db, owner, ownerPassword), ownerSQL)
+	mustExec(t, su,
+		`alter table public.contacts disable trigger stet_capture_ins`,
+		`alter table public.deals disable trigger stet_capture_upd`)
+	before := triggerState(t, stet)
+	if len(before["contacts"]) != 1 || len(before["deals"]) != 1 {
+		t.Fatalf("before the rerun: %q, want one disabled trigger each", before)
+	}
+	openTx(t, db, `insert into public.deals values (2)`)
+	wantTimeout(t, db, owner, ownerSQL)
+	if after := triggerState(t, stet); !slices.Equal(after["contacts"], before["contacts"]) || !slices.Equal(after["deals"], before["deals"]) {
+		t.Errorf("rerun: triggers %q after the timeout, want them as before, %q", after, before)
+	}
+}
+
+// A rerun of the install SQL does not wait for transactions that only read
+// its tables (ruling R12: CREATE OR REPLACE TRIGGER takes a lock that blocks
+// writes, not reads, where DROP TRIGGER blocks both), and afterwards the
+// triggers are as printed again.
+func TestInstallSQLRerunsAlongsideAReader(t *testing.T) {
+	db, stet, su, owner, ownerSQL := lockFixture(t)
+	ctx := context.Background()
+	mustExec(t, connectAs(t, db, owner, ownerPassword), ownerSQL)
+	mustExec(t, su,
+		`alter table public.deals disable trigger stet_capture_upd`,
+		`create or replace trigger stet_capture_del after delete on public.deals referencing old table as o
+		 for each statement execute function stet.capture('deals', 'id')`)
+	if got := triggerState(t, stet)["deals"]; len(got) != 2 {
+		t.Fatalf("before the rerun: %q, want two problems", got)
+	}
+
+	reader := openTx(t, db, `select count(*) from public.deals`)
+	if _, err := connectAs(t, db, owner, ownerPassword).Exec(ctx, ownerSQL); err != nil {
+		t.Fatalf("rerun alongside a reader: %v", err)
+	}
+	for key, lines := range triggerState(t, stet) {
+		if len(lines) != 0 {
+			t.Errorf("%s after the rerun: %q, want the four as printed", key, lines)
+		}
+	}
+	if _, err := reader.Exec(ctx, `select count(*) from public.deals`); err != nil {
+		t.Errorf("the reader after the rerun: %v", err)
 	}
 }
 
 // Each warning is one line naming the table key: a table not found, its
 // trigger problems (with the fix), uncaptured children, any other problem.
 func TestWarnings(t *testing.T) {
+	const other = "old_capture also calls stet.capture(), so a write it fires on is recorded twice"
 	ts := []undo.Table{
 		{Key: "contacts", PK: "id", Schema: "public", Name: "contacts", Owner: "crm_owner", OID: 1},
 		{Key: "deal_view", PK: "id", Schema: "public", Name: "deal_view", Owner: "crm_owner", OID: 2,
 			Problem: "public.deal_view is a view, not an ordinary table"},
 		{Key: "deals", PK: "id", Schema: "public", Name: "deals", Owner: "crm_owner", OID: 3,
-			Triggers: []string{"stet_capture_ins is missing", "stet_capture_upd is disabled"},
+			Triggers: []string{"stet_capture_ins is missing", "stet_capture_upd is disabled", other},
 			Children: []string{"public.deal_tags", `public."Deal Notes"`}},
 		{Key: "nope", PK: "id", Problem: "Stet's account finds no table \"nope\" on its search_path"},
+		{Key: "notes", PK: "id", Schema: "public", Name: "notes", Owner: "crm_owner", OID: 4, Triggers: []string{other}},
 	}
 	got := undo.Warnings(ts)
-	if len(got) != 4 {
-		t.Fatalf("%d warnings, want 4: %q", len(got), got)
-	}
-	const fix = "run stet undo-sql and have the table's owner run its output"
+	const (
+		fix     = "run stet undo-sql and have the table's owner run its output"
+		dropFix = "have the table's owner drop it; the output of stet undo-sql does not"
+	)
 	want := [][]string{
 		{"undo.tables.deal_view", "public.deal_view is a view, not an ordinary table", "not captured"},
 		{"undo.tables.deals", "stet_capture_ins is missing", "stet_capture_upd is disabled", fix},
-		{"undo.tables.deals", "public.deal_tags", `public."Deal Notes"`, "not captured"},
+		{"undo.tables.deals", "old_capture also calls stet.capture()", dropFix},
+		{"undo.tables.deals", "public.deal_tags", `public."Deal Notes"`, "ON DELETE", "not captured"},
 		{"undo.tables.nope", `finds no table "nope"`, "not captured"},
+		{"undo.tables.notes", "old_capture also calls stet.capture()", dropFix},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("%d warnings, want %d: %q", len(got), len(want), got)
 	}
 	for i, parts := range want {
 		if strings.Contains(got[i], "\n") {
@@ -1014,6 +1147,14 @@ func TestWarnings(t *testing.T) {
 	if !strings.HasSuffix(got[1], fix) {
 		t.Errorf("the trigger warning does not end with the fix: %q", got[1])
 	}
+	if strings.Contains(got[1], "old_capture") || strings.Contains(got[2], "stet_capture_ins") {
+		t.Errorf("the four triggers and another capture trigger share a warning: %q, %q", got[1], got[2])
+	}
+	for _, i := range []int{2, 5} {
+		if !strings.HasSuffix(got[i], dropFix) {
+			t.Errorf("the warning about another capture trigger does not end with its fix: %q", got[i])
+		}
+	}
 	for _, w := range got {
 		if strings.Contains(w, "contacts") {
 			t.Errorf("a warning about a table with nothing wrong: %q", w)
@@ -1021,5 +1162,22 @@ func TestWarnings(t *testing.T) {
 	}
 	if len(undo.Warnings(ts[:1])) != 0 {
 		t.Errorf("warnings for a table with nothing wrong")
+	}
+}
+
+// Undo needs PostgreSQL 14 or later: the install SQL replaces triggers with
+// CREATE OR REPLACE TRIGGER (ruling R12), and 14 is the only version tested.
+// There is no older server to run against; the check takes the version.
+func TestRequireServer(t *testing.T) {
+	for _, v := range []int{140000, 140018, 150007, 170002} {
+		if err := undo.RequireServer(v); err != nil {
+			t.Errorf("RequireServer(%d) = %v, want nil", v, err)
+		}
+	}
+	for v, says := range map[int]string{130011: "PostgreSQL 13", 120000: "PostgreSQL 12", 90624: "PostgreSQL 9.6"} {
+		err := undo.RequireServer(v)
+		if err == nil || !strings.Contains(err.Error(), "PostgreSQL 14 or later") || !strings.Contains(err.Error(), says) {
+			t.Errorf("RequireServer(%d) = %v, want an error saying PostgreSQL 14 or later and %s", v, err, says)
+		}
 	}
 }
