@@ -132,30 +132,28 @@ var serverVersionNum = func(ctx context.Context, tx pgx.Tx) (int, error) {
 	return v, err
 }
 
-// undoGrantSQL is stet undo-sql -grant role: it reads the undo functions in a
-// read-only transaction and writes undo.GrantSQL's block to out.
+// undoGrantSQL is stet undo-sql -grant role: it reads Stet's undo functions
+// in a read-only transaction and writes undo.GrantSQL's block to out. Without
+// Stet's stet.undo (undo.ErrNoUndo) it says to start Stet once.
 func undoGrantSQL(ctx context.Context, pool *pgxpool.Pool, grantTo string, out io.Writer) error {
 	var (
 		role      string
-		hasUndo   bool
 		functions []string
 	)
 	err := readOnly(ctx, pool, func(tx pgx.Tx) error {
-		if err := tx.QueryRow(ctx, `
-			select session_user, exists (select from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-			                              where n.nspname = 'stet' and p.proname = 'undo')`).Scan(&role, &hasUndo); err != nil {
+		if err := tx.QueryRow(ctx, `select session_user`).Scan(&role); err != nil {
 			return err
 		}
 		var err error
 		functions, err = undo.ReviewerFunctions(ctx, tx)
 		return err
 	})
+	if errors.Is(err, undo.ErrNoUndo) {
+		return errors.New("undo-sql: this database has no stet.undo() of Stet's, which a reviewer calls: start Stet once " +
+			"with this config so that it creates its stet schema, then run stet undo-sql again")
+	}
 	if err != nil {
 		return fmt.Errorf("undo-sql: reading the undo functions: %w", err)
-	}
-	if !hasUndo {
-		return errors.New("undo-sql: this database has no stet.undo(), which a reviewer calls: start Stet once " +
-			"with this config so that it creates its stet schema, then run stet undo-sql again")
 	}
 	sql, err := undo.GrantSQL(role, grantTo, functions)
 	if err != nil {

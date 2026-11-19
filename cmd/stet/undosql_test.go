@@ -204,3 +204,23 @@ func TestUndoSQLGrant(t *testing.T) {
 	fails("no stet schema", "start Stet once", "-config", undoSQLConfig(t, pg, bare, "  tables:\n    public.deals: {pk: id}\n"),
 		"-grant", "reviewer")
 }
+
+// stet undo-sql -grant refuses, as when there is no undo, when the only
+// stet.undo in the schema is another role's: the block lists only Stet's
+// own functions and must hold Stet's stet.undo.
+func TestUndoSQLGrantRefusesAnUndoThatIsNotStets(t *testing.T) {
+	pg := testPG(t)
+	other := createRole(t, superuser(t, pg), "other", "login password 'other-pw'")
+	db := cleanDatabase(t, pg)
+	stetPoolIn(t, pg, db)
+	mustExec(t, connectTo(t, pg, db, "stet_scram", "scram-pw"), "grant usage, create on schema stet to "+other)
+	mustExec(t, connectTo(t, pg, db, "postgres", "postgres-pw"), "drop function stet.undo(text, timestamptz, timestamptz, text[], text)")
+	mustExec(t, connectTo(t, pg, db, other, "other-pw"), `create function stet.undo(agent_role text, since timestamptz,
+		until timestamptz, tables text[], note text) returns int language sql as 'select 1'`)
+
+	var out bytes.Buffer
+	err := runUndoSQL([]string{"-config", undoSQLConfig(t, pg, db, "  tables:\n    public.deals: {pk: id}\n"), "-grant", "reviewer"}, &out)
+	if err == nil || !strings.Contains(err.Error(), "start Stet once") || out.Len() != 0 {
+		t.Errorf("with another role's stet.undo: %v, printed %q; want the error of a database without undo, and nothing", err, out.String())
+	}
+}

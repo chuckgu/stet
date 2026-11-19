@@ -287,24 +287,53 @@ func RequireServer(versionNum int) error {
 		"the only version it is tested on); this server is PostgreSQL %s", version)
 }
 
+// ErrNoUndo is ReviewerFunctions' error when the stet schema has no stet.undo
+// of Stet's: Stet has not created its schema in the database, or the one
+// there is another role's.
+var ErrNoUndo = errors.New("the stet schema has no stet.undo(text, timestamptz, timestamptz, text[], text) of Stet's")
+
 // ReviewerFunctions are the functions a reviewer calls to plan and undo an
-// agent's changes, and the helpers those call with the reviewer's rights:
-// every function of the stet schema whose name starts with undo, read from
-// the catalog, each as stet.<name>(<argument types>), the text GRANT EXECUTE
-// ON FUNCTION takes (no argument names, no defaults), in byte order. Nothing
-// else of the schema is among them: not stet.approve or stet.reject, which
-// approve held writes, nor stet.capture().
+// agent's changes, and the helpers those call with the reviewer's rights,
+// read from the catalog: the ordinary functions of the stet schema named
+// undo or undo_*, owned by the owner of stet.capture() (the account that ran
+// Migrate, which creates them all). A function another role with CREATE on
+// the schema made, under such a name or as an overload of one of Stet's, is
+// not among them, nor an aggregate or procedure, nor stet.approve,
+// stet.reject or stet.capture(). Each is stet.<name>(<argument types>), the
+// text GRANT EXECUTE ON FUNCTION takes (no argument names, no defaults), in
+// byte order. It fails with ErrNoUndo unless the list holds stet.undo with
+// the signature Stet installs; the one query decides both.
 func ReviewerFunctions(ctx context.Context, q store.Querier) ([]string, error) {
-	var functions []string
+	var (
+		functions []string
+		hasUndo   bool
+	)
 	if err := q.QueryRow(ctx, `
-		select array(select format('stet.%I(%s)', p.proname,
-		                           (select coalesce(string_agg(format_type(a.t, NULL), ', ' order by a.n), '')
-		                              from unnest(p.proargtypes::oid[]) with ordinality as a(t, n)))
-		               from pg_proc p
-		               join pg_namespace n on n.oid = p.pronamespace
-		              where n.nspname = 'stet' and p.prokind = 'f' and starts_with(p.proname::text, 'undo'))`).
-		Scan(&functions); err != nil {
+		with stet_owner as (
+		  select p.proowner
+		    from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+		   where n.nspname = 'stet' and p.proname = 'capture' and p.prokind = 'f' and p.pronargs = 0
+		), mine as (
+		  select p.oid, p.proname, p.proargtypes
+		    from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+		   where n.nspname = 'stet' and p.prokind = 'f'
+		     and (p.proname = 'undo' or pg_catalog.starts_with(p.proname::text, 'undo_'))
+		     and p.proowner = (select proowner from stet_owner)
+		)
+		select array(select pg_catalog.format('stet.%I(%s)', m.proname,
+		                    (select coalesce(pg_catalog.string_agg(pg_catalog.format_type(a.t, NULL), ', ' order by a.n), '')
+		                       from pg_catalog.unnest(m.proargtypes::pg_catalog.oid[]) with ordinality as a(t, n)))
+		               from mine m),
+		       exists (select from mine m
+		                where m.proname = 'undo'
+		                  and m.proargtypes = pg_catalog.array_to_string(array['pg_catalog.text', 'pg_catalog.timestamptz',
+		                      'pg_catalog.timestamptz', 'pg_catalog.text[]', 'pg_catalog.text']::pg_catalog.regtype[]::pg_catalog.oid[],
+		                      ' ')::pg_catalog.oidvector)`).
+		Scan(&functions, &hasUndo); err != nil {
 		return nil, err
+	}
+	if !hasUndo {
+		return nil, ErrNoUndo
 	}
 	slices.Sort(functions)
 	return functions, nil

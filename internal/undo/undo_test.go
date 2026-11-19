@@ -1692,3 +1692,71 @@ func TestGrantSQLLetsAReviewerUndo(t *testing.T) {
 		}
 	}
 }
+
+// grantCreateOnStet has Stet's account give role (a newOwner) USAGE and
+// CREATE on the stet schema of db, and returns a connection as role.
+func grantCreateOnStet(t *testing.T, db, role string) *pgx.Conn {
+	t.Helper()
+	mustExec(t, connectAs(t, db, stetRole, stetPassword), "grant usage, create on schema stet to "+pgx.Identifier{role}.Sanitize())
+	return connectAs(t, db, role, ownerPassword)
+}
+
+// Only Stet's own undo functions are listed: ordinary functions of the stet
+// schema named undo or undo_*, owned by the owner of stet.capture(). A
+// function another role with CREATE on the schema made, under a new name or
+// as an overload of one of Stet's, is not, nor an aggregate or a function of
+// another name that Stet's account owns; the grant block names none of them.
+func TestReviewerFunctionsAreStetsOwn(t *testing.T) {
+	other := newOwner(t, "stet_undo_other")
+	db, stet := ownDatabase(t)
+	ctx := context.Background()
+	want, err := undo.ReviewerFunctions(ctx, stet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(want, "stet.undo_lock(oid)") {
+		t.Fatalf("Stet's undo_lock(oid) is not listed: %q", want)
+	}
+	mustExec(t, grantCreateOnStet(t, db, other),
+		`create function stet.undo_evil() returns int language sql as 'select 1'`,
+		`create function stet.undo_lock(integer) returns int language sql as 'select 1'`)
+	mustExec(t, connectAs(t, db, stetRole, stetPassword),
+		`create aggregate stet.undo_sum(int) (sfunc = int4pl, stype = int)`,
+		`create function stet.undone() returns int language sql as 'select 1'`)
+
+	got, err := undo.ReviewerFunctions(ctx, stet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("with functions that are not Stet's undo functions in the schema: %q, want %q", got, want)
+	}
+	sql, err := undo.GrantSQL(stetRole, "reviewer", got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"undo_evil", "undo_lock(integer)", "undo_sum", "undone"} {
+		if strings.Contains(sql, p) {
+			t.Errorf("the grant block names %s:\n%s", p, sql)
+		}
+	}
+}
+
+// The list must hold Stet's stet.undo, by the signature Stet installs and
+// owned as stet.capture() is: when the only stet.undo is another role's,
+// ReviewerFunctions fails with ErrNoUndo, as when there is none.
+func TestReviewerFunctionsNeedStetsUndo(t *testing.T) {
+	other := newOwner(t, "stet_undo_other")
+	db, stet := ownDatabase(t)
+	ctx := context.Background()
+	impostor := grantCreateOnStet(t, db, other)
+	mustExec(t, superuser(t, db), `drop function stet.undo(text, timestamptz, timestamptz, text[], text)`)
+	if got, err := undo.ReviewerFunctions(ctx, stet); !errors.Is(err, undo.ErrNoUndo) || got != nil {
+		t.Errorf("without stet.undo: %q, %v; want ErrNoUndo", got, err)
+	}
+	mustExec(t, impostor, `create function stet.undo(agent_role text, since timestamptz, until timestamptz, tables text[], note text)
+		returns int language sql as 'select 1'`)
+	if got, err := undo.ReviewerFunctions(ctx, stet); !errors.Is(err, undo.ErrNoUndo) || got != nil {
+		t.Errorf("with another role's stet.undo: %q, %v; want ErrNoUndo", got, err)
+	}
+}
