@@ -672,11 +672,64 @@ bin/stet-lab bench undo-check -name crm_undo_check_m -max-rows 100000
 - 진행은 표준 에러, 결과는 표준 출력이다. 복제본마다 보낸 문장 수(실행, 막힘, DB 거부, 모름), 남은 묶음 수, 계정마다 되돌리기의 줄 수(결과와 이유별)와 걸린 시간, 테이블마다 같은 행·다른 행·없어진 행·더 있는 행의 수와 다른 행의 이유, 되돌리기 순서에 따라 달라질 수 있어 그대로 받아들인 줄(`23503`, `23505`, `0A000`, `referenced`)의 목록, 따라간 경로가 바꾼 행이 돌아왔는지를 쓴다.
 - 같지 않은 행의 이유는 시스템이 알린 것으로만 댄다. 그 키를 되돌리지 못했다고 스스로 말하는 줄(`failed`, `restored_differs`, `referenced` 등), 기록에서 근거를 찾은 `changed_since`와 `interleaved`(그 뒤나 그 사이에 되돌려지지 않은 변경이 있다), 그 테이블의 값을 남기지 않은 묶음이다. 근거를 찾지 못한 행은 설명되지 않은 행이고, 하나라도 있으면 종료 코드 1이다.
 
-**두 실행을 읽는 법.** X 세트에는 테이블 전체를 바꾸는 공격이 둘 있다. `s4.update_no_where`는 `contacts`의 모든 행을 고치고, `s4.range_delete`는 `deals`의 모든 행을 지운다. 기본 실행(`max_rows` 10,000)에서 둘은 상한을 넘어 값 없이 표지만 남긴다. 그래서 그 실행의 `contacts`에서는 그 표지 하나가 모든 행의 다름을 설명할 수 있고, "설명되지 않은 행 0"은 모든 차이에 시스템이 알린 이유가 있다는 뜻일 뿐 캡처가 빠뜨린 것이 없다는 뜻이 아니다. 되돌리기가 행을 실제로 돌려놓는지는 `-max-rows 100000` 실행이 보인다. 거기서는 두 공격도 값과 함께 남는다.
+**두 실행을 읽는 법.** X 세트에는 테이블 전체를 바꾸는 공격이 둘 있다. `s4.update_no_where`는 `contacts`의 모든 행(49,419)을 고치고, 데이터베이스를 깨는 공격이라 그 뒤의 공격은 새 복제본으로 간다. 거기서 `s4.range_delete`가 `deals`의 모든 행(29,022)을 지운다. 기본 실행(`max_rows` 10,000)에서 둘은 상한을 넘어 값 없이 표지만 남긴다. 그래서 그 실행에서 같지 않은 행은 모두 이 두 표지로 설명된다. 첫 복제본의 `contacts`에서는 그 문장만 바꾼 행이 그 표지로, 에이전트가 바꾼 뒤 그 문장이 다시 바꾼 행이 그 표지를 근거로 한 `changed_since`로 설명되고, 둘째 복제본의 `deals`는 `s4.range_delete`의 표지로 설명된다. "설명되지 않은 행 0"은 모든 차이에 시스템이 알린 이유가 있다는 뜻일 뿐, 캡처가 빠뜨린 것이 없다거나 행이 돌아온다는 뜻이 아니다. 이 실행이 보이는 것은 되돌릴 수 없는 것이 그 이유와 함께 알려진다는 것이다. 되돌리기가 행을 실제로 돌려놓는지는 `-max-rows 100000` 실행이 보인다. 거기서는 두 공격도 값과 함께 남는다.
 
-**결과**
+**결과** (2026-11-19, PostgreSQL 14.18, 이 컴퓨터의 테스트 서버. `bin/stet-lab`은 커밋 `f683767`에서 `go build -o bin/stet-lab ./cmd/stet-lab`으로 빌드했다)
 
-<!-- TASK10-RESULTS -->
+두 실행은 차례로 돌렸고 둘 다 종료 코드 0이다. 답을 받지 못한 문장은 없다.
+
+| | 실행 1 (기본) | 실행 2 |
+|---|---|---|
+| 명령 | `bin/stet-lab bench undo-check` | `bin/stet-lab bench undo-check -name crm_undo_check_m -max-rows 100000` |
+| 시각(UTC) | 07:14:34 ~ 07:31:25 (16분 51초) | 07:31:36 ~ 07:52:10 (20분 34초) |
+| 보낸 문장 | 1,713 (첫 복제본 1,712: 실행 1,709, DB 거부 3, 모름 0. 둘째 복제본 1) | 1,713 (같다. 모름 0) |
+| 남은 묶음 | 1,709 (첫 복제본: `agent_sync` 316, `agent_v` 975, `agent_x` 416은 값과 함께, `agent_x`의 `too_many_rows` 표지 1. 둘째 복제본: `agent_x`의 `too_many_rows` 표지 1) | 1,709 (첫 복제본: `agent_sync` 316, `agent_v` 975, `agent_x` 417, 모두 값과 함께. 둘째 복제본: `agent_x` 1, 값과 함께) |
+| 첫 복제본 `contacts` (49,419행) | 같음 528, 다름 48,891, 없어짐 0, 더 있음 562 | 같음 49,419 |
+| 첫 복제본 `deals` (29,022행) | 같음 29,022 | 같음 29,022 |
+| 둘째 복제본 `contacts` | 같음 49,419 | 같음 49,419 |
+| 둘째 복제본 `deals` | 같음 0, 없어짐 29,022 | 같음 29,022 |
+| `accounts` (934), `activities` (7,563), 캡처하지 않음 | 두 복제본 모두 같음 | 두 복제본 모두 같음 |
+| 같지 않은 행 | 78,475 | 0 |
+| 설명되지 않은 행 | 0 | 0 |
+| `s5.call` | 캡처됨, 돌아오지 않음 (`contacts` 45225: `agent_x: skipped changed_since`) | 돌아옴 |
+| `s5.view` | 캡처됨, 돌아오지 않음 (`contacts` 45226: `agent_x: skipped changed_since`) | 돌아옴 |
+| 결과 줄 | `result: OK` | `result: OK` |
+
+**실행 1.** 같지 않은 행 78,475개(첫 복제본 `contacts`의 다름 48,891과 더 있음 562, 둘째 복제본 `deals`의 없어짐 29,022)가 모두 시스템이 알린 이유로 설명됐다. 첫 복제본 `contacts`의 이유는 다음과 같다.
+
+- 43,999행 `agent_x: not_captured too_many_rows`. `s4.update_no_where`만 바꾼 행이다.
+- 4,472행 `agent_x: skipped changed_since`, 695행 `agent_v: skipped changed_since`, 186행 `agent_sync`와 `agent_v`의 `skipped changed_since`, 81행 `agent_sync: skipped changed_since`, 20행 `agent_sync`와 `agent_x`의 `skipped changed_since`. 에이전트가 바꾼 뒤 `s4.update_no_where`가 다시 바꾼 행이다. 근거는 각 키의 마지막 변경 뒤에 남은 그 문장의 표지다(예: `agent_v: skipped changed_since (left undone after its last change: agent_x: not_captured too_many_rows at 2026-11-19T07:31:19.087417Z)`).
+- 위의 수를 더하면 49,453으로, 다름 48,891과 더 있음 562의 합이다. 더 있는 행도 이 `changed_since` 줄들로 설명된다. 에이전트가 넣은 행을 그 뒤에 `s4.update_no_where`가 고쳐, 넣은 것을 지우는 되돌리기가 건너뛰어졌다.
+
+둘째 복제본 `deals`의 29,022행은 `agent_x: not_captured too_many_rows`, `s4.range_delete`가 지운 행이다. `s5.call`과 `s5.view`가 바꾼 행(각 1행)은 프로시저와 뷰를 거쳤어도 캡처됐다. 되돌리기는 둘 다 `changed_since`로 건너뛰었다. 그 뒤에 캡처되지 않은 `s4.update_no_where`가 그 행의 `status`를 바꿨기 때문이다. 이 실행은 되돌릴 수 없는 것이 이유와 함께 알려진다는 것을 보일 뿐, 모든 행이 돌아온다는 것을 보이지 않는다(위의 "두 실행을 읽는 법").
+
+**실행 2.** 두 공격도 값과 함께 남았다. 두 복제본의 모든 테이블에서 모든 행이 스트림 전과 같다(같지 않은 행 0, 설명되지 않은 행 0). `s5.call`과 `s5.view`가 바꾼 행도 되돌려져 전과 같다. 되돌리기가 행을 돌려놓는다는 것을 보이는 것은 이 실행이다. Stet의 프록시가 판단하지 못한 경로(함수와 뷰)의 쓰기도 캡처되고 되돌려진다.
+
+**`failed`와 `referenced`가 없는 이유.** 두 실행 모두 되돌리기의 줄 가운데 `failed`나 `skipped referenced`가 하나도 없다(`SQLSTATE 0A000`도 없다). 그래서 되돌리기의 순서에 따라 달라질 수 있어 그대로 받아들인 줄의 목록도 비었다. 이 CRM의 외래 키는 모두 `NO ACTION`이어서 `referenced`가 볼 연쇄 외래 키가 없다. 이 결과는 연쇄 외래 키에 대해서는 아무것도 말하지 않는다. 연쇄 외래 키의 `referenced`와 그 거절은 `internal/store`의 테스트가 확인한다.
+
+**계정마다의 되돌리기** (줄은 키마다 하나, 값을 남기지 않은 묶음마다 키 없는 줄 하나)
+
+| 실행 | 복제본 | 계정 | 걸린 시간 | 줄 | 결과와 이유 | 줄마다 |
+|---|---|---|---|---|---|---|
+| 1 | 1 | `agent_x` | 4.805초 | 7,493 | `skipped changed_since` 4,492, `restored` 3,000, `not_captured too_many_rows` 1 | 0.64ms |
+| 1 | 1 | `agent_v` | 284ms | 975 | `skipped changed_since` 895, `restored` 78, `skipped no_net_change` 2 | 0.29ms |
+| 1 | 1 | `agent_sync` | 80ms | 316 | `skipped changed_since` 287, `restored` 29 | 0.25ms |
+| 1 | 1 | `agent_i` | 1ms | 0 | 없음 | |
+| 1 | 2 | `agent_x` | 4ms | 1 | `not_captured too_many_rows` 1 | |
+| 1 | 2 | `agent_v`, `agent_i`, `agent_sync` | 각 1ms | 0 | 없음 | |
+| 2 | 1 | `agent_x` | 3분 32.746초 | 52,981 | `restored` 52,467, `skipped no_net_change` 514 | 4.0ms |
+| 2 | 1 | `agent_v` | 1.212초 | 975 | `restored` 955, `skipped no_net_change` 20 | 1.24ms |
+| 2 | 1 | `agent_sync` | 213ms | 316 | `restored` 316 | 0.67ms |
+| 2 | 1 | `agent_i` | 1ms | 0 | 없음 | |
+| 2 | 2 | `agent_x` | 11.916초 | 29,022 | `restored` 29,022 | 0.41ms |
+| 2 | 2 | `agent_v`, `agent_i`, `agent_sync` | 각 1~2ms | 0 | 없음 | |
+
+**묶음을 많이 걸친 되돌리기는 느리다.** 실행 2의 첫 복제본에서 `agent_x`의 52,981키를 되돌리는 데 3분 32.7초, 키마다 약 4ms가 걸렸다. 둘째 복제본에서 같은 계정의 29,022키는 11.9초, 키마다 0.41ms였다. 그동안 검토자의 트랜잭션은 되돌린 행의 잠금을 쥐고 있었다(스펙 11장).
+
+- 다시 해 본 키는 없다. `failed`나 `referenced`로 끝난 키가 없으므로 다음 바퀴가 없다.
+- 잠금을 기다린 것도 아니다. 그 호출 동안 5초마다 본 `pg_stat_activity`와 `pg_locks`에서 그 백엔드는 한 번(임시 파일 읽기)을 빼고 기다림 없이 `active`였다.
+- 원인의 읽기. 호출이 시작된 지 약 180초에 3초 동안 뜬 그 백엔드의 스택 2,292개가 모두 한 문장 안에 있었다. `stet.undo_record`가 되돌린 변경을 `stet.undone_changes`에 적는 `INSERT ... SELECT DISTINCT`이고, 그 계획은 디스크로 넘친 정렬을 바깥 행마다 다시 읽는 것으로 보였다. 첫 복제본의 고른 범위는 묶음 417개에 걸치고 `stet.changes`는 어림으로 58,000줄이다. 둘째 복제본은 묶음 하나다. 그래서 시간의 대부분은 되돌리는 쓰기가 아니라 이 기록 문장이라고 읽는다. 스택을 읽은 것이고 잰 것은 아니다. 실행 계획은 보지 않았다.
+- 실행 2에서 `agent_v`와 `agent_sync`는 실행 1보다 줄마다 2~4배 오래 걸렸다. 줄이 `skipped`가 아니라 `restored`여서 쓰기 때문일 수 있다.
 
 ## 합성 CRM
 
