@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/stetdb/stet/internal/store"
@@ -368,8 +370,8 @@ func undoWhileWaiting(t *testing.T, su, rv *pgx.Conn, then func(), role string, 
 // change, the key is changed_since and the change stays; once it rolls back,
 // the key is restored. A reviewer's lock_timeout makes such a key failed and
 // the others are restored; a statement_timeout is not caught, and the call
-// fails as a whole. A transaction that is not READ COMMITTED is refused
-// (spec 7) and nothing changes.
+// fails as a whole. A transaction that is not READ COMMITTED, READ
+// UNCOMMITTED too, is refused (spec 7) and nothing changes.
 func TestUndoWaitsForAConcurrentChangeAndSkips(t *testing.T) {
 	pool, db := captureDB(t)
 	ctx := context.Background()
@@ -448,13 +450,13 @@ func TestUndoWaitsForAConcurrentChangeAndSkips(t *testing.T) {
 			t.Errorf("stet.undos has %d rows after the cancelled undo, want %d", n, recorded)
 		}
 	})
-	t.Run("REPEATABLE READ and SERIALIZABLE", func(t *testing.T) {
+	t.Run("REPEATABLE READ, SERIALIZABLE and READ UNCOMMITTED", func(t *testing.T) {
 		keyedTable(t, owner, "isolated", 2)
 		since := dbClock(t, pool)
 		mustExec(t, agent, `update public.isolated set n = 10 where id = 1`)
 		rv := undoer(t, db, "public.isolated")
 		recorded := len(undoRecords(t, pool))
-		for _, level := range []pgx.TxIsoLevel{pgx.RepeatableRead, pgx.Serializable} {
+		for _, level := range []pgx.TxIsoLevel{pgx.RepeatableRead, pgx.Serializable, pgx.ReadUncommitted} {
 			tx, err := rv.BeginTx(ctx, pgx.TxOptions{IsoLevel: level})
 			if err != nil {
 				t.Fatal(err)
@@ -1468,7 +1470,8 @@ func TestUndoRecordTakesOnlyItsOwnItems(t *testing.T) {
 
 // The refusals of spec 7 are ST006, and nothing is
 // recorded: no agent_role, no since, until not after since, the reviewer's
-// own writes, and a transaction that is not READ COMMITTED.
+// own writes, and a transaction that is not READ COMMITTED, READ UNCOMMITTED
+// among them.
 func TestUndoRefusals(t *testing.T) {
 	pool, db := captureDB(t)
 	rv := undoer(t, db)
@@ -1488,12 +1491,17 @@ func TestUndoRefusals(t *testing.T) {
 		{"the reviewer's own writes", me, since, nil, ""},
 		{"a REPEATABLE READ transaction", "stet_md5", since, nil, "repeatable read"},
 		{"a SERIALIZABLE transaction", "stet_md5", since, nil, "serializable"},
+		{"a READ UNCOMMITTED transaction", "stet_md5", since, nil, "read uncommitted"},
 	} {
 		if c.isolation != "" {
 			mustExec(t, rv, "set default_transaction_isolation = '"+c.isolation+"'")
 		}
 		_, err := tryUndo(rv, c.role, c.since, c.until)
 		wantCode(t, err, "ST006", "stet.undo, "+c.name)
+		var pgErr *pgconn.PgError
+		if c.isolation != "" && errors.As(err, &pgErr) && !strings.HasSuffix(pgErr.Message, "this one is "+strings.ToUpper(c.isolation)) {
+			t.Errorf("stet.undo, %s: %q, want a message that names the level", c.name, pgErr.Message)
+		}
 		mustExec(t, rv, "reset default_transaction_isolation")
 	}
 	if recs := undoRecords(t, pool); len(recs) != 0 {

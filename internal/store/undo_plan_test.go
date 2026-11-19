@@ -988,8 +988,10 @@ func TestPlanFindsKeysOfEachType(t *testing.T) {
 // The plan and every function a role can call directly that reads a
 // customer table or judges a key refuse a transaction that is not READ
 // COMMITTED (spec 7): under REPEATABLE READ and SERIALIZABLE the
-// transaction's snapshot and the catalog as it is now disagree. Under READ
-// COMMITTED each answers.
+// transaction's snapshot and the catalog as it is now disagree. READ
+// UNCOMMITTED, which PostgreSQL runs as READ COMMITTED, is refused as well:
+// only the setting read committed is taken. The refusal names the level the
+// transaction is at. Under READ COMMITTED each answers.
 func TestPlanRunsOnlyUnderReadCommitted(t *testing.T) {
 	pool, db := captureDB(t)
 	ctx := context.Background()
@@ -1033,7 +1035,7 @@ func TestPlanRunsOnlyUnderReadCommitted(t *testing.T) {
 			return err
 		},
 	}
-	for _, level := range []pgx.TxIsoLevel{pgx.RepeatableRead, pgx.Serializable, pgx.ReadCommitted} {
+	for _, level := range []pgx.TxIsoLevel{pgx.RepeatableRead, pgx.Serializable, pgx.ReadUncommitted, pgx.ReadCommitted} {
 		for name, call := range calls {
 			tx, err := rv.BeginTx(ctx, pgx.TxOptions{IsoLevel: level})
 			if err != nil {
@@ -1053,6 +1055,9 @@ func TestPlanRunsOnlyUnderReadCommitted(t *testing.T) {
 			var pgErr *pgconn.PgError
 			if errors.As(err, &pgErr) && !strings.Contains(pgErr.Message, "READ COMMITTED") {
 				t.Errorf("%s under %s: %q, want a message that names READ COMMITTED", name, level, pgErr.Message)
+			}
+			if this := "this one is " + strings.ToUpper(string(level)); errors.As(err, &pgErr) && !strings.HasSuffix(pgErr.Message, this) {
+				t.Errorf("%s under %s: %q, want a message that ends %q", name, level, pgErr.Message, this)
 			}
 		}
 	}

@@ -385,6 +385,175 @@ func writersOf(t *testing.T, pool *pgxpool.Pool, txid int64) int64 {
 		select c.xmin::text from stet.changes c join stet.change_sets s on s.id = c.set_id where s.txid = $1) w`, txid)
 }
 
+// idsTakenBy measures how many transaction ids conn's transaction is
+// assigned while it runs stmt, after the statements of before, all in one
+// call of a function owner creates for it, in one transaction. A ruler
+// brackets stmt: two subtransactions (PL/pgSQL blocks with an exception
+// handler) each update a row of public.ruler, which stamps the row with the
+// id that subtransaction is assigned at that moment. (A function, not a DO
+// block: its statements are planned once for the session, so the moment
+// between the two stamps is as short as stmt itself.) Ids are handed out in order to the whole server,
+// so the ids between the two stamps are those stmt took and those other
+// sessions were assigned meanwhile. The transaction is still open when it
+// looks at them: none of its own ids is committed yet, so an id between the
+// stamps that has committed is another session's and is left out.
+//
+// What is left can only be too many, never too few: an id another session
+// took in that moment and has not committed (it rolled back, or its
+// transaction is still open) is counted. So a measurement that does not come
+// down to want within 20ms is made again, for at most 10 seconds; the
+// smallest number seen is returned with whether every measurement was at
+// least want and how many were made. A measurement of exactly want is proof
+// for that run of stmt, which does the same thing every time. Sessions that
+// commit what they do, however many and however fast, do not disturb it.
+func idsTakenBy(t *testing.T, owner, conn *pgx.Conn, before, stmt string, want int64) (least int64, never bool, measured int) {
+	t.Helper()
+	ctx := context.Background()
+	const probe = `begin update public.ruler set n = n + 1 where id = %d; exception when division_by_zero then null; end;`
+	mustExec(t, owner, "create or replace function public.measured() returns void language plpgsql as $$ begin "+
+		before+" "+fmt.Sprintf(probe, 1)+" "+stmt+"; "+fmt.Sprintf(probe, 2)+" end $$")
+	const do = `select public.measured()`
+	// Once outside the measurements, so that the session has the function's
+	// statements planned.
+	mustExec(t, conn, do)
+	// between is the ids after $1 and before $2 that have not committed, and
+	// those among them still in progress, which may yet commit. The stamps
+	// are 32-bit ids of the epoch the transaction's own id is in.
+	const between = `
+		select count(*) filter (where st is distinct from 'committed'), count(*) filter (where st = 'in progress')
+		from generate_series($1::bigint + 1, $2::bigint - 1) y,
+		     pg_xact_status(((pg_current_xact_id()::text::bigint >> 32 << 32) + y)::text::xid8) st`
+	least, never = -1, true
+	for deadline := time.Now().Add(10 * time.Second); least != want && (measured == 0 || time.Now().Before(deadline)); {
+		measured++
+		tx, err := conn.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, do); err != nil {
+			t.Fatalf("%s: %v", do, err)
+		}
+		var first, second int64
+		if err := tx.QueryRow(ctx, `select (select xmin::text::bigint from public.ruler where id = 1),
+			(select xmin::text::bigint from public.ruler where id = 2)`).Scan(&first, &second); err != nil {
+			t.Fatal(err)
+		}
+		if second <= first {
+			t.Fatalf("the ruler's stamps are %d and %d: the ids wrapped around between them", first, second)
+		}
+		var taken, open int64
+		for wait := 0; ; wait++ {
+			if err := tx.QueryRow(ctx, between, first, second).Scan(&taken, &open); err != nil {
+				t.Fatal(err)
+			}
+			// Waiting helps only while more ids are in progress than this
+			// transaction is to hold: one that rolled back stays counted.
+			if taken <= want || open <= want || wait == 4 {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if taken < want {
+			never = false
+		}
+		if least < 0 || taken < least {
+			least = taken
+		}
+	}
+	return least, never, measured
+}
+
+// Capture takes no transaction id where it records nothing (spec 4, the cap
+// of one transaction). Its block is a subtransaction, which is assigned an id
+// only when it writes, and in a session it does not capture it returns before
+// it writes. A write of such a session to a table with the capture triggers
+// takes no id beyond the transaction's own, as the same write to a table
+// without triggers; nor does the agent's statement that changes no row, nor
+// its write past the 32 captures of one transaction. The ids are counted with
+// a ruler inside the writing transaction (idsTakenBy), which other sessions
+// of the server cannot make read too low, and make read too high only for a
+// moment.
+//
+// A capture that records something does take one: the ruler never reads less
+// than one for the agent's write, and what that write recorded was written
+// under an id that is not the transaction's own. That is what the same
+// measurement would read for a session that is not captured, did capture
+// write before it returned.
+func TestCaptureTakesNoTransactionIDWhereItRecordsNothing(t *testing.T) {
+	pool, db := captureDB(t)
+	owner := superuserIn(t, db)
+	for _, table := range []string{"public.items", "public.plain"} {
+		mustExec(t, owner,
+			`create table `+table+` (id int primary key, v text)`,
+			`insert into `+table+` select g, 'v' from generate_series(1, 40) g`)
+	}
+	mustExec(t, owner, `create table public.ruler (id int primary key, n int)`, `insert into public.ruler values (1, 0), (2, 0)`)
+	installCapture(t, owner, "public.items", "items", "id")
+	setCapture(t, pool, []string{"stet_md5"}, 10000)
+	other := writerIn(t, db, "public.items", "public.plain", "public.ruler")
+	agent := agentIn(t, db)
+
+	const (
+		write     = `update public.%s set v = v || '.' where id = 33`
+		miss      = `update public.%s set v = 'none' where id = -1`
+		thirtyTwo = `for k in 1..32 loop update public.items set v = v || '.' where id = k; end loop;`
+	)
+	for _, c := range []struct {
+		name         string
+		conn         *pgx.Conn
+		before, stmt string
+		want         int64
+		atLeast      bool // want is a floor, which the ruler must never read below
+	}{
+		{"a session not captured", other, "", fmt.Sprintf(write, "items"), 0, false},
+		{"a session not captured, a statement that changes no row", other, "", fmt.Sprintf(miss, "items"), 0, false},
+		{"a session not captured, a table without triggers", other, "", fmt.Sprintf(write, "plain"), 0, false},
+		{"the agent, a table without triggers", agent, "", fmt.Sprintf(write, "plain"), 0, false},
+		{"the agent, a statement that changes no row", agent, "", fmt.Sprintf(miss, "items"), 0, false},
+		{"the agent, a write past the 32 captures of its transaction", agent, thirtyTwo, fmt.Sprintf(write, "items"), 0, false},
+		{"the agent", agent, "", fmt.Sprintf(write, "items"), 1, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			least, never, measured := idsTakenBy(t, owner, c.conn, c.before, c.stmt, c.want)
+			if measured > 1 && never && (least == c.want || c.atLeast) {
+				t.Logf("measured %d times, the least read %d: in the others, another session was assigned an id in between "+
+					"that it did not commit", measured, least)
+			}
+			switch {
+			case !never:
+				t.Errorf("the statement took %d transaction ids, fewer than the %d it must", least, c.want)
+			case least != c.want && !c.atLeast:
+				t.Errorf("the statement took at least %d transaction ids in each of %d measurements, want %d", least, measured, c.want)
+			}
+		})
+	}
+
+	// What was measured is what was meant: the agent's writes were captured,
+	// the 32 and the one past them leaving 32 sets each time, and the other
+	// session's left nothing.
+	if n := countOf(t, pool, `select count(*) from stet.change_sets where agent_role <> 'stet_md5'`); n != 0 {
+		t.Errorf("%d sets recorded for a session that is not captured", n)
+	}
+	if n := countOf(t, pool, `select count(*) from (select txid from stet.change_sets group by txid having count(*) not in (1, 32)) x`); n != 0 {
+		t.Errorf("%d of the agent's transactions left neither 1 set nor 32", n)
+	}
+	if n := countOf(t, pool, `select count(*) from stet.change_sets where skipped = 'too_many_statements'`); n == 0 {
+		t.Errorf("no transaction of the agent's reached the cap")
+	}
+	// Every set, and every line, was written by a subtransaction of the
+	// transaction that made the write: under an id of its own.
+	if n := countOf(t, pool, `select count(*) from stet.change_sets`); n == 0 {
+		t.Errorf("no write of the agent's was captured")
+	}
+	if n := countOf(t, pool, `select count(*) from stet.change_sets s left join stet.changes c on c.set_id = s.id
+		where s.xmin::text::bigint = (s.txid & 4294967295) or c.xmin::text::bigint = (s.txid & 4294967295)`); n != 0 {
+		t.Errorf("%d sets or lines were written under the transaction's own id, not a subtransaction's", n)
+	}
+}
+
 // In one transaction capture records values for the first 31 writes it
 // records anything for, a too_many_statements set for the 32nd, and nothing
 // after; the subtransactions that wrote what it recorded are at most 32. A
