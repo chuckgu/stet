@@ -71,10 +71,18 @@ type UndoClone struct {
 	Captured []CapturedTable
 	Since    time.Time      // the server's clock just before the first statement; every undo selects from it on
 	Sent     map[string]int // statements sent, by result (Executed, Blocked, DBRejected, Unknown)
-	Sets     []SetCount     // the change sets capture recorded, by agent and skipped
-	Undone   []AgentUndo    // in the order undone
-	Tables   []TableCompare // by name
-	Paths    []PathResult   // the followed paths of which a statement was sent here
+	// Unanswered are the statements whose result is Unknown, in the order sent: no answer came, so whether they
+	// ran is for the comparison to show.
+	Unanswered []Unanswered
+	Sets       []SetCount     // the change sets capture recorded, by agent and skipped
+	Undone     []AgentUndo    // in the order undone
+	Tables     []TableCompare // by name
+	Paths      []PathResult   // the followed paths of which a statement was sent here
+}
+
+// Unanswered is a statement sent whose client got no answer, and what the client saw instead.
+type Unanswered struct {
+	ID, Set, Path, Message string
 }
 
 // CapturedTable is a table capture was installed on.
@@ -344,6 +352,9 @@ func (r *undoRun) clone(ctx context.Context, name string, first bool, from int) 
 	save := func(o Outcome) error {
 		cl.Sent[o.Result]++
 		outcomes[o.ID] = o
+		if o.Result == Unknown {
+			cl.Unanswered = append(cl.Unanswered, Unanswered{ID: o.ID, Set: o.Set, Path: r.byID[o.ID].Path, Message: o.Message})
+		}
 		return nil
 	}
 	if first {
@@ -1097,6 +1108,13 @@ func (r UndoResult) Write(w io.Writer) error {
 		p("  captured: %s", strings.Join(captured, ", "))
 		p("  since %s (the server's clock, just before the first statement)", c.Since.UTC().Format(time.RFC3339Nano))
 		p("  statements sent: %d (%s)", c.Statements(), resultCounts(c.Sent))
+		for _, u := range c.Unanswered {
+			where := "set " + u.Set
+			if u.Path != "" {
+				where += ", path " + u.Path
+			}
+			p("    no answer: %s (%s): %s", u.ID, where, u.Message)
+		}
 		var bySet []string
 		for _, s := range c.Sets {
 			what := "with values"

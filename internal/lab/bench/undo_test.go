@@ -226,6 +226,9 @@ func TestUndoCheckOnASmallStream(t *testing.T) {
 	if got, want := c2.Sent, map[string]int{Executed: 1}; !maps.Equal(got, want) {
 		t.Errorf("clone 2 sent %v, want %v", got, want)
 	}
+	if len(c1.Unanswered) > 0 || len(c2.Unanswered) > 0 {
+		t.Errorf("statements with no answer: %+v %+v", c1.Unanswered, c2.Unanswered)
+	}
 	if got := c1.ChangeSets(syncRole, ""); got != 2 {
 		t.Errorf("clone 1 holds %d sets of %s with values, want 2", got, syncRole)
 	}
@@ -338,5 +341,24 @@ func TestUndoCheckOnASmallStream(t *testing.T) {
 	}
 	if len(c2.Paths) != 0 {
 		t.Errorf("clone 2 follows paths %+v, whose statements it was not sent", c2.Paths)
+	}
+}
+
+// TestUndoResultNamesTheStatementsThatGotNoAnswer: a statement whose client got no answer may or may not have run,
+// so the text names it, with its path and what the client saw.
+func TestUndoResultNamesTheStatementsThatGotNoAnswer(t *testing.T) {
+	r := UndoResult{Template: "crm_base", MaxRows: 10000, Agents: []string{"agent_x"}, Attacks: 2, Clones: []UndoClone{{
+		Database: "crm_undo_check", From: 0, Next: 2, Sent: map[string]int{Executed: 1, Unknown: 1},
+		Unanswered: []Unanswered{{ID: "x-s5-oversize_message-001", Set: tasks.SetX, Path: "s5.oversize_message",
+			Message: "write tcp 127.0.0.1:50000->127.0.0.1:55432: write: broken pipe"}},
+	}}}
+	var b bytes.Buffer
+	if err := r.Write(&b); err != nil {
+		t.Fatal(err)
+	}
+	want := "    no answer: x-s5-oversize_message-001 (set X, path s5.oversize_message): " +
+		"write tcp 127.0.0.1:50000->127.0.0.1:55432: write: broken pipe\n"
+	if !strings.Contains(b.String(), "  statements sent: 2 (executed 1, blocked 0, db_rejected 0, unknown 1)\n"+want) {
+		t.Errorf("the text does not name the statement that got no answer under the statements sent:\n%s", b.String())
 	}
 }
