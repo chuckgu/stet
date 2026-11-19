@@ -1417,9 +1417,9 @@ BEGIN
 END
 $$;
 
--- 되돌리기는 연쇄를 일으키지 않는다 (7장 "referenced", 계획의 판정 R20). 복구 문장이 없애거나 바꾸는 값을, 연쇄하는 외래
--- 키로 가리키는 행이 있는 테이블들이다. 없으면 NULL이고, 있으면 'referenced: <테이블들>'이다(스키마까지 %I.%I, 바이트 순,
--- ", "로 잇는다). stet.undo가 키의 행을 FOR UPDATE로 잠그고 지금 행이 a임을 확인한 뒤, 복구 문장 앞에 부른다.
+-- 되돌리기는 연쇄를 일으키지 않는다 (7장 "referenced", 계획의 판정 R20, R24, R25). 복구 문장이 없애거나 바꾸는 값을,
+-- 연쇄하는 외래 키로 가리키는 행이 있는 테이블들이다. 없으면 NULL이고, 있으면 'referenced: <테이블들>'이다(스키마까지
+-- %I.%I, 바이트 순, ", "로 잇는다). stet.undo가 키의 행을 FOR UPDATE로 잠그고 지금 행이 a임을 확인한 뒤, 복구 문장 앞에 부른다.
 -- 1. 거절(READ COMMITTED만, 판정 R15). insert는 아무것도 없애거나 바꾸지 않으므로 NULL이다. update에서 SET할 컬럼이 없으면
 --    (stet.undo_statement가 NULL) 아무것도 바뀌지 않으므로 NULL이다.
 -- 2. 복구할 테이블을 ROW EXCLUSIVE로 잠근 뒤에 외래 키를 읽는다. 그 테이블을 가리키는 외래 키를 더하는 ALTER TABLE은 그
@@ -1430,6 +1430,10 @@ $$;
 --    단위의 INSERT, UPDATE, DELETE, TRUNCATE 권한을 요구해서, 고칠 컬럼의 UPDATE만 가진 검토자의 복구까지 막았다. 권한이
 --    없으면 42501이고, stet.undo의 키마다의 블록 안이므로 그 키는 보통의 failed 줄이다(복구 문장도 같은 이유로 실패했을
 --    것이다). 계획(stet.undo_plan)은 이 함수를 부르지 않으므로 ACCESS SHARE만 잡고 읽기만 한다.
+--    EXPLAIN 뒤에 이 백엔드가 relid에 ROW EXCLUSIVE를 쥐었는지 pg_locks로 본다(판정 R24의 4). 문장 안의 이름은 잠금을
+--    기다리는 동안 다른 테이블을 가리키게 될 수 있고(ALTER SCHEMA ... RENAME은 테이블을 잠그지 않는다), 그러면 PostgreSQL은
+--    이름을 다시 풀어 그 테이블을 잠그고 relid의 잠금은 놓는다. 쥐지 않았으면 object_not_in_prerequisite_state이고 그 키는
+--    failed다. 앞의 키를 복구해 트랜잭션이 이미 relid에 그 잠금을 쥐고 있으면 그것으로 외래 키의 목록은 지켜진다.
 -- 3. relid를 가리키는 외래 키 가운데 delete면 ON DELETE가, update면 ON UPDATE가 CASCADE, SET NULL, SET DEFAULT인 것을 본다.
 --    파티션마다 복제된 외래 키(conparentid가 있다)는 보지 않는다. NO ACTION과 RESTRICT는 서버가 23503으로 막고, stet.undo가
 --    다시 해 본다.
@@ -1437,23 +1441,38 @@ $$;
 --    컬럼(생성 컬럼과 GENERATED ALWAYS AS IDENTITY 컬럼이 아니고 a와 b에서 값이 다른 것)과, a와 b에서 값이 다른 생성 컬럼(SET한
 --    컬럼에서 다시 계산된다)이다. IDENTITY ALWAYS 컬럼은 SET하지 않으므로 바뀌지 않는다. 고객의 BEFORE 트리거가 바꾸는 컬럼은
 --    알 수 없다.
--- 5. 타입이 다른 컬럼 사이의 연쇄 외래 키는 따라가지 않는다. 가리키는 컬럼과 가리키는 쪽 컬럼의 타입이 도메인을 벗긴
---    기본 타입에서 다르면(char와 text, timestamptz와 timestamp, integer와 bigint) feature_not_supported(0A000)이고 그 키는
---    failed다. PostgreSQL의 연쇄는 그런 비교에 캐스트를 더하고, 그 결과는 세션의 설정(TimeZone 등)에 따를 수 있다. 같은 기본
---    타입이면 typmod는 보지 않는다(varchar(10)과 varchar(20)).
--- 6. 자식이 있는지는 외래 키가 비교하는 대로 본다: 제약의 등호 연산자(conpfeqop, OPERATOR(<스키마>.<이름>)), 왼쪽이 부모의
---    컬럼, 오른쪽이 자식의 컬럼이다. 두 컬럼의 콜레이션이 다르면 부모 컬럼의 콜레이션으로 비교한다(PostgreSQL의 연쇄도
---    그렇다). 부모의 값은 a의 글자를 다시 읽지 않고 그 키의 행(이미 잠근 행, 연쇄가 OLD로 볼 행)에서 조인으로 가져온다:
---    SELECT EXISTS (SELECT FROM ONLY <부모> p, [ONLY] <자식> x WHERE <키의 행> AND p.<부모 컬럼> OPERATOR(...) x.<자식 컬럼>
---    [COLLATE ...] AND ...). 그 행을 찾지 못하면 object_not_in_prerequisite_state다. 값 가운데 NULL이 있으면 비교가 거짓이라
---    아무 행도 맞지 않는다(PostgreSQL도 NULL이 든 키에서는 연쇄하지 않는다. MATCH SIMPLE에서 NULL이 든 자식은 아무것도
---    가리키지 않는다). 자기를 가리키는 외래 키에서는 그 행 자신을 ctid로 뺀다(x.ctid <> p.ctid, NULL이 될 수 없다).
---    자식은 파티션 테이블이면 파티션까지, 아니면 ONLY로 읽는다(PostgreSQL의 외래 키 동작과 같다).
+-- 5. 따라가지 않는 외래 키. 그 외래 키를 불러일으킬 복구는 feature_not_supported(0A000)이고 그 키는 failed다. 메시지가 제약과
+--    자식 테이블을 말한다.
+--    - 컬럼 짝의 타입이 도메인을 벗긴 기본 타입에서 다르다(char와 text, timestamptz와 timestamp, integer와 bigint. 판정 R20).
+--      PostgreSQL의 연쇄는 그런 비교에 캐스트를 더하고, 그 결과는 세션의 설정(TimeZone 등)에 따를 수 있다. typmod는 보지
+--      않는다(varchar(10)과 varchar(20)).
+--    - 비교에 드는 콜레이션 넷 가운데 하나라도 비결정적이다(판정 R25): 부모 컬럼의 타입의 것(연쇄의 매개변수가 이것을
+--      갖는다), 부모 컬럼의 것(비결정적이고 자식과 다르면 연쇄가 이것으로 비교한다), 자식 컬럼의 것, 자식 컬럼의 타입의 것
+--      (자식을 받아들이는 확인의 매개변수가 이것을 갖고, 새 자식이 어느 부모 행을 잠그는지를 정한다). 비결정적인 비교에서는
+--      연쇄가 닿는 자식이 이 행이 아닌 다른 부모 행을 가리킬 수 있어, 그런 자식은 조사와 복구 사이에 생길 수 있다. 모두
+--      같은 비결정적 콜레이션인 경우도 거절한다.
+--    - 연쇄가 쓸 콜레이션을 정할 수 없다: 부모 컬럼의 타입의 것과 자식 컬럼의 것이 둘 다 기본이 아니고 서로 다르다(연쇄
+--      자체가 콜레이션 충돌로 실패한다).
+-- 6. 자식이 있는지는 PostgreSQL의 연쇄가 쓰는 비교 그대로 본다(ri_triggers.c의 ri_GenerateQual, ruleutils.c의
+--    generate_operator_clause와 같은 글자). 짝마다 p.<부모 컬럼>[::<연산자의 왼쪽 타입>] OPERATOR(<스키마>.<conpfeqop의 이름>)
+--    x.<자식 컬럼>[::<연산자의 오른쪽 타입>] COLLATE <연쇄의 콜레이션>이다. 캐스트는 컬럼의 타입(도메인이면 도메인 자체)이
+--    연산자가 받는 타입과 다를 때만 붙이고, 타입은 pg_type의 스키마와 이름을 %I.%I로 적는다. 두 피연산자가 연산자가 받는
+--    타입 그대로이므로 OPERATOR(스키마.이름)은 conpfeqop 하나로만 풀린다(같은 스키마, 이름, 입력 타입의 연산자는 둘일 수
+--    없다). 그래서 에이전트가 그 스키마에 컬럼의 타입끼리의 같은 이름의 연산자를 더해도 고르지 않는다. 콜레이션은 연쇄가
+--    쓰는 것, 곧 부모 컬럼의 타입의 콜레이션과 자식 컬럼의 콜레이션을 PostgreSQL이 두 암묵 콜레이션을 합치는 대로 합친
+--    것이다(같으면 그것, 한쪽이 기본이면 다른 쪽). 스키마까지 적고 명시한다. 콜레이션이 없는 타입에는 붙이지 않는다.
+--    부모의 값은 a의 글자를 다시 읽지 않고 그 키의 행(이미 잠근 행, 연쇄가 OLD로 볼 행)에서 조인으로 가져온다:
+--    SELECT EXISTS (SELECT FROM ONLY <부모> p, [ONLY] <자식> x WHERE <키의 행> AND <짝마다의 비교> [AND x.ctid <> p.ctid]).
+--    그 행을 찾지 못하면 object_not_in_prerequisite_state다. 값 가운데 NULL이 있으면 비교가 참이 아니어서 아무 행도 맞지
+--    않는다(PostgreSQL도 NULL이 든 키에서는 연쇄하지 않는다. MATCH SIMPLE에서 NULL이 든 자식은 아무것도 가리키지 않는다).
+--    자기를 가리키는 외래 키에서는 그 행 자신을 ctid로 뺀다. 자식은 파티션 테이블이면 파티션까지, 아니면 ONLY로 읽는다.
 -- 7. 자식 테이블은 부른 계정의 권한으로 읽는다(SECURITY INVOKER). 읽을 권한이 없으면 42501이다. 행 수준 보안이 부른 역할에게
 --    적용되면 숨은 자식을 놓칠 수 있으므로(연쇄는 행 수준 보안을 지나간다) 42501이다. 이것을 조사 앞뒤로 본다. 조사가 자식
 --    테이블의 잠금을 기다리는 동안 행 수준 보안이 켜질 수 있다.
--- 잠근 뒤에 보므로 그 사이에 새 자식이 생기지 않는다. 자식을 넣거나 그 행을 가리키게 고치는 쪽은 부모 행에 FOR KEY SHARE를
--- 잡아야 하는데, 그것은 FOR UPDATE를 기다린다. 이미 그 잠금을 쥔 쪽이 있었다면 FOR UPDATE가 그쪽을 기다렸다.
+-- 잠근 뒤에 보므로 그 사이에 새 자식이 생기지 않는다. 외래 키의 등호는 부모의 유일 인덱스의 것이고 비교가 결정적이므로,
+-- 이 행의 값과 같은 부모 행은 이 행뿐이고 그런 자식은 이 행을 가리킨다. 그런 자식을 넣거나 이 행을 가리키게 고치는 쪽은 이
+-- 행에 FOR KEY SHARE를 잡아야 하는데, 그것은 FOR UPDATE를 기다린다. 이미 그 잠금을 쥔 쪽이 있었다면 FOR UPDATE가 그쪽을
+-- 기다렸다.
 -- 이 단계의 앞선 개발판은 key_column과 key 없이 네 인자의 이 함수를 만들었다. 인자가 바뀌면 CREATE OR REPLACE는 새 함수를
 -- 더하므로 그 모양을 지운다.
 DROP FUNCTION IF EXISTS stet.undo_referenced(oid, text, jsonb, jsonb);
@@ -1478,6 +1497,10 @@ DECLARE
   cbase     oid;
   ttype     "char";
   tbase     oid;
+  dflt      oid;
+  eff       oid;
+  coll      text;
+  nd        text;
   cond      text;
   found_row boolean;
   hit       boolean;
@@ -1497,11 +1520,16 @@ BEGIN
     RETURN NULL;
   END IF;
   EXECUTE 'EXPLAIN ' || restore;
-  SELECT lk.table_name INTO tbl FROM stet.undo_lock(undo_referenced.relid) lk;
-  IF pg_catalog.to_regclass(tbl) IS DISTINCT FROM undo_referenced.relid THEN
-    RAISE EXCEPTION 'the table with oid % was renamed or replaced while it was read', undo_referenced.relid
-      USING ERRCODE = 'object_not_in_prerequisite_state';
+  IF NOT EXISTS (SELECT FROM pg_catalog.pg_locks l
+                  WHERE l.locktype = 'relation'
+                    AND l.database = (SELECT d.oid FROM pg_catalog.pg_database d WHERE d.datname = current_database())
+                    AND l.relation = undo_referenced.relid AND l.pid = pg_backend_pid()
+                    AND l.mode = 'RowExclusiveLock' AND l.granted) THEN
+    RAISE EXCEPTION 'the restore statement for the table with oid % locked another table: its name was given to another table while it waited for the lock',
+      undo_referenced.relid USING ERRCODE = 'object_not_in_prerequisite_state';
   END IF;
+  SELECT lk.table_name INTO tbl FROM stet.undo_lock(undo_referenced.relid) lk;
+  dflt := 'pg_catalog."default"'::regcollation;
   keyed := format('p.%I OPERATOR(pg_catalog.=) %L AND p.tableoid OPERATOR(pg_catalog.=) %L',
                   undo_referenced.key_column, undo_referenced.key, undo_referenced.relid);
   FOR fk IN
@@ -1525,15 +1553,20 @@ BEGIN
     FOR pair IN
       SELECT pa.attname AS pcol, ca.attname AS ccol, pa.atttypid AS ptype, ca.atttypid AS ctype,
              format('OPERATOR(%I.%s)', opn.nspname, op.oprname) AS op,
-             CASE WHEN pa.attcollation <> ca.attcollation AND pa.attcollation <> 0
-                  THEN format(' COLLATE %I.%I', coln.nspname, co.collname) ELSE '' END AS coll
+             CASE WHEN pa.atttypid <> op.oprleft THEN format('::%I.%I', ln.nspname, lt.typname) ELSE '' END AS lcast,
+             CASE WHEN ca.atttypid <> op.oprright THEN format('::%I.%I', rn.nspname, rt.typname) ELSE '' END AS rcast,
+             pt.typcollation AS pcoll, pa.attcollation AS pacoll, ca.attcollation AS fcoll, ct.typcollation AS qcoll
         FROM unnest(fk.confkey, fk.conkey, fk.conpfeqop) WITH ORDINALITY AS k(pk, ck, eqop, n)
         JOIN pg_catalog.pg_attribute pa ON pa.attrelid = undo_referenced.relid AND pa.attnum = k.pk
         JOIN pg_catalog.pg_attribute ca ON ca.attrelid = fk.conrelid AND ca.attnum = k.ck
+        JOIN pg_catalog.pg_type pt ON pt.oid = pa.atttypid
+        JOIN pg_catalog.pg_type ct ON ct.oid = ca.atttypid
         JOIN pg_catalog.pg_operator op ON op.oid = k.eqop
         JOIN pg_catalog.pg_namespace opn ON opn.oid = op.oprnamespace
-        LEFT JOIN pg_catalog.pg_collation co ON co.oid = pa.attcollation
-        LEFT JOIN pg_catalog.pg_namespace coln ON coln.oid = co.collnamespace
+        JOIN pg_catalog.pg_type lt ON lt.oid = op.oprleft
+        JOIN pg_catalog.pg_namespace ln ON ln.oid = lt.typnamespace
+        JOIN pg_catalog.pg_type rt ON rt.oid = op.oprright
+        JOIN pg_catalog.pg_namespace rn ON rn.oid = rt.typnamespace
        ORDER BY k.n
     LOOP
       pbase := pair.ptype;
@@ -1553,7 +1586,38 @@ BEGIN
           quote_ident(fk.conname), fk.name, format_type(pbase, NULL), format_type(cbase, NULL)
           USING ERRCODE = 'feature_not_supported';
       END IF;
-      cond := concat_ws(' AND ', cond, format('p.%I %s x.%I%s', pair.pcol, pair.op, pair.ccol, pair.coll));
+      SELECT format('%I.%I', cn.nspname, c.collname) INTO nd
+        FROM unnest(ARRAY[pair.pcoll, pair.pacoll, pair.fcoll, pair.qcoll]) WITH ORDINALITY AS u(coll, n)
+        JOIN pg_catalog.pg_collation c ON c.oid = u.coll
+        JOIN pg_catalog.pg_namespace cn ON cn.oid = c.collnamespace
+       WHERE NOT c.collisdeterministic
+       ORDER BY u.n
+       LIMIT 1;
+      IF nd IS NOT NULL THEN
+        RAISE EXCEPTION 'the cascading foreign key % of % compares under the nondeterministic collation %; undo does not follow a cascade under a nondeterministic collation',
+          quote_ident(fk.conname), fk.name, nd USING ERRCODE = 'feature_not_supported';
+      END IF;
+      IF pair.pcoll = 0 OR pair.fcoll = 0 THEN
+        coll := '';
+      ELSE
+        eff := CASE WHEN pair.pcoll = pair.fcoll THEN pair.pcoll
+                    WHEN pair.pcoll = dflt THEN pair.fcoll
+                    WHEN pair.fcoll = dflt THEN pair.pcoll END;
+        IF eff IS NULL THEN
+          RAISE EXCEPTION 'the cascading foreign key % of % compares under the collations % and %, between which PostgreSQL cannot choose; undo does not follow such a cascade',
+            quote_ident(fk.conname), fk.name,
+            (SELECT format('%I.%I', cn.nspname, c.collname) FROM pg_catalog.pg_collation c
+               JOIN pg_catalog.pg_namespace cn ON cn.oid = c.collnamespace WHERE c.oid = pair.pcoll),
+            (SELECT format('%I.%I', cn.nspname, c.collname) FROM pg_catalog.pg_collation c
+               JOIN pg_catalog.pg_namespace cn ON cn.oid = c.collnamespace WHERE c.oid = pair.fcoll)
+            USING ERRCODE = 'feature_not_supported';
+        END IF;
+        SELECT format(' COLLATE %I.%I', cn.nspname, c.collname) INTO coll
+          FROM pg_catalog.pg_collation c JOIN pg_catalog.pg_namespace cn ON cn.oid = c.collnamespace
+         WHERE c.oid = eff;
+      END IF;
+      cond := concat_ws(' AND ', cond,
+                        format('p.%I%s %s x.%I%s%s', pair.pcol, pair.lcast, pair.op, pair.ccol, pair.rcast, coll));
     END LOOP;
     IF fk.conrelid = undo_referenced.relid THEN
       cond := cond || ' AND x.ctid OPERATOR(pg_catalog.<>) p.ctid';
