@@ -457,7 +457,7 @@ level=WARN msg="the config has no undo clause, but triggers that call stet.captu
 - **스키마의 잠금.** `stet.change_sets`, `stet.changes`, `stet.capture_settings`에는 캡처한 에이전트의 트랜잭션이 끝날 때까지 약한 잠금이 걸린다. `schema.sql`이 이 세 표에 강한 잠금을 잡는 문장을 실행하면, 열린 에이전트 트랜잭션을 기다리는 동안 그 뒤의 모든 캡처가 줄을 선다. 그동안의 캡처는 에이전트의 `lock_timeout`에 걸려 `capture_failed`가 되거나, 그 설정이 없으면 쓰기가 기다린다. 그래서 `schema.sql`은 이 세 표가 이미 있으면 그 표에 잠금을 잡는 문장을 실행하지 않아야 한다. 트리거와 인덱스는 없는지 먼저 보고 만든다(`CREATE INDEX IF NOT EXISTS`도 있는지 보기 전에 잠금을 잡는다). 나중에 컬럼을 더할 때는 이 한계를 다시 본다. 이 세 표 말고는 그렇지 않다. `schema.sql`이 다시 돌 때(Stet을 올려 파일이 바뀌었을 때) `stet.decisions`의 `ALTER TABLE`과 뷰의 `CREATE OR REPLACE VIEW`는 그 표와 뷰에 `ACCESS EXCLUSIVE`가 필요하다. `stet.history`나 `stet.review`를 읽은 검토자의 트랜잭션이 열려 있으면 Stet의 연결은 `lock_timeout`(200ms)만큼 기다리다 실패하고, Stet은 멈춰 서지 않고 시작에 실패한다. 그 트랜잭션이 끝난 뒤 다시 시작한다. 파일이 그대로면 Stet은 DDL을 돌리지 않으므로 기다리지 않는다.
 - **설정은 마지막에 시작한 Stet의 것이다.** 한 데이터베이스에 `agents.roles`나 `undo.max_rows`가 다른 Stet이 여럿이면 `stet.capture_settings`는 마지막에 시작한 쪽의 값이다.
 - **되돌리기 기록은 검토자가 도우미 함수를 직접 불러 자기 이름으로 지어낼 수 있다.** 남의 이름으로는 못 한다.
-- 되돌리기를 다시 되돌릴 수 없다. 되돌리기의 쓰기는 검토자의 것이어서 남지 않는다(`roles`가 NULL일 때만 남는다).
+- 되돌리기를 다시 되돌릴 수 없다. 되돌리기의 쓰기는 검토자의 것이어서 남지 않는다. 남는 것은 `roles`가 NULL일 때와, 검토자가 Stet의 계정으로 접속해 되돌렸을 때다(4장의 3).
 
 ## 12. 패키지별 변경
 
