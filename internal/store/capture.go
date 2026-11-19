@@ -32,11 +32,11 @@ func (s *Store) SyncCaptureSettings(ctx context.Context, roles []string, maxRows
 }
 
 // purgeChanges deletes, of the $2 oldest change sets by id, those recorded
-// more than $1 microseconds before the database's clock, read once. It reads
-// the sets through the primary key's index only, to find them and to delete
-// them (a join would scan the whole table to delete them), so it does not go
-// through the table when nothing is old. The lines of stet.changes go with
-// their sets (ON DELETE CASCADE).
+// more than $1 microseconds before the database's clock, read once. It finds
+// the sets, and deletes them, by index scans on the primary key, which read
+// those sets' rows (for at) and no others (a join would scan the whole table
+// to delete them), so it does not go through the table when nothing is old.
+// The lines of stet.changes go with their sets (ON DELETE CASCADE).
 const purgeChanges = `
 	delete from stet.change_sets
 	where id = any (array(

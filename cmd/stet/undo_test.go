@@ -223,6 +223,67 @@ undo:
 	}
 }
 
+// In enforce mode the settings are synced before the executor starts: a held
+// write approved before Stet started, which the executor applies at once, is
+// captured under the new settings. The sync is held up by a lock on the row
+// for up to 100ms, within the 200ms lock_timeout of Stet's pool, so that an
+// executor started first would apply the write meanwhile, under the old row,
+// which captures no write of stet_md5.
+func TestRunSyncsCaptureSettingsBeforeApplyingHeldWrites(t *testing.T) {
+	pg := testPG(t)
+	ctx := context.Background()
+	db, table, admin, pool := capturedTable(t, pg, 1)
+	mustExec(t, admin, `insert into stet.capture_settings (roles, max_rows) values ('{other}', 5)`)
+	id := approvedWrite(t, pool, db, table, "update "+table+" set name = 'applied' where id = 1")
+
+	su := connectTo(t, pg, db, "postgres", "postgres-pw")
+	lock, err := connectTo(t, pg, db, "postgres", "postgres-pw").Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Rollback(ctx)
+	if _, err := lock.Exec(ctx, `select from stet.capture_settings for update`); err != nil {
+		t.Fatal(err)
+	}
+	r := start(t, parseConfig(t, undoYAML, pg, db, table, "enforce"))
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting bool
+		if err := su.QueryRow(ctx, `select exists (select from pg_stat_activity where datname = $1
+			and usename = 'stet_scram' and wait_event_type = 'Lock' and query like '%capture_settings%')`, db).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Stet's settings sync never waited for the row; log:\n%s", r.log)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	for held := time.Now(); time.Since(held) < 100*time.Millisecond && statusOf(t, admin, id) != "applied"; {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := lock.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitListening(t, r)
+	waitStatus(t, admin, id, "applied", 5*time.Second, r.log)
+
+	if s := captureSettingsIn(t, admin); !s.ok || !slices.Equal(s.Roles, []string{"stet_md5"}) || s.MaxRows != 7 {
+		t.Fatalf("stet.capture_settings: present %v, roles %q, max_rows %d; want [stet_md5], 7; log:\n%s",
+			s.ok, s.Roles, s.MaxRows, r.log)
+	}
+	var captured int
+	if err := admin.QueryRow(ctx, `select count(*) from stet.change_sets where held_write = $1`, id).Scan(&captured); err != nil {
+		t.Fatal(err)
+	}
+	if captured != 1 {
+		t.Errorf("%d change sets record the approved write, want 1: it ran under the settings before the sync; log:\n%s",
+			captured, r.log)
+	}
+}
+
 // Without undo, Stet neither writes stet.capture_settings, nor puts a row in,
 // nor deletes change records, in either mode.
 func TestRunWithoutUndoLeavesCaptureSettingsAlone(t *testing.T) {

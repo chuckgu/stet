@@ -1326,9 +1326,14 @@ func TestPurgerPurgesAtStartAndStops(t *testing.T) {
 
 	restore := undo.SetPurgeEvery(20 * time.Millisecond)
 	defer restore()
+	atStart := recordSets(t, su, 1, "2 hours")
 	p = undo.NewPurger(st, time.Hour, log)
 	p.Start()
-	waitGone(t, stet, recordSets(t, su, 2, "2 hours"), 5*time.Second, buf) // recorded after the purge at start
+	// Once the set recorded before Start is gone, the purge at start has
+	// deleted it and ended (one set is fewer than 10,000): a set recorded
+	// now can go only at a later wake-up.
+	waitGone(t, stet, atStart, 5*time.Second, buf)
+	waitGone(t, stet, recordSets(t, su, 2, "2 hours"), 5*time.Second, buf)
 	p.Close()
 	after := recordSets(t, su, 2, "2 hours")
 	time.Sleep(300 * time.Millisecond) // many wake-ups, had it not stopped
@@ -1340,8 +1345,30 @@ func TestPurgerPurgesAtStartAndStops(t *testing.T) {
 	}
 }
 
-// Close waits for a purge in progress, which is then finished; a purge that
-// cannot finish holds Close no longer than its bound.
+// A delete that takes longer than Close would wait for one is not cut short
+// while the Purger runs: the bound for shutdown is not the bound for work.
+func TestPurgerFinishesADeleteSlowerThanCloseWaits(t *testing.T) {
+	defer undo.SetCloseGrace(200 * time.Millisecond)()
+	db, stet := ownDatabase(t)
+	log, buf := newLog()
+
+	old := recordSets(t, superuser(t, db), 3, "2 hours")
+	release := lockSets(t, db)
+	p := undo.NewPurger(store.New(stet), time.Hour, log)
+	p.Start()
+	defer p.Close()
+	waitPurgeWaits(t, db, buf)
+	time.Sleep(time.Second) // five times Close's grace
+	release()
+	waitGone(t, stet, old, 5*time.Second, buf)
+	if strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("the log has a warning:\n%s", buf)
+	}
+}
+
+// Close waits for a delete in progress, which is then finished. A delete
+// still running after Close's grace is cancelled: Close returns, and the
+// delete deleted nothing, which the log says.
 func TestPurgerCloseWaitsForAPurgeInProgress(t *testing.T) {
 	db, stet := ownDatabase(t)
 	su := superuser(t, db)
@@ -1373,26 +1400,35 @@ func TestPurgerCloseWaitsForAPurgeInProgress(t *testing.T) {
 		t.Errorf("%d sets and %d lines left: the purge in progress at Close was not finished", sets, lines)
 	}
 
-	restore := undo.SetPurgeTimeout(500 * time.Millisecond)
-	defer restore()
+	const grace = 300 * time.Millisecond
+	defer undo.SetCloseGrace(grace)()
 	old = recordSets(t, su, 3, "2 hours")
-	lockSets(t, db) // released when the test ends
+	release = lockSets(t, db)
 	p = undo.NewPurger(st, time.Hour, log)
 	p.Start()
 	waitPurgeWaits(t, db, buf)
 	began := time.Now()
 	p.Close()
-	if took := time.Since(began); took > 3*time.Second {
-		t.Errorf("Close took %s with the purge's bound at 500ms", took)
+	if took := time.Since(began); took < grace || took > grace+time.Second {
+		t.Errorf("Close took %s with a delete that could not finish; want its grace, %s, and at most a second more",
+			took, grace)
 	}
-	if sets, _ := setsLeft(t, stet, old); sets != 3 {
-		t.Errorf("%d of 3 sets left after a purge that could not finish", sets)
+	release()
+	time.Sleep(200 * time.Millisecond)
+	if sets, lines := setsLeft(t, stet, old); sets != 3 || lines != 6 {
+		t.Errorf("%d sets and %d lines left after the delete Close cancelled, want 3 and 6", sets, lines)
+	}
+	if w, ok := lineWith(buf.String(), "level=WARN", "did not finish"); !ok {
+		t.Errorf("no warning says the delete did not finish; log:\n%s", buf)
+	} else if !strings.Contains(w, "deleted nothing") {
+		t.Errorf("the warning does not say the delete deleted nothing: %s", w)
 	}
 }
 
-// A purge that fails is logged as a warning, and the next wake-up purges.
+// A delete that does not finish within its bound is logged as a warning that
+// says so, and the next wake-up purges.
 func TestPurgerLogsAFailureAndCarriesOn(t *testing.T) {
-	defer undo.SetPurgeTimeout(200 * time.Millisecond)()
+	defer undo.SetDeleteTimeout(200 * time.Millisecond)()
 	defer undo.SetPurgeEvery(100 * time.Millisecond)()
 	db, stet := ownDatabase(t)
 	log, buf := newLog()
@@ -1409,9 +1445,23 @@ func TestPurgerLogsAFailureAndCarriesOn(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if !strings.Contains(buf.String(), "not purged") {
-		t.Errorf("the warning does not say the records were not purged:\n%s", buf)
+	if _, ok := lineWith(buf.String(), "level=WARN", "not purged", "did not finish within 200ms"); !ok {
+		t.Errorf("the warning does not say the delete did not finish within its bound:\n%s", buf)
 	}
 	release()
 	waitGone(t, stet, old, 5*time.Second, buf)
+}
+
+// lineWith returns the first line of log holding every one of parts.
+func lineWith(log string, parts ...string) (string, bool) {
+	for line := range strings.Lines(log) {
+		all := true
+		for _, p := range parts {
+			all = all && strings.Contains(line, p)
+		}
+		if all {
+			return line, true
+		}
+	}
+	return "", false
 }

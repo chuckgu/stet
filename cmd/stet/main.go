@@ -125,12 +125,15 @@ func run(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog.Log
 }
 
 // openGate opens Stet's pool, brings the stet schema up to date, checks the
-// database (check), and builds the gate over cfg's tables. In enforce mode it
-// also starts the executor of approved held writes (spec-v0.2-approve 7); in
-// shadow mode there is none, and no write is executed (rule 6). With undo it
-// then does what Stet does at start for undo (startUndo), in both modes.
-// closeGate closes the gate, then the executor, then the purge of old change
-// records, then the pool.
+// database (check), and builds the gate over cfg's tables. With undo it then
+// does what Stet does at start for undo (startUndo), in both modes: after the
+// check has passed, so that a start the check refuses changes nothing, and
+// before the executor starts, so that the held writes it applies are
+// captured under the settings of this start. In enforce mode it then starts
+// the executor of approved held writes (spec-v0.2-approve 7); in shadow mode
+// there is none, and no write is executed (rule 6). closeGate closes the
+// gate, then the executor, then the purge of old change records, then the
+// pool.
 //
 // With no table there is no gate, no executor and no check: the proxy passes
 // every session through, in enforce mode too (spec correction B10), which is
@@ -156,7 +159,6 @@ func openGate(ctx context.Context, cfg *config.Config, log *slog.Logger) (g *gat
 	if err := st.Migrate(ctx); err != nil {
 		return fail(err)
 	}
-	var applier *apply.Applier
 	if len(cfg.Tables) > 0 {
 		warnings, err := check(ctx, pool, cfg)
 		for _, w := range warnings {
@@ -172,14 +174,15 @@ func openGate(ctx context.Context, cfg *config.Config, log *slog.Logger) (g *gat
 		if g, err = gate.New(cfg, pool, st, d, log); err != nil {
 			return fail(err)
 		}
-		if cfg.Mode == config.ModeEnforce {
-			applier = apply.New(cfg, pool, st, log)
-			applier.Start()
-		}
 	}
 	var purger *undo.Purger
 	if cfg.Undo != nil {
 		purger = startUndo(ctx, cfg, pool, st, log)
+	}
+	var applier *apply.Applier
+	if len(cfg.Tables) > 0 && cfg.Mode == config.ModeEnforce {
+		applier = apply.New(cfg, pool, st, log)
+		applier.Start()
 	}
 	return g, func() {
 		if g != nil {

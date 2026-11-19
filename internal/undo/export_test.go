@@ -11,10 +11,18 @@ func SetPurgeEvery(d time.Duration) (restore func()) {
 	return func() { purgeEvery = old }
 }
 
-// SetPurgeTimeout changes the bound on one delete of a purge until restore is
-// called, under the terms of SetPurgeEvery.
-func SetPurgeTimeout(d time.Duration) (restore func()) {
-	old := purgeTimeout
-	purgeTimeout = d
-	return func() { purgeTimeout = old }
+// SetDeleteTimeout changes the bound on one delete of a purge until restore
+// is called, under the terms of SetPurgeEvery.
+func SetDeleteTimeout(d time.Duration) (restore func()) {
+	old := deleteTimeout
+	deleteTimeout = d
+	return func() { deleteTimeout = old }
+}
+
+// SetCloseGrace changes how long Close waits for a delete in progress until
+// restore is called, under the terms of SetPurgeEvery.
+func SetCloseGrace(d time.Duration) (restore func()) {
+	old := closeGrace
+	closeGrace = d
+	return func() { closeGrace = old }
 }
