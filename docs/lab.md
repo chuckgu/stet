@@ -578,7 +578,7 @@ bin/stet-lab bench collect -practice -arm stet
 bin/stet undo-sql -config stet.yaml > undo-install.sql
 ```
 
-출력은 `-- N. Run as <계정> (...)`으로 시작하는 묶음들이다. 첫 묶음은 Stet의 계정이 실행할 `GRANT`이고(테이블 소유자가 Stet의 계정이 아닐 때만 있다), 나머지는 테이블 소유자마다 한 트랜잭션이다. 캡처하지 않는 연쇄 자식 테이블이 있으면 끝에 주석으로 알린다.
+출력은 `-- N. Run as <계정> (...)`으로 시작하는 묶음들이다. 첫 묶음은 Stet의 계정이 실행할 `GRANT`이고(테이블 소유자가 Stet의 계정이 아닐 때만 있다), 나머지는 테이블 소유자마다 한 트랜잭션이다. 캡처하지 않는 연쇄 자식 테이블이 있으면 그 테이블 소유자의 묶음(`COMMIT`) 바로 뒤에 주석으로 알린다.
 
 ```sql
 -- 1. Run as stet (the account Stet connects as).
@@ -606,6 +606,20 @@ bin/stet undo-sql -config stet.yaml -grant reviewer > undo-grant.sql
 
 6. Stet을 다시 시작할 필요는 없다. 캡처는 트리거가 생긴 때부터 돈다. 다음에 시작할 때 되돌리기의 경고가 없으면 맞게 설치된 것이다.
 
+**끄는 순서**
+
+1. 설정에 `undo` 절이 아직 있을 때 트리거를 지우는 SQL을 출력한다.
+
+```bash
+bin/stet undo-sql -config stet.yaml -drop > undo-drop.sql
+```
+
+2. 묶음마다 머리에 적힌 계정(테이블 소유자)이 실행한다.
+3. 그다음 설정에서 `undo` 절을 지우고 Stet을 다시 시작한다.
+
+- 순서를 바꾸면 안 된다. `-drop`도 `undo.tables`로 테이블을 찾으므로 `undo` 절이 없는 설정은 거절한다. 절만 지우면 트리거는 남아 마지막으로 맞춘 `stet.capture_settings`로 계속 캡처하는데, Stet은 오래된 묶음을 지우지도 경고하지도 않는다(스펙 9·11장).
+- 남은 변경 기록과 되돌리기 기록은 그대로다. 변경 기록은 Stet의 계정이 `stet.change_sets`에서 지울 수 있다(행의 줄은 연쇄로 지워진다).
+
 **검토와 되돌리기** (검토자의 세션)
 
 ```sql
@@ -617,7 +631,7 @@ SELECT at, target_table, op, key, before, after, skipped, decision_id, decision_
 
 -- 무엇이 되돌려지고 무엇이 건너뛰어질지 본 뒤 되돌린다. READ COMMITTED 트랜잭션에서만 돈다
 BEGIN ISOLATION LEVEL READ COMMITTED;
-SELECT * FROM stet.undo_plan('agent_enricher', '2026-11-19 09:00+09');
+SELECT * FROM stet.undo_plan('agent_enricher', '2026-11-19 09:00+09', NULL, ARRAY['contacts']);
 SELECT * FROM stet.undo('agent_enricher', '2026-11-19 09:00+09', NULL, ARRAY['contacts'], 'enrichment run was wrong');
 COMMIT;   -- 결과의 줄을 보고. 아니면 ROLLBACK
 ```
@@ -637,9 +651,9 @@ COMMIT;   -- 결과의 줄을 보고. 아니면 ROLLBACK
 | 캡처함 | 387~398µs | 512~524µs |
 
 - 캡처가 더하는 시간은 p95로 0.39~0.41ms다(수용 기준은 1ms 이하). 다른 패키지의 테스트가 함께 돌면 서버가 바빠 더 나올 수 있어서, 테스트는 세 번까지 재고 한 번이라도 1ms 안이면 통과한다.
-- `stet.undo_plan`: 한 테이블의 5,000키에 약 0.52초.
+- `stet.undo_plan`: 한 테이블의 5,000키에 약 0.54초(`-race`로 돈 테스트에서 한 번).
 - `stet.undo`: 한 문장이 바꾼 5,000키를 모두 되돌리는 데 2.74~2.78초(`TestUndoOfManyKeys`, `-race` 없이 세 번).
-- `stet.history`: 판단 기록 70,102건, 묶음 20,202개, 변경 60,202건의 데이터베이스에서, 판단 기록 50,100건이 있는 백엔드의 최근 묶음 100개 0.43~0.51ms, 오래된 묶음 100개 52ms, 뷰 전체의 `count(*)` 123~134ms.
+- `stet.history`: 판단 기록 70,102건, 묶음 20,202개, 변경 60,202건의 데이터베이스에서, 판단 기록 50,100건이 있는 백엔드의 최근 묶음 100개 0.43~0.51ms, 오래된 묶음 100개 52ms, 뷰 전체의 `count(*)` 123~134ms. 뷰가 `stet.undone_changes`를 붙여 `undo_id`, `undone_at`을 보이기 전에 잰 것이다. 그 조인은 변경마다 기본 키를 한 번 거꾸로 훑는다.
 - 보존 기간의 지우기: 줄이 하나씩인 묶음 10,000개에 약 20ms.
 
 **끝에서 끝까지의 확인** (`stet-lab bench undo-check`, 스펙 10장)

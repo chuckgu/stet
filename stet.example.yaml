@@ -90,6 +90,7 @@ tables:
 # 검토자는 READ COMMITTED 트랜잭션에서 stet.undo_plan('<계정>', '<언제부터>')로 무엇이 되돌려질지 보고,
 # stet.undo(...)로 되돌린 뒤 결과의 줄을 보고 COMMIT하거나 ROLLBACK한다.
 # Stet은 시작할 때 트리거가 없거나 출력과 다른 테이블을 경고하고 stet undo-sql을 실행하라고 말한다.
+# 끌 때는 이 절이 있는 채로 stet undo-sql -config stet.yaml -drop 의 출력을 소유자가 실행한 뒤 절을 지운다(docs/lab.md).
 # undo:
 #   tables:                  # 필수. 되돌리기를 켤 테이블. 키 컬럼은 기본 키이거나 NOT NULL이고 유일한 컬럼 하나다
 #     contacts:              # tables의 키. 키 컬럼은 거기서 가져온다
