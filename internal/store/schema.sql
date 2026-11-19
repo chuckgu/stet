@@ -1417,27 +1417,48 @@ BEGIN
 END
 $$;
 
--- 되돌리기는 연쇄를 일으키지 않는다 (7장 "referenced"). 복구 문장이 없애거나 바꾸는 값을, 연쇄하는 외래 키로 가리키는 행이
--- 있는 테이블들이다. 없으면 NULL이고, 있으면 'referenced: <테이블들>'이다(스키마까지 %I.%I, 바이트 순, ", "로 잇는다).
--- - delete는 relid를 가리키는 외래 키 가운데 ON DELETE가 CASCADE, SET NULL, SET DEFAULT인 것을 본다. update는 ON UPDATE가
---   그런 것 가운데 가리키는 컬럼의 값이 a와 b에서 다른 것만 본다(그 컬럼은 복구 문장이 바꾼다. 생성 컬럼도 따라 바뀐다).
---   insert는 아무것도 없애거나 바꾸지 않는다.
--- - 없애거나 바꾸는 값은 a의 것이다. stet.undo는 이 함수를 키의 행을 잠그고(FOR UPDATE) 지금 행이 a임을 확인한 뒤에
---   부른다. 그 값 가운데 NULL이 있으면 그 외래 키로는 아무 행도 가리키지 않는다.
--- - 자식 테이블에서 외래 키의 컬럼들이 모두 그 값인 행이 하나라도 있으면 그 테이블을 이름에 넣는다. 여러 컬럼의 외래 키는
---   모든 컬럼을 맞춘다. 자기를 가리키는 외래 키에서는 그 행 자신을 빼고 본다(가리키는 컬럼들은 유일하므로 그 값을 가진
---   행은 그 행뿐이다). 빼는 조건은 NOT coalesce((같다), false)다. 가리키는 컬럼의 값이 NULL인 행에서 같다는 NULL이고,
---   NOT (NULL)도 NULL이어서 그대로 쓰면 그런 자식까지 빠진다(연쇄는 그 행에 닿는다). 자식 쪽의 비교(x.<외래 키 컬럼> = 값)는
---   자식의 컬럼이 NULL이면 거짓이 되어 빠지는데, MATCH SIMPLE에서 그런 행은 아무것도 가리키지 않으므로 그것이 맞다.
---   값은 타입 없는 리터럴로 자식 컬럼의 타입으로 읽히고, 비교는 OPERATOR(pg_catalog.=)다. 파티션 테이블인
---   자식은 파티션까지, 아니면 ONLY로 읽는다(PostgreSQL의 외래 키 동작과 같다). 파티션마다 복제된 외래 키는 보지 않는다.
--- - 자식 테이블은 부른 계정의 권한으로 읽는다(SECURITY INVOKER). 읽을 권한이 없으면 42501이고, 그 키는 failed가 된다.
---   행 수준 보안이 부른 역할에게 적용되면 숨은 자식을 놓칠 수 있으므로 42501이다(외래 키의 연쇄는 행 수준 보안을 지나간다).
--- - 잠근 뒤에 보므로 그 사이에 새 자식이 생기지 않는다. 자식을 넣거나 그 행을 가리키게 고치는 쪽은 부모 행에 FOR KEY
---   SHARE를 잡아야 하는데, 그것은 FOR UPDATE를 기다린다. 이미 그 잠금을 쥔 쪽이 있었다면 FOR UPDATE가 그쪽을 기다렸다.
--- NO ACTION과 RESTRICT는 보지 않는다. 서버가 23503으로 막고, stet.undo가 다시 해 본다.
--- READ COMMITTED에서만 돈다(판정 R15, stet.undo_lock과 같은 거절).
-CREATE OR REPLACE FUNCTION stet.undo_referenced(relid oid, action text, b jsonb, a jsonb) RETURNS text
+-- 되돌리기는 연쇄를 일으키지 않는다 (7장 "referenced", 계획의 판정 R20). 복구 문장이 없애거나 바꾸는 값을, 연쇄하는 외래
+-- 키로 가리키는 행이 있는 테이블들이다. 없으면 NULL이고, 있으면 'referenced: <테이블들>'이다(스키마까지 %I.%I, 바이트 순,
+-- ", "로 잇는다). stet.undo가 키의 행을 FOR UPDATE로 잠그고 지금 행이 a임을 확인한 뒤, 복구 문장 앞에 부른다.
+-- 1. 거절(READ COMMITTED만, 판정 R15). insert는 아무것도 없애거나 바꾸지 않으므로 NULL이다. update에서 SET할 컬럼이 없으면
+--    (stet.undo_statement가 NULL) 아무것도 바뀌지 않으므로 NULL이다.
+-- 2. 복구할 테이블을 ROW EXCLUSIVE로 잠근 뒤에 외래 키를 읽는다. 그 테이블을 가리키는 외래 키를 더하는 ALTER TABLE은 그
+--    테이블에 SHARE ROW EXCLUSIVE를 잡아야 하는데, 그것은 ROW EXCLUSIVE를 기다린다. 그래서 외래 키를 읽은 뒤 복구 문장이 돌
+--    때까지 보지 못한 연쇄 외래 키가 생기지 않는다. 잠금은 복구 문장 자체를 EXPLAIN으로 계획해서 잡는다(ANALYZE 없이).
+--    PostgreSQL은 문장을 분석할 때 대상 테이블에 ROW EXCLUSIVE를 잡아 트랜잭션이 끝날 때까지 쥐고, 계획을 시작할 때 그 문장의
+--    권한(컬럼 권한까지)을 확인하며, 실행하지 않으므로 트리거도 돌지 않는다. LOCK TABLE ... IN ROW EXCLUSIVE MODE는 테이블
+--    단위의 INSERT, UPDATE, DELETE, TRUNCATE 권한을 요구해서, 고칠 컬럼의 UPDATE만 가진 검토자의 복구까지 막았다. 권한이
+--    없으면 42501이고, stet.undo의 키마다의 블록 안이므로 그 키는 보통의 failed 줄이다(복구 문장도 같은 이유로 실패했을
+--    것이다). 계획(stet.undo_plan)은 이 함수를 부르지 않으므로 ACCESS SHARE만 잡고 읽기만 한다.
+-- 3. relid를 가리키는 외래 키 가운데 delete면 ON DELETE가, update면 ON UPDATE가 CASCADE, SET NULL, SET DEFAULT인 것을 본다.
+--    파티션마다 복제된 외래 키(conparentid가 있다)는 보지 않는다. NO ACTION과 RESTRICT는 서버가 23503으로 막고, stet.undo가
+--    다시 해 본다.
+-- 4. update는 그 외래 키가 가리키는 컬럼 가운데 복구 문장이 실제로 바꾸는 것이 있을 때만 본다. stet.undo_statement가 SET하는
+--    컬럼(생성 컬럼과 GENERATED ALWAYS AS IDENTITY 컬럼이 아니고 a와 b에서 값이 다른 것)과, a와 b에서 값이 다른 생성 컬럼(SET한
+--    컬럼에서 다시 계산된다)이다. IDENTITY ALWAYS 컬럼은 SET하지 않으므로 바뀌지 않는다. 고객의 BEFORE 트리거가 바꾸는 컬럼은
+--    알 수 없다.
+-- 5. 타입이 다른 컬럼 사이의 연쇄 외래 키는 따라가지 않는다. 가리키는 컬럼과 가리키는 쪽 컬럼의 타입이 도메인을 벗긴
+--    기본 타입에서 다르면(char와 text, timestamptz와 timestamp, integer와 bigint) feature_not_supported(0A000)이고 그 키는
+--    failed다. PostgreSQL의 연쇄는 그런 비교에 캐스트를 더하고, 그 결과는 세션의 설정(TimeZone 등)에 따를 수 있다. 같은 기본
+--    타입이면 typmod는 보지 않는다(varchar(10)과 varchar(20)).
+-- 6. 자식이 있는지는 외래 키가 비교하는 대로 본다: 제약의 등호 연산자(conpfeqop, OPERATOR(<스키마>.<이름>)), 왼쪽이 부모의
+--    컬럼, 오른쪽이 자식의 컬럼이다. 두 컬럼의 콜레이션이 다르면 부모 컬럼의 콜레이션으로 비교한다(PostgreSQL의 연쇄도
+--    그렇다). 부모의 값은 a의 글자를 다시 읽지 않고 그 키의 행(이미 잠근 행, 연쇄가 OLD로 볼 행)에서 조인으로 가져온다:
+--    SELECT EXISTS (SELECT FROM ONLY <부모> p, [ONLY] <자식> x WHERE <키의 행> AND p.<부모 컬럼> OPERATOR(...) x.<자식 컬럼>
+--    [COLLATE ...] AND ...). 그 행을 찾지 못하면 object_not_in_prerequisite_state다. 값 가운데 NULL이 있으면 비교가 거짓이라
+--    아무 행도 맞지 않는다(PostgreSQL도 NULL이 든 키에서는 연쇄하지 않는다. MATCH SIMPLE에서 NULL이 든 자식은 아무것도
+--    가리키지 않는다). 자기를 가리키는 외래 키에서는 그 행 자신을 ctid로 뺀다(x.ctid <> p.ctid, NULL이 될 수 없다).
+--    자식은 파티션 테이블이면 파티션까지, 아니면 ONLY로 읽는다(PostgreSQL의 외래 키 동작과 같다).
+-- 7. 자식 테이블은 부른 계정의 권한으로 읽는다(SECURITY INVOKER). 읽을 권한이 없으면 42501이다. 행 수준 보안이 부른 역할에게
+--    적용되면 숨은 자식을 놓칠 수 있으므로(연쇄는 행 수준 보안을 지나간다) 42501이다. 이것을 조사 앞뒤로 본다. 조사가 자식
+--    테이블의 잠금을 기다리는 동안 행 수준 보안이 켜질 수 있다.
+-- 잠근 뒤에 보므로 그 사이에 새 자식이 생기지 않는다. 자식을 넣거나 그 행을 가리키게 고치는 쪽은 부모 행에 FOR KEY SHARE를
+-- 잡아야 하는데, 그것은 FOR UPDATE를 기다린다. 이미 그 잠금을 쥔 쪽이 있었다면 FOR UPDATE가 그쪽을 기다렸다.
+-- 이 단계의 앞선 개발판은 key_column과 key 없이 네 인자의 이 함수를 만들었다. 인자가 바뀌면 CREATE OR REPLACE는 새 함수를
+-- 더하므로 그 모양을 지운다.
+DROP FUNCTION IF EXISTS stet.undo_referenced(oid, text, jsonb, jsonb);
+CREATE OR REPLACE FUNCTION stet.undo_referenced(relid oid, key_column text, key text, action text, b jsonb, a jsonb)
+RETURNS text
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 SET DateStyle = 'ISO, MDY'
@@ -1448,13 +1469,19 @@ SET bytea_output = 'hex'
 SET client_min_messages = warning
 AS $$
 DECLARE
-  fk         record;
-  pcols      text[];
-  ccols      text[];
-  vals       text[];
-  cond       text;
-  hit        boolean;
-  children   text[] := '{}';
+  restore   text;
+  tbl       text;
+  keyed     text;
+  fk        record;
+  pair      record;
+  pbase     oid;
+  cbase     oid;
+  ttype     "char";
+  tbase     oid;
+  cond      text;
+  found_row boolean;
+  hit       boolean;
+  children  text[] := '{}';
 BEGIN
   IF current_setting('transaction_isolation') <> 'read committed' THEN
     RAISE EXCEPTION 'undo runs only in a READ COMMITTED transaction; this one is %',
@@ -1464,8 +1491,22 @@ BEGIN
   IF undo_referenced.action IS NULL OR undo_referenced.action NOT IN ('delete', 'update') THEN
     RETURN NULL;
   END IF;
+  restore := stet.undo_statement(undo_referenced.relid, undo_referenced.key_column, undo_referenced.key,
+                                 undo_referenced.action, undo_referenced.b, undo_referenced.a);
+  IF restore IS NULL THEN
+    RETURN NULL;
+  END IF;
+  EXECUTE 'EXPLAIN ' || restore;
+  SELECT lk.table_name INTO tbl FROM stet.undo_lock(undo_referenced.relid) lk;
+  IF pg_catalog.to_regclass(tbl) IS DISTINCT FROM undo_referenced.relid THEN
+    RAISE EXCEPTION 'the table with oid % was renamed or replaced while it was read', undo_referenced.relid
+      USING ERRCODE = 'object_not_in_prerequisite_state';
+  END IF;
+  keyed := format('p.%I OPERATOR(pg_catalog.=) %L AND p.tableoid OPERATOR(pg_catalog.=) %L',
+                  undo_referenced.key_column, undo_referenced.key, undo_referenced.relid);
   FOR fk IN
-    SELECT con.conrelid, con.confkey, con.conkey, cl.relkind, format('%I.%I', ns.nspname, cl.relname) AS name
+    SELECT con.conname, con.conrelid, con.confkey, con.conkey, con.conpfeqop, cl.relkind,
+           format('%I.%I', ns.nspname, cl.relname) AS name
       FROM pg_catalog.pg_constraint con
       JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid
       JOIN pg_catalog.pg_namespace ns ON ns.oid = cl.relnamespace
@@ -1473,33 +1514,64 @@ BEGIN
        AND CASE undo_referenced.action WHEN 'delete' THEN con.confdeltype ELSE con.confupdtype END IN ('c', 'n', 'd')
      ORDER BY format('%I.%I', ns.nspname, cl.relname) COLLATE pg_catalog."C", con.oid
   LOOP
-    SELECT array_agg(pa.attname::text ORDER BY k.n), array_agg(ca.attname::text ORDER BY k.n),
-           array_agg(undo_referenced.a ->> pa.attname::text ORDER BY k.n)
-      INTO pcols, ccols, vals
-      FROM unnest(fk.confkey, fk.conkey) WITH ORDINALITY AS k(pk, ck, n)
-      JOIN pg_catalog.pg_attribute pa ON pa.attrelid = undo_referenced.relid AND pa.attnum = k.pk
-      JOIN pg_catalog.pg_attribute ca ON ca.attrelid = fk.conrelid AND ca.attnum = k.ck;
     IF undo_referenced.action = 'update'
-       AND NOT EXISTS (SELECT FROM unnest(pcols) AS p(name)
-                        WHERE (undo_referenced.a -> p.name) IS DISTINCT FROM (undo_referenced.b -> p.name)) THEN
+       AND NOT EXISTS (SELECT FROM unnest(fk.confkey) AS k(pk)
+                         JOIN pg_catalog.pg_attribute pa ON pa.attrelid = undo_referenced.relid AND pa.attnum = k.pk
+                        WHERE (pa.attgenerated <> '' OR pa.attidentity <> 'a')
+                          AND (undo_referenced.a -> pa.attname::text) IS DISTINCT FROM (undo_referenced.b -> pa.attname::text)) THEN
       CONTINUE;
     END IF;
-    IF array_position(vals, NULL) IS NOT NULL THEN
-      CONTINUE;
+    cond := NULL;
+    FOR pair IN
+      SELECT pa.attname AS pcol, ca.attname AS ccol, pa.atttypid AS ptype, ca.atttypid AS ctype,
+             format('OPERATOR(%I.%s)', opn.nspname, op.oprname) AS op,
+             CASE WHEN pa.attcollation <> ca.attcollation AND pa.attcollation <> 0
+                  THEN format(' COLLATE %I.%I', coln.nspname, co.collname) ELSE '' END AS coll
+        FROM unnest(fk.confkey, fk.conkey, fk.conpfeqop) WITH ORDINALITY AS k(pk, ck, eqop, n)
+        JOIN pg_catalog.pg_attribute pa ON pa.attrelid = undo_referenced.relid AND pa.attnum = k.pk
+        JOIN pg_catalog.pg_attribute ca ON ca.attrelid = fk.conrelid AND ca.attnum = k.ck
+        JOIN pg_catalog.pg_operator op ON op.oid = k.eqop
+        JOIN pg_catalog.pg_namespace opn ON opn.oid = op.oprnamespace
+        LEFT JOIN pg_catalog.pg_collation co ON co.oid = pa.attcollation
+        LEFT JOIN pg_catalog.pg_namespace coln ON coln.oid = co.collnamespace
+       ORDER BY k.n
+    LOOP
+      pbase := pair.ptype;
+      LOOP
+        SELECT ty.typtype, ty.typbasetype INTO ttype, tbase FROM pg_catalog.pg_type ty WHERE ty.oid = pbase;
+        EXIT WHEN ttype IS DISTINCT FROM 'd';
+        pbase := tbase;
+      END LOOP;
+      cbase := pair.ctype;
+      LOOP
+        SELECT ty.typtype, ty.typbasetype INTO ttype, tbase FROM pg_catalog.pg_type ty WHERE ty.oid = cbase;
+        EXIT WHEN ttype IS DISTINCT FROM 'd';
+        cbase := tbase;
+      END LOOP;
+      IF pbase IS DISTINCT FROM cbase THEN
+        RAISE EXCEPTION 'the cascading foreign key % of % compares % with %; undo does not follow a cascade between columns of different types',
+          quote_ident(fk.conname), fk.name, format_type(pbase, NULL), format_type(cbase, NULL)
+          USING ERRCODE = 'feature_not_supported';
+      END IF;
+      cond := concat_ws(' AND ', cond, format('p.%I %s x.%I%s', pair.pcol, pair.op, pair.ccol, pair.coll));
+    END LOOP;
+    IF fk.conrelid = undo_referenced.relid THEN
+      cond := cond || ' AND x.ctid OPERATOR(pg_catalog.<>) p.ctid';
     END IF;
     IF row_security_active(fk.conrelid) THEN
       RAISE EXCEPTION 'row-level security on % applies to %', fk.name, current_user USING ERRCODE = 'insufficient_privilege';
     END IF;
-    SELECT string_agg(format('x.%I OPERATOR(pg_catalog.=) %L', c.col, c.val), ' AND ' ORDER BY c.n) INTO cond
-      FROM unnest(ccols, vals) WITH ORDINALITY AS c(col, val, n);
-    IF fk.conrelid = undo_referenced.relid THEN
-      SELECT cond || ' AND NOT coalesce(('
-             || string_agg(format('x.%I OPERATOR(pg_catalog.=) %L', c.col, c.val), ' AND ' ORDER BY c.n) || '), false)'
-        INTO cond
-        FROM unnest(pcols, vals) WITH ORDINALITY AS c(col, val, n);
+    EXECUTE format('SELECT EXISTS (SELECT FROM ONLY %1$s p WHERE %2$s), '
+                   'EXISTS (SELECT FROM ONLY %1$s p, %3$s%4$s x WHERE %2$s AND %5$s)',
+                   tbl, keyed, CASE WHEN fk.relkind = 'p' THEN '' ELSE 'ONLY ' END, fk.conrelid::regclass, cond)
+      INTO found_row, hit;
+    IF row_security_active(fk.conrelid) THEN
+      RAISE EXCEPTION 'row-level security on % applies to %', fk.name, current_user USING ERRCODE = 'insufficient_privilege';
     END IF;
-    EXECUTE format('SELECT EXISTS (SELECT FROM %s%s x WHERE %s)',
-                   CASE WHEN fk.relkind = 'p' THEN '' ELSE 'ONLY ' END, fk.conrelid::regclass, cond) INTO hit;
+    IF NOT found_row THEN
+      RAISE EXCEPTION 'no row of % has % as its %', tbl, quote_literal(undo_referenced.key), quote_ident(undo_referenced.key_column)
+        USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
     IF hit AND NOT fk.name = ANY (children) THEN
       children := children || fk.name;
     END IF;
@@ -1910,7 +1982,7 @@ BEGIN
         SELECT j.action, j.reason INTO act, why
           FROM stet.undo_judge(k.relid, k.key_column, k.key, k.b, k.a, k.key_changed, k.interleaved, true) AS j;
         IF why IS NULL THEN
-          why := stet.undo_referenced(k.relid, act, k.b, k.a);
+          why := stet.undo_referenced(k.relid, k.key_column, k.key, act, k.b, k.a);
         END IF;
         IF why IS NOT NULL THEN
           skipping := true;
@@ -1981,7 +2053,7 @@ $$;
 --   GRANT EXECUTE ON FUNCTION stet.undo(text, timestamptz, timestamptz, text[], text),
 --                             stet.undo_lines(text, timestamptz, timestamptz, text[]),
 --                             stet.undo_next(jsonb, integer[], text[], text[], text[], integer),
---                             stet.undo_referenced(oid, text, jsonb, jsonb),
+--                             stet.undo_referenced(oid, text, text, text, jsonb, jsonb),
 --                             stet.undo_statement(oid, text, text, text, jsonb, jsonb),
 --                             stet.undo_outcome(oid, text, text, text, jsonb, jsonb, text, bigint, oid),
 --                             stet.undo_recheck(jsonb, integer[], text[], text[]),
@@ -2009,7 +2081,7 @@ REVOKE EXECUTE ON FUNCTION stet.undo_plan(text, timestamptz, timestamptz, text[]
                            stet.undo(text, timestamptz, timestamptz, text[], text),
                            stet.undo_lines(text, timestamptz, timestamptz, text[]),
                            stet.undo_next(jsonb, integer[], text[], text[], text[], integer),
-                           stet.undo_referenced(oid, text, jsonb, jsonb),
+                           stet.undo_referenced(oid, text, text, text, jsonb, jsonb),
                            stet.undo_statement(oid, text, text, text, jsonb, jsonb),
                            stet.undo_outcome(oid, text, text, text, jsonb, jsonb, text, bigint, oid),
                            stet.undo_recheck(jsonb, integer[], text[], text[]),
