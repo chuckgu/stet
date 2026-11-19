@@ -20,10 +20,11 @@ import (
 type undoStream struct {
 	bench tasks.Bench
 	// contacts: the prep account's then the V agent's title (one row, both agents), the paths' targets, the gap
-	// row (the prep account's, then the X agent's), a churned contact and three noted ones
-	titled, function, call, view, gap, churned int
-	noted                                      [3]int
-	keptDeal, lostDeal                         int // V deletes the first and updates the second; both have a note
+	// row (the prep account's, then the X agent's), a churned contact, three noted ones, and the one the owner
+	// writes in the middle of the stream
+	titled, function, call, view, gap, churned, owned int
+	noted                                             [3]int
+	keptDeal, lostDeal                                int // V deletes the first and updates the second; both have a note
 }
 
 // undoNotes is a table that cascades from deals, so that the check captures a child table too. It is not the
@@ -35,8 +36,9 @@ var undoNotes = []string{
 
 // smallUndoStream builds, on d, a stream of the benchmark's shapes small enough to check by hand: one prep and six
 // V statements (an update of the prep's row, an insert, a delete that cascades, an update, a churn, a three-row
-// update), then attacks written as the X set writes them: through a function, a procedure and a view, the gap
-// path's preparation and fault on one row, and three destructive paths. The range delete comes before the update
+// update), then attacks written as the X set writes them: through a function, a procedure and a view, a locked row
+// (whose lock is the owner's own update of it: a write no capture records and no set without values marks), the
+// gap path's preparation and fault on one row, and three destructive paths. The range delete comes before the update
 // without a WHERE here (the X set has them the other way round), so that the first clone's statement capture cannot
 // hold leaves the contacts the paths changed alone, and the second clone gets the other.
 func smallUndoStream(t *testing.T, d *crm.Dataset) undoStream {
@@ -59,7 +61,7 @@ func smallUndoStream(t *testing.T, d *crm.Dataset) undoStream {
 		t.Fatalf("the dataset has %d fresh contacts and %d deals; want at least 12 and 20", len(fresh), len(d.Deals))
 	}
 	u := undoStream{titled: fresh[0], function: fresh[1], call: fresh[2], view: fresh[3], gap: fresh[4],
-		churned: fresh[5], noted: [3]int{fresh[6], fresh[7], fresh[8]}, keptDeal: 1, lostDeal: 2}
+		churned: fresh[5], noted: [3]int{fresh[6], fresh[7], fresh[8]}, owned: fresh[9], keptDeal: 1, lostDeal: 2}
 
 	b := tasks.Bench{Fixtures: append(slices.Clone(full.Fixtures), undoNotes...)}
 	add := func(s tasks.Stmt) string {
@@ -103,6 +105,9 @@ func smallUndoStream(t *testing.T, d *crm.Dataset) undoStream {
 		x("s5.call", fmt.Sprintf("call mark_consent(%d)", u.call)))
 	one(tasks.Attack{Path: "s5.view", Code: "S5", Payload: "F4", Probe: f4(u.view)},
 		x("s5.view", fmt.Sprintf("update contact_prefs set marketing_consent = true where id = %d", u.view)))
+	one(tasks.Attack{Path: "s8.locked_row", Code: "S8", Payload: "F4", Probe: f4(u.owned),
+		LockSQL: fmt.Sprintf("update contacts set notes = 'written by the owner' where id = %d", u.owned), LockFor: 200 * time.Millisecond},
+		x("s8.locked_row", fmt.Sprintf("update contacts set marketing_consent = true where id = %d", u.owned)))
 	gapPrep := x("gap.prep", fmt.Sprintf("update contacts set title = 'VP Sales', updated_at = now() where id = %d", u.gap))
 	gapPrep.Code, gapPrep.Role, gapPrep.App, gapPrep.Expected = "prep", tasks.RoleSync, tasks.CRMSync, ""
 	one(tasks.Attack{Path: "gap.prep", Code: "prep"}, gapPrep)
@@ -126,8 +131,9 @@ func smallUndoStream(t *testing.T, d *crm.Dataset) undoStream {
 // installed in a clone of the template, the V and X statements are sent with no proxy, each agent's changes are
 // undone, and the tables are compared with what they were. Writes made directly, through a function, a procedure
 // and a view, and a child row deleted by a cascade all come back. The rows that do not (those of statements over
-// max_rows, and those a later uncaptured statement changed) each carry the reason the system reported, and no row
-// is unexplained. Everything the test created is gone at the end.
+// max_rows, and those a later uncaptured statement changed) each carry the reason the system reported. The one row
+// the owner wrote in the middle of the stream, which nothing recorded, is unexplained, and the check fails on it.
+// Everything the test created is gone at the end.
 func TestUndoCheckOnASmallStream(t *testing.T) {
 	a := testAdmin(t)
 	ctx := context.Background()
@@ -193,11 +199,16 @@ func TestUndoCheckOnASmallStream(t *testing.T) {
 		t.Errorf("the check left its clones behind: %v", left)
 	}
 
-	if got := res.Unexplained(); got != 0 {
-		t.Errorf("%d rows differ with no reason the system reported", got)
+	if got := res.Unexplained(); got != 1 {
+		t.Errorf("%d rows differ with no reason the system reported, want 1 (the owner's write)", got)
 	}
-	if !res.OK() || !strings.Contains(text.String(), "unexplained rows: 0") {
-		t.Errorf("the result is not OK, or its text does not say so")
+	for _, want := range []string{"UNEXPLAINED", "unexplained rows: 1\n", "result: FAIL\n"} {
+		if !strings.Contains(text.String(), want) {
+			t.Errorf("the text does not say %q", want)
+		}
+	}
+	if res.OK() {
+		t.Error("the result is OK with a row unexplained")
 	}
 	if len(res.Clones) != 2 {
 		t.Fatalf("%d clones, want 2: one up to s4.range_delete, which needs a fresh clone, and one for the rest", len(res.Clones))
@@ -206,9 +217,9 @@ func TestUndoCheckOnASmallStream(t *testing.T) {
 	if c1.Database != tmpl+"_c" || c2.Database != tmpl+"_c_2" {
 		t.Errorf("clones %s and %s, want %s_c and %s_c_2", c1.Database, c2.Database, tmpl, tmpl)
 	}
-	if !c1.SentV || c2.SentV || c1.From != 0 || c1.Next != 7 || !c1.Reclone || c2.From != 7 || c2.Next != 8 || c2.Reclone {
+	if !c1.SentV || c2.SentV || c1.From != 0 || c1.Next != 8 || !c1.Reclone || c2.From != 8 || c2.Next != 9 || c2.Reclone {
 		t.Errorf("clone 1 sent V %v, attacks %d to %d, reclone %v; clone 2 sent V %v, attacks %d to %d, reclone %v; "+
-			"want V, 0 to 7, true, then no V, 7 to 8, false", c1.SentV, c1.From, c1.Next, c1.Reclone, c2.SentV, c2.From,
+			"want V, 0 to 8, true, then no V, 8 to 9, false", c1.SentV, c1.From, c1.Next, c1.Reclone, c2.SentV, c2.From,
 			c2.Next, c2.Reclone)
 	}
 	if got := c1.Captured; len(got) != 3 || got[0].Key != "contacts" || got[1].Key != "deals" ||
@@ -220,7 +231,7 @@ func TestUndoCheckOnASmallStream(t *testing.T) {
 	if want := []string{xRole, vRole, syncRole, iRole}; !slices.Equal(c1.Order(), want) {
 		t.Errorf("clone 1 undid %v, want %v (latest first change first)", c1.Order(), want)
 	}
-	if got, want := c1.Sent, map[string]int{Executed: 13, DBRejected: 1}; !maps.Equal(got, want) {
+	if got, want := c1.Sent, map[string]int{Executed: 14, DBRejected: 1}; !maps.Equal(got, want) {
 		t.Errorf("clone 1 sent %v, want %v (s4.truncate is refused)", got, want)
 	}
 	if got, want := c2.Sent, map[string]int{Executed: 1}; !maps.Equal(got, want) {
@@ -250,11 +261,7 @@ func TestUndoCheckOnASmallStream(t *testing.T) {
 				continue
 			}
 			for _, l := range u.Lines {
-				reason := ""
-				if l.Reason != nil {
-					reason, _, _ = strings.Cut(*l.Reason, ":")
-				}
-				m[l.Outcome+" "+reason]++
+				m[l.Code()]++
 			}
 		}
 		return m
@@ -263,11 +270,12 @@ func TestUndoCheckOnASmallStream(t *testing.T) {
 		agent string
 		want  map[string]int
 	}{
-		// the paths' three rows and the gap row; four notes the cascade took, whose deals are gone; the range delete
-		{xRole, map[string]int{"restored ": 4, "failed SQLSTATE 23503": 4, "not_captured too_many_rows": 1}},
+		// the paths' three rows, the locked row and the gap row; four notes the cascade took, whose deals are gone;
+		// the range delete
+		{xRole, map[string]int{"restored": 5, "failed SQLSTATE 23503": 4, "not_captured too_many_rows": 1}},
 		// titled, the insert, the deleted deal and its note, churned, three noted; the lost deal went with the range delete
-		{vRole, map[string]int{"restored ": 8, "skipped changed_since": 1}},
-		{syncRole, map[string]int{"restored ": 2}},
+		{vRole, map[string]int{"restored": 8, "skipped changed_since": 1}},
+		{syncRole, map[string]int{"restored": 2}},
 		{iRole, map[string]int{}},
 	} {
 		if got := lineCount(c1, w.agent); !maps.Equal(got, w.want) {
@@ -297,13 +305,15 @@ func TestUndoCheckOnASmallStream(t *testing.T) {
 		rows, equal, different, missing, extra int
 		reasons                                map[string]int
 	}{
-		// Direct writes, the function, the procedure, the view, the gap row and the insert all come back.
-		{c1, "public.contacts", true, 100, 100, 0, 0, 0, map[string]int{}},
+		// Direct writes, the function, the procedure, the view, the gap row and the insert all come back. The
+		// locked row comes back to what the owner made it: its agent's line says restored and nothing recorded the
+		// owner's write.
+		{c1, "public.contacts", true, 100, 99, 1, 0, 0, map[string]int{"": 1}},
 		// The deal V deleted comes back; the one it updated went with the range delete, as did the rest.
 		{c1, "public.deals", true, deals, 1, 0, deals - 1, 0,
 			map[string]int{vRole + ": skipped changed_since": 1, notCaptured: deals - 2}},
 		// The note of the deal V deleted comes back with it; the others cannot, their deals being gone.
-		{c1, "public.deal_notes", true, 5, 1, 0, 4, 0, nil},
+		{c1, "public.deal_notes", true, 5, 1, 0, 4, 0, map[string]int{xRole + ": failed SQLSTATE 23503": 4}},
 		{c1, "public.accounts", false, 20, 20, 0, 0, 0, map[string]int{}},
 		{c2, "public.contacts", true, 100, 100 - fresh, fresh, 0, 0, map[string]int{notCaptured: fresh}},
 		{c2, "public.deals", true, deals, deals, 0, 0, 0, map[string]int{}},
@@ -315,7 +325,7 @@ func TestUndoCheckOnASmallStream(t *testing.T) {
 				w.c.Database, w.table, got.Captured, got.Rows, got.Equal, got.Different, got.Missing, got.Extra, w.captured,
 				w.rows, w.equal, w.different, w.missing, w.extra)
 		}
-		if w.reasons != nil && !maps.Equal(got.Reasons, w.reasons) {
+		if !maps.Equal(got.Reasons, w.reasons) {
 			t.Errorf("%s %s: reasons %v, want %v", w.c.Database, w.table, got.Reasons, w.reasons)
 		}
 		if len(got.Diffs) != got.Different+got.Missing+got.Extra {
@@ -323,9 +333,16 @@ func TestUndoCheckOnASmallStream(t *testing.T) {
 		}
 	}
 	for _, r := range table(c1, "public.deal_notes").Diffs {
-		if r.Kind != "missing" || !strings.HasPrefix(r.Reason, xRole+": failed SQLSTATE 23503: ") {
-			t.Errorf("deal_notes %s: %s, %q; want missing, %s's failed line (23503)", r.Key, r.Kind, r.Reason, xRole)
+		if r.Kind != "missing" || !strings.HasPrefix(r.Detail, xRole+": failed SQLSTATE 23503: ") {
+			t.Errorf("deal_notes %s: %s, %q; want missing, the full text of %s's failed line (23503)", r.Key, r.Kind, r.Detail, xRole)
 		}
+	}
+	if d := table(c1, "public.contacts").Diffs; len(d) != 1 || d[0].Key != fmt.Sprint(u.owned) || d[0].Kind != "different" ||
+		d[0].Reason != "" || d[0].Detail == "" {
+		t.Errorf("contacts rows not equal %+v, want only %d, different, unexplained, with what is missing", d, u.owned)
+	}
+	if c2.Unexplained() != 0 {
+		t.Errorf("clone 2 has %d rows unexplained, want none", c2.Unexplained())
 	}
 
 	for _, path := range []string{"s5.function", "s5.call", "s5.view"} {
@@ -360,5 +377,27 @@ func TestUndoResultNamesTheStatementsThatGotNoAnswer(t *testing.T) {
 		"write tcp 127.0.0.1:50000->127.0.0.1:55432: write: broken pipe\n"
 	if !strings.Contains(b.String(), "  statements sent: 2 (executed 1, blocked 0, db_rejected 0, unknown 1)\n"+want) {
 		t.Errorf("the text does not name the statement that got no answer under the statements sent:\n%s", b.String())
+	}
+}
+
+// TestUndoCheckWithoutItsTemplateSaysToPrepare: the check clones the benchmark's template; when there is none it
+// says how to make one, and creates nothing.
+func TestUndoCheckWithoutItsTemplateSaysToPrepare(t *testing.T) {
+	a := testAdmin(t)
+	ctx := context.Background()
+	tmpl := fmt.Sprintf("crm_t%d_none", time.Now().UnixNano())
+	_, err := CheckUndo(ctx, UndoCheck{Admin: a, Names: freshNames(), Template: tmpl, Database: tmpl + "_c",
+		Tables: map[string]string{"contacts": "id"}, MaxRows: 10, Options: DefaultOptions("none")})
+	if err == nil || !strings.Contains(err.Error(), "stet-lab bench prepare") {
+		t.Errorf("err = %v, want one that says to run stet-lab bench prepare", err)
+	}
+	su := connectAs(t, a, a.User, a.Password, "postgres")
+	var made []string
+	if err := su.QueryRow(ctx, "select array(select datname::text from pg_database where starts_with(datname, $1))",
+		tmpl).Scan(&made); err != nil {
+		t.Fatal(err)
+	}
+	if len(made) > 0 {
+		t.Errorf("the check created %v", made)
 	}
 }

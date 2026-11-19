@@ -4,16 +4,15 @@ package bench
 // of the benchmark's template, Stet's schema is created and capture is installed on the gated tables and the tables
 // they cascade into, with the SQL stet undo-sql prints; the V and X sets are sent as the none arm sends them, with no
 // proxy and no model; each agent's changes are undone in the reviewer's transaction; and every table is compared,
-// key by key, with what it held before the stream. A row that did not come back must carry a reason the system
-// reported: the undo line for its key, a set capture recorded without values, its table not being captured, or a
-// statement sent as a role that is not captured. Any other row is unexplained, and the check fails on it.
+// key by key, with what it held before the stream. A row that did not come back must be accounted for by what the
+// system reported (undo_explain.go). Any other row is unexplained, and the check fails on it. The result and its
+// text are in undo_result.go.
 
 import (
 	"cmp"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"maps"
 	"regexp"
 	"slices"
@@ -48,177 +47,6 @@ type UndoCheck struct {
 	Progress func(line string) // a line per step; nil: none
 }
 
-// UndoResult is what CheckUndo found, clone by clone.
-type UndoResult struct {
-	Template string
-	MaxRows  int64
-	Agents   []string // the captured roles; each is undone once in every clone
-	Attacks  int      // the X set's attacks
-	Paths    []string
-	Clones   []UndoClone
-}
-
-// UndoClone is one clone: what was sent to it, what capture recorded, what each agent's undo returned, and how its
-// tables compare with what they held before the stream.
-type UndoClone struct {
-	Database   string
-	SentV      bool // the V set, with its preparation, was sent here (the first clone only)
-	From, Next int  // the X attacks sent here: From to Next-1
-	// Reclone: attack Next-1 (Broke) breaks the database and ran, or may have; the attacks after it go to a fresh
-	// clone, after this one is undone and compared.
-	Reclone  bool
-	Broke    string
-	Captured []CapturedTable
-	Since    time.Time      // the server's clock just before the first statement; every undo selects from it on
-	Sent     map[string]int // statements sent, by result (Executed, Blocked, DBRejected, Unknown)
-	// Unanswered are the statements whose result is Unknown, in the order sent: no answer came, so whether they
-	// ran is for the comparison to show.
-	Unanswered []Unanswered
-	Sets       []SetCount     // the change sets capture recorded, by agent and skipped
-	Undone     []AgentUndo    // in the order undone
-	Tables     []TableCompare // by name
-	Paths      []PathResult   // the followed paths of which a statement was sent here
-}
-
-// Unanswered is a statement sent whose client got no answer, and what the client saw instead.
-type Unanswered struct {
-	ID, Set, Path, Message string
-}
-
-// CapturedTable is a table capture was installed on.
-type CapturedTable struct {
-	Key    string // the table key: the triggers' first argument, stet.undo's target_table
-	Table  string // schema.name
-	Column string // the key column
-}
-
-// SetCount is how many change sets of one agent capture recorded, with values (Skipped "") or without.
-type SetCount struct {
-	Agent, Skipped string
-	Sets           int
-}
-
-// AgentUndo is one stet.undo call: the lines it returned, committed.
-type AgentUndo struct {
-	Agent string
-	Lines []UndoLine
-	Took  time.Duration
-}
-
-// UndoLine is one line stet.undo returned. Key, Action, Reason and Warning are nil where it returned NULL.
-type UndoLine struct {
-	Table                        string // target_table: the table key
-	Key, Action, Reason, Warning *string
-	Outcome                      string
-	ChangeIDs                    []int64
-}
-
-// TableCompare is one table compared, key by key, with what it held before the stream.
-type TableCompare struct {
-	Table    string // schema.name
-	Key      string // the table key it is captured under; "" when it is not captured
-	Captured bool
-	Rows     int // before the stream
-	Equal    int
-	// Different: the key is there and the row is not what it was. Missing: the key was there and is gone. Extra:
-	// the key is new.
-	Different, Missing, Extra int
-	Reasons                   map[string]int // the rows not equal, by reason; "" counts the unexplained
-	Diffs                     []RowDiff      // every row not equal, by key
-}
-
-// RowDiff is a row that is not what it was before the stream.
-type RowDiff struct {
-	Key    string // the key column's text
-	Kind   string // different, missing or extra
-	Reason string // what the system reported that accounts for it; "" when nothing does
-}
-
-// PathResult says whether the rows the statements of one X path changed came back.
-type PathResult struct {
-	Path        string
-	Statements  int            // its statements sent to the clone
-	Results     map[string]int // their results, as the client saw them
-	Changed     int            // the rows capture recorded them changing (distinct table and key)
-	NotCaptured int            // their change sets that hold no values
-	Restored    int            // of the rows changed, those the line of the agent that changed them calls restored
-	Equal       int            // of the rows changed, those now what they were before the stream
-	NotBack     []string       // each changed row not both restored and equal: "table key: what was reported"
-}
-
-// AllRestored reports whether the path's statements were sent, changed rows, and every row they changed was
-// captured, restored and is what it was.
-func (p PathResult) AllRestored() bool {
-	return p.Statements > 0 && p.Changed > 0 && p.NotCaptured == 0 && p.Restored == p.Changed && p.Equal == p.Changed
-}
-
-// Order is the agents in the order they were undone.
-func (c UndoClone) Order() []string {
-	out := make([]string, len(c.Undone))
-	for i, u := range c.Undone {
-		out[i] = u.Agent
-	}
-	return out
-}
-
-// ChangeSets is how many sets of agent capture recorded with skipped ("" for those that hold values).
-func (c UndoClone) ChangeSets(agent, skipped string) int {
-	for _, s := range c.Sets {
-		if s.Agent == agent && s.Skipped == skipped {
-			return s.Sets
-		}
-	}
-	return 0
-}
-
-// Statements is how many statements were sent to the clone.
-func (c UndoClone) Statements() int {
-	n := 0
-	for _, v := range c.Sent {
-		n += v
-	}
-	return n
-}
-
-// TotalSets is how many change sets capture recorded in the clone.
-func (c UndoClone) TotalSets() int {
-	n := 0
-	for _, s := range c.Sets {
-		n += s.Sets
-	}
-	return n
-}
-
-// NotEqual is how many rows of the clone's tables are not what they were.
-func (c UndoClone) NotEqual() int {
-	n := 0
-	for _, t := range c.Tables {
-		n += len(t.Diffs)
-	}
-	return n
-}
-
-// Unexplained is how many rows of the clone's tables differ with no reason the system reported.
-func (c UndoClone) Unexplained() int {
-	n := 0
-	for _, t := range c.Tables {
-		n += t.Reasons[""]
-	}
-	return n
-}
-
-// Unexplained is how many rows differ with no reason the system reported, in all clones.
-func (r UndoResult) Unexplained() int {
-	n := 0
-	for _, c := range r.Clones {
-		n += c.Unexplained()
-	}
-	return n
-}
-
-// OK reports whether the check ran on at least one clone and found no unexplained row.
-func (r UndoResult) OK() bool { return len(r.Clones) > 0 && r.Unexplained() == 0 }
-
 // undoNote is the note stet.undo records with each undo.
 const undoNote = "stet-lab bench undo-check"
 
@@ -234,7 +62,8 @@ const undoNote = "stet-lab bench undo-check"
 // and compares them. When an attack that breaks the database ran, it does (e) and (f) on that clone and goes on with
 // the attacks after it in a fresh clone, from (a). The I set is not sent.
 //
-// It returns an error, with the clones it finished, when a step fails: stet.undo raising an error is one.
+// It returns an error, with the clones it finished, when a step fails: stet.undo raising an error is one, and a
+// template that does not exist another.
 func CheckUndo(ctx context.Context, c UndoCheck) (UndoResult, error) {
 	switch {
 	case c.Template == "" || c.Database == "":
@@ -253,6 +82,9 @@ func CheckUndo(ctx context.Context, c UndoCheck) (UndoResult, error) {
 	}
 	if c.Options.Sleep == nil {
 		c.Options.Sleep = time.Sleep
+	}
+	if err := templateExists(ctx, c.Admin, c.Template); err != nil {
+		return UndoResult{}, fmt.Errorf("undo check: %w", err)
 	}
 	r := &undoRun{c: c}
 	res := UndoResult{Template: c.Template, MaxRows: c.MaxRows, Agents: c.Names.Agents(), Paths: c.Paths}
@@ -273,6 +105,24 @@ func CheckUndo(ctx context.Context, c UndoCheck) (UndoResult, error) {
 		}
 		from = cl.Next
 	}
+}
+
+// templateExists refuses a template that is not on the server, saying how to make it.
+func templateExists(ctx context.Context, a Admin, template string) error {
+	su, err := pgx.Connect(ctx, a.URL(adminDB))
+	if err != nil {
+		return err
+	}
+	defer su.Close(context.WithoutCancel(ctx))
+	var exists bool
+	if err := su.QueryRow(ctx, "select exists (select from pg_database where datname = $1)", template).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("the template %s does not exist on %s: create it first with stet-lab bench prepare "+
+			"(with -practice for crm_practice), which also creates the benchmark's roles", template, a.Addr)
+	}
+	return nil
 }
 
 // undoRun is one CheckUndo call.
@@ -521,6 +371,11 @@ func undoConfig(tables map[string]string) *config.Config {
 	return &config.Config{Undo: &config.Undo{Tables: tables}}
 }
 
+// primaryKeyOf is the SQL of the one column of the primary key of the table whose OID is the SQL expression %s;
+// NULL when it has none, or one of more columns.
+const primaryKeyOf = `(select a.attname from pg_index i join pg_attribute a on a.attrelid = i.indrelid and a.attnum = i.indkey[0]
+  where i.indrelid = %s and i.indisprimary and i.indnkeyatts = 1)`
+
 // inspectWithChildren looks up the gated tables as Stet's account, adds each table that references one of them
 // with a foreign key that cascades (Table.Children) under its schema-qualified name and its primary key, until none
 // is left out, and refuses a table capture cannot take.
@@ -545,17 +400,14 @@ func inspectWithChildren(ctx context.Context, q store.Querier, gated map[string]
 				if strings.Contains(child, `"`) {
 					return nil, nil, fmt.Errorf("%s cascades from %s, and a quoted name cannot be a table key here", child, t.Key)
 				}
-				var pk string
-				err := q.QueryRow(ctx, `
-					select a.attname from pg_index i join pg_attribute a on a.attrelid = i.indrelid and a.attnum = i.indkey[0]
-					 where i.indrelid = $1::text::regclass and i.indisprimary and i.indnkeyatts = 1`, child).Scan(&pk)
-				if errors.Is(err, pgx.ErrNoRows) {
-					return nil, nil, fmt.Errorf("%s cascades from %s and has no single-column primary key to capture it by", child, t.Key)
-				}
-				if err != nil {
+				var pk *string
+				if err := q.QueryRow(ctx, "select "+fmt.Sprintf(primaryKeyOf, "$1::text::regclass"), child).Scan(&pk); err != nil {
 					return nil, nil, err
 				}
-				tables[child], added = pk, true
+				if pk == nil {
+					return nil, nil, fmt.Errorf("%s cascades from %s and has no single-column primary key to capture it by", child, t.Key)
+				}
+				tables[child], added = *pk, true
 			}
 		}
 		if len(problems) > 0 {
@@ -633,30 +485,29 @@ func comparedTables(ctx context.Context, conn *pgx.Conn, installed []installedTa
 		}
 	}
 	rows, err := conn.Query(ctx, `
-		select c.oid, n.nspname, c.relname, format('%I.%I', n.nspname, c.relname),
-		       (select a.attname from pg_index i join pg_attribute a on a.attrelid = i.indrelid and a.attnum = i.indkey[0]
-		         where i.indrelid = c.oid and i.indisprimary and i.indnkeyatts = 1)
+		select c.oid, n.nspname, c.relname, format('%I.%I', n.nspname, c.relname), `+fmt.Sprintf(primaryKeyOf, "c.oid")+`
 		  from pg_class c join pg_namespace n on n.oid = c.relnamespace
 		 where c.relkind in ('r', 'p') and n.nspname = any($1)
 		 order by 4`, schemas)
 	if err != nil {
 		return nil, err
 	}
-	var out []compared
-	for rows.Next() {
-		var t compared
-		var column *string
-		if err := rows.Scan(&t.oid, &t.schema, &t.name, &t.display, &column); err != nil {
-			return nil, err
-		}
+	var (
+		out    []compared
+		t      compared
+		column *string
+	)
+	if _, err := pgx.ForEachRow(rows, []any{&t.oid, &t.schema, &t.name, &t.display, &column}, func() error {
 		if column == nil {
-			rows.Close()
-			return nil, fmt.Errorf("table %s has no single-column primary key, and the check compares rows by key", t.display)
+			return fmt.Errorf("table %s has no single-column primary key, and the check compares rows by key", t.display)
 		}
 		t.column, t.key = *column, keyOf[t.oid]
 		out = append(out, t)
+		return nil
+	}); err != nil {
+		return nil, err
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // fixedSettings are the five settings capture fixes while it writes values (spec 4), so that a key here reads as
@@ -690,14 +541,11 @@ func fingerprint(ctx context.Context, conn *pgx.Conn, tables []compared) (map[st
 			return nil, fmt.Errorf("read %s: %w", t.display, err)
 		}
 		m := map[string]string{}
-		for rows.Next() {
-			var k, h string
-			if err := rows.Scan(&k, &h); err != nil {
-				return nil, fmt.Errorf("read %s: %w", t.display, err)
-			}
+		var k, h string
+		if _, err := pgx.ForEachRow(rows, []any{&k, &h}, func() error {
 			m[k] = h
-		}
-		if err := rows.Err(); err != nil {
+			return nil
+		}); err != nil {
 			return nil, fmt.Errorf("read %s: %w", t.display, err)
 		}
 		out[t.display] = m
@@ -746,15 +594,14 @@ func undoOrder(ctx context.Context, conn *pgx.Conn, since time.Time, agents []st
 		return nil, err
 	}
 	first := map[string]time.Time{}
-	for rows.Next() {
-		var agent string
-		var at time.Time
-		if err := rows.Scan(&agent, &at); err != nil {
-			return nil, err
-		}
+	var (
+		agent string
+		at    time.Time
+	)
+	if _, err := pgx.ForEachRow(rows, []any{&agent, &at}, func() error {
 		first[agent] = at
-	}
-	if err := rows.Err(); err != nil {
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 	order := slices.Clone(agents)
@@ -774,23 +621,10 @@ func undoOrder(ctx context.Context, conn *pgx.Conn, since time.Time, agents []st
 	return order, nil
 }
 
-// undoHistory is what the check reads from stet.history, as the reviewer.
-type undoHistory struct {
-	sets    []SetCount
-	first   map[string]map[string]time.Time // table key -> key -> the time of its first change
-	markers map[string][]marker             // table key -> its sets that hold no values, the first of each kind
-}
-
-// marker is a change set that holds no values: its statement's rows were not captured.
-type marker struct {
-	agent, skipped string
-	at             time.Time
-}
-
-func (m marker) describe() string { return m.agent + ": not_captured " + m.skipped }
-
+// readHistory reads, as the reviewer, the sets recorded since since by agent and skipped, every captured change of a
+// key with its agent and time, and every set without values with its table, agent and time.
 func readHistory(ctx context.Context, conn *pgx.Conn, since time.Time) (undoHistory, error) {
-	h := undoHistory{first: map[string]map[string]time.Time{}, markers: map[string][]marker{}}
+	h := undoHistory{changes: map[string]map[string][]keyChange{}, markers: map[string][]marker{}}
 	rows, err := conn.Query(ctx, `select agent_role, coalesce(skipped, ''), count(distinct set_id)::int from stet.history
 		where at >= $1 group by 1, 2 order by 1, 2`, since)
 	if err != nil {
@@ -803,173 +637,39 @@ func readHistory(ctx context.Context, conn *pgx.Conn, since time.Time) (undoHist
 	}); err != nil {
 		return h, err
 	}
-	rows, err = conn.Query(ctx, `select target_table, key, min(at) from stet.history
-		where at >= $1 and key is not null group by 1, 2`, since)
+
+	rows, err = conn.Query(ctx, `select target_table, key, agent_role, at from stet.history
+		where at >= $1 and key is not null order by at, change_id`, since)
 	if err != nil {
 		return h, err
 	}
-	for rows.Next() {
-		var table, key string
-		var at time.Time
-		if err := rows.Scan(&table, &key, &at); err != nil {
-			return h, err
+	var (
+		table, key string
+		ch         keyChange
+	)
+	if _, err := pgx.ForEachRow(rows, []any{&table, &key, &ch.agent, &ch.at}, func() error {
+		if h.changes[table] == nil {
+			h.changes[table] = map[string][]keyChange{}
 		}
-		if h.first[table] == nil {
-			h.first[table] = map[string]time.Time{}
-		}
-		h.first[table][key] = at
-	}
-	if err := rows.Err(); err != nil {
+		h.changes[table][key] = append(h.changes[table][key], ch)
+		return nil
+	}); err != nil {
 		return h, err
 	}
-	rows, err = conn.Query(ctx, `select target_table, agent_role, skipped, min(at) from stet.history
-		where at >= $1 and skipped is not null group by 1, 2, 3 order by 1, 2, 3`, since)
+
+	rows, err = conn.Query(ctx, `select target_table, agent_role, skipped, at from stet.history
+		where at >= $1 and skipped is not null order by at, set_id`, since)
 	if err != nil {
 		return h, err
 	}
-	for rows.Next() {
-		var table string
-		var m marker
-		if err := rows.Scan(&table, &m.agent, &m.skipped, &m.at); err != nil {
-			return h, err
-		}
+	var m marker
+	if _, err := pgx.ForEachRow(rows, []any{&table, &m.agent, &m.skipped, &m.at}, func() error {
 		h.markers[table] = append(h.markers[table], m)
+		return nil
+	}); err != nil {
+		return h, err
 	}
-	return h, rows.Err()
-}
-
-// agentLine is a line of one agent's undo.
-type agentLine struct {
-	agent string
-	UndoLine
-}
-
-func (l agentLine) describe() string { return l.agent + ": " + l.text() }
-
-// text is the line's outcome and reason.
-func (l UndoLine) text() string {
-	if l.Reason == nil {
-		return l.Outcome
-	}
-	return l.Outcome + " " + *l.Reason
-}
-
-// explainer finds, for a row that is not what it was, the reason the system reported.
-type explainer struct {
-	lines      map[string]map[string][]agentLine // table key -> key -> its lines
-	keyless    map[string][]agentLine            // table key -> its lines without a key
-	h          undoHistory
-	uncaptured []string // the roles that sent statements and are not captured
-}
-
-func newExplainer(undone []AgentUndo, h undoHistory, uncaptured []string) explainer {
-	e := explainer{lines: map[string]map[string][]agentLine{}, keyless: map[string][]agentLine{}, h: h, uncaptured: uncaptured}
-	for _, u := range undone {
-		for _, l := range u.Lines {
-			al := agentLine{agent: u.Agent, UndoLine: l}
-			if l.Key == nil {
-				e.keyless[l.Table] = append(e.keyless[l.Table], al)
-				continue
-			}
-			if e.lines[l.Table] == nil {
-				e.lines[l.Table] = map[string][]agentLine{}
-			}
-			e.lines[l.Table][*l.Key] = append(e.lines[l.Table][*l.Key], al)
-		}
-	}
-	return e
-}
-
-// reason accounts for a row of t, by key, that is not what it was, from what the system reported, or returns "":
-//
-//   - t is not captured;
-//   - a line of the key that is not restored (skipped, failed, restored_differs) says why;
-//   - a key with no line (no captured change) is accounted for by the table's lines without a key: a set that holds
-//     no values, of a statement over max_rows, say;
-//   - a key whose lines all say restored is accounted for by a set without values recorded before its first change
-//     (the row came back to what that statement had made it);
-//   - otherwise, statements were sent as a role that is not captured.
-func (e explainer) reason(t compared, key string) string {
-	if t.key == "" {
-		return "table not captured"
-	}
-	var why []string
-	lines := e.lines[t.key][key]
-	for _, l := range lines {
-		if l.Outcome != "restored" {
-			why = append(why, l.describe())
-		}
-	}
-	if len(why) == 0 && len(lines) == 0 {
-		for _, l := range e.keyless[t.key] {
-			why = append(why, l.describe())
-		}
-	} else if len(why) == 0 {
-		if first, ok := e.h.first[t.key][key]; ok {
-			for _, m := range e.h.markers[t.key] {
-				if m.at.Before(first) {
-					why = append(why, m.describe())
-				}
-			}
-		}
-	}
-	if len(why) == 0 && len(e.uncaptured) > 0 {
-		why = append(why, "changed by a role not captured ("+strings.Join(e.uncaptured, ", ")+")")
-	}
-	slices.Sort(why)
-	return strings.Join(slices.Compact(why), "; ")
-}
-
-// compareTables compares each table's rows after with those before, key by key.
-func compareTables(tables []compared, before, after map[string]map[string]string, e explainer) []TableCompare {
-	out := make([]TableCompare, 0, len(tables))
-	for _, t := range tables {
-		b, a := before[t.display], after[t.display]
-		tc := TableCompare{Table: t.display, Key: t.key, Captured: t.key != "", Rows: len(b), Reasons: map[string]int{}}
-		diff := func(key, kind string) {
-			d := RowDiff{Key: key, Kind: kind, Reason: e.reason(t, key)}
-			tc.Diffs = append(tc.Diffs, d)
-			tc.Reasons[d.Reason]++
-			switch kind {
-			case "different":
-				tc.Different++
-			case "missing":
-				tc.Missing++
-			case "extra":
-				tc.Extra++
-			}
-		}
-		for k, hb := range b {
-			switch ha, ok := a[k]; {
-			case !ok:
-				diff(k, "missing")
-			case ha != hb:
-				diff(k, "different")
-			default:
-				tc.Equal++
-			}
-		}
-		for k := range a {
-			if _, ok := b[k]; !ok {
-				diff(k, "extra")
-			}
-		}
-		slices.SortFunc(tc.Diffs, func(x, y RowDiff) int { return keyOrder(x.Key, y.Key) })
-		out = append(out, tc)
-	}
-	return out
-}
-
-// keyOrder orders keys as numbers when both are digits, else as text.
-func keyOrder(a, b string) int {
-	if digits(a) && digits(b) {
-		return cmp.Or(cmp.Compare(len(a), len(b)), strings.Compare(a, b))
-	}
-	return strings.Compare(a, b)
-}
-
-func digits(s string) bool {
-	return s != "" && strings.Trim(s, "0123456789") == ""
+	return h, nil
 }
 
 // paths follows the rows each of the check's paths changed in the clone: the rows capture recorded under its
@@ -1015,21 +715,20 @@ func (r *undoRun) paths(ctx context.Context, conn *pgx.Conn, cl UndoClone, outco
 			if err != nil {
 				return nil, err
 			}
-			for rows.Next() {
-				var set int64
-				var table, agent string
-				var key *string
-				var skip bool
-				if err := rows.Scan(&set, &table, &key, &agent, &skip); err != nil {
-					return nil, err
-				}
+			var (
+				set          int64
+				table, agent string
+				key          *string
+				skip         bool
+			)
+			if _, err := pgx.ForEachRow(rows, []any{&set, &table, &key, &agent, &skip}, func() error {
 				if skip {
 					skipped[set] = true
 				} else if key != nil {
 					changed[row{table, *key}] = agent
 				}
-			}
-			if err := rows.Err(); err != nil {
+				return nil
+			}); err != nil {
 				return nil, err
 			}
 		}
@@ -1061,7 +760,7 @@ func (r *undoRun) paths(ctx context.Context, conn *pgx.Conn, cl UndoClone, outco
 					why = strings.Join(lines, "; ")
 				}
 				if restored && !equal {
-					why += "; the row is not what it was: " + cmp.Or(e.reason(t, k.key), "unexplained")
+					why += "; the row is not what it was: " + cmp.Or(e.explain(t, k.key).reason, "unexplained")
 				}
 				p.NotBack = append(p.NotBack, fmt.Sprintf("%s %s: %s", k.table, k.key, why))
 			}
@@ -1069,166 +768,4 @@ func (r *undoRun) paths(ctx context.Context, conn *pgx.Conn, cl UndoClone, outco
 		out = append(out, p)
 	}
 	return out, nil
-}
-
-// Write writes the result as text: per clone, what was sent and recorded, each agent's undo lines by outcome and
-// reason, each table's rows by comparison and the rows not equal by reason (with up to five keys each, and every
-// unexplained row), and the followed paths; then the totals and whether the check passed.
-func (r UndoResult) Write(w io.Writer) error {
-	var b strings.Builder
-	p := func(format string, a ...any) { fmt.Fprintf(&b, format+"\n", a...) }
-	p("undo check of template %s, max_rows %d", r.Template, r.MaxRows)
-	p("captured roles: %s", strings.Join(r.Agents, ", "))
-	p("in each clone every captured role is undone once, as the tables' owner, from just before the first statement,")
-	p("the one whose first change came latest first; the I set is not sent")
-	statements, sets, notEqual := 0, 0, 0
-	for i, c := range r.Clones {
-		statements += c.Statements()
-		sets += c.TotalSets()
-		notEqual += c.NotEqual()
-		p("")
-		var sent []string
-		if c.SentV {
-			sent = append(sent, "the V set with its preparation")
-		}
-		if c.Next > c.From {
-			sent = append(sent, fmt.Sprintf("attacks %d to %d of %d of the X set", c.From, c.Next-1, r.Attacks))
-		}
-		if len(sent) == 0 {
-			sent = append(sent, "nothing")
-		}
-		p("clone %d, %s: %s", i+1, c.Database, strings.Join(sent, ", then "))
-		if c.Reclone {
-			p("  attack %d (%s) breaks the database and ran: the attacks after it go to a fresh clone", c.Next-1, c.Broke)
-		}
-		var captured []string
-		for _, t := range c.Captured {
-			captured = append(captured, fmt.Sprintf("%s (%s, key %s)", t.Key, t.Table, t.Column))
-		}
-		p("  captured: %s", strings.Join(captured, ", "))
-		p("  since %s (the server's clock, just before the first statement)", c.Since.UTC().Format(time.RFC3339Nano))
-		p("  statements sent: %d (%s)", c.Statements(), resultCounts(c.Sent))
-		for _, u := range c.Unanswered {
-			where := "set " + u.Set
-			if u.Path != "" {
-				where += ", path " + u.Path
-			}
-			p("    no answer: %s (%s): %s", u.ID, where, u.Message)
-		}
-		var bySet []string
-		for _, s := range c.Sets {
-			what := "with values"
-			if s.Skipped != "" {
-				what = "not_captured " + s.Skipped
-			}
-			bySet = append(bySet, fmt.Sprintf("%s %s %d", s.Agent, what, s.Sets))
-		}
-		p("  change sets recorded: %d (%s)", c.TotalSets(), strings.Join(bySet, ", "))
-		p("  undo, in the order run (lines by outcome and reason):")
-		for _, u := range c.Undone {
-			count := map[string]int{}
-			for _, l := range u.Lines {
-				count[l.text()]++
-			}
-			p("    %s (lines %d, %s): %s", u.Agent, len(u.Lines), u.Took.Round(time.Millisecond), byCount(count, "none"))
-		}
-		p("  tables (rows before: equal, different, missing, extra):")
-		for _, t := range c.Tables {
-			name := t.Table
-			if t.Captured {
-				name += " (captured as " + t.Key + ")"
-			} else {
-				name += " (not captured)"
-			}
-			p("    %s %d: %d, %d, %d, %d", name, t.Rows, t.Equal, t.Different, t.Missing, t.Extra)
-			for _, reason := range sortedByCount(t.Reasons) {
-				var examples []string
-				for _, d := range t.Diffs {
-					if d.Reason == reason && len(examples) < 5 {
-						examples = append(examples, d.Key+" "+d.Kind)
-					}
-				}
-				p("      %d %s (%s%s)", t.Reasons[reason], cmp.Or(reason, "UNEXPLAINED"), strings.Join(examples, ", "),
-					more(t.Reasons[reason], len(examples)))
-			}
-		}
-		p("  unexplained rows: %d", c.Unexplained())
-		for _, t := range c.Tables {
-			for _, d := range t.Diffs {
-				if d.Reason == "" {
-					p("    %s %s %s", t.Table, d.Key, d.Kind)
-				}
-			}
-		}
-		if len(c.Paths) > 0 {
-			p("  paths:")
-		}
-		for _, pr := range c.Paths {
-			verdict := "not all restored"
-			if pr.AllRestored() {
-				verdict = "all restored"
-			}
-			p("    %s: statements %d (%s); rows changed as capture recorded them %d, sets without values %d; "+
-				"restored %d, now as they were %d: %s", pr.Path, pr.Statements, resultCounts(pr.Results), pr.Changed,
-				pr.NotCaptured, pr.Restored, pr.Equal, verdict)
-			for _, nb := range pr.NotBack {
-				p("      %s", nb)
-			}
-		}
-	}
-	p("")
-	p("total: clones %d, statements sent %d, change sets recorded %d; rows not equal %d: explained %d, unexplained %d",
-		len(r.Clones), statements, sets, notEqual, notEqual-r.Unexplained(), r.Unexplained())
-	for _, path := range r.Paths {
-		var said []string
-		for _, c := range r.Clones {
-			for _, pr := range c.Paths {
-				if pr.Path == path {
-					v := "not all restored"
-					if pr.AllRestored() {
-						v = "all restored"
-					}
-					said = append(said, fmt.Sprintf("%s: rows changed %d, restored %d, as they were %d: %s", c.Database,
-						pr.Changed, pr.Restored, pr.Equal, v))
-				}
-			}
-		}
-		p("%s: %s", path, cmp.Or(strings.Join(said, "; "), "no statement sent"))
-	}
-	p("unexplained rows: %d", r.Unexplained())
-	if r.OK() {
-		p("result: OK")
-	} else {
-		p("result: FAIL")
-	}
-	_, err := io.WriteString(w, b.String())
-	return err
-}
-
-func resultCounts(m map[string]int) string {
-	var out []string
-	for _, k := range []string{Executed, Blocked, DBRejected, Unknown} {
-		out = append(out, fmt.Sprintf("%s %d", k, m[k]))
-	}
-	return strings.Join(out, ", ")
-}
-
-// sortedByCount is m's keys, the largest count first, then by text.
-func sortedByCount(m map[string]int) []string {
-	return slices.SortedFunc(maps.Keys(m), func(a, b string) int { return cmp.Or(cmp.Compare(m[b], m[a]), strings.Compare(a, b)) })
-}
-
-func byCount(m map[string]int, none string) string {
-	var out []string
-	for _, k := range sortedByCount(m) {
-		out = append(out, fmt.Sprintf("%s %d", k, m[k]))
-	}
-	return cmp.Or(strings.Join(out, "; "), none)
-}
-
-func more(total, shown int) string {
-	if total > shown {
-		return fmt.Sprintf(", and %d more", total-shown)
-	}
-	return ""
 }
