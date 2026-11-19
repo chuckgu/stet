@@ -1588,6 +1588,82 @@ func TestUndoOfManyKeys(t *testing.T) {
 	}
 }
 
+// 4,000 keys of one table that the agent changed in 1,600 statements, twenty
+// keys to a statement and each key eight times, are restored, and every
+// change is marked undone. Recording them does not grow with the number of
+// change sets: stet.undo_record, given the same lines again, finds each change
+// by its id and is done within three seconds. Pairing every line with every
+// set of its table, or every change with every set of the agent's, took it
+// many times that.
+func TestUndoOfKeysSpreadOverManySets(t *testing.T) {
+	const blocks, perBlock, passes = 200, 20, 8
+	const keys, sets = blocks * perBlock, blocks * passes
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	owner := superuserIn(t, db)
+	setCapture(t, pool, []string{"stet_md5"}, 10000)
+	mustExec(t, owner,
+		`create table public.spread (id int primary key, n int)`,
+		fmt.Sprintf(`insert into public.spread select i, i from generate_series(1, %d) i`, 2*keys),
+		`analyze public.spread`)
+	installCapture(t, owner, "public.spread", "spread", "id")
+	before := contentOf(t, owner, "public.spread")
+	since := dbClock(t, pool)
+	agent := agentIn(t, db)
+	for s := range sets {
+		b := s % blocks
+		if _, err := agent.Exec(ctx, `update public.spread set n = n + 1 where id > $1 and id <= $2`, b*perBlock, (b+1)*perBlock); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := countOf(t, pool, `select count(*) from stet.change_sets where target_table = 'spread' and skipped is null`); n != sets {
+		t.Fatalf("%d change sets, want %d", n, sets)
+	}
+
+	rv := undoer(t, db, "public.spread")
+	start := time.Now()
+	rows := undoOf(t, rv, "stet_md5", since)
+	took := time.Since(start)
+	if len(rows) != keys {
+		t.Fatalf("%d lines, want %d", len(rows), keys)
+	}
+	items := make([]map[string]any, len(rows))
+	for i, r := range rows {
+		if r.Action != "update" || r.Outcome != "restored" || r.Key == nil || len(r.ChangeIDs) != passes {
+			t.Fatalf("line %d: %v %v, want an update restored with %d changes", i, r, r.ChangeIDs, passes)
+		}
+		items[i] = map[string]any{"target_table": r.TargetTable, "key": *r.Key, "action": r.Action, "outcome": r.Outcome,
+			"reason": nil, "warning": nil, "change_ids": r.ChangeIDs}
+	}
+	checkContent(t, owner, "after the undo", "public.spread", before)
+	const marked = `select count(*) from stet.undone_changes u join stet.changes c on c.id = u.change_id where u.undo_id = $1`
+	recs := undoRecords(t, pool)
+	if len(recs) != 1 {
+		t.Fatalf("stet.undos: %+v, want one row", recs)
+	}
+	if n := countOf(t, pool, marked, recs[0].ID); n != keys*passes {
+		t.Errorf("the undo marks %d changes undone, want %d", n, keys*passes)
+	}
+
+	encoded, err := json.Marshal(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var id int64
+	start = time.Now()
+	if err := rv.QueryRow(ctx, `select stet.undo_record('stet_md5', $1, null, null, null, $2)`, since, string(encoded)).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	recording := time.Since(start)
+	t.Logf("undoing %d keys of %d sets took %v; recording the same lines again took %v", keys, sets, took, recording)
+	if n := countOf(t, pool, marked, id); n != keys*passes {
+		t.Errorf("the record made directly marks %d changes undone, want %d", n, keys*passes)
+	}
+	if recording > 3*time.Second {
+		t.Errorf("recording %d lines over %d sets took %v, want under 3s", keys, sets, recording)
+	}
+}
+
 // An undo that selects nothing (a table key no change has, a since in the
 // future) returns no line, changes nothing and is still recorded, with three
 // counts of 0.

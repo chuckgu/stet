@@ -1926,6 +1926,11 @@ $$;
 --   고른 조건에 드는 변경만 적는다: agent_role의 묶음의 변경이고, at이 since 이상 until 미만이고(until이 NULL이면 지금까지),
 --   tables가 있으면 target_table이 그 안에 있고, 그 줄의 target_table과 key의 변경이다. stet.undo의 줄은 언제나 그렇다.
 --   그래서 직접 부른 검토자도 남의 계정, 다른 테이블이나 시간, 없는 변경을 되돌렸다고 보이게 할 수 없다.
+--   변경은 id로 하나씩 찾는다: 변경의 id에서 stet.changes의 기본 키로, 거기서 그 묶음의 기본 키로 간다. 두 읽기를
+--   저마다 LATERAL 안에 두고 OFFSET 0으로 막는다. 그 안에는 기본 키의 같음만 있고, 고른 조건은 밖에서 거른다(OFFSET이
+--   있는 하위 질의 안으로는 조건이 들어가지 않는다). 막지 않으면 플래너가 줄과 묶음을 target_table로 먼저 묶거나 묶음을
+--   (agent_role, at)의 인덱스로 훑어, 변경마다 그 테이블이나 그 계정의 묶음을 모두 읽는다. 묶음이 많은 되돌리기에서
+--   기록이 변경 수와 묶음 수의 곱만큼 걸렸다.
 -- 부른 쪽의 식이나 이름을 평가하지 않고, 동적 SQL이 없으며, 고객의 코드를 부르지 않는다. 쓰는 곳은 세 표뿐이다.
 CREATE OR REPLACE FUNCTION stet.undo_record(agent_role text, since timestamptz, until timestamptz, tables text[],
                                             note text, items jsonb)
@@ -1959,8 +1964,8 @@ BEGIN
   SELECT DISTINCT ch.id, new_id
     FROM stet.undo_unpack(undo_record.items) AS r
    CROSS JOIN LATERAL unnest(r.change_ids) AS c(id)
-    JOIN stet.changes ch ON ch.id = c.id
-    JOIN stet.change_sets cs ON cs.id = ch.set_id
+   CROSS JOIN LATERAL (SELECT x.id, x.key, x.set_id FROM stet.changes x WHERE x.id = c.id OFFSET 0) ch
+   CROSS JOIN LATERAL (SELECT y.target_table, y.agent_role, y.at FROM stet.change_sets y WHERE y.id = ch.set_id OFFSET 0) cs
    WHERE r.outcome IN ('restored', 'restored_differs')
      AND cs.agent_role = undo_record.agent_role
      AND cs.at >= undo_record.since
