@@ -79,8 +79,8 @@ func superuser(t *testing.T, db string) *pgx.Conn {
 	return connectAs(t, db, "postgres", "postgres-pw")
 }
 
-// newOwner creates a login role to own the test's tables, named prefix and
-// a unique suffix, and drops it, with what it owns or was granted in
+// newOwner creates a login role (to own the test's tables, or to review),
+// named prefix and a unique suffix, and drops it, with what it owns or was granted in
 // stet_test, when the test ends. Create it before the database it owns
 // tables in (ownDatabase), so that the database, with the rights granted in
 // it, is dropped first.
@@ -1464,4 +1464,231 @@ func lineWith(log string, parts ...string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// approvalAndCapture are functions of the stet schema that are not a
+// reviewer's to undo with: approving held writes, and the capture trigger's.
+var approvalAndCapture = []string{"stet.approve(uuid, text, bigint)", "stet.reject(uuid, text)", "stet.capture()"}
+
+// What GrantSQL prints, exactly: for Stet's account to run, USAGE on the
+// stet schema, SELECT on stet.history and EXECUTE on each function given,
+// sorted, and what the table owners still have to grant.
+func TestGrantSQLPrintsTheReviewerBlock(t *testing.T) {
+	functions := []string{
+		"stet.undo_plan(text, timestamp with time zone, timestamp with time zone, text[])",
+		"stet.undo(text, timestamp with time zone, timestamp with time zone, text[], text)",
+		"stet.undo_lock(oid)",
+	}
+	got, err := undo.GrantSQL("stet_scram", "reviewer", functions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `-- Run as stet_scram (the account Stet connects as): lets "reviewer" read stet.history and undo an agent's changes.
+GRANT USAGE ON SCHEMA stet TO reviewer;
+GRANT SELECT ON stet.history TO reviewer;
+GRANT EXECUTE ON FUNCTION stet.undo(text, timestamp with time zone, timestamp with time zone, text[], text) TO reviewer;
+GRANT EXECUTE ON FUNCTION stet.undo_lock(oid) TO reviewer;
+GRANT EXECUTE ON FUNCTION stet.undo_plan(text, timestamp with time zone, timestamp with time zone, text[]) TO reviewer;
+-- The role also needs SELECT, INSERT, UPDATE and DELETE on the tables it is to restore, and SELECT on the tables that
+-- reference those with ON DELETE or ON UPDATE CASCADE, SET NULL or SET DEFAULT; grant those as the tables' owners.
+`
+	if got != want {
+		t.Errorf("GrantSQL printed:\n%s\nwant:\n%s", got, want)
+	}
+	if again, _ := undo.GrantSQL("stet_scram", "reviewer", slices.Clone(functions)); again != got {
+		t.Errorf("GrantSQL is not deterministic:\n%s", again)
+	}
+
+	// A role name that needs quoting is an identifier in the statements and
+	// stays on its comment's line.
+	odd := "Re\"view er\nX"
+	got, err = undo.GrantSQL("stet_scram", odd, functions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{
+		"-- Run as stet_scram (the account Stet connects as): lets \"Re\"view er\\x0aX\" read",
+		"GRANT USAGE ON SCHEMA stet TO \"Re\"\"view er\nX\";\n",
+		"GRANT EXECUTE ON FUNCTION stet.undo_lock(oid) TO \"Re\"\"view er\nX\";\n",
+	} {
+		if !strings.Contains(got, p) {
+			t.Errorf("GrantSQL for %q does not say %q:\n%s", odd, p, got)
+		}
+	}
+
+	for _, c := range []struct{ stet, role string }{{"stet_scram", ""}, {"stet_scram", "a\x00b"}, {"", "reviewer"}} {
+		if got, err := undo.GrantSQL(c.stet, c.role, functions); err == nil || got != "" {
+			t.Errorf("GrantSQL(%q, %q) = %q, %v; want an error and nothing", c.stet, c.role, got, err)
+		}
+	}
+}
+
+// ReviewerFunctions lists, from the catalog, every function of the stet
+// schema whose name starts with undo, as text GRANT EXECUTE ON FUNCTION
+// takes, sorted; nothing else of the schema.
+func TestReviewerFunctionsAreTheUndoFunctions(t *testing.T) {
+	db, stet := ownDatabase(t)
+	ctx := context.Background()
+	got, err := undo.ReviewerFunctions(ctx, stet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.IsSorted(got) {
+		t.Errorf("not sorted: %q", got)
+	}
+	if again, err := undo.ReviewerFunctions(ctx, stet); err != nil || !slices.Equal(again, got) {
+		t.Errorf("a second read: %q, %v", again, err)
+	}
+
+	su := superuser(t, db)
+	var want []string
+	rows, err := su.Query(ctx, `select p.oid::regprocedure::text from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+		where n.nspname = 'stet' and p.proname like 'undo%' order by 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) || len(want) < 2 {
+		t.Fatalf("%d functions %q, want the catalog's %d: %q", len(got), got, len(want), want)
+	}
+	// Each signature names one of them, and together all of them.
+	var named []string
+	for _, sig := range got {
+		var proc *string
+		if err := su.QueryRow(ctx, `select to_regprocedure($1)::text`, sig).Scan(&proc); err != nil || proc == nil {
+			t.Errorf("%q names no function (%v)", sig, err)
+			continue
+		}
+		named = append(named, *proc)
+	}
+	slices.Sort(named)
+	if !slices.Equal(named, want) {
+		t.Errorf("the signatures name %q, want %q", named, want)
+	}
+	for _, sig := range got {
+		if !strings.HasPrefix(sig, "stet.undo") {
+			t.Errorf("%q is not an undo function of the stet schema", sig)
+		}
+	}
+}
+
+// Run as Stet's account, the block lets a role that had nothing read
+// stet.history, plan and undo an agent's changes, and nothing more: not
+// approve or reject held writes, not call stet.capture(), not read the
+// capture tables. A role whose name needs quoting gets the same rights.
+func TestGrantSQLLetsAReviewerUndo(t *testing.T) {
+	reviewer := newOwner(t, "stet_undo_reviewer")
+	odd := newOwner(t, "Stet \"Odd\" Reviewer\nX")
+	db, stet := ownDatabase(t)
+	ctx := context.Background()
+	su := superuser(t, db)
+	mustExec(t, su,
+		`create table public.deals (id int primary key, name text)`,
+		`insert into public.deals values (2, 'two')`,
+		`grant select, insert, update, delete on public.deals to `+agentRole+`, `+reviewer)
+	installByHand(t, su, "public.deals", "deals", "id")
+
+	functions, err := undo.ReviewerFunctions(ctx, stet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	can := func(role string) map[string]bool {
+		t.Helper()
+		m := map[string]bool{}
+		var b bool
+		for _, q := range []struct{ what, sql, object string }{
+			{"usage", `select has_schema_privilege($1, 'stet', 'usage')`, ""},
+			{"history", `select has_table_privilege($1, 'stet.history', 'select')`, ""},
+			{"change_sets", `select has_table_privilege($1, 'stet.change_sets', 'select')`, ""},
+			{"changes", `select has_table_privilege($1, 'stet.changes', 'select')`, ""},
+			{"review", `select has_table_privilege($1, 'stet.review', 'select')`, ""},
+		} {
+			if err := su.QueryRow(ctx, q.sql, role).Scan(&b); err != nil {
+				t.Fatal(err)
+			}
+			m[q.what] = b
+		}
+		for _, f := range append(slices.Clone(functions), approvalAndCapture...) {
+			if err := su.QueryRow(ctx, `select has_function_privilege($1, $2, 'execute')`, role, f).Scan(&b); err != nil {
+				t.Fatal(err)
+			}
+			m[f] = b
+		}
+		return m
+	}
+	for _, role := range []string{reviewer, odd} {
+		for what, has := range can(role) {
+			if has {
+				t.Errorf("%q has %s before the grants", role, what)
+			}
+		}
+	}
+
+	var since time.Time
+	if err := su.QueryRow(ctx, `select clock_timestamp()`).Scan(&since); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, connectAs(t, db, agentRole, agentPassword),
+		`insert into public.deals values (1, 'one')`,
+		`update public.deals set name = 'changed' where id = 2`)
+
+	asStet := connectAs(t, db, stetRole, stetPassword)
+	for _, role := range []string{reviewer, odd} {
+		sql, err := undo.GrantSQL(stetRole, role, functions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustExec(t, asStet, sql)
+		for what, has := range can(role) {
+			want := what != "change_sets" && what != "changes" && what != "review" && !slices.Contains(approvalAndCapture, what)
+			if has != want {
+				t.Errorf("%q after the grants: %s %v, want %v", role, what, has, want)
+			}
+		}
+	}
+
+	rv := connectAs(t, db, reviewer, ownerPassword)
+	var shown int
+	if err := rv.QueryRow(ctx, `select count(*) from stet.history where target_table = 'deals'`).Scan(&shown); err != nil || shown != 2 {
+		t.Errorf("the reviewer reads %d changes of deals in stet.history (%v), want 2", shown, err)
+	}
+	outcomes := func(sql string) []string {
+		t.Helper()
+		rows, err := rv.Query(ctx, sql, agentRole, since)
+		if err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		slices.Sort(got)
+		return got
+	}
+	if got := outcomes(`select key || ' ' || outcome from stet.undo_plan($1, $2)`); !slices.Equal(got, []string{"1 would_restore", "2 would_restore"}) {
+		t.Errorf("the reviewer's plan: %q", got)
+	}
+	if got := outcomes(`select key || ' ' || outcome from stet.undo($1, $2)`); !slices.Equal(got, []string{"1 restored", "2 restored"}) {
+		t.Errorf("the reviewer's undo: %q", got)
+	}
+	rows, err := su.Query(ctx, `select id || ' ' || name from public.deals order by id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || !slices.Equal(content, []string{"2 two"}) {
+		t.Errorf("deals after the undo: %q (%v), want only 2 two", content, err)
+	}
+
+	for _, sql := range []string{
+		`select count(*) from stet.change_sets`,
+		`select stet.reject('00000000-0000-0000-0000-000000000000', 'no')`,
+		`select stet.approve('00000000-0000-0000-0000-000000000000')`,
+	} {
+		var pgErr *pgconn.PgError
+		if _, err := rv.Exec(ctx, sql); !errors.As(err, &pgErr) || pgErr.Code != "42501" {
+			t.Errorf("the reviewer: %s: %v, want 42501", sql, err)
+		}
+	}
 }

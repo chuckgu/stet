@@ -29,7 +29,8 @@ const usage = `usage: stet <command> [flags]
 
 commands:
   proxy      run the pgwire proxy (stet proxy -config stet.yaml)
-  undo-sql   print the SQL a table owner runs to capture undo.tables (stet undo-sql -config stet.yaml [-drop])
+  undo-sql   print the SQL a table owner runs to capture undo.tables (stet undo-sql -config stet.yaml [-drop]),
+             or with -grant <role> the grants that let a role review and undo
   bench-jev  time single Jev calls (needs TYPESAFE_API_KEY)
 `
 

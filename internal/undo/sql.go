@@ -2,6 +2,7 @@ package undo
 
 import (
 	"cmp"
+	"context"
 	"errors"
 	"fmt"
 	"slices"
@@ -9,6 +10,8 @@ import (
 	"unicode"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
+
+	"github.com/stetdb/stet/internal/store"
 )
 
 // lockTimeout bounds how long an owner's transaction waits for the locks of
@@ -282,4 +285,60 @@ func RequireServer(versionNum int) error {
 	}
 	return fmt.Errorf("undo needs PostgreSQL 14 or later (its install SQL uses CREATE OR REPLACE TRIGGER, and 14 is "+
 		"the only version it is tested on); this server is PostgreSQL %s", version)
+}
+
+// ReviewerFunctions are the functions a reviewer calls to plan and undo an
+// agent's changes, and the helpers those call with the reviewer's rights:
+// every function of the stet schema whose name starts with undo, read from
+// the catalog, each as stet.<name>(<argument types>), the text GRANT EXECUTE
+// ON FUNCTION takes (no argument names, no defaults), in byte order. Nothing
+// else of the schema is among them: not stet.approve or stet.reject, which
+// approve held writes, nor stet.capture().
+func ReviewerFunctions(ctx context.Context, q store.Querier) ([]string, error) {
+	var functions []string
+	if err := q.QueryRow(ctx, `
+		select array(select format('stet.%I(%s)', p.proname,
+		                           (select coalesce(string_agg(format_type(a.t, NULL), ', ' order by a.n), '')
+		                              from unnest(p.proargtypes::oid[]) with ordinality as a(t, n)))
+		               from pg_proc p
+		               join pg_namespace n on n.oid = p.pronamespace
+		              where n.nspname = 'stet' and p.prokind = 'f' and starts_with(p.proname::text, 'undo'))`).
+		Scan(&functions); err != nil {
+		return nil, err
+	}
+	slices.Sort(functions)
+	return functions, nil
+}
+
+// GrantSQL is what `stet undo-sql -grant <role>` prints: for stetRole, which
+// owns the stet schema, to run, what lets role read stet.history and plan and
+// undo an agent's changes (spec 6, 7): USAGE on the stet schema, SELECT on
+// stet.history, and EXECUTE on each of functions (ReviewerFunctions), in byte
+// order. It grants nothing else of the schema. The rights on the tables to
+// restore are their owners' to give, which a closing comment says. role is
+// an identifier, quoted where it must be, and need not exist yet; in the
+// comment it is written as text with its control characters escaped.
+func GrantSQL(stetRole, role string, functions []string) (string, error) {
+	switch {
+	case role == "":
+		return "", errors.New("the role to grant to is empty")
+	case stetRole == "":
+		return "", errors.New("the name of Stet's account is empty")
+	case hasNUL(stetRole, role) || hasNUL(functions...):
+		return "", errors.New("a name holds a NUL byte")
+	case len(functions) == 0:
+		return "", errors.New("there are no undo functions in the stet schema to grant")
+	}
+	to := quoteIdent(role)
+	var b strings.Builder
+	fmt.Fprintf(&b, "-- Run as %s (the account Stet connects as): lets \"%s\" read stet.history and undo an agent's changes.\n",
+		comment(quoteIdent(stetRole)), comment(role))
+	fmt.Fprintf(&b, "GRANT USAGE ON SCHEMA stet TO %s;\n", to)
+	fmt.Fprintf(&b, "GRANT SELECT ON stet.history TO %s;\n", to)
+	for _, f := range slices.Compact(slices.Sorted(slices.Values(functions))) {
+		fmt.Fprintf(&b, "GRANT EXECUTE ON FUNCTION %s TO %s;\n", f, to)
+	}
+	b.WriteString("-- The role also needs SELECT, INSERT, UPDATE and DELETE on the tables it is to restore, and SELECT on the tables that\n")
+	b.WriteString("-- reference those with ON DELETE or ON UPDATE CASCADE, SET NULL or SET DEFAULT; grant those as the tables' owners.\n")
+	return b.String(), nil
 }

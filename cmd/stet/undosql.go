@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/stetdb/stet/internal/config"
 	"github.com/stetdb/stet/internal/undo"
@@ -24,17 +25,35 @@ const undoSQLTimeout = 30 * time.Second
 // catalogs, in a read-only transaction. The install SQL needs PostgreSQL 14
 // or later, and on an older server it refuses (ruling R12); -drop does not.
 // When the database has no stet.capture() it says to start Stet once, which
-// creates the stet schema, and creates nothing itself (ruling U8). On any
-// failure it writes nothing to out.
+// creates the stet schema, and creates nothing itself (ruling U8).
+//
+// With -grant <role> it writes only the grants that let role review and undo
+// (undo.GrantSQL), for Stet's account to run, with the undo functions read
+// from the catalog; it refuses with -drop or an empty role, and when the
+// database has no stet.undo(), saying to start Stet once.
+//
+// On any failure it writes nothing to out.
 func runUndoSQL(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("undo-sql", flag.ContinueOnError)
 	path := fs.String("config", "stet.yaml", "config file")
 	drop := fs.Bool("drop", false, "print the SQL that removes the capture triggers")
+	var grantTo string
+	grant := false
+	fs.Func("grant", "print only the grants that let `role` read stet.history and undo, for Stet's account to run",
+		func(role string) error {
+			grantTo, grant = role, true
+			return nil
+		})
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() > 0 {
+	switch {
+	case fs.NArg() > 0:
 		return fmt.Errorf("undo-sql: unexpected arguments %q", fs.Args())
+	case grant && *drop:
+		return errors.New("undo-sql: -grant prints only a reviewer's grants and does not go with -drop")
+	case grant && grantTo == "":
+		return errors.New("undo-sql: -grant needs the name of the role to grant to")
 	}
 	cfg, err := config.Load(*path)
 	if err != nil {
@@ -51,6 +70,9 @@ func runUndoSQL(args []string, out io.Writer) error {
 		return err
 	}
 	defer pool.Close()
+	if grant {
+		return undoGrantSQL(ctx, pool, grantTo, out)
+	}
 	var (
 		role    string
 		capture bool
@@ -108,4 +130,37 @@ var serverVersionNum = func(ctx context.Context, tx pgx.Tx) (int, error) {
 	var v int
 	err := tx.QueryRow(ctx, `select current_setting('server_version_num')::int`).Scan(&v)
 	return v, err
+}
+
+// undoGrantSQL is stet undo-sql -grant role: it reads the undo functions in a
+// read-only transaction and writes undo.GrantSQL's block to out.
+func undoGrantSQL(ctx context.Context, pool *pgxpool.Pool, grantTo string, out io.Writer) error {
+	var (
+		role      string
+		hasUndo   bool
+		functions []string
+	)
+	err := readOnly(ctx, pool, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `
+			select session_user, exists (select from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+			                              where n.nspname = 'stet' and p.proname = 'undo')`).Scan(&role, &hasUndo); err != nil {
+			return err
+		}
+		var err error
+		functions, err = undo.ReviewerFunctions(ctx, tx)
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("undo-sql: reading the undo functions: %w", err)
+	}
+	if !hasUndo {
+		return errors.New("undo-sql: this database has no stet.undo(), which a reviewer calls: start Stet once " +
+			"with this config so that it creates its stet schema, then run stet undo-sql again")
+	}
+	sql, err := undo.GrantSQL(role, grantTo, functions)
+	if err != nil {
+		return fmt.Errorf("undo-sql: %w", err)
+	}
+	_, err = io.WriteString(out, sql)
+	return err
 }

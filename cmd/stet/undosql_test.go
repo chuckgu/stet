@@ -136,3 +136,71 @@ func TestUndoSQLRefusesAServerBefore14(t *testing.T) {
 		t.Errorf("-drop on PostgreSQL 13: %v, printed:\n%s", err, out.String())
 	}
 }
+
+// stet undo-sql -grant <role> prints only the block that lets the role review
+// and undo, for Stet's account to run, and changes nothing. The role need not
+// exist. With -drop, with an empty role, or in a database without Stet's
+// schema it fails and prints nothing.
+func TestUndoSQLGrant(t *testing.T) {
+	pg := testPG(t)
+	ctx := context.Background()
+	db := cleanDatabase(t, pg)
+	stetPoolIn(t, pg, db)
+	in := connectTo(t, pg, db, "postgres", "postgres-pw")
+	mustExec(t, in, "create table public.deals (id int primary key)")
+	path := undoSQLConfig(t, pg, db, "  tables:\n    public.deals: {pk: id}\n")
+
+	var out bytes.Buffer
+	if err := runUndoSQL([]string{"-config", path, "-grant", "Re viewer"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	s := out.String()
+	for _, p := range []string{
+		"-- Run as stet_scram (the account Stet connects as): lets \"Re viewer\" read stet.history and undo an agent's changes.\n",
+		"GRANT USAGE ON SCHEMA stet TO \"Re viewer\";\n",
+		"GRANT SELECT ON stet.history TO \"Re viewer\";\n",
+		"GRANT EXECUTE ON FUNCTION stet.undo(text, timestamp with time zone, timestamp with time zone, text[], text) TO \"Re viewer\";\n",
+		"GRANT EXECUTE ON FUNCTION stet.undo_plan(text, timestamp with time zone, timestamp with time zone, text[]) TO \"Re viewer\";\n",
+	} {
+		if !strings.Contains(s, p) {
+			t.Errorf("stet undo-sql -grant does not print %q:\n%s", p, s)
+		}
+	}
+	if !strings.HasPrefix(s, "-- Run as stet_scram") {
+		t.Errorf("stet undo-sql -grant prints more than the grant block:\n%s", s)
+	}
+	for _, p := range []string{"TRIGGER", "stet.capture", "approve", "reject", "change_sets", "BEGIN"} {
+		if strings.Contains(s, p) {
+			t.Errorf("stet undo-sql -grant prints %q:\n%s", p, s)
+		}
+	}
+	var functions int
+	if err := in.QueryRow(ctx, `select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+		where n.nspname = 'stet' and p.proname like 'undo%'`).Scan(&functions); err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(s, "GRANT EXECUTE ON FUNCTION stet.undo"); n != functions {
+		t.Errorf("%d functions granted, want the catalog's %d", n, functions)
+	}
+	var roles int
+	if err := in.QueryRow(ctx, `select count(*) from pg_roles where rolname = 'Re viewer'`).Scan(&roles); err != nil || roles != 0 {
+		t.Errorf("stet undo-sql -grant created the role (%d, %v)", roles, err)
+	}
+
+	fails := func(name, want string, args ...string) {
+		t.Helper()
+		out.Reset()
+		err := runUndoSQL(args, &out)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %v, want an error saying %q", name, err, want)
+		}
+		if out.Len() != 0 {
+			t.Errorf("%s: printed %q, want nothing", name, out.String())
+		}
+	}
+	fails("-grant with -drop", "-grant", "-config", path, "-grant", "reviewer", "-drop")
+	fails("an empty role", "-grant", "-config", path, "-grant", "")
+	bare := cleanDatabase(t, pg)
+	fails("no stet schema", "start Stet once", "-config", undoSQLConfig(t, pg, bare, "  tables:\n    public.deals: {pk: id}\n"),
+		"-grant", "reviewer")
+}
