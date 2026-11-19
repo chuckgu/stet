@@ -930,8 +930,11 @@ $$;
 -- 읽을 수 있는 테이블의 줄은 이렇다. withheld는 NULL이다.
 -- - 값을 남긴 묶음의 줄은 (target_table, relid, key_column, key)마다 한 줄이다. 남긴 순서(변경의 id 순)로 본다.
 --   b는 고른 첫 변경의 before, a는 마지막 변경의 after다(그 두 변경만 id로 읽는다). change_ids는 그 키의 변경들,
---   first_change는 첫 변경의 id다. key_changed는 고른 변경 가운데 update 묶음인데 before나 after가 없는 줄이 있는가다(키를
---   바꾼 UPDATE). interleaved는 이어진 두 변경에서 앞의 after와 뒤의 before가 다른가다(행이 없는 것끼리는 같다).
+--   first_change는 첫 변경의 id다. key_changed는 고른 변경 가운데 키를 바꾼 UPDATE의 묶음에 든 것이 있는가다. 키를 바꾼
+--   UPDATE의 묶음은 줄 가운데 before나 after가 없는 것이 하나라도 있는 update 묶음이고, 그 묶음의 줄은 양쪽이 다 있는
+--   것까지 모두 그렇게 본다. 키를 하나씩 민 UPDATE(id = id + 1)에서는 가운데 키의 줄에 before와 after가 다 있지만 둘은
+--   서로 다른 행이다. 그 키만 되돌리면 한 행의 값이 둘이 되고 다른 행의 값은 사라진다.
+--   interleaved는 이어진 두 변경에서 앞의 after와 뒤의 before가 다른가다(행이 없는 것끼리는 같다).
 -- - 값을 남기지 않은 묶음(skipped)은 묶음마다 key 없이 한 줄이다. 값과 변경과 두 표시는 NULL이고 skipped가 그 이유다.
 -- - also_changed는 같은 문장(pid, txid, stmt_at이 같은 이 계정의 묶음)이 바꾼 테이블 가운데 tables가 고르지 않은 것의
 --   target_table이다. 시각으로 거르지 않는다. 정렬해 돌려주고, 없으면 NULL이다.
@@ -1005,9 +1008,15 @@ BEGIN
        AND (o.target_table = ANY (undo_selection.tables)) IS NOT TRUE
      GROUP BY sel.set_id
   ),
+  -- 키를 바꾼 UPDATE의 묶음: 줄 가운데 before나 after가 없는 것이 있다
+  rekeyed AS (
+    SELECT DISTINCT sel.set_id
+      FROM sel JOIN stet.changes ch ON ch.set_id = sel.set_id
+     WHERE sel.op = 'update' AND sel.skip IS NULL AND (ch.before IS NULL OR ch.after IS NULL)
+  ),
   lines AS (
     SELECT sel.set_id, sel.tt, sel.rel, sel.kc, ch.key AS k, ch.id AS change_id,
-           sel.op = 'update' AND (ch.before IS NULL OR ch.after IS NULL) AS key_change,
+           sel.set_id IN (SELECT rk.set_id FROM rekeyed rk) AS key_change,
            row_number() OVER w > 1 AND ch.before IS DISTINCT FROM lag(ch.after) OVER w AS broken
       FROM sel JOIN stet.changes ch ON ch.set_id = sel.set_id
      WHERE sel.skip IS NULL
@@ -1518,12 +1527,20 @@ $$;
 --      같은 비결정적 콜레이션인 경우도 거절한다.
 --    - 연쇄가 쓸 콜레이션을 정할 수 없다: 부모 컬럼의 타입의 것과 자식 컬럼의 것이 둘 다 기본이 아니고 서로 다르다(연쇄
 --      자체가 콜레이션 충돌로 실패한다).
+--    - 제약의 같음 연산자가 pg_catalog 밖에 있고 받는 타입 가운데 의사 타입(anyarray, anyelement 등)이 있다. 6의 비교는
+--      피연산자를 연산자가 받는 타입으로 캐스트해 그 연산자 하나로만 풀리게 하는데, 의사 타입으로의 캐스트는 피연산자의
+--      타입을 바꾸지 않는다. 그러면 OPERATOR(스키마.이름)은 컬럼의 실제 타입으로 풀리고, 그 스키마에 그 타입끼리의 같은
+--      이름의 연산자가 있으면 제약의 것이 아니라 그것이 골라져 검토자의 권한으로 돈다(테스트 서버에서 확인했다). 그 스키마에
+--      만들 수 있는 계정이면 누구나 더할 수 있다. pg_catalog에는 superuser만 연산자를 더한다.
 -- 6. 자식이 있는지는 PostgreSQL의 연쇄가 쓰는 비교 그대로 본다(ri_triggers.c의 ri_GenerateQual, ruleutils.c의
 --    generate_operator_clause와 같은 글자). 짝마다 p.<부모 컬럼>[::<연산자의 왼쪽 타입>] OPERATOR(<스키마>.<conpfeqop의 이름>)
 --    x.<자식 컬럼>[::<연산자의 오른쪽 타입>] COLLATE <연쇄의 콜레이션>이다. 캐스트는 컬럼의 타입(도메인이면 도메인 자체)이
---    연산자가 받는 타입과 다를 때만 붙이고, 타입은 pg_type의 스키마와 이름을 %I.%I로 적는다. 두 피연산자가 연산자가 받는
---    타입 그대로이므로 OPERATOR(스키마.이름)은 conpfeqop 하나로만 풀린다(같은 스키마, 이름, 입력 타입의 연산자는 둘일 수
---    없다). 그래서 에이전트가 그 스키마에 컬럼의 타입끼리의 같은 이름의 연산자를 더해도 고르지 않는다. 콜레이션은 연쇄가
+--    연산자가 받는 타입과 다를 때만 붙이고, 타입은 pg_type의 스키마와 이름을 %I.%I로 적는다. 연산자가 받는 타입이 보통
+--    타입이면 두 피연산자가 그 타입 그대로이므로 OPERATOR(스키마.이름)은 conpfeqop 하나로만 풀린다(같은 스키마, 이름, 입력
+--    타입의 연산자는 둘일 수 없다). 그래서 에이전트가 그 스키마에 컬럼의 타입끼리의 같은 이름의 연산자를 더해도 고르지
+--    않는다. 받는 타입이 의사 타입이면 그렇지 않다. 캐스트가 피연산자의 타입을 바꾸지 않아 컬럼의 타입끼리의 연산자가
+--    먼저 골라진다. pg_catalog의 연산자(배열의 같음 등)에서는 superuser만 그런 연산자를 더할 수 있으므로 그대로 따라가고,
+--    pg_catalog 밖의 것은 5에서 거절한다. 콜레이션은 연쇄가
 --    쓰는 것, 곧 부모 컬럼의 타입의 콜레이션과 자식 컬럼의 콜레이션을 PostgreSQL이 두 암묵 콜레이션을 합치는 대로 합친
 --    것이다(같으면 그것, 한쪽이 기본이면 다른 쪽). 스키마까지 적고 명시한다. 콜레이션이 없는 타입에는 붙이지 않는다.
 --    부모의 값은 a의 글자를 다시 읽지 않고 그 키의 행(이미 잠근 행, 연쇄가 OLD로 볼 행)에서 조인으로 가져온다:
@@ -1531,6 +1548,14 @@ $$;
 --    그 행을 찾지 못하면 object_not_in_prerequisite_state다. 값 가운데 NULL이 있으면 비교가 참이 아니어서 아무 행도 맞지
 --    않는다(PostgreSQL도 NULL이 든 키에서는 연쇄하지 않는다. MATCH SIMPLE에서 NULL이 든 자식은 아무것도 가리키지 않는다).
 --    자기를 가리키는 외래 키에서는 그 행 자신을 ctid로 뺀다. 자식은 파티션 테이블이면 파티션까지, 아니면 ONLY로 읽는다.
+--    자식 테이블은 이름으로 적는다(conrelid의 regclass 출력). 이름은 조사가 자식의 잠금을 기다리는 동안 다른 테이블을
+--    가리키게 될 수 있다(ALTER SCHEMA ... RENAME은 테이블을 잠그지 않는다). 그러면 PostgreSQL은 이름을 다시 풀어 그 테이블을
+--    읽고, 조사는 자식이 없다고 답하며, 복구는 진짜 자식으로 연쇄한다. 그래서 조사 뒤에 두 가지를 본다. 조사에 적은 바로 그
+--    이름이 아직 conrelid를 가리키고(to_regclass), 이 백엔드가 conrelid에 ACCESS SHARE를 쥐고 있다(pg_locks, 부모의 2와
+--    같다). 하나라도 아니면 object_not_in_prerequisite_state이고 그 키는 failed다. 잠금만 보면 모자란다. 같은 되돌리기의
+--    앞의 키가 조사하며 잡은 잠금이 남아 있을 수 있다. 이름만 봐도 모자란다. 이름이 조사 뒤에 돌아왔을 수 있다. 남는 것은
+--    조사가 이름을 푼 때와 이 확인 사이에 이름이 다른 테이블로 갔다가 돌아오고(두 번 바뀌고), 앞의 키가 잡은 잠금이 남아
+--    있는 경우다(스펙 11장).
 -- 7. 자식 테이블은 부른 계정의 권한으로 읽는다(SECURITY INVOKER). 읽을 권한이 없으면 42501이다. 행 수준 보안이 부른 역할에게
 --    적용되면 숨은 자식을 놓칠 수 있으므로(연쇄는 행 수준 보안을 지나간다) 42501이다. 이것을 조사 앞뒤로 본다. 조사가 자식
 --    테이블의 잠금을 기다리는 동안 행 수준 보안이 켜질 수 있다.
@@ -1567,6 +1592,7 @@ DECLARE
   coll      text;
   nd        text;
   cond      text;
+  kid       text;
   found_row boolean;
   hit       boolean;
   children  text[] := '{}';
@@ -1620,7 +1646,9 @@ BEGIN
              format('OPERATOR(%I.%s)', opn.nspname, op.oprname) AS op,
              CASE WHEN pa.atttypid <> op.oprleft THEN format('::%I.%I', ln.nspname, lt.typname) ELSE '' END AS lcast,
              CASE WHEN ca.atttypid <> op.oprright THEN format('::%I.%I', rn.nspname, rt.typname) ELSE '' END AS rcast,
-             pt.typcollation AS pcoll, pa.attcollation AS pacoll, ca.attcollation AS fcoll, ct.typcollation AS qcoll
+             pt.typcollation AS pcoll, pa.attcollation AS pacoll, ca.attcollation AS fcoll, ct.typcollation AS qcoll,
+             opn.nspname <> 'pg_catalog' AND (lt.typtype = 'p' OR rt.typtype = 'p') AS loose,
+             format('%I.%s(%s, %s)', opn.nspname, op.oprname, format_type(op.oprleft, NULL), format_type(op.oprright, NULL)) AS opname
         FROM unnest(fk.confkey, fk.conkey, fk.conpfeqop) WITH ORDINALITY AS k(pk, ck, eqop, n)
         JOIN pg_catalog.pg_attribute pa ON pa.attrelid = undo_referenced.relid AND pa.attnum = k.pk
         JOIN pg_catalog.pg_attribute ca ON ca.attrelid = fk.conrelid AND ca.attnum = k.ck
@@ -1634,6 +1662,10 @@ BEGIN
         JOIN pg_catalog.pg_namespace rn ON rn.oid = rt.typnamespace
        ORDER BY k.n
     LOOP
+      IF pair.loose THEN
+        RAISE EXCEPTION 'the cascading foreign key % of % compares with the operator %, which is not in pg_catalog and takes a pseudo-type; undo does not follow such a cascade',
+          quote_ident(fk.conname), fk.name, pair.opname USING ERRCODE = 'feature_not_supported';
+      END IF;
       pbase := pair.ptype;
       LOOP
         SELECT ty.typtype, ty.typbasetype INTO ttype, tbase FROM pg_catalog.pg_type ty WHERE ty.oid = pbase;
@@ -1690,10 +1722,23 @@ BEGIN
     IF row_security_active(fk.conrelid) THEN
       RAISE EXCEPTION 'row-level security on % applies to %', fk.name, current_user USING ERRCODE = 'insufficient_privilege';
     END IF;
+    kid := format('%s', fk.conrelid::pg_catalog.regclass);
     EXECUTE format('SELECT EXISTS (SELECT FROM ONLY %1$s p WHERE %2$s), '
                    'EXISTS (SELECT FROM ONLY %1$s p, %3$s%4$s x WHERE %2$s AND %5$s)',
-                   tbl, keyed, CASE WHEN fk.relkind = 'p' THEN '' ELSE 'ONLY ' END, fk.conrelid::regclass, cond)
+                   tbl, keyed, CASE WHEN fk.relkind = 'p' THEN '' ELSE 'ONLY ' END, kid, cond)
       INTO found_row, hit;
+    IF pg_catalog.to_regclass(kid) IS DISTINCT FROM fk.conrelid THEN
+      RAISE EXCEPTION 'the table with oid %, which references %, is no longer named %: its name was given to another table while it was read',
+        fk.conrelid, tbl, kid USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_catalog.pg_locks l
+                    WHERE l.locktype = 'relation'
+                      AND l.database = (SELECT d.oid FROM pg_catalog.pg_database d WHERE d.datname = current_database())
+                      AND l.relation = fk.conrelid AND l.pid = pg_backend_pid()
+                      AND l.mode = 'AccessShareLock' AND l.granted) THEN
+      RAISE EXCEPTION 'reading %, which references %, locked another table than the one with oid %: its name was given to another table while it waited for the lock',
+        kid, tbl, fk.conrelid USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
     IF row_security_active(fk.conrelid) THEN
       RAISE EXCEPTION 'row-level security on % applies to %', fk.name, current_user USING ERRCODE = 'insufficient_privilege';
     END IF;

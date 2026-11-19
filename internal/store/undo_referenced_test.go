@@ -4,6 +4,10 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // These tests pin how stet.undo decides that restoring a key would cascade
@@ -454,4 +458,272 @@ func TestUndoChecksRowLevelSecurityAfterTheProbe(t *testing.T) {
 		`parents "2" delete failed SQLSTATE 42501: row-level security on public.kids applies to `+name+` -`)
 	checkContent(t, owner, "the other party's child", "public.kids", "(10,2)")
 	checkContent(t, owner, "the parents", "public.parents", "(1,r1,1)\n(2,r2,2)")
+}
+
+// kidsInASchema creates public.parents with capture, lets the agent insert
+// the rows 2 and 3 into it, and creates two tables named kid: s.kid, whose
+// row 10 references the agent's row ref through an ON DELETE CASCADE foreign
+// key, and s2.kid, which references nothing and is empty. If partitioned,
+// both are partitioned tables with one partition, kid_1. It returns since,
+// s.kid's oid, and a reviewer that may undo the agent's rows and read both
+// kids, with a lock_timeout of 10s. Whoever swaps the two schemas' names
+// makes the name s.kid mean the empty table. stet.undo tries row 3, inserted
+// later, before row 2.
+func kidsInASchema(t *testing.T, pool *pgxpool.Pool, db string, owner *pgx.Conn, ref int, partitioned bool) (time.Time, uint32, *pgx.Conn) {
+	t.Helper()
+	keyedTable(t, owner, "parents", 1)
+	mustExec(t, owner, `create schema s`, `create schema s2`)
+	if partitioned {
+		mustExec(t, owner,
+			`create table s.kid (id int, parent int references public.parents on delete cascade) partition by range (id)`,
+			`create table s.kid_1 partition of s.kid for values from (0) to (100)`,
+			`create table s2.kid (id int, parent int) partition by range (id)`,
+			`create table s2.kid_1 partition of s2.kid for values from (0) to (100)`)
+	} else {
+		mustExec(t, owner,
+			`create table s.kid (id int primary key, parent int references public.parents on delete cascade)`,
+			`create table s2.kid (id int primary key, parent int)`)
+	}
+	since := dbClock(t, pool)
+	mustExec(t, agentIn(t, db), `insert into public.parents values (2, 'r2', 2)`, `insert into public.parents values (3, 'r3', 3)`)
+	mustExec(t, owner, fmt.Sprintf(`insert into s.kid values (10, %d)`, ref))
+	rv := undoer(t, db, "public.parents")
+	name := roleOf(t, rv)
+	grant(t, db, name, "grant usage on schema s, s2 to "+name, "grant select on all tables in schema s, s2 to "+name)
+	mustExec(t, rv, `set lock_timeout = '10s'`)
+	return since, relidOf(t, owner, "s.kid"), rv
+}
+
+// movedOn is the reason of a key whose probe named the child table with oid
+// kid as s.kid when that name no longer was its own.
+func movedOn(kid uint32) string {
+	return "SQLSTATE 55000: the table with oid " + fmt.Sprint(kid) +
+		", which references public.parents, is no longer named s.kid: its name was given to another table while it was read"
+}
+
+// The probe names the child table in SQL, and a name can be given to another
+// table while the probe waits for the child's lock. A session holds s.kid in
+// ACCESS EXCLUSIVE mode, so the probe of row 3 waits; meanwhile the session
+// swaps the two schemas' names and commits. PostgreSQL then reads the empty
+// table that s.kid now names, and the probe finds no child. stet.undo sees
+// that the name it used is no longer that of the foreign key's table, and
+// that it holds no lock on that table, and fails the key with 55000: the
+// agent's row is not deleted, so nothing cascades into the real child. Row 2,
+// probed after the swap under the child's new name, is restored.
+func TestUndoRefusesWhenItsProbeReadAnotherTable(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	owner := superuserIn(t, db)
+	setCapture(t, pool, []string{"stet_md5"}, 10000)
+	since, kid, rv := kidsInASchema(t, pool, db, owner, 3, false)
+
+	tx, err := superuserIn(t, db).Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	mustExec(t, tx, `lock table s.kid in access exclusive mode`)
+	rows, err := undoWhileWaiting(t, owner, rv, func() {
+		mustExec(t, tx, `alter schema s rename to s_old`, `alter schema s2 rename to s`)
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}, "stet_md5", since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkUndo(t, "a child table whose name was taken while the probe waited", rows,
+		`parents "2" delete restored - -`,
+		`parents "3" delete failed `+movedOn(kid)+` -`)
+	checkContent(t, owner, "the real child", "s_old.kid", "(10,3)")
+	checkContent(t, owner, "the table the name means now", "s.kid", "")
+	checkContent(t, owner, "the parents", "public.parents", "(1,r1,1)\n(3,r3,3)")
+}
+
+// The name is checked on its own, also when this transaction does hold the
+// foreign key's table. The child is a partitioned table: the probe of row 3
+// resolves s.kid, locks it, and then waits for its partition, which a session
+// holds in ACCESS EXCLUSIVE mode. That session swaps the schemas' names and
+// commits. The probe has read the real child and the transaction holds its
+// lock, but s.kid now names another table: the key is failed with 55000 and
+// nothing is written.
+func TestUndoRefusesWhenTheProbedNameMovedOn(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	owner := superuserIn(t, db)
+	setCapture(t, pool, []string{"stet_md5"}, 10000)
+	since, kid, rv := kidsInASchema(t, pool, db, owner, 3, true)
+
+	tx, err := superuserIn(t, db).Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	mustExec(t, tx, `lock table s.kid_1 in access exclusive mode`)
+	rows, err := undoWhileWaiting(t, owner, rv, func() {
+		if n := countOf(t, owner, `select count(*) from pg_locks where pid = $1 and relation = $2 and granted`,
+			int64(rv.PgConn().PID()), kid); n == 0 {
+			t.Errorf("the probe waits without holding s.kid")
+		}
+		mustExec(t, tx, `alter schema s rename to s_old`, `alter schema s2 rename to s`)
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}, "stet_md5", since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkUndo(t, "a child table whose name moved on while the probe read it", rows,
+		`parents "2" delete restored - -`,
+		`parents "3" delete failed `+movedOn(kid)+` -`)
+	checkContent(t, owner, "the real child", "s_old.kid", "(10,3)")
+	checkContent(t, owner, "the parents", "public.parents", "(1,r1,1)\n(3,r3,3)")
+}
+
+// The lock is checked as well as the name, for the name can come back. The
+// probe of row 3 waits for s.kid, which one session holds; that session swaps
+// the schemas' names and commits, and PostgreSQL lets the real child go and
+// takes the table the name now means. The probe then waits for that table's
+// partition, which a second session holds; that session swaps the names back
+// and commits. The probe reads the empty table and finds no child, and s.kid
+// is the real child's name again. But this transaction does not hold the real
+// child: the key is failed with 55000 and nothing cascades into it.
+func TestUndoRefusesWhenTheNameCameBackAfterTheProbe(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	owner := superuserIn(t, db)
+	setCapture(t, pool, []string{"stet_md5"}, 10000)
+	since, kid, rv := kidsInASchema(t, pool, db, owner, 3, true)
+	decoyPart := relidOf(t, owner, "s2.kid_1")
+
+	first, err := superuserIn(t, db).Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Rollback(ctx)
+	mustExec(t, first, `lock table s.kid in access exclusive mode`)
+	second, err := superuserIn(t, db).Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Rollback(ctx)
+	mustExec(t, second, `lock table s2.kid_1 in access exclusive mode`)
+
+	rows, err := undoWhileWaiting(t, owner, rv, func() {
+		mustExec(t, first, `alter schema s rename to s_old`, `alter schema s2 rename to s`)
+		if err := first.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		// The probe now reads the other table, and waits for its partition.
+		deadline := time.Now().Add(5 * time.Second)
+		for countOf(t, owner, `select count(*) from pg_locks where pid = $1 and relation = $2 and not granted`,
+			int64(rv.PgConn().PID()), decoyPart) == 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("the probe did not wait for the partition of the table s.kid now names")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		mustExec(t, second, `alter schema s rename to s2`, `alter schema s_old rename to s`)
+		if err := second.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}, "stet_md5", since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkUndo(t, "a child table whose name went and came back while the probe read another", rows,
+		`parents "2" delete restored - -`,
+		`parents "3" delete failed SQLSTATE 55000: reading s.kid, which references public.parents, locked another table than the one with oid `+
+			fmt.Sprint(kid)+`: its name was given to another table while it waited for the lock -`)
+	checkContent(t, owner, "the real child", "s.kid", "(10,3)")
+	checkContent(t, owner, "the parents", "public.parents", "(1,r1,1)\n(3,r3,3)")
+}
+
+// An earlier key of the same undo has probed the real child, so this
+// transaction holds its lock, when the schemas' names are swapped. Row 3 has
+// no child and is restored; the undo then waits for row 2, which a session
+// holds; that session swaps the names, commits, and lets the row go. A
+// transaction that holds the child's lock never waits for it again, so
+// nothing can be made to happen between the name row 2's probe writes and
+// its use: the probe names the child as it is called now, finds the child
+// row and skips the key. Nothing cascades into the real child.
+func TestUndoProbesTheRealChildAfterAnEarlierKeyLockedIt(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	owner := superuserIn(t, db)
+	setCapture(t, pool, []string{"stet_md5"}, 10000)
+	since, kid, rv := kidsInASchema(t, pool, db, owner, 2, false)
+
+	tx, err := superuserIn(t, db).Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	mustExec(t, tx, `select from public.parents where id = 2 for update`)
+	rows, err := undoWhileWaiting(t, owner, rv, func() {
+		if n := countOf(t, owner, `select count(*) from pg_locks where pid = $1 and relation = $2 and granted`,
+			int64(rv.PgConn().PID()), kid); n == 0 {
+			t.Errorf("the undo waits for row 2 without holding s.kid from row 3's probe")
+		}
+		mustExec(t, owner, `alter schema s rename to s_old`, `alter schema s2 rename to s`)
+		if err := tx.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}, "stet_md5", since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkUndo(t, "names swapped after an earlier key locked the child", rows,
+		`parents "2" - skipped referenced: s_old.kid -`,
+		`parents "3" delete restored - -`)
+	checkContent(t, owner, "the real child", "s_old.kid", "(10,2)")
+	checkContent(t, owner, "the parents", "public.parents", "(1,r1,1)\n(2,r2,2)")
+}
+
+// A foreign key whose equality operator is not PostgreSQL's own and is
+// declared on a pseudo-type is not followed. Casting an operand to anyarray
+// leaves it the type it is, so OPERATOR(ext.=) between two int[] columns
+// would rather be an operator ext.=(int[], int[]) than the constraint's
+// ext.=(anyarray, anyarray): whoever may create in that schema could have
+// the probe run its function as the reviewer and answer that there is no
+// child. The key whose restore would fire such a foreign key is failed with
+// 0A000, child or no child, and the agent's function never runs.
+func TestUndoRefusesACascadeThroughAPseudoTypeOperator(t *testing.T) {
+	pool, db := captureDB(t)
+	owner := superuserIn(t, db)
+	setCapture(t, pool, []string{"stet_md5"}, 10000)
+	mustExec(t, owner,
+		`create schema ext`,
+		`grant usage, create on schema ext to stet_md5`,
+		`create operator ext.= (leftarg = anyarray, rightarg = anyarray, function = pg_catalog.array_eq, commutator = operator(ext.=))`,
+		`create operator class ext.array_ops for type anyarray using btree as
+			operator 1 pg_catalog.<(anyarray, anyarray), operator 2 pg_catalog.<=(anyarray, anyarray),
+			operator 3 ext.=(anyarray, anyarray),
+			operator 4 pg_catalog.>=(anyarray, anyarray), operator 5 pg_catalog.>(anyarray, anyarray),
+			function 1 pg_catalog.btarraycmp(anyarray, anyarray)`,
+		`create table public.ap (id int primary key, tags int[])`,
+		`create unique index ap_tags on public.ap (tags ext.array_ops)`,
+		`create table public.ac (id int primary key, tags int[] references public.ap (tags) on delete cascade)`,
+		`create table public.calls (who text)`)
+	installCapture(t, owner, "public.ap", "ap", "id")
+	since := dbClock(t, pool)
+	agent := agentIn(t, db)
+	mustExec(t, agent, `insert into public.ap values (1, '{1,2}')`, `insert into public.ap values (2, '{3}')`)
+	mustExec(t, writerIn(t, db, "public.ac"), `insert into public.ac values (10, '{1,2}')`)
+	mustExec(t, agent,
+		`create function ext.agent_eq(int[], int[]) returns boolean language plpgsql
+		 as $$ begin insert into public.calls values (current_user); return false; end $$`,
+		`create operator ext.= (leftarg = int[], rightarg = int[], function = ext.agent_eq)`)
+
+	rv := undoer(t, db, "public.ap")
+	name := roleOf(t, rv)
+	grant(t, db, name, "grant usage on schema ext to "+name, "grant select on public.ac to "+name, "grant insert on public.calls to "+name)
+	const refused = `SQLSTATE 0A000: the cascading foreign key ac_tags_fkey of public.ac compares with the operator ` +
+		`ext.=(anyarray, anyarray), which is not in pg_catalog and takes a pseudo-type; undo does not follow such a cascade`
+	checkUndo(t, "a pseudo-type operator outside pg_catalog", undoOf(t, rv, "stet_md5", since),
+		`ap "1" delete failed `+refused+` -`,
+		`ap "2" delete failed `+refused+` -`)
+	checkContent(t, owner, "the other party's child", "public.ac", "(10,\"{1,2}\")")
+	checkContent(t, owner, "the agent's rows", "public.ap", "(1,\"{1,2}\")\n(2,{3})")
+	checkContent(t, owner, "the calls of the agent's operator", "public.calls", "")
 }

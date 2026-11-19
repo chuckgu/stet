@@ -191,19 +191,58 @@ func TestPlanSkipsAKeyThatIsNotUnique(t *testing.T) {
 }
 
 // An UPDATE that changed a row's key leaves its old key and its new key
-// key_changed. A row of the same statement whose key stayed is restored.
+// key_changed, and with them every other key of that statement: a row whose
+// key stayed may hold what another row of the statement held, as below, and
+// restoring it alone would lose that. An UPDATE that changed no key is
+// restored as before.
 func TestPlanSkipsAKeyChange(t *testing.T) {
 	pool, db := captureDB(t)
 	owner := superuserIn(t, db)
 	setCapture(t, pool, []string{"stet_md5"}, 10000)
-	keyedTable(t, owner, "deals", 2)
+	keyedTable(t, owner, "deals", 3)
 	since := dbClock(t, pool)
-	mustExec(t, agentIn(t, db), `update public.deals set id = case id when 1 then 101 else id end, note = note || '!' where id in (1, 2)`)
+	mustExec(t, agentIn(t, db),
+		`update public.deals set id = case id when 1 then 101 else id end, note = note || '!' where id in (1, 2)`,
+		`update public.deals set note = note || '?' where id = 3`)
 
 	checkShownInAnyOrder(t, "a key change", planOf(t, undoReviewer(t, db, "public.deals"), "stet_md5", since),
 		`deals "1" - skipped key_changed -`,
 		`deals "101" - skipped key_changed -`,
-		`deals "2" update would_restore - -`)
+		`deals "2" - skipped key_changed -`,
+		`deals "3" update would_restore - -`)
+}
+
+// An UPDATE that shifts every key by one, over (1, A) and (2, B), leaves key
+// 2 with a row before and a row after, as if one row had changed: the row
+// that was (2, B) is now (3, B), and (2, A) is the row that was (1, A).
+// Putting key 2 back to (2, B) alone would leave B twice and A nowhere. The
+// plan and the undo skip all three keys as key_changed and the table stays as
+// the agent left it.
+func TestUndoSkipsEveryKeyOfAnUpdateThatShiftedKeys(t *testing.T) {
+	pool, db := captureDB(t)
+	owner := superuserIn(t, db)
+	setCapture(t, pool, []string{"stet_md5"}, 10000)
+	// Row 2 is stored first, so that the UPDATE moves it out of the way before
+	// row 1 takes its key.
+	mustExec(t, owner,
+		`create table public.shifted (id int primary key, v text)`,
+		`insert into public.shifted values (2, 'B')`,
+		`insert into public.shifted values (1, 'A')`)
+	installCapture(t, owner, "public.shifted", "shifted", "id")
+	since := dbClock(t, pool)
+	mustExec(t, agentIn(t, db), `update public.shifted set id = id + 1`)
+	const left = "(2,A)\n(3,B)"
+	checkContent(t, owner, "after the agent's update", "public.shifted", left)
+
+	rv := undoer(t, db, "public.shifted")
+	want := []string{
+		`shifted "1" - skipped key_changed -`,
+		`shifted "2" - skipped key_changed -`,
+		`shifted "3" - skipped key_changed -`,
+	}
+	checkShownInAnyOrder(t, "the plan of a shift of keys", planOf(t, rv, "stet_md5", since), slices.Clone(want)...)
+	checkShownInAnyOrder(t, "the undo of a shift of keys", undoOf(t, rv, "stet_md5", since), want...)
+	checkContent(t, owner, "after the undo", "public.shifted", left)
 }
 
 // A change that no longer fits its table is not restored: columns_changed
