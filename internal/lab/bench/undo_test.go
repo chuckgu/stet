@@ -202,7 +202,9 @@ func TestUndoCheckOnASmallStream(t *testing.T) {
 	if got := res.Unexplained(); got != 1 {
 		t.Errorf("%d rows differ with no reason the system reported, want 1 (the owner's write)", got)
 	}
-	for _, want := range []string{"UNEXPLAINED", "unexplained rows: 1\n", "result: FAIL\n"} {
+	for _, want := range []string{"UNEXPLAINED", "unexplained rows: 1\n", "result: FAIL\n",
+		"  lines accepted as reported that may depend on the undo order, on rows not equal: 4\n",
+		"    public.deal_notes 2 missing: " + n.Role(tasks.RoleX) + ": failed SQLSTATE 23503: "} {
 		if !strings.Contains(text.String(), want) {
 			t.Errorf("the text does not say %q", want)
 		}

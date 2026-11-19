@@ -39,19 +39,27 @@ func TestExplainerAcceptsOnlyEvidenceOfWhatWasNotUndone(t *testing.T) {
 		reason     string // "" is unexplained
 		detail     string // a part of the detail
 		once       string // a part of the detail that is there once
+		reported   int    // lines accepted as reported that may depend on the undo order (failed 23503, 23505, 0A000; referenced)
 	}{
 		{name: "a table that is not captured", table: accounts, reason: "table not captured"},
 
 		// Lines that are evidence by themselves.
 		{name: "failed", order: []string{"a"}, changes: []change{{"a", 1}},
 			lines:  []line{{agent: "a", outcome: "failed", reason: "SQLSTATE 23503: insert or update on table \"deal_notes\" violates foreign key constraint \"f\""}},
-			reason: "a: failed SQLSTATE 23503", detail: `a: failed SQLSTATE 23503: insert or update on table "deal_notes"`},
+			reason: "a: failed SQLSTATE 23503", detail: `a: failed SQLSTATE 23503: insert or update on table "deal_notes"`,
+			reported: 1},
+		{name: "failed 0A000", order: []string{"a"}, changes: []change{{"a", 1}},
+			lines:  []line{{agent: "a", outcome: "failed", reason: "SQLSTATE 0A000: the foreign key pairs columns of different types"}},
+			reason: "a: failed SQLSTATE 0A000", reported: 1},
+		{name: "failed for another reason", order: []string{"a"}, changes: []change{{"a", 1}},
+			lines:  []line{{agent: "a", outcome: "failed", reason: "SQLSTATE 22P02: invalid input syntax"}},
+			reason: "a: failed SQLSTATE 22P02"},
 		{name: "restored_differs", order: []string{"a"}, changes: []change{{"a", 1}},
 			lines:  []line{{agent: "a", outcome: "restored_differs"}},
 			reason: "a: restored_differs"},
 		{name: "referenced", order: []string{"a"}, changes: []change{{"a", 1}},
 			lines:  []line{{agent: "a", outcome: "skipped", reason: "referenced: public.deal_notes"}},
-			reason: "a: skipped referenced", detail: "referenced: public.deal_notes"},
+			reason: "a: skipped referenced", detail: "referenced: public.deal_notes", reported: 1},
 		{name: "key_changed", order: []string{"a"}, changes: []change{{"a", 1}},
 			lines:  []line{{agent: "a", outcome: "skipped", reason: "key_changed"}},
 			reason: "a: skipped key_changed"},
@@ -72,7 +80,7 @@ func TestExplainerAcceptsOnlyEvidenceOfWhatWasNotUndone(t *testing.T) {
 		{name: "changed_since, the later change's agent failed to restore it", order: []string{"b", "a"},
 			changes: []change{{"a", 1}, {"b", 2}},
 			lines:   []line{{agent: "a", outcome: "skipped", reason: "changed_since"}, {agent: "b", outcome: "failed", reason: "SQLSTATE 23505: duplicate key"}},
-			reason:  "a: skipped changed_since; b: failed SQLSTATE 23505"},
+			reason:  "a: skipped changed_since; b: failed SQLSTATE 23505", reported: 1},
 		{name: "changed_since, the later change's agent made no net change", order: []string{"b", "a"},
 			changes: []change{{"a", 1}, {"b", 2}},
 			lines:   []line{{agent: "a", outcome: "skipped", reason: "changed_since"}, {agent: "b", outcome: "skipped", reason: "no_net_change"}}},
@@ -110,10 +118,38 @@ func TestExplainerAcceptsOnlyEvidenceOfWhatWasNotUndone(t *testing.T) {
 		{name: "interleaved, nothing between", order: []string{"a"},
 			changes: []change{{"a", 1}, {"a", 3}}, markers: []marker{{"b", "too_many_rows", at(4)}},
 			lines: []line{{agent: "a", outcome: "skipped", reason: "interleaved"}}},
+		{name: "interleaved, a statement of a role that is not captured", order: []string{"a"},
+			changes: []change{{"a", 1}, {"a", 3}}, uncaptured: []string{"crm_owner"},
+			lines:  []line{{agent: "a", outcome: "skipped", reason: "interleaved"}},
+			reason: "a: skipped interleaved", detail: "crm_owner"},
+
+		// What stet.undo returns must match the history: a decision for every key an agent changed (a line of the
+		// key, or a line without a key that withholds the table), and a captured change behind every line.
+		{name: "a table withheld from the undo of the agent that changed the key", order: []string{"a"},
+			changes: []change{{"a", 1}},
+			lines:   []line{{agent: "a", outcome: "skipped", reason: "SQLSTATE 42501: permission denied for table contacts", keyless: true}},
+			reason:  "a: skipped SQLSTATE 42501", detail: "permission denied for table contacts"},
+		{name: "changed_since, the later change's table withheld from its agent's undo", order: []string{"b", "a"},
+			changes: []change{{"a", 1}, {"b", 2}},
+			lines: []line{{agent: "a", outcome: "skipped", reason: "changed_since"},
+				{agent: "b", outcome: "skipped", reason: "table_gone", keyless: true}},
+			reason: "a: skipped changed_since; b: skipped table_gone", detail: "b's later change"},
+		{name: "a captured change its agent's undo returned no line for", order: []string{"x", "sync"},
+			changes: []change{{"sync", 1}, {"x", 2}},
+			lines:   []line{{agent: "sync", outcome: "skipped", reason: "changed_since"}},
+			detail:  "a captured change of x that its undo returned no line for"},
+		{name: "captured changes and no line at all, after a set without values", order: []string{"a"},
+			changes: []change{{"a", 2}}, markers: []marker{{"b", "too_many_rows", at(1)}},
+			detail: "a captured change of a that its undo returned no line for"},
+		{name: "a line with no captured change behind it", order: []string{"a"},
+			markers: []marker{{"b", "too_many_rows", at(5)}},
+			lines:   []line{{agent: "a", outcome: "skipped", reason: "changed_since"}},
+			detail:  "the history holds no captured change of the key by a"},
 
 		// Lines that say nothing is left to undo.
 		{name: "no_net_change", order: []string{"a"}, changes: []change{{"a", 1}},
-			lines: []line{{agent: "a", outcome: "skipped", reason: "no_net_change"}}},
+			lines:  []line{{agent: "a", outcome: "skipped", reason: "no_net_change"}},
+			detail: "its lines say nothing is left to undo"},
 		{name: "no_net_change after a set without values", order: []string{"a"}, changes: []change{{"a", 1}},
 			markers: []marker{{"b", "too_many_rows", at(0.5)}},
 			lines:   []line{{agent: "a", outcome: "skipped", reason: "no_net_change"}},
@@ -124,7 +160,8 @@ func TestExplainerAcceptsOnlyEvidenceOfWhatWasNotUndone(t *testing.T) {
 			reason:  "b: not_captured too_many_rows"},
 		{name: "restored, a set without values only after", order: []string{"a"}, changes: []change{{"a", 1}},
 			markers: []marker{{"b", "too_many_rows", at(2)}},
-			lines:   []line{{agent: "a", outcome: "restored"}}},
+			lines:   []line{{agent: "a", outcome: "restored"}},
+			detail:  "its lines say nothing is left to undo"},
 		{name: "restored, a role that is not captured", order: []string{"a"}, changes: []change{{"a", 1}},
 			uncaptured: []string{"crm_owner"}, lines: []line{{agent: "a", outcome: "restored"}},
 			reason: "changed by a role not captured (crm_owner)"},
@@ -135,9 +172,9 @@ func TestExplainerAcceptsOnlyEvidenceOfWhatWasNotUndone(t *testing.T) {
 			lines:   []line{{agent: "b", outcome: "not_captured", reason: "too_many_rows", keyless: true}},
 			reason:  "b: not_captured too_many_rows", detail: "b: not_captured too_many_rows at 2026-11-19T05:00:09Z",
 			once: "not_captured too_many_rows"},
-		{name: "no change, a line without a key for the table", order: []string{"a"},
+		{name: "no change, only a table withheld from the undo of an agent that did not change the key", order: []string{"a"},
 			lines:  []line{{agent: "a", outcome: "skipped", reason: "SQLSTATE 42501: permission denied for table contacts", keyless: true}},
-			reason: "a: skipped SQLSTATE 42501"},
+			detail: "no captured change of the key"},
 		{name: "no change, a role that is not captured", uncaptured: []string{"crm_owner"},
 			reason: "changed by a role not captured (crm_owner)"},
 		{name: "no change, nothing", detail: "no captured change"},
@@ -179,6 +216,9 @@ func TestExplainerAcceptsOnlyEvidenceOfWhatWasNotUndone(t *testing.T) {
 			}
 			if got.detail == "" || !strings.Contains(got.detail, c.detail) {
 				t.Errorf("detail %q, want one containing %q", got.detail, c.detail)
+			}
+			if len(got.asReported) != c.reported {
+				t.Errorf("lines accepted as reported %q, want %d", got.asReported, c.reported)
 			}
 			if c.once != "" && strings.Count(got.detail, c.once) != 1 {
 				t.Errorf("detail %q, want %q in it once", got.detail, c.once)

@@ -118,6 +118,10 @@ type RowDiff struct {
 	// "" when nothing does. Detail is the whole text: the lines, the evidence that what they say was left undone,
 	// or, for a row unexplained, what is missing.
 	Reason, Detail string
+	// AsReported are the lines among those that account for the row which the check takes as stet.undo reported
+	// them although another order of undoing the agents might have restored the key (failed 23503, 23505, 0A000,
+	// skipped referenced), each "agent: outcome reason".
+	AsReported []string
 }
 
 // PathResult says whether the rows the statements of one X path changed came back.
@@ -301,6 +305,18 @@ func (r UndoResult) Write(w io.Writer) error {
 					p("        e.g. %s: %s", examples[reason][0].Key, examples[reason][0].Detail)
 				}
 			}
+		}
+		var asReported []string
+		for _, t := range c.Tables {
+			for _, d := range t.Diffs {
+				for _, l := range d.AsReported {
+					asReported = append(asReported, fmt.Sprintf("    %s %s %s: %s", t.Table, d.Key, d.Kind, l))
+				}
+			}
+		}
+		if len(asReported) > 0 {
+			p("  lines accepted as reported that may depend on the undo order, on rows not equal: %d", len(asReported))
+			b.WriteString(strings.Join(asReported, "\n") + "\n")
 		}
 		p("  unexplained rows: %d", c.Unexplained())
 		for _, t := range c.Tables {
