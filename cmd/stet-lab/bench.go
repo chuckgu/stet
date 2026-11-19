@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/stetdb/stet/internal/config"
 	"github.com/stetdb/stet/internal/lab/bench"
 	"github.com/stetdb/stet/internal/lab/crm"
 	"github.com/stetdb/stet/internal/lab/tasks"
@@ -61,6 +62,14 @@ commands:
             -out <file>)
   stet-config  write the frozen Stet config with only its upstream's database replaced, to a new file
            (-database <db> [-in lab/bench/stet.yaml] -out <file>)
+  undo-check  check undo end to end (spec-v0.2-undo 10): clone the template, install capture on the tables of
+           -config and those they cascade into as stet undo-sql prints it, send the V and X sets as the none arm
+           does, undo each agent's changes as the tables' owner, compare every table with what it held before,
+           and print the result; fails when a row differs with no reason the system reported. An attack that
+           breaks the database gets the rest a fresh clone, after its own is undone and compared. The clones
+           are dropped at the end unless -keep; -fast sends without the none arm's rate and pauses
+           ([-practice] [-name crm_undo_check] [-config lab/bench/stet.yaml] [-max-rows 10000]
+            [-paths s5.call,s5.view] [-keep] [-fast])
 `
 
 // benchEpoch is the date the benchmark's data is generated relative to.
@@ -98,6 +107,8 @@ func runBench(args []string) error {
 		return benchHoopConfig(args[1:])
 	case "stet-config":
 		return benchStetConfig(args[1:])
+	case "undo-check":
+		return benchUndoCheck(args[1:])
 	}
 	fmt.Fprint(os.Stderr, benchUsage)
 	os.Exit(2)
@@ -917,6 +928,66 @@ func benchStetConfig(args []string) error {
 	}
 	if *out != "-" && *out != "/dev/stdout" {
 		fmt.Fprintf(os.Stderr, "bench stet-config: wrote %s\n", *out)
+	}
+	return nil
+}
+
+// benchUndoCheck runs bench.CheckUndo (docs/spec-v0.2-undo.md 10) on clones of the template, named -name, -name_2,
+// and so on, with the benchmark's roles as they are, and prints the result. The tables to capture are the gated
+// tables of -config, each with its key column. It calls no model and reads no key. It fails when the check could
+// not finish, and when a row differs with no reason the system reported.
+func benchUndoCheck(args []string) error {
+	fs := flag.NewFlagSet("bench undo-check", flag.ExitOnError)
+	f := newBenchFlags(fs)
+	name := fs.String("name", "crm_undo_check", "the first clone, which must not exist; the n-th is <name>_n")
+	cfgPath := fs.String("config", "lab/bench/stet.yaml", "the Stet config whose tables are the gated tables to capture")
+	maxRows := fs.Int64("max-rows", 10000, "capture's cap on the rows of one statement (undo.max_rows; Stet's default is 10000)")
+	pathList := fs.String("paths", "s5.call,s5.view", "the X paths whose changed rows are followed, comma-separated")
+	keep := fs.Bool("keep", false, "keep the clones (drop them with bench drop -name)")
+	fast := fs.Bool("fast", false, "send with no rate limit and no pauses, unlike the none arm (to check the tools)")
+	fs.Parse(args)
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return fmt.Errorf("bench undo-check: %w", err)
+	}
+	tables := map[string]string{}
+	for key, t := range cfg.Tables {
+		tables[key] = t.PK
+	}
+	var paths []string
+	for _, p := range strings.Split(*pathList, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			paths = append(paths, p)
+		}
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	o := bench.DefaultOptions("none")
+	o.Sleep = func(d time.Duration) { // the pause before a split bundle ends early on an interrupt
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+		case <-timer.C:
+		}
+	}
+	if *fast {
+		o.PerSecond, o.Sleep = 0, func(time.Duration) {}
+	}
+	res, err := bench.CheckUndo(ctx, bench.UndoCheck{Admin: f.admin(), Names: bench.Names{},
+		Template: bench.Template(*f.practice), Database: *name, Tables: tables, MaxRows: *maxRows, Options: o,
+		Paths: paths, Keep: *keep, Progress: func(line string) { fmt.Fprintln(os.Stderr, line) }})
+	if len(res.Clones) > 0 {
+		if werr := res.Write(os.Stdout); werr != nil {
+			return errors.Join(err, werr)
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("bench undo-check: %w", err)
+	}
+	if n := res.Unexplained(); n > 0 {
+		return fmt.Errorf("bench undo-check: %d rows differ with no reason the system reported", n)
 	}
 	return nil
 }
