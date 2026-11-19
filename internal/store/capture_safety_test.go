@@ -127,7 +127,7 @@ func TestCaptureFailureWhileReadingSettings(t *testing.T) {
 // A failure before the count, reading stet.capture_settings, still leaves
 // one capture_failed set when the agent has set stet.captures at or near the
 // cap or past it: the failure path counts the transaction's own sets, and
-// capture reads nothing the agent sets (ruling R7).
+// capture reads nothing the agent sets (spec 4, the cap of one transaction).
 func TestCaptureFailureIgnoresTheAgentsCounter(t *testing.T) {
 	pool, db := captureDB(t)
 	ctx := context.Background()
@@ -717,7 +717,7 @@ func TestCaptureCountFollowsSavepoints(t *testing.T) {
 	checkTransactions(t, pool, "items", want)
 }
 
-// stet.captures, the setting capture counted in before ruling R7, means
+// stet.captures, a setting capture once counted in, means
 // nothing to it now. A session that sets it, to any value, before its
 // transaction or in the middle of it, leaves the same records as one that
 // never did: values for 31 writes, too_many_statements for the 32nd, nothing
@@ -797,7 +797,7 @@ func otherRole(t *testing.T, database string) string {
 }
 
 // Nothing the agent can set in its session breaks capture or changes whose
-// write it is: stet.captures, which capture no longer reads (ruling R7; see
+// write it is: stet.captures, which capture no longer reads (see
 // TestCaptureIgnoresStetCaptures for every value), a held write that is not a
 // uuid. Each write succeeds and leaves its values. A write after SET ROLE is
 // still stet_md5's.
@@ -1079,7 +1079,7 @@ func twoSessions(t *testing.T, pool *pgxpool.Pool, db, prefix, isolation string,
 // Under SERIALIZABLE, capture's own reads and writes of Stet's tables
 // conflict across sessions: two agent sessions, each writing its own captured
 // table, make one of them fail with 40001. Capture does not swallow that
-// (ruling R8): a write that capture could not record because of it fails, and
+// (spec 4): a write that capture could not record because of it fails, and
 // is retried, instead of committing with no set and no marker. Both orders,
 // for captures that record values and for captures that record only a marker
 // (max_rows 0). READ COMMITTED sessions do the same and are unaffected: every
@@ -1216,7 +1216,7 @@ func noStackToRecord(t *testing.T, pool *pgxpool.Pool, db string) {
 
 // The count takes only this backend's sets of this transaction id. Sets with
 // the same txid from another cluster (restored by pg_dump or replicated) are
-// not this transaction's (ruling R9).
+// not this transaction's (spec 4, the cap of one transaction).
 func TestCaptureCountsOnlyThisBackendsSets(t *testing.T) {
 	pool, db := captureDB(t)
 	ctx := context.Background()

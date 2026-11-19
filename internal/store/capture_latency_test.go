@@ -32,7 +32,7 @@ func (d tripTimes) p95() time.Duration { return d[int(0.95*float64(len(d)-1))] }
 // capture's triggers by a session that is not captured, and on a table with
 // them by the agent, whose write is captured. Load on the server (other
 // packages' tests) only ever adds time, so the test measures up to three
-// rounds and passes when one is within the bound (ruling R5); it logs each.
+// rounds and passes when one is within the bound; it logs each.
 func TestCaptureAddsUnderAMillisecond(t *testing.T) {
 	if testing.Short() {
 		t.Skip("latency measurement skipped in -short mode")

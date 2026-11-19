@@ -386,6 +386,46 @@ func TestGuardTriggersIgnoreTheCallersSearchPath(t *testing.T) {
 	}
 }
 
+// The trigger functions that guard Stet's tables are not PUBLIC's to execute,
+// and the triggers fire all the same for a role that may write the tables but
+// not execute the functions: PostgreSQL asks for EXECUTE when a trigger is
+// created, not when it fires. Such a role labels a decision, and its other
+// changes are refused with ST004.
+func TestGuardTriggersFireForARoleWithoutExecute(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	s := store.New(pool)
+	d := sample(uniqueTable(t))
+	if err := s.Insert(ctx, d); err != nil {
+		t.Fatal(err)
+	}
+	h := insertHeld(t, s, pool)
+	name := loginRole(t, "labeller")
+	grant(t, db, name, "grant usage on schema stet to "+name,
+		"grant select, update on stet.decisions, stet.held_writes to "+name)
+	conn := connectAs(t, db, name)
+	for _, f := range []string{"stet.decisions_append_only()", "stet.held_writes_guard()"} {
+		var may bool
+		if err := conn.QueryRow(ctx, `select has_function_privilege($1, 'execute')`, f).Scan(&may); err != nil {
+			t.Fatal(err)
+		}
+		if may {
+			t.Errorf("%s may execute %s", name, f)
+		}
+	}
+	if _, err := conn.Exec(ctx, `update stet.decisions set label = 'correct', label_by = 'qa', labeled_at = now() where id = $1`, d.ID); err != nil {
+		t.Errorf("labeling by a role without EXECUTE on the trigger function: %v", err)
+	}
+	for _, c := range []struct{ sql, id string }{
+		{`update stet.decisions set verdict = 'hold' where id = $1`, d.ID},
+		{`update stet.held_writes set statement = 'select 1' where id = $1`, h.ID},
+		{`update stet.held_writes set status = 'applied' where id = $1`, h.ID},
+	} {
+		_, err := conn.Exec(ctx, c.sql, c.id)
+		wantCode(t, err, "ST004", c.sql)
+	}
+}
+
 // status moves only along the arrows of spec 3; an update that keeps it
 // passes, and a row in any status can be deleted.
 func TestHeldWritesStatusFollowsTheArrows(t *testing.T) {

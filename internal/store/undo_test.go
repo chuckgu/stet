@@ -369,7 +369,7 @@ func undoWhileWaiting(t *testing.T, su, rv *pgx.Conn, then func(), role string, 
 // the key is restored. A reviewer's lock_timeout makes such a key failed and
 // the others are restored; a statement_timeout is not caught, and the call
 // fails as a whole. A transaction that is not READ COMMITTED is refused
-// (plan ruling R15) and nothing changes.
+// (spec 7) and nothing changes.
 func TestUndoWaitsForAConcurrentChangeAndSkips(t *testing.T) {
 	pool, db := captureDB(t)
 	ctx := context.Background()
@@ -843,7 +843,7 @@ func TestUndoReportsWhenTheRowDiffers(t *testing.T) {
 }
 
 // An update is put back by setting only the columns whose value differs
-// between the row now and the row before (plan correction U3): the owner's
+// between the row now and the row before (spec 7): the owner's
 // trigger on a column the agent did not change does not fire, and a column the
 // reviewer may not update but the agent did not change is not touched.
 func TestUndoSetsOnlyTheColumnsThatDiffer(t *testing.T) {
@@ -1259,7 +1259,7 @@ func TestUndoTwice(t *testing.T) {
 // table whose foreign key would cascade from the row it deletes, or from
 // which row-level security would hide such rows (the cascade itself would not
 // be hidden from them). A table it cannot read at all shows as one line,
-// skipped (plan ruling R11).
+// skipped (spec 7).
 func TestUndoNeedsRightsOnTheTable(t *testing.T) {
 	pool, db := captureDB(t)
 	owner := superuserIn(t, db)
@@ -1322,7 +1322,21 @@ func TestUndoGrantsAreSeparate(t *testing.T) {
 	if len(functions) < len(planFunctions)+11 {
 		t.Fatalf("the catalog has %d undo functions: %v", len(functions), functions)
 	}
-	for _, f := range functions {
+	// No function of the stet schema is PUBLIC's to execute: not the undo
+	// functions, and not capture, approve, reject or the trigger functions
+	// that guard Stet's tables.
+	rows, err := owner.Query(ctx, `select p.oid::regprocedure::text from pg_proc p where p.pronamespace = 'stet'::regnamespace order by 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) < len(functions)+6 {
+		t.Fatalf("the stet schema has %d functions: %v", len(all), all)
+	}
+	for _, f := range all {
 		var public bool
 		if err := owner.QueryRow(ctx, `select has_function_privilege('public', $1, 'execute')`, f).Scan(&public); err != nil {
 			t.Fatal(err)
@@ -1344,7 +1358,7 @@ func TestUndoGrantsAreSeparate(t *testing.T) {
 
 	planner := undoReviewer(t, db, "public.deals")
 	grant(t, db, roleOf(t, planner), "grant insert, update, delete on public.deals to "+roleOf(t, planner))
-	_, err := tryUndo(planner, "stet_md5", since)
+	_, err = tryUndo(planner, "stet_md5", since)
 	wantCode(t, err, "42501", "a role granted the plan's functions calling stet.undo")
 	_, err = planner.Exec(ctx, `select stet.undo_record('stet_md5', $1, null, null, null, '[]')`, since)
 	wantCode(t, err, "42501", "a role granted the plan's functions calling stet.undo_record")
@@ -1452,7 +1466,7 @@ func TestUndoRecordTakesOnlyItsOwnItems(t *testing.T) {
 	}
 }
 
-// The refusals of spec 7 and plan ruling R15 are ST006, and nothing is
+// The refusals of spec 7 are ST006, and nothing is
 // recorded: no agent_role, no since, until not after since, the reviewer's
 // own writes, and a transaction that is not READ COMMITTED.
 func TestUndoRefusals(t *testing.T) {

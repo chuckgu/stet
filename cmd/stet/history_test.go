@@ -19,7 +19,7 @@ import (
 // captureOn installs the four capture triggers of spec-v0.2-undo 4 on table,
 // as its owner (owner's role) does with what stet undo-sql prints: key is the
 // table's key in the configuration, pk its key column. The transition tables
-// are named stet_old and stet_new (plan ruling U11).
+// are named stet_old and stet_new (spec 4).
 func captureOn(t *testing.T, owner *pgx.Conn, table, key, pk string) {
 	t.Helper()
 	call := fmt.Sprintf("execute function stet.capture('%s', '%s')", key, pk)
@@ -288,7 +288,7 @@ func TestWriteThroughAFunctionIsNotLinked(t *testing.T) {
 // Two writes of the same text under one Sync (a pgx batch) are not linked:
 // the proxy reports both once the Sync is answered, so each decision's window
 // holds the other's statement, and a change matched by two decisions is
-// linked to neither, whatever rows they wrote (plan ruling U16). Each change
+// linked to neither, whatever rows they wrote (spec 5). Each change
 // shows 2 candidates and no decision, for different rows and for the same
 // row. The test counts the matching decisions itself, from what the decisions
 // and capture recorded: only if the second write reached the gate more than

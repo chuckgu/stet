@@ -204,7 +204,7 @@ func runAs(t *testing.T, db string, s section, passwords map[string]string) {
 	}
 }
 
-// installByHand creates the four triggers of ruling U11 on table (its name
+// installByHand creates the four triggers of spec 4 on table (its name
 // as SQL) as owner, dropping any of theirs first.
 func installByHand(t *testing.T, owner execer, table, key, pk string) {
 	t.Helper()
@@ -465,7 +465,7 @@ func TestInspectFindsTablesAndProblems(t *testing.T) {
 }
 
 // Triggers says, one line each, what is missing or wrong with the four
-// capture triggers, and nothing when the four are as ruling U11 prints them.
+// capture triggers, and nothing when the four are as spec 4 prints them.
 func TestInspectReportsTriggerState(t *testing.T) {
 	db, stet := ownDatabase(t)
 	su := superuser(t, db)
@@ -527,7 +527,7 @@ func TestInspectReportsTriggerState(t *testing.T) {
 		{"for each row", "stet_capture_del", []string{`drop trigger stet_capture_del on public.deals`,
 			`create trigger stet_capture_del after delete on public.deals referencing old table as stet_old for each row` + capture},
 			"fires FOR EACH ROW rather than FOR EACH STATEMENT"},
-		{"names before U11", "stet_capture_upd", []string{`drop trigger stet_capture_upd on public.deals`,
+		{"short transition table names", "stet_capture_upd", []string{`drop trigger stet_capture_upd on public.deals`,
 			`create trigger stet_capture_upd after update on public.deals referencing old table as o new table as n
 			 for each statement` + capture},
 			"says REFERENCING OLD TABLE AS o NEW TABLE AS n rather than REFERENCING OLD TABLE AS stet_old NEW TABLE AS stet_new"},
@@ -725,7 +725,7 @@ COMMIT;
 		t.Errorf("InstallSQL printed:\n%s\nwant:\n%s", got, want)
 	}
 	if strings.Contains(got, "DROP") {
-		t.Errorf("the install SQL drops a trigger, which waits for readers of the table (ruling R12)")
+		t.Errorf("the install SQL drops a trigger, which waits for readers of the table")
 	}
 
 	// When Stet's account owns every table there is nothing to grant.
@@ -1078,7 +1078,7 @@ func TestInstallSQLTimesOutOnALockedTable(t *testing.T) {
 }
 
 // A rerun of the install SQL does not wait for transactions that only read
-// its tables (ruling R12: CREATE OR REPLACE TRIGGER takes a lock that blocks
+// its tables (spec 9: CREATE OR REPLACE TRIGGER takes a lock that blocks
 // writes, not reads, where DROP TRIGGER blocks both), and afterwards the
 // triggers are as printed again.
 func TestInstallSQLRerunsAlongsideAReader(t *testing.T) {
@@ -1169,7 +1169,7 @@ func TestWarnings(t *testing.T) {
 }
 
 // Undo needs PostgreSQL 14 or later: the install SQL replaces triggers with
-// CREATE OR REPLACE TRIGGER (ruling R12), and 14 is the only version tested.
+// CREATE OR REPLACE TRIGGER (spec 9), and 14 is the only version tested.
 // There is no older server to run against; the check takes the version.
 func TestRequireServer(t *testing.T) {
 	for _, v := range []int{140000, 140018, 150007, 170002} {

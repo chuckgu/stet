@@ -30,7 +30,7 @@ func undoSQLConfig(t *testing.T, pg, db, undo string) string {
 // stet undo-sql prints the install SQL for the config's undo tables, or with
 // -drop the SQL that removes the triggers, and changes nothing in the
 // database. A config without undo, a table capture does not take, and a
-// database without Stet's schema (U8) are errors, and nothing is printed.
+// database without Stet's schema are errors, and nothing is printed.
 func TestUndoSQLCommand(t *testing.T) {
 	pg := testPG(t)
 	ctx := context.Background()
@@ -112,7 +112,7 @@ func TestUndoSQLCommand(t *testing.T) {
 }
 
 // On a server older than PostgreSQL 14 stet undo-sql refuses to print the
-// install SQL (ruling R12) and prints nothing; -drop still prints. The test
+// install SQL (spec 9) and prints nothing; -drop still prints. The test
 // server is 14, so the version read is faked.
 func TestUndoSQLRefusesAServerBefore14(t *testing.T) {
 	pg := testPG(t)

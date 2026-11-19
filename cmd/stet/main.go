@@ -139,7 +139,7 @@ func run(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog.Log
 // With no table there is no gate, no executor and no check: the proxy passes
 // every session through, in enforce mode too (spec correction B10), which is
 // logged. Then the pool is opened, and the schema brought up, only for undo
-// (ruling U7); without undo there is no pool either.
+// (spec 9); without undo there is no pool either.
 func openGate(ctx context.Context, cfg *config.Config, log *slog.Logger) (g *gate.Gate, closeGate func(), err error) {
 	if len(cfg.Tables) == 0 && cfg.Mode == config.ModeEnforce {
 		log.Warn("mode is enforce but there are no gated tables: without a gate every session, the agents' " +

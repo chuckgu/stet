@@ -72,13 +72,14 @@ CREATE INDEX IF NOT EXISTS decisions_role_idx ON stet.decisions (login_role, tar
 -- 되돌리기의 변경을 판단 기록에 잇는다 (docs/spec-v0.2-undo.md 5장). 셋 다 줄을 넣을 때만 적는다(규칙 3).
 -- 서버로 보내지 않은 쓰기와 pid를 모르는 세션의 쓰기는 NULL이다. 두 시각은 DB의 시계다. Stet은 자기 시계의 시각을
 -- 보내지 않고, 줄을 넣는 순간까지 흐른 시간을 보내 transaction_timestamp()에서 뺀다. 넣는 문장의 트랜잭션은 그 문장의
--- 메시지가 서버에 닿을 때 시작하므로, 그 뒤에 이 표의 잠금을 기다려도 시각이 늦어지지 않는다(계획의 판정 U12).
+-- 메시지가 서버에 닿을 때 시작하므로, 그 뒤에 이 표의 잠금을 기다려도 시각이 늦어지지 않는다.
 ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS backend_pid integer;      -- 그 세션의 서버 쪽 백엔드 pid
 ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS sent_after  timestamptz;  -- DB 시계. 문장은 이보다 뒤에 서버로 갔다
 ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS done_before timestamptz;  -- DB 시계. 문장의 결과는 이보다 앞에 나왔다
 -- stet.history가 묶음마다 후보를 찾는 인덱스. 창의 두 끝이 모두 인덱스 안에 있어 힙을 읽지 않고 거른다. done_before가
--- 앞이므로 묶음의 stmt_at 이후로 끝난 것만 훑는다. 검토와 되돌리기는 대개 최근의 변경을 읽는다. 앞의 단계에서 만든
--- 두 컬럼의 decisions_backend_idx는 지운다. 같은 이름으로는 IF NOT EXISTS가 옛 인덱스를 그대로 두기 때문에 이름을 바꿨다.
+-- 앞이므로 묶음의 stmt_at 이후로 끝난 것만 훑는다. 검토와 되돌리기는 대개 최근의 변경을 읽는다. 이 단계의 앞선 판을
+-- 실행한 데이터베이스에는 두 컬럼의 decisions_backend_idx가 남아 있다. 그것을 지운다. 같은 이름으로는 IF NOT EXISTS가
+-- 옛 인덱스를 그대로 두기 때문에 이름을 바꿨다.
 DROP INDEX IF EXISTS stet.decisions_backend_idx;
 CREATE INDEX IF NOT EXISTS decisions_window_idx ON stet.decisions (backend_pid, done_before, sent_after);
 
@@ -412,7 +413,7 @@ $$;
 -- 남기는 값과 query, app은 에이전트가 쓴 데이터다(규칙 5).
 -- 전이 테이블 stet_old, stet_new는 동적 SQL에서도 보인다. 컬럼이 테이블마다 다르므로 문장을 그때의 pg_attribute로
 -- 만든다. 그 트리거에 없는 전이 테이블을 가리키는 문장은 실행하지 않는다. 이름이 긴 것은 세션의 임시 릴레이션과 우연히
--- 겹치지 않게 하려는 것이다(아래, 계획의 판정 U11).
+-- 겹치지 않게 하려는 것이다(아래).
 -- 트리거가 위와 다르게 설치됐으면 전이 테이블을 읽기 전에 에러를 낸다. 그 이름의 전이 테이블이 없으면 그 이름은 세션의 임시
 -- 스키마(pg_temp, 릴레이션을 찾을 때 빠지지 않는다)의 같은 이름의 릴레이션으로 읽힌다. 캡처되는 세션은 누구나, 에이전트도,
 -- 그런 뷰를 만들어 자기 코드를 Stet의 계정으로 돌리고 없던 행을 남기게 할 수 있다. 키 컬럼 인자도 그 테이블의 컬럼인지 본다.
@@ -425,14 +426,16 @@ $$;
 -- skipped = 'capture_failed'와 detail의 SQLSTATE, 메시지로 남긴다. 그것도 실패하면 서버 로그(RAISE LOG)에만 남긴다.
 -- client_min_messages가 warning이므로 클라이언트에게는 아무것도 가지 않는다. WHEN OTHERS는 시간 초과와 취소(57014)를
 -- 잡지 않으므로 그때는 쓰기가 실패한다. lock_timeout(55P03)은 잡는다.
--- 삼키면 에이전트가 일으켜 쓰기를 기록도 표지도 없이 커밋시킬 수 있는 에러는 쓰기로 되돌려 보낸다(계획의 판정 R8). 쓰기가
+-- 삼키면 에이전트가 일으켜 쓰기를 기록도 표지도 없이 커밋시킬 수 있는 에러는 쓰기로 되돌려 보낸다(4장). 쓰기가
 -- 실패해 다시 보내지는 것은 안전하고, 기록 없이 커밋되는 것은 안전하지 않다.
 -- - serialization_failure(40001)는 두 블록 모두 되돌려 보낸다. SERIALIZABLE에서는 캡처가 stet의 표를 읽고 쓰는 것이 세션
 --   사이에 충돌하고, 에이전트는 두 세션으로 이것을 일으킨다. 표지를 쓰는 블록도 같은 충돌에 걸린다.
 -- - 자원과 한도(53, 54 부류, 예를 들어 깊은 함수 호출 끝에서 캡처만 스택이 모자라는 54001)는 아무것도 남길 수 없을 때,
 --   곧 표지를 쓰는 블록이 실패했거나 세는 것이 실패했을 때만 되돌려 보낸다. 큰 블록만 실패하면 표지가 남는다.
 -- - 교착(40P01)은 삼킨다. 캡처는 stet의 표의 잠금만 기다리고, 에이전트는 그 표를 잠글 수 없으므로 캡처가 낀 교착을 만들 수
---   없다. REPEATABLE READ의 40001도 같은 코드라 되돌려 보내지만, 캡처의 문장(삽입과 잠그지 않는 읽기)은 그것을 내지 않는다.
+--   없다. REPEATABLE READ의 40001도 같은 코드라 되돌려 보내지만, 캡처의 문장은 그것을 내지 않는다. 캡처는 넣고 읽기만 하고,
+--   행을 잠그는 것은 줄을 넣을 때의 외래 키 확인(FOR KEY SHARE)뿐인데 그것은 이 트랜잭션이 방금 넣은 묶음의 줄을 잠근다.
+--   다른 트랜잭션이 고친 행을 잠그거나 고치는 일이 없다.
 -- 한 트랜잭션의 상한. EXCEPTION 블록은 하위 트랜잭션이고, 표에 쓸 때만 자기 트랜잭션 id를 받는다. 커밋된 하위 트랜잭션의
 -- id는 트랜잭션이 끝날 때까지 백엔드의 캐시(64개)에 남고, 넘치면 서버 전체의 스냅숏 확인이 느려진다. 되돌려진 하위
 -- 트랜잭션은 자리를 돌려준다. 표에 쓰는 캡처 하나는 id 하나만 남긴다: 값이나 표지를 남기면 큰 블록의 것, 실패하면 큰 블록은
@@ -440,9 +443,10 @@ $$;
 -- too_many_statements 표지 하나이고, 그 뒤로는 아무것도 쓰지 않는다.
 -- 쓴 횟수(done)는 이 백엔드가 이 트랜잭션의 id로 남긴 묶음의 수다(change_sets_txid_idx). 한 트랜잭션의 묶음은 모두 한
 -- 백엔드의 것이다. pid도 보는 것은 다른 클러스터에서 옮겨 온 묶음(pg_dump, 논리 복제)이 같은 txid를 가질 수 있어서다.
--- 겹칠 수는 여전히 있지만 드물다(계획의 판정 R9).
--- 캡처할 때마다 센다. 세션의 값(설정)으로 세지 않는다. 에이전트가 적을 수 있는 값이어서, 낮추면 상한을 넘어 표지 없이 남기지 않게 되고 높이면 캡처가 꺼졌다(계획의 판정
--- R7, 보정 U9를 대신한다). 되돌려진 쓰기의 묶음은 보이지 않으므로 세지 않는다. 그 하위 트랜잭션도 자리를 돌려주었다.
+-- 겹칠 수는 여전히 있지만 드물다.
+-- 캡처할 때마다 센다. 세션의 값(설정)으로 세지 않는다. 에이전트가 적을 수 있는 값이어서, 낮추면 상한을 넘어 표지 없이
+-- 남기지 않게 되고 높이면 캡처가 꺼진다. 되돌려진 쓰기의 묶음은 보이지 않으므로 세지 않는다. 그 하위 트랜잭션도 자리를
+-- 돌려주었다.
 -- 시각으로 고르지 않는다. 프로시저가 COMMIT한 뒤의 트랜잭션에서는 문장의 statement_timestamp()가 그 트랜잭션의 now()보다
 -- 이르다(같은 Sync 아래 뒤따르는 문장도 그 트랜잭션에 든다). 묶음의 txid는 txid_current()다. 트랜잭션이 id를 받기 전에
 -- 쓰는 표지(0행 문장의 거절)도 그 id를 남기고 세어진다.
@@ -743,8 +747,10 @@ REVOKE EXECUTE ON FUNCTION stet.approve(uuid, text, bigint), stet.reject(uuid, t
 --   GRANT USAGE ON SCHEMA stet TO table_owner;
 --   GRANT EXECUTE ON FUNCTION stet.capture() TO table_owner;
 REVOKE EXECUTE ON FUNCTION stet.capture() FROM PUBLIC;
--- 기록을 지키는 트리거의 함수는 아무에게도 주지 않는다. 트리거는 함수의 권한 없이도 불린다.
+-- 기록을 지키는 트리거의 함수는 아무에게도 주지 않는다. 트리거는 함수의 권한 없이도 불린다. 판단 기록과 보류 건을 지키는
+-- 두 함수도 같다. 그래서 stet 스키마에는 PUBLIC이 부를 수 있는 함수가 없다.
 REVOKE EXECUTE ON FUNCTION stet.changes_guard() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION stet.decisions_append_only(), stet.held_writes_guard() FROM PUBLIC;
 
 -- 되돌리기의 기록 (docs/spec-v0.2-undo.md 7장 "기록"). stet.undo가 부를 때마다 stet.undos에 한 줄, 결과의 줄마다
 -- stet.undo_items에 한 줄, 되돌린 변경마다 stet.undone_changes에 한 줄을 검토자의 트랜잭션 안에서 남긴다
@@ -762,7 +768,7 @@ CREATE TABLE IF NOT EXISTS stet.undos (
   until       timestamptz,
   tables      text[],
   note        text,                          -- 검토자가 적은 말
-  restored    integer NOT NULL,              -- restored와 restored_differs의 수 (계획의 보정 U5)
+  restored    integer NOT NULL,              -- restored와 restored_differs의 수
   skipped     integer NOT NULL,              -- skipped와 not_captured의 수
   failed      integer NOT NULL
 );
@@ -790,7 +796,7 @@ CREATE TABLE IF NOT EXISTS stet.undone_changes (
 );
 
 -- 검토자가 보는 것 (docs/spec-v0.2-undo.md 6장). 캡처한 변경마다 한 줄이고, 값을 남기지 않은 묶음(skipped)은 key 없이
--- 한 줄이다. 변경을 그 쓰기를 판단한 기록에 잇는다(5장의 "잇는 규칙", 계획의 판정 U16).
+-- 한 줄이다. 변경을 그 쓰기를 판단한 기록에 잇는다(5장의 "잇는 규칙").
 -- 묶음 하나는 다음을 모두 만족하는 판단 기록이 하나뿐일 때만 그것에 이어진다: backend_pid가 묶음의 pid와 같고,
 -- executed가 참이고, 묶음의 stmt_at이 sent_after에서 10ms를 뺀 때부터 done_before까지(양 끝 포함)이고, statement가
 -- 묶음의 query와 같은 글자다. 둘 이상이면 잇지 않고 그 수를 decision_candidates로 보여 준다. 키로 좁히지 않는다.
@@ -871,7 +877,7 @@ LEFT JOIN LATERAL (
 -- 두 컬럼의 같은 글자를 한 행으로 보지 않으려는 것이다.
 -- 판단은 값으로만 한다. 비교는 캡처와 같은 식으로 만든 jsonb끼리 하고, 행이 없는 쪽은 NULL이다.
 
--- 거절 (7장 "거절하는 경우", 계획의 보정 U4와 판정 R15). stet.undo_plan, stet.undo_selection, stet.undo가 먼저 부른다.
+-- 거절 (7장 "거절하는 경우"와 "READ COMMITTED에서만"). stet.undo_plan, stet.undo_selection, stet.undo가 먼저 부른다.
 -- SQLSTATE는 ST006이다. agent_role이나 since가 NULL이다. until이 since보다 앞이거나 같다(NULL이면 지금까지다).
 -- session_user가 agent_role이다: 자기 쓰기를 되돌리거나 그 기록을 읽을 수 없다. 트랜잭션의 격리 수준이 READ COMMITTED가
 -- 아니다: REPEATABLE READ와 SERIALIZABLE에서는 카탈로그를 SQL로 읽으면 트랜잭션의 스냅숏을 따르고 SQL의 이름은 지금의
@@ -915,16 +921,16 @@ $$;
 -- - 먼저 stet.undo_refuse로 다섯 거절을 한다. 에이전트가 이 함수의 권한을 받았어도 자기 기록은 읽지 못한다.
 -- - 인자로 고른 것만 돌려준다: agent_role의 묶음 가운데 at이 since 이상 until 미만(until이 NULL이면 지금까지)이고, tables가
 --   있으면 target_table이 그 안에 있는 것. 돌려주는 컬럼은 아래의 열셋뿐이다. 부른 쪽의 식이나 이름을 평가하지 않는다.
--- - 부른 세션이 읽을 수 없는 테이블은 키를 하나도 보이지 않는다(계획의 판정 R11). 키도 데이터다(이메일 같은 자연 키).
+-- - 부른 세션이 읽을 수 없는 테이블은 키를 하나도 보이지 않는다(7장 "고르기"). 키도 데이터다(이메일 같은 자연 키).
 --   그 (target_table, relid)는 key 없는 한 줄이고, 키 컬럼, 값, 변경, 표시, also_changed가 모두 NULL이며 withheld가
 --   'SQLSTATE 42501: permission denied for table <이름>'이다. 읽을 수 있다는 것은 session_user나 session_user가 SET ROLE로
 --   될 수 있는 역할 가운데 하나가 그 테이블의 SELECT를 갖고 그 역할에게 행 수준 보안이 적용되지 않는 것이다. 곧 테이블의
 --   행 수준 보안이 꺼져 있거나, 그 역할이 superuser나 BYPASSRLS이거나, 테이블 소유자의 권한을 갖고 테이블이 FORCE ROW
 --   LEVEL SECURITY가 아니다. 정책이 실제로 무엇을 숨기는지는 보지 않는다. 켜져 있으면 숨길 수 있다고 본다. SET ROLE로 될
 --   수 있는 역할까지 보는 것은, SECURITY DEFINER 안에서는 부른 쪽의 current_user를 알 수 없기 때문이다. 그 세션이 스스로
---   얻을 수 있는 권한이다. 이 판단은 이 함수의 문장이 시작할 때의 카탈로그로 한다(READ COMMITTED만 받는다. 판정 R15).
+--   얻을 수 있는 권한이다. 이 판단은 이 함수의 문장이 시작할 때의 카탈로그로 한다(READ COMMITTED만 받는다).
 --   그 뒤에 켜진 행 수준 보안과, 판단한 역할이 아닌 지금의 역할에게 적용되는 행 수준 보안은 stet.undo_lock이 그 테이블을
---   잠근 뒤에 42501로 거절한다(판정 R16. stet.undo_judge와 stet.undo_row가 부른다. stet.undo_row는 행을 읽은 뒤에 한 번 더 본다).
+--   잠근 뒤에 42501로 거절한다(stet.undo_judge와 stet.undo_row가 부른다. stet.undo_row는 행을 읽은 뒤에 한 번 더 본다).
 -- - relid가 더는 보통 테이블을 가리키지 않으면 그 (target_table, relid)도 key 없는 한 줄이고 withheld가 'table_gone'이다.
 --   지켜 줄 테이블의 권한이 없으므로 키를 보이지 않는다.
 -- 읽을 수 있는 테이블의 줄은 이렇다. withheld는 NULL이다.
@@ -943,8 +949,9 @@ $$;
 --   처음 남은 변경, 곧 그 묶음보다 id가 큰 묶음 가운데 줄이 있는 첫 묶음의 가장 작은 변경 id다(그런 변경이 없으면 맨
 --   뒤). 보이지 않는 테이블의 한 줄의 자리는 그 테이블의 줄들이 가졌을 자리 가운데 가장 앞이다. 자리가 같으면 key 없는
 --   줄이 먼저이고, 그것끼리는 묶음의 id 순이다. 그래서 key 없는 줄은 자기 테이블의 줄 가운데 그 묶음이 남은 때에 선다.
--- 이 단계의 앞선 개발판은 withheld가 없는 이 함수를 만들었다. CREATE OR REPLACE는 돌려주는 컬럼을 바꾸지 못하므로 그
--- 모양일 때만 지운다. 그 밖에는 지우지 않아 운영자가 준 EXECUTE가 남는다.
+-- 이 단계의 앞선 판을 실행한 데이터베이스에는 withheld가 없는 이 함수가 남아 있다. CREATE OR REPLACE는 돌려주는 컬럼을
+-- 바꾸지 못하므로 그 모양일 때만 지운다. 그 밖에는 지우지 않아 운영자가 준 EXECUTE가 남는다. 이 문장을 빼면 그런
+-- 데이터베이스에서 이 파일이 실패한다.
 DO $$
 BEGIN
   IF EXISTS (SELECT FROM pg_catalog.pg_proc p
@@ -1077,7 +1084,7 @@ $$;
 
 -- 잠그고 컬럼을 읽기. stet.undo_judge와 stet.undo_row가 테이블을 잠그고 그 컬럼을 읽는 한 곳이다. 둘의 비교는 모두 이
 -- 함수가 잠근 뒤에 읽은 컬럼으로 한다. 부른 계정의 권한으로 돈다(SECURITY INVOKER). READ COMMITTED 트랜잭션에서만 돈다
--- (stet.undo_refuse와 같은 ST006. 판정 R15). 돌려주는 것은 한 줄이다: table_name(지금의 이름, SQL에 그대로 쓸 수 있게
+-- (stet.undo_refuse와 같은 ST006). 돌려주는 것은 한 줄이다: table_name(지금의 이름, SQL에 그대로 쓸 수 있게
 -- 인용된 것)과 column_names(지워지지 않은 컬럼, attnum 순).
 -- 순서. READ COMMITTED에서는 문장마다 그 문장이 시작할 때의 카탈로그를 읽는다. 다른 세션이 두 문장 사이에 테이블의 이름을
 -- 바꾸거나, 테이블을 지우고 다시 만들거나, 컬럼을 바꿀 수 있으므로:
@@ -1088,7 +1095,7 @@ $$;
 --    테이블을 가리키게 됐으면 PostgreSQL은 그 테이블을 잠그므로, 잠근 뒤 이름이 아직 relid인지 본다. 다르면
 --    object_not_in_prerequisite_state다. 잠근 뒤에는 트랜잭션이 끝날 때까지 그 테이블의 이름, 컬럼, 행 수준 보안을 바꾸는
 --    ALTER TABLE이 기다린다.
--- 4. 행 수준 보안이 부른 역할에게 적용되면 42501이다(판정 R16). 숨긴 행을 "없는 행"으로 읽으면 insert가 될 수 있다.
+-- 4. 행 수준 보안이 부른 역할에게 적용되면 42501이다. 숨긴 행을 "없는 행"으로 읽으면 insert가 될 수 있다.
 --    stet.undo_selection은 고를 때의 카탈로그와, 지금의 역할이 아니라 세션이 될 수 있는 역할로 판단하기 때문이다.
 -- 5. 파티션이면 feature_not_supported다. 파티션의 캡처는 받지 않는다(4장). 파티션 테이블을 가리키는 외래 키는 파티션마다
 --    복제되어(conparentid가 있다) stet.undo_referenced가 보지 않고, 파티션 테이블에 단 트리거와 판단도 파티션을 따로 보지
@@ -1149,7 +1156,7 @@ $$;
 -- stet.undo_lock으로 테이블을 잠그고 컬럼을 읽는다(그래서 READ COMMITTED에서만 돈다).
 -- 그림은 stet.capture()와 같은 식, 같은 일곱 설정으로 만든다. 컬럼은 stet.undo_lock이 잠근 뒤에 읽은 것(attnum 순, 지워진
 -- 컬럼은 뺀다)이고, 값은 CASE WHEN num_nulls(v) = 0 THEN format('%s', v) END다. 타입의 출력 함수(C, superuser만 만든다)이고
--- 캐스트가 아니다(계획의 판정 U10). 그래서 같은 행이 캡처가 남긴 것과 같은 jsonb가 된다. 캡처의 함수와 코드를 나누지 않으므로
+-- 캐스트가 아니다(4장). 그래서 같은 행이 캡처가 남긴 것과 같은 jsonb가 된다. 캡처의 함수와 코드를 나누지 않으므로
 -- 둘이 같다는 것은 테스트(TestUndoRowMatchesCapture)가 지킨다. 한쪽을 바꾸면 다른 쪽도 바꾼다. 컬럼 이름은 그대로 SQL에
 -- 들어가므로(r.<이름>) 컬럼이 아닌 이름은 r을 받는 함수로 읽힐 것이나, 잠근 뒤에 읽은 이름이고 잠근 뒤에는 바뀌지 않는다.
 -- 행은 키로 찾는다. 키 컬럼의 값이 키의 글자와 OPERATOR(pg_catalog.=)로 같은 행이다. 키의 글자는 타입이 정해지지 않은
@@ -1213,11 +1220,11 @@ $$;
 
 -- 키마다 하나의 결정 (7장 "키마다 하나의 결정"). 스펙의 여섯 확인을 그 순서로 하고 처음 걸린 것을 reason으로 돌려준다:
 -- table_gone(relid가 보통 테이블을 가리키지 않는다), columns_changed(b나 a의 컬럼 이름들이 지금 테이블의 컬럼들과 다르거나
--- 키 컬럼이 없다. 계획의 보정 U1), key_changed, interleaved(둘은 stet.undo_selection이 남은 변경으로 정한다),
+-- 키 컬럼이 없다), key_changed, interleaved(둘은 stet.undo_selection이 남은 변경으로 정한다),
 -- changed_since(지금 행이 a와 다르다. 없는 행은 NULL), no_net_change(b와 a가 같다). 하나도 걸리지 않으면 reason은 NULL이고
 -- action이 b가 없으면 delete, a가 없으면 insert, 둘 다 있으면 update다. 걸리면 action은 NULL이다.
--- 부른 계정의 권한으로 돈다(SECURITY INVOKER). READ COMMITTED 트랜잭션에서만 돈다(stet.undo_refuse와 같은 ST006. 판정
--- R15). 순서:
+-- 부른 계정의 권한으로 돈다(SECURITY INVOKER). READ COMMITTED 트랜잭션에서만 돈다(stet.undo_refuse와 같은 ST006).
+-- 순서:
 -- 1. 거절. 2. table_gone: relid가 이 문장의 카탈로그에서 보통 테이블이 아니다. 잠글 테이블이 없으므로 잠그기 전이다.
 -- 3. stet.undo_lock으로 테이블을 잠그고 컬럼을 읽는다. 그 뒤로 이 트랜잭션이 끝날 때까지 컬럼은 바뀌지 않는다. 2와 3 사이에
 --    테이블이 지워지거나 이름이 다른 테이블로 넘어갔으면 stet.undo_lock의 에러가 그대로 나간다(계획에서는 skipped).
@@ -1328,7 +1335,7 @@ $$;
 -- 고객의 테이블을 읽는다(SECURITY INVOKER). 기록은 stet.undo_selection으로만 읽는다.
 -- 줄은 stet.undo_selection의 순서(target_table, 그 키의 첫 변경 id)다. outcome은 would_restore, skipped, not_captured다.
 -- 값을 남기지 않은 묶음은 key와 action이 NULL이고 reason이 그 skipped다. 부른 세션이 읽을 수 없는 테이블과 없어진 테이블은
--- key, action, change_ids가 NULL인 한 줄이고 outcome이 skipped, reason이 stet.undo_selection의 withheld다(계획의 판정 R11).
+-- key, action, change_ids가 NULL인 한 줄이고 outcome이 skipped, reason이 stet.undo_selection의 withheld다.
 -- 경고는 되돌릴 줄(would_restore)에만 붙는다.
 -- 에러를 내는 것은 다섯 거절(ST006)과, 이 함수와 stet.undo_refuse, stet.undo_selection의 EXECUTE가 없는 것(42501)뿐이다.
 -- stet.undo_judge, stet.undo_lock, stet.undo_row, stet.undo_warning의 EXECUTE가 없으면 그 에러는 키마다의 블록 안에서
@@ -1399,7 +1406,7 @@ $$;
 -- pg_catalog보다 먼저 찾으므로, 예를 들어 text나 record라는 임시 테이블이 있으면 스키마 없는 text와 record는 그 행
 -- 타입이 된다(테스트 서버에서 확인했다). 판단과 글자 만들기는 모두 일곱 설정을 고정한 도우미가 한다. 몸통이 하는 일은
 -- 도우미를 부르고, 도우미가 돌려준 문장을 EXECUTE하고, 키마다의 블록에서 에러를 잡는 것뿐이다.
--- 복구 문장의 값(계획의 판정 U10). 값은 타입을 적지 않은 글자 리터럴(%L)이다. INSERT의 VALUES와 UPDATE의 SET에서 타입이
+-- 복구 문장의 값(7장 "stet.undo"의 3). 값은 타입을 적지 않은 글자 리터럴(%L)이다. INSERT의 VALUES와 UPDATE의 SET에서 타입이
 -- 정해지지 않은 리터럴은 PostgreSQL이 그 컬럼의 타입(도메인이면 기본 타입의 입력 뒤 도메인의 제약)의 입력 함수로 바로
 -- 읽는다. 글자에서 그 타입으로 가는 캐스트(테이블 소유자가 만든 함수일 수 있다)는 돌지 않는다. %L::<타입>으로 적지 않는
 -- 것은, format_type이 pg_catalog의 타입을 스키마 없이(text, date) 적어 그 이름이 부른 세션의 search_path와 임시 테이블로
@@ -1491,10 +1498,10 @@ BEGIN
 END
 $$;
 
--- 되돌리기는 연쇄를 일으키지 않는다 (7장 "referenced", 계획의 판정 R20, R24, R25). 복구 문장이 없애거나 바꾸는 값을,
+-- 되돌리기는 연쇄를 일으키지 않는다 (7장 "referenced"). 복구 문장이 없애거나 바꾸는 값을,
 -- 연쇄하는 외래 키로 가리키는 행이 있는 테이블들이다. 없으면 NULL이고, 있으면 'referenced: <테이블들>'이다(스키마까지
 -- %I.%I, 바이트 순, ", "로 잇는다). stet.undo가 키의 행을 FOR UPDATE로 잠그고 지금 행이 a임을 확인한 뒤, 복구 문장 앞에 부른다.
--- 1. 거절(READ COMMITTED만, 판정 R15). insert는 아무것도 없애거나 바꾸지 않으므로 NULL이다. update에서 SET할 컬럼이 없으면
+-- 1. 거절(READ COMMITTED만). insert는 아무것도 없애거나 바꾸지 않으므로 NULL이다. update에서 SET할 컬럼이 없으면
 --    (stet.undo_statement가 NULL) 아무것도 바뀌지 않으므로 NULL이다.
 -- 2. 복구할 테이블을 ROW EXCLUSIVE로 잠근 뒤에 외래 키를 읽는다. 그 테이블을 가리키는 외래 키를 더하는 ALTER TABLE은 그
 --    테이블에 SHARE ROW EXCLUSIVE를 잡아야 하는데, 그것은 ROW EXCLUSIVE를 기다린다. 그래서 외래 키를 읽은 뒤 복구 문장이 돌
@@ -1504,7 +1511,7 @@ $$;
 --    단위의 INSERT, UPDATE, DELETE, TRUNCATE 권한을 요구해서, 고칠 컬럼의 UPDATE만 가진 검토자의 복구까지 막았다. 권한이
 --    없으면 42501이고, stet.undo의 키마다의 블록 안이므로 그 키는 보통의 failed 줄이다(복구 문장도 같은 이유로 실패했을
 --    것이다). 계획(stet.undo_plan)은 이 함수를 부르지 않으므로 ACCESS SHARE만 잡고 읽기만 한다.
---    EXPLAIN 뒤에 이 백엔드가 relid에 ROW EXCLUSIVE를 쥐었는지 pg_locks로 본다(판정 R24의 4). 문장 안의 이름은 잠금을
+--    EXPLAIN 뒤에 이 백엔드가 relid에 ROW EXCLUSIVE를 쥐었는지 pg_locks로 본다. 문장 안의 이름은 잠금을
 --    기다리는 동안 다른 테이블을 가리키게 될 수 있고(ALTER SCHEMA ... RENAME은 테이블을 잠그지 않는다), 그러면 PostgreSQL은
 --    이름을 다시 풀어 그 테이블을 잠그고 relid의 잠금은 놓는다. 쥐지 않았으면 object_not_in_prerequisite_state이고 그 키는
 --    failed다. 앞의 키를 복구해 트랜잭션이 이미 relid에 그 잠금을 쥐고 있으면 그것으로 외래 키의 목록은 지켜진다.
@@ -1517,10 +1524,10 @@ $$;
 --    알 수 없다.
 -- 5. 따라가지 않는 외래 키. 그 외래 키를 불러일으킬 복구는 feature_not_supported(0A000)이고 그 키는 failed다. 메시지가 제약과
 --    자식 테이블을 말한다.
---    - 컬럼 짝의 타입이 도메인을 벗긴 기본 타입에서 다르다(char와 text, timestamptz와 timestamp, integer와 bigint. 판정 R20).
+--    - 컬럼 짝의 타입이 도메인을 벗긴 기본 타입에서 다르다(char와 text, timestamptz와 timestamp, integer와 bigint).
 --      PostgreSQL의 연쇄는 그런 비교에 캐스트를 더하고, 그 결과는 세션의 설정(TimeZone 등)에 따를 수 있다. typmod는 보지
 --      않는다(varchar(10)과 varchar(20)).
---    - 비교에 드는 콜레이션 넷 가운데 하나라도 비결정적이다(판정 R25): 부모 컬럼의 타입의 것(연쇄의 매개변수가 이것을
+--    - 비교에 드는 콜레이션 넷 가운데 하나라도 비결정적이다: 부모 컬럼의 타입의 것(연쇄의 매개변수가 이것을
 --      갖는다), 부모 컬럼의 것(비결정적이고 자식과 다르면 연쇄가 이것으로 비교한다), 자식 컬럼의 것, 자식 컬럼의 타입의 것
 --      (자식을 받아들이는 확인의 매개변수가 이것을 갖고, 새 자식이 어느 부모 행을 잠그는지를 정한다). 비결정적인 비교에서는
 --      연쇄가 닿는 자식이 이 행이 아닌 다른 부모 행을 가리킬 수 있어, 그런 자식은 조사와 복구 사이에 생길 수 있다. 모두
@@ -1563,8 +1570,9 @@ $$;
 -- 이 행의 값과 같은 부모 행은 이 행뿐이고 그런 자식은 이 행을 가리킨다. 그런 자식을 넣거나 이 행을 가리키게 고치는 쪽은 이
 -- 행에 FOR KEY SHARE를 잡아야 하는데, 그것은 FOR UPDATE를 기다린다. 이미 그 잠금을 쥔 쪽이 있었다면 FOR UPDATE가 그쪽을
 -- 기다렸다.
--- 이 단계의 앞선 개발판은 key_column과 key 없이 네 인자의 이 함수를 만들었다. 인자가 바뀌면 CREATE OR REPLACE는 새 함수를
--- 더하므로 그 모양을 지운다.
+-- 이 단계의 앞선 판을 실행한 데이터베이스에는 key_column과 key 없이 네 인자의 이 함수가 남아 있다. 인자가 바뀌면 CREATE
+-- OR REPLACE는 새 함수를 더하므로 그 모양을 지운다. 남겨 두면 PUBLIC이 부를 수 있는 옛 함수가 남고, stet undo-sql
+-- -grant가 그것까지 검토자에게 준다.
 DROP FUNCTION IF EXISTS stet.undo_referenced(oid, text, jsonb, jsonb);
 CREATE OR REPLACE FUNCTION stet.undo_referenced(relid oid, key_column text, key text, action text, b jsonb, a jsonb)
 RETURNS text
@@ -1758,7 +1766,7 @@ END
 $$;
 
 -- 복구 문장의 글자 (7장 "stet.undo"의 3). action이 delete면 그 키의 행을 지우고, update면 a와 b가 다른 컬럼만 b의 값으로
--- 바꾸고(계획의 보정 U3), insert면 b의 행을 넣는다. 값을 적는 법과 이름을 적는 법은 이 절의 머리 주석에 있다.
+-- 바꾸고, insert면 b의 행을 넣는다. 값을 적는 법과 이름을 적는 법은 이 절의 머리 주석에 있다.
 -- - 생성 컬럼(GENERATED ALWAYS AS ... STORED)에는 값을 주지 않는다. GENERATED ALWAYS AS IDENTITY 컬럼은 UPDATE로는 값을 줄
 --   수 없으므로 insert에서만 주고, 그래서 insert는 OVERRIDING SYSTEM VALUE를 쓴다(테이블 소유자가 아니어도 된다).
 --   update에서 바꿀 컬럼이 그런 것뿐이면 문장이 없다(NULL). 그때 그 행은 b가 될 수 없어 restored_differs가 된다.
@@ -1826,8 +1834,8 @@ $$;
 --   아무것도 쓰지 않았는데 되돌렸다고 기록된다. 문장을 지금의 이름으로 다시 만들어 같은지 본다. 컬럼은 잠근 뒤라 바뀌지
 --   않으므로, 다르면 이름이 바뀐 것이다. 이름이 바뀌었다가 그 사이에 돌아온 경우는 가려내지 못한다(그때도 다른 테이블의 행은
 --   바꾸지 않는다).
--- 이 단계의 앞선 개발판은 statement 없이 여섯 인자의 stet.undo_outcome을 만들었다. 인자가 바뀌면 CREATE OR REPLACE는 새
--- 함수를 더하므로 그 모양을 지운다.
+-- 이 단계의 앞선 판을 실행한 데이터베이스에는 statement 없이 여섯 인자의 stet.undo_outcome이 남아 있다. 인자가 바뀌면
+-- CREATE OR REPLACE는 새 함수를 더하므로 그 모양을 지운다. 남겨 두면 stet undo-sql -grant가 그것까지 검토자에게 준다.
 DROP FUNCTION IF EXISTS stet.undo_outcome(oid, text, text, jsonb, bigint, oid);
 CREATE OR REPLACE FUNCTION stet.undo_outcome(relid oid, key_column text, key text, action text, b jsonb, a jsonb,
                                              statement text, changed bigint, written oid)
@@ -2031,7 +2039,7 @@ $$;
 --   이름으로 기록을 만들 수 없다. 자기 이름으로 지어낸 기록은 만들 수 있다(스펙 11장의 한계).
 -- - stet.undo_refuse의 다섯 거절을 똑같이 한다(자기 쓰기의 되돌리기를 기록할 수 없다).
 -- - items는 stet.undo_unpack으로 꼴을 확인하고 행으로 읽는다(22023). 세 수는 이 함수가 줄에서 센다: restored는 restored와
---   restored_differs, skipped는 skipped와 not_captured, failed는 failed다(계획의 보정 U5).
+--   restored_differs, skipped는 skipped와 not_captured, failed는 failed다.
 -- - 줄은 받은 그대로 적지만, stet.undone_changes(stet.history의 undo_id, undone_at)에는 되돌린 줄의 change_ids 가운데
 --   고른 조건에 드는 변경만 적는다: agent_role의 묶음의 변경이고, at이 since 이상 until 미만이고(until이 NULL이면 지금까지),
 --   tables가 있으면 target_table이 그 안에 있고, 그 줄의 target_table과 key의 변경이다. stet.undo의 줄은 언제나 그렇다.
@@ -2090,13 +2098,13 @@ $$;
 -- outcome은 restored, restored_differs, skipped, failed, not_captured다. action은 stet.undo가 하기로 정한 것이고, 건너뛴
 -- 줄과 정하기 전에 실패한 줄은 NULL이다. warning은 되돌린 줄(restored, restored_differs)에만 붙는다.
 -- 부른 계정의 권한으로 돌고(SECURITY INVOKER) SET 절이 없다. 몸통에 대해서는 이 절의 머리 주석을 본다.
--- 1. 거절(stet.undo_refuse, ST006): 인자가 틀렸거나 트랜잭션이 READ COMMITTED가 아니다(판정 R15). 에러를 내는 것은
+-- 1. 거절(stet.undo_refuse, ST006): 인자가 틀렸거나 트랜잭션이 READ COMMITTED가 아니다. 에러를 내는 것은
 --    이것과, 이 함수와 키마다의 블록 밖에서 부르는 도우미의 EXECUTE가 없는 것(42501), 시간 초과와 취소(57014), 읽기
 --    전용 트랜잭션(25006, 기록을 적을 때. 그 전에 모든 키가 failed다)뿐이다. 미룬 제약(DEFERRABLE INITIALLY DEFERRED의
 --    외래 키와 유일 제약, 제약 트리거, 검토자의 SET CONSTRAINTS)은 커밋할 때 확인되므로 그 실패는 검토자의 COMMIT에서
 --    나오고 되돌리기 전체가 롤백된다.
 -- 2. 고른 줄들을 한 번 읽는다(stet.undo_lines).
--- 3. 바퀴마다 stet.undo_next가 정한 키들을 차례로 해 본다. 키 하나는 예외 블록(하위 트랜잭션, 계획의 보정 U2) 하나다:
+-- 3. 바퀴마다 stet.undo_next가 정한 키들을 차례로 해 본다. 키 하나는 예외 블록(하위 트랜잭션) 하나다:
 --    a. stet.undo_judge(..., lock => true): 테이블을 잠그고(ACCESS SHARE) 그 행을 FOR UPDATE로 잠근 뒤 여섯 확인을 다시
 --       한다. 걸리면 건너뛴다(skipped와 그 이유).
 --    b. stet.undo_referenced: 연쇄하는 외래 키로 가리키는 행이 있으면 건너뛴다(skipped와 'referenced: <테이블들>').

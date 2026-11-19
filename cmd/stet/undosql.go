@@ -23,9 +23,9 @@ const undoSQLTimeout = 30 * time.Second
 // and writes to out the SQL that installs their capture triggers, or with
 // -drop the SQL that removes them. It executes none of it: it only reads the
 // catalogs, in a read-only transaction. The install SQL needs PostgreSQL 14
-// or later, and on an older server it refuses (ruling R12); -drop does not.
+// or later, and on an older server it refuses (spec 9); -drop does not.
 // When the database has no stet.capture() it says to start Stet once, which
-// creates the stet schema, and creates nothing itself (ruling U8).
+// creates the stet schema, and creates nothing itself (spec 9).
 //
 // With -grant <role> it writes only the grants that let role review and undo
 // (undo.GrantSQL), for Stet's account to run, with the undo functions read

@@ -338,8 +338,8 @@ func TestHistoryLinkBounds(t *testing.T) {
 
 // A set is linked only when exactly one decision matches it on backend,
 // executed, window and statement text; with several it is not linked,
-// whatever their keys say, and shows how many matched (plan ruling U16,
-// which withdraws spec 5's narrowing). Neither target_pk nor the recorded
+// whatever their keys say, and shows how many matched (spec 5: candidates
+// are not narrowed by key). Neither target_pk nor the recorded
 // keys take part. Every set of one statement (same backend, stmt_at and
 // query: a cascade's child sets, say) shows the same. The cases are the
 // arrangements in which a narrowing by keys linked a decision that did not

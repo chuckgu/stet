@@ -716,7 +716,7 @@ func windowed(t *testing.T) *store.Decision {
 // the insert runs. In between it may wait for a lock on stet.decisions
 // (another Stet's migration, DDL by hand), and that wait would make
 // sent_after later than the write was sent: the unsafe direction, in which a
-// change the write made falls outside its window (plan ruling U12). In every
+// change the write made falls outside its window (spec 5). In every
 // exec mode, for a connection's first insert and a later one: the statement
 // Insert prepared waits at Bind, the simple protocol's while its query is
 // read; and an insert must not describe its statement in a transaction of

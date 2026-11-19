@@ -11,14 +11,16 @@ import (
 )
 
 // These tests pin how stet.undo decides that restoring a key would cascade
-// into rows another party made (spec-v0.2-undo 7, referenced; plan rulings
-// R20, R24, R25): it compares as the foreign key's own cascade does, with the
-// constraint's equality operator, both sides cast to that operator's input
-// types, under the collation the cascade uses, the referenced values taken
-// from the row undo has locked; it refuses a cascading foreign key between
-// columns of different types, or under a nondeterministic collation, rather
-// than follow it; and it reads the foreign keys only once it holds the table,
-// so that no cascading foreign key can be added before its statement runs.
+// into rows another party made (spec-v0.2-undo 7, referenced): it compares as
+// the foreign key's own cascade does, with the constraint's equality operator,
+// both sides cast to that operator's input types, under the collation the
+// cascade uses, the referenced values taken from the row undo has locked; it
+// refuses a cascading foreign key between columns of different types, under a
+// nondeterministic collation, or through an operator it cannot pin, rather
+// than follow it; it reads the foreign keys only once it holds the table, so
+// that no cascading foreign key can be added before its statement runs; and
+// it checks, after reading a child table, that the table it read is the
+// foreign key's.
 
 // A child that the foreign key itself takes as referencing the agent's row is
 // found as the cascade compares: citext's own equality ('A@X' references
@@ -108,7 +110,7 @@ func TestUndoProbesAsTheForeignKeyCompares(t *testing.T) {
 }
 
 // A cascading foreign key whose comparison involves a nondeterministic
-// collation is not followed (plan ruling R25): the cascade then compares
+// collation is not followed (spec 7): the cascade then compares
 // case-insensitively, and the rows it reaches need not reference the agent's
 // row, so a child can appear between the probe and the restore. The key whose
 // restore would fire it is failed with 0A000 naming the constraint and the

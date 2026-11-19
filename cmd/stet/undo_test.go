@@ -166,7 +166,7 @@ func TestRunWarnsAboutUndoTables(t *testing.T) {
 	}
 }
 
-// Ruling U7: with undo.tables and no gated table, Stet opens its pool,
+// Spec 9: with undo.tables and no gated table, Stet opens its pool,
 // brings its schema up and syncs the settings, and passes sessions through
 // as it does without tables: no gate, and none of the start's checks, which
 // could not read in time here and would stop enforce.
@@ -321,7 +321,7 @@ func TestRunWithoutUndoLeavesCaptureSettingsAlone(t *testing.T) {
 }
 
 // Started with undo, Stet deletes the change sets older than undo.keep, with
-// their lines, and keeps the newer ones, with or without gated tables (U7).
+// their lines, and keeps the newer ones, with or without gated tables (spec 9).
 func TestRunPurgesOldChangeRecords(t *testing.T) {
 	pg := testPG(t)
 	for _, tc := range []struct{ name, tables string }{
@@ -420,7 +420,7 @@ func undoFunctionsIn(t *testing.T, conn *pgx.Conn) []string {
 // installed; a reviewer reads stet.history and sees each change linked to the
 // decision on its write, plans the undo and undoes it in its own READ
 // COMMITTED transaction, commits, and the table holds what it held before the
-// agent wrote; stet.history then shows each change undone (plan ruling R14).
+// agent wrote; stet.history then shows each change undone.
 func TestUndoEndToEnd(t *testing.T) {
 	pg := testPG(t)
 	ctx := context.Background()

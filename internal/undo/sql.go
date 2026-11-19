@@ -27,7 +27,7 @@ const lockTimeout = "5s"
 // on the stet schema, EXECUTE on stet.capture()); an owner that is stetRole
 // has them. Each owner's part is one transaction that first sets
 // lock_timeout, then, table by table, creates or replaces each of the four
-// triggers, so it can be run again (ruling R12). CREATE OR REPLACE TRIGGER
+// triggers, so it can be run again (spec 9). CREATE OR REPLACE TRIGGER
 // takes a lock that waits for, and blocks, writes to the table, not reads;
 // DROP TRIGGER would block reads too, so the SQL drops nothing, and a
 // trigger of another name is left alone. It needs PostgreSQL 14 or later
@@ -273,7 +273,7 @@ func hasNUL(ss ...string) bool {
 const minServer = 140000
 
 // RequireServer refuses a server older than PostgreSQL 14; versionNum is its
-// server_version_num. The install SQL needs it (ruling R12); the SQL of
+// server_version_num. The install SQL needs it (spec 9); the SQL of
 // DropSQL does not.
 func RequireServer(versionNum int) error {
 	if versionNum >= minServer {

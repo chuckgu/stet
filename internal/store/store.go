@@ -154,7 +154,7 @@ const insertDecisionName = "stet_insert_decision"
 // runs the insert (a Parse or Bind, or the Query of the simple protocol)
 // reaches the server, before the insert waits for any lock on
 // stet.decisions. clock_timestamp() would be read after such a wait, and the
-// wait would make the window later than the write was (plan ruling U12).
+// wait would make the window later than the write was (spec 5).
 const insertDecision = `
 	insert into stet.decisions (
 		id, created_at, mode, agent_id, on_behalf_of, session_id,

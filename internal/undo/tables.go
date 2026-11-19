@@ -37,7 +37,7 @@ type Table struct {
 }
 
 // trigger is one of the four capture triggers as stet undo-sql prints them
-// (spec 4, with the transition tables of ruling U11).
+// (spec 4, with the transition tables stet_old and stet_new).
 type trigger struct {
 	name     string
 	event    string // INSERT, UPDATE, DELETE or TRUNCATE
@@ -201,7 +201,7 @@ func look(ctx context.Context, q store.Querier, t *Table) error {
 	case temp:
 		t.Problem = qual + " is a temporary table, not an ordinary table"
 	case parent != nil:
-		// Ruling R13: a write through the parent fires only the parent's
+		// Spec 4: a write through the parent fires only the parent's
 		// statement triggers.
 		t.Problem = fmt.Sprintf("%s is an inheritance child of %s; capture takes no inheritance child, since a write "+
 			"through %s changes its rows without firing its statement triggers", qual, *parent, *parent)

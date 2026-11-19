@@ -249,7 +249,7 @@ func TestUndoSkipsEveryKeyOfAnUpdateThatShiftedKeys(t *testing.T) {
 // when a column was added, dropped or renamed, or the key column is gone
 // even where no image is left to compare; table_gone when the table was
 // dropped, even if one of the same name and shape was made again: one line
-// for the vanished table, without keys (plan ruling R11). The new table's own
+// for the vanished table, without keys (spec 7). The new table's own
 // changes are a key of their own, not folded into the old table's. A table
 // that was only renamed is still the same table.
 func TestPlanSkipsWhatNoLongerFitsTheTable(t *testing.T) {
@@ -535,7 +535,7 @@ func TestPlanChangesNothing(t *testing.T) {
 	}
 }
 
-// The refusals of spec 7 (and plan rulings U4, R15) are ST006: no
+// The refusals of spec 7 are ST006: no
 // agent_role, no since, until not after since, the reviewer's own writes, and
 // a transaction that is not READ COMMITTED. The selection refuses them too,
 // so that no one reads their own records through it. until NULL is up to now.
@@ -577,7 +577,7 @@ func TestPlanRefusals(t *testing.T) {
 // PUBLIC cannot execute any function of the plan, and a role without the
 // grants cannot call it (42501). A reviewer with them plans without any right
 // on Stet's tables. A table it cannot read gives no error and shows as one
-// line, skipped with 42501 and no key (plan ruling R11); no helper called
+// line, skipped with 42501 and no key (spec 7); no helper called
 // directly gives it a key or a value of that table. What the session can read
 // as its login role or a role it can SET ROLE to, it sees.
 func TestPlanNeedsGrants(t *testing.T) {
@@ -658,9 +658,9 @@ func TestPlanNeedsGrants(t *testing.T) {
 // A table whose row-level security would apply to the session (no role it
 // is or can SET ROLE to owns the table without FORCE ROW LEVEL SECURITY or
 // has BYPASSRLS) is withheld like a table it cannot read: one line, no key, no
-// value (plan ruling R11). Its owner, without FORCE, and a role with
+// value (spec 7). Its owner, without FORCE, and a role with
 // BYPASSRLS see the keys, here natural ones. A key read by a role to which
-// row-level security applies is refused, not read as a missing row (R16).
+// row-level security applies is refused, not read as a missing row.
 func TestPlanWithholdsATableUnderRowLevelSecurity(t *testing.T) {
 	pool, db := captureDB(t)
 	ctx := context.Background()
@@ -693,7 +693,7 @@ func TestPlanWithholdsATableUnderRowLevelSecurity(t *testing.T) {
 	// selection takes it as able to read (it can SET ROLE to the owner), but as
 	// itself row-level security applies to it. Its keys are refused with 42501,
 	// never read as missing rows, which would offer the deleted row as an
-	// insert (ruling R16).
+	// insert.
 	member := loginRole(t, "member")
 	grant(t, db, member, "grant usage on schema stet to "+member,
 		"grant execute on function "+strings.Join(planFunctions, ", ")+" to "+member,
@@ -987,7 +987,7 @@ func TestPlanFindsKeysOfEachType(t *testing.T) {
 
 // The plan and every function a role can call directly that reads a
 // customer table or judges a key refuse a transaction that is not READ
-// COMMITTED (plan ruling R15): under REPEATABLE READ and SERIALIZABLE the
+// COMMITTED (spec 7): under REPEATABLE READ and SERIALIZABLE the
 // transaction's snapshot and the catalog as it is now disagree. Under READ
 // COMMITTED each answers.
 func TestPlanRunsOnlyUnderReadCommitted(t *testing.T) {
@@ -1068,9 +1068,8 @@ func TestPlanRunsOnlyUnderReadCommitted(t *testing.T) {
 //   - a table dropped and made again: gone;
 //   - a column added; one added, dropped and added again; one dropped:
 //     columns_changed;
-//   - row-level security enabled: the key's read is refused with 42501
-//     (ruling R16), not read as a missing row; the plan then withholds the
-//     table.
+//   - row-level security enabled: the key's read is refused with 42501,
+//     not read as a missing row; the plan then withholds the table.
 //
 // Once the plan has read a table, the table cannot change until the
 // transaction ends.

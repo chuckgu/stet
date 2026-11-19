@@ -88,7 +88,7 @@ func captureDB(t *testing.T) (stet *pgxpool.Pool, db string) {
 
 // installCapture creates the four triggers of spec 4 on table, its name as
 // SQL (quoted where it must be), as the table owner does, with the
-// transition tables named stet_old and stet_new (ruling U11). key is the
+// transition tables named stet_old and stet_new (spec 4). key is the
 // configuration's table key and pk the key column's name, the two arguments
 // of stet.capture().
 func installCapture(t *testing.T, owner *pgx.Conn, table, key, pk string) {
@@ -1137,7 +1137,7 @@ func TestCaptureRefusesATriggerNotInstalledAsPrinted(t *testing.T) {
 	for _, c := range []struct{ name, trigger, write string }{
 		{"no transition table", `after insert on %s for each statement`, `insert into %s values (1)`},
 		{"another name", `after insert on %s referencing new table as new_rows for each statement`, `insert into %s values (1)`},
-		{"the names before U11", `after insert on %s referencing new table as n for each statement`, `insert into %s values (1)`},
+		{"the short name n", `after insert on %s referencing new table as n for each statement`, `insert into %s values (1)`},
 		{"no old table", `after update on %s referencing new table as stet_new for each statement`, `update %s set id = 2`},
 		{"no new table", `after update on %s referencing old table as stet_old for each statement`, `update %s set id = 2`},
 		{"names swapped", `after update on %s referencing old table as stet_new new table as stet_old for each statement`, `update %s set id = 2`},
@@ -1259,8 +1259,8 @@ func TestCaptureRefusesATriggerSwappedDuringTheStatement(t *testing.T) {
 
 // An agent session that holds a temporary relation named like a transition
 // table gets no values recorded, only a capture_failed set, and its write
-// goes through: the cost of the check above (ruling U11 makes the names
-// unlikely to be chosen by accident).
+// goes through: the cost of the check above (the long names are unlikely to
+// be chosen by accident).
 func TestCaptureRefusesWhileTheSessionHoldsATransitionTableName(t *testing.T) {
 	pool, db := captureDB(t)
 	ctx := context.Background()
@@ -1280,8 +1280,9 @@ func TestCaptureRefusesWhileTheSessionHoldsATransitionTableName(t *testing.T) {
 	}
 }
 
-// Temporary tables named o and n, the transition tables' names before ruling
-// U11, do not disturb capture.
+// Temporary tables named o and n, names short enough to be a session's own
+// by accident, do not disturb capture: the transition tables are not called
+// that.
 func TestCaptureIgnoresTemporaryTablesNamedOAndN(t *testing.T) {
 	pool, db := captureDB(t)
 	dealsTable(t, superuserIn(t, db))
