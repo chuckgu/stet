@@ -27,6 +27,11 @@ const undoSQLTimeout = 30 * time.Second
 // When the database has no stet.capture() it says to start Stet once, which
 // creates the stet schema, and creates nothing itself (spec 9).
 //
+// With -drop and a config that has no undo clause, it finds the tables in the
+// catalog instead: every table that carries a trigger calling stet.capture(),
+// and it drops each such trigger by its name (undo.DropCapturedSQL). It fails
+// when there is none. Without -drop a config without the clause is refused.
+//
 // With -grant <role> it writes only the grants that let role review and undo
 // (undo.GrantSQL), for Stet's account to run, with the undo functions read
 // from the catalog; it refuses with -drop or an empty role, and when the
@@ -59,7 +64,7 @@ func runUndoSQL(args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if cfg.Undo == nil {
+	if cfg.Undo == nil && !*drop {
 		return fmt.Errorf("%s has no undo clause: list the tables to capture under undo.tables", *path)
 	}
 
@@ -72,6 +77,9 @@ func runUndoSQL(args []string, out io.Writer) error {
 	defer pool.Close()
 	if grant {
 		return undoGrantSQL(ctx, pool, grantTo, out)
+	}
+	if cfg.Undo == nil {
+		return undoDropCapturedSQL(ctx, pool, *path, out)
 	}
 	var (
 		role    string
@@ -121,6 +129,28 @@ func runUndoSQL(args []string, out io.Writer) error {
 		return err
 	}
 	_, err = io.WriteString(out, sql)
+	return err
+}
+
+// undoDropCapturedSQL is stet undo-sql -drop for the config at path, which
+// has no undo clause: it reads the tables that carry capture triggers from
+// the catalog, in a read-only transaction, and writes undo.DropCapturedSQL's
+// output to out. With no such table it fails.
+func undoDropCapturedSQL(ctx context.Context, pool *pgxpool.Pool, path string, out io.Writer) error {
+	var ts []undo.Captured
+	err := readOnly(ctx, pool, func(tx pgx.Tx) error {
+		var err error
+		ts, err = undo.CapturedTables(ctx, tx)
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("undo-sql: looking for capture triggers: %w", err)
+	}
+	if len(ts) == 0 {
+		return fmt.Errorf("undo-sql: %s has no undo clause, and no table of this database has a trigger that calls "+
+			"stet.capture(): there is nothing to drop", path)
+	}
+	_, err = io.WriteString(out, undo.DropCapturedSQL(ts))
 	return err
 }
 

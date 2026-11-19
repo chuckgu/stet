@@ -541,3 +541,96 @@ func TestUndoEndToEnd(t *testing.T) {
 		}
 	}
 }
+
+// noUndoYAML is a config without an undo clause over database %[2]s of the
+// test server %[1]s, in mode %[4]s with table %[3]s gated.
+const noUndoYAML = `mode: %[4]s
+agents: {roles: [stet_md5]}
+listen: 127.0.0.1:0
+upstream: postgres://stet_scram:scram-pw@%[1]s/%[2]s?sslmode=disable
+model: {adapter: none, on_failure: pass}
+tables:
+  %[3]s: {pk: id, send_fields: [name]}
+`
+
+// Started without an undo clause while capture triggers are still installed,
+// Stet says so in one warning that names the tables and both remedies, and
+// starts, in either mode: capture goes on without it, and nothing purges what
+// it records. A database without such triggers gets no such warning.
+func TestRunWarnsOfCaptureLeftWithoutAnUndoClause(t *testing.T) {
+	pg := testPG(t)
+	ctx := context.Background()
+	for _, mode := range []string{"shadow", "enforce"} {
+		t.Run(mode, func(t *testing.T) {
+			db, table, admin, _ := capturedTable(t, pg, 1)
+			mustExec(t, admin, "create table public.also_captured (id int primary key)")
+			captureOn(t, admin, "public.also_captured", "public.also_captured", "id")
+			r := start(t, parseConfig(t, noUndoYAML, pg, db, table, mode))
+			agent := connectTo(t, r.addr, db, "stet_md5", "md5-pw")
+			if _, err := agent.Exec(ctx, "update "+table+" set name = 'through' where id = 1"); err != nil {
+				t.Fatalf("an agent's write through Stet: %v; log:\n%s", err, r.log)
+			}
+			if err := r.stop(t); err != nil {
+				t.Fatalf("run = %v, want nil", err)
+			}
+			w, ok := warningWith(warnings(r.log.String()), "no undo clause", "public."+table, "public.also_captured",
+				"still recorded", "nothing deletes old change records", "put the undo clause back", "stet undo-sql -drop")
+			if !ok {
+				t.Errorf("no warning of capture left without an undo clause; log:\n%s", r.log)
+			}
+			if n := strings.Count(r.log.String(), "no undo clause"); n != 1 {
+				t.Errorf("%d log lines say there is no undo clause, want one: %s", n, w)
+			}
+		})
+	}
+	t.Run("no triggers", func(t *testing.T) {
+		db, table, _ := agentTable(t, pg, 1)
+		stetPoolIn(t, pg, db)
+		r := start(t, parseConfig(t, noUndoYAML, pg, db, table, "shadow"))
+		waitListening(t, r)
+		if err := r.stop(t); err != nil {
+			t.Fatalf("run = %v, want nil", err)
+		}
+		if w, ok := warningWith(warnings(r.log.String()), "undo clause"); ok {
+			t.Errorf("a warning about the undo clause with no capture trigger installed: %s", w)
+		}
+	})
+}
+
+// When Stet cannot read whether capture triggers are left (here its time is
+// up at once), that is a warning that says so, and Stet starts. With neither
+// gated tables nor an undo clause Stet opens no pool and reads nothing: there
+// is no such warning, with triggers installed too.
+func TestRunStartsWhenTheCheckForLeftCaptureFails(t *testing.T) {
+	pg := testPG(t)
+	ctx := context.Background()
+	db, table, _, _ := capturedTable(t, pg, 1)
+	was := undoStartTimeout
+	t.Cleanup(func() { undoStartTimeout = was })
+	undoStartTimeout = time.Nanosecond
+
+	r := start(t, parseConfig(t, noUndoYAML, pg, db, table, "enforce"))
+	agent := connectTo(t, r.addr, db, "stet_md5", "md5-pw")
+	if _, err := agent.Exec(ctx, "update "+table+" set name = 'through' where id = 1"); err != nil {
+		t.Fatalf("an agent's write through Stet: %v; log:\n%s", err, r.log)
+	}
+	if err := r.stop(t); err != nil {
+		t.Fatalf("run = %v, want nil", err)
+	}
+	if _, ok := warningWith(warnings(r.log.String()), "could not check whether capture triggers", "no undo clause"); !ok {
+		t.Errorf("no warning that the check could not be made; log:\n%s", r.log)
+	}
+
+	undoStartTimeout = was
+	r = start(t, parseConfig(t, `mode: shadow
+listen: 127.0.0.1:0
+upstream: postgres://stet_scram:scram-pw@%[1]s/%[2]s?sslmode=disable
+`, pg, db))
+	waitListening(t, r)
+	if err := r.stop(t); err != nil {
+		t.Fatalf("run = %v, want nil", err)
+	}
+	if w, ok := warningWith(warnings(r.log.String()), "undo clause"); ok {
+		t.Errorf("a warning about the undo clause from a Stet that opens no pool: %s", w)
+	}
+}

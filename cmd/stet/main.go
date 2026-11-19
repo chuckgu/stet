@@ -130,11 +130,12 @@ func run(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog.Log
 // does what Stet does at start for undo (startUndo), in both modes: after the
 // check has passed, so that a start the check refuses changes nothing, and
 // before the executor starts, so that the held writes it applies are
-// captured under the settings of this start. In enforce mode it then starts
-// the executor of approved held writes (spec-v0.2-approve 7); in shadow mode
-// there is none, and no write is executed (rule 6). closeGate closes the
-// gate, then the executor, then the purge of old change records, then the
-// pool.
+// captured under the settings of this start. Without undo it warns if
+// capture triggers are still installed (warnOfLeftCapture). In enforce mode
+// it then starts the executor of approved held writes (spec-v0.2-approve 7);
+// in shadow mode there is none, and no write is executed (rule 6). closeGate
+// closes the gate, then the executor, then the purge of old change records,
+// then the pool.
 //
 // With no table there is no gate, no executor and no check: the proxy passes
 // every session through, in enforce mode too (spec correction B10), which is
@@ -179,6 +180,8 @@ func openGate(ctx context.Context, cfg *config.Config, log *slog.Logger) (g *gat
 	var purger *undo.Purger
 	if cfg.Undo != nil {
 		purger = startUndo(ctx, cfg, pool, st, log)
+	} else {
+		warnOfLeftCapture(ctx, pool, log)
 	}
 	var applier *apply.Applier
 	if len(cfg.Tables) > 0 && cfg.Mode == config.ModeEnforce {
@@ -233,6 +236,31 @@ func startUndo(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, st *
 	p := undo.NewPurger(st, cfg.Undo.Keep, log)
 	p.Start()
 	return p
+}
+
+// warnOfLeftCapture is what Stet does at start, once its pool is open, when
+// the config has no undo clause (spec-v0.2-undo 9): it reads from the catalog
+// whether capture triggers are still installed, and warns if so. Without the
+// clause Stet neither syncs the capture settings nor purges, while the
+// triggers go on recording. It does not stop the start: a read that fails is
+// a warning that says so, within the time startUndo has.
+func warnOfLeftCapture(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(ctx, undoStartTimeout)
+	defer cancel()
+	var ts []undo.Captured
+	err := readOnly(ctx, pool, func(tx pgx.Tx) error {
+		var err error
+		ts, err = undo.CapturedTables(ctx, tx)
+		return err
+	})
+	if err != nil {
+		log.Warn("the config has no undo clause, and Stet could not check whether capture triggers are still installed; "+
+			"if they are, writes are still recorded and nothing deletes old change records", "err", err)
+		return
+	}
+	if w := undo.CaptureWithoutUndo(ts); w != "" {
+		log.Warn(w)
+	}
 }
 
 // openPool connects Stet's own sessions: state reads and decision writes.

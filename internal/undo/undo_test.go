@@ -1760,3 +1760,177 @@ func TestReviewerFunctionsNeedStetsUndo(t *testing.T) {
 		t.Errorf("with another role's stet.undo: %q, %v; want ErrNoUndo", got, err)
 	}
 }
+
+// CapturedTables finds, in the catalog alone, every table that carries a
+// trigger calling Stet's stet.capture(): under the four names or another,
+// enabled or not, with the triggers' names and the table's owner, in byte
+// order of schema and name. A table whose trigger calls another function,
+// also one named capture in another schema, is not among them.
+func TestCapturedTablesReadsTheCatalog(t *testing.T) {
+	owner := newOwner(t, "stet_undo_owner")
+	db, stet := ownDatabase(t)
+	ctx := context.Background()
+	su := superuser(t, db)
+	if got, err := undo.CapturedTables(ctx, stet); err != nil || len(got) != 0 {
+		t.Fatalf("CapturedTables in a database without capture triggers: %+v, %v", got, err)
+	}
+	mustExec(t, su,
+		`create table public.deals (id int primary key)`,
+		`create table public.notes (id int primary key)`,
+		`create table public.plain (id int primary key)`,
+		`create schema "Odd"`,
+		`create table "Odd"."T 1" (id int primary key)`,
+		`alter table "Odd"."T 1" owner to `+owner,
+		`create function public.capture() returns trigger language plpgsql as $$ begin return null; end $$`,
+		`create trigger stet_capture_ins after insert on public.plain for each statement execute function public.capture()`,
+		`create trigger "Old Capture" after insert on public.notes referencing new table as stet_new
+		   for each statement execute function stet.capture('notes', 'id')`,
+		`alter table public.notes disable trigger "Old Capture"`)
+	installByHand(t, su, "public.deals", "deals", "id")
+	installByHand(t, su, `"Odd"."T 1"`, "odd", "id")
+
+	got, err := undo.CapturedTables(ctx, stet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	four := []string{"stet_capture_del", "stet_capture_ins", "stet_capture_trunc", "stet_capture_upd"}
+	want := []undo.Captured{
+		{Schema: "Odd", Name: "T 1", Owner: owner, Triggers: four},
+		{Schema: "public", Name: "deals", Owner: "postgres", Triggers: four},
+		{Schema: "public", Name: "notes", Owner: "postgres", Triggers: []string{"Old Capture"}},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("CapturedTables = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i].Schema != want[i].Schema || got[i].Name != want[i].Name || got[i].Owner != want[i].Owner ||
+			!slices.Equal(got[i].Triggers, want[i].Triggers) {
+			t.Errorf("table %d: %+v, want %+v", i, got[i], want[i])
+		}
+	}
+
+	// In a database without the stet schema there is no stet.capture() and so
+	// no such table; the read does not fail.
+	bare := fmt.Sprintf("stet_undo_bare_%d", time.Now().UnixNano())
+	admin := superuser(t, "stet_test")
+	mustExec(t, admin, "create database "+bare+" template template0")
+	t.Cleanup(func() { admin.Exec(context.Background(), "drop database if exists "+bare+" with (force)") })
+	if got, err := undo.CapturedTables(ctx, superuser(t, bare)); err != nil || len(got) != 0 {
+		t.Errorf("CapturedTables in a database without the stet schema: %+v, %v", got, err)
+	}
+}
+
+// DropCapturedSQL drops every trigger CapturedTables found, by its name, in
+// one transaction per owner as DropSQL does, and says where its tables come
+// from. Names are quoted where they must be.
+func TestDropCapturedSQLPrintsOneTransactionPerOwner(t *testing.T) {
+	ts := []undo.Captured{
+		{Schema: "public", Name: "deals", Owner: "crm_owner", Triggers: []string{"stet_capture_del", "stet_capture_ins"}},
+		{Schema: "Odd", Name: "T 1", Owner: "Sales Owner", Triggers: []string{"stet_capture_upd"}},
+		{Schema: "public", Name: "notes", Owner: "crm_owner", Triggers: []string{"Old Capture"}},
+	}
+	const want = `-- The config has no undo clause: these are the tables of this database that carry a trigger calling stet.capture().
+-- 1. Run as "Sales Owner" (the owner of "Odd"."T 1").
+BEGIN;
+SET LOCAL lock_timeout = '5s';
+DROP TRIGGER IF EXISTS stet_capture_upd ON "Odd"."T 1";
+COMMIT;
+
+-- 2. Run as crm_owner (the owner of public.deals, public.notes).
+BEGIN;
+SET LOCAL lock_timeout = '5s';
+DROP TRIGGER IF EXISTS stet_capture_del ON public.deals;
+DROP TRIGGER IF EXISTS stet_capture_ins ON public.deals;
+DROP TRIGGER IF EXISTS "Old Capture" ON public.notes;
+COMMIT;
+`
+	if got := undo.DropCapturedSQL(ts); got != want {
+		t.Errorf("DropCapturedSQL printed:\n%s\nwant:\n%s", got, want)
+	}
+	if got := undo.DropCapturedSQL(nil); got != "" {
+		t.Errorf("DropCapturedSQL of no table printed %q", got)
+	}
+}
+
+// CaptureWithoutUndo is the one line Stet logs when its config has no undo
+// clause and capture triggers are still installed: it names the tables, says
+// capture goes on and nothing is purged, and gives both remedies. With no
+// table it is empty.
+func TestCaptureWithoutUndoWarning(t *testing.T) {
+	got := undo.CaptureWithoutUndo([]undo.Captured{
+		{Schema: "public", Name: "deals", Owner: "crm_owner", Triggers: []string{"stet_capture_ins"}},
+		{Schema: "Odd", Name: "T\n1", Owner: "crm_owner", Triggers: []string{"x"}},
+	})
+	for _, p := range []string{"no undo clause", "public.deals", `"Odd"."T\x0a1"`, "still recorded", "nothing deletes old change records",
+		"put the undo clause back", "stet undo-sql -drop"} {
+		if !strings.Contains(got, p) {
+			t.Errorf("the warning %q does not say %q", got, p)
+		}
+	}
+	if strings.Contains(got, "\n") {
+		t.Errorf("the warning has more than one line: %q", got)
+	}
+	if got := undo.CaptureWithoutUndo(nil); got != "" {
+		t.Errorf("a warning with no captured table: %q", got)
+	}
+}
+
+// A key column whose unique index compares with an operator outside
+// pg_catalog (citext's, here) is found by Inspect: stet.undo looks rows up
+// with pg_catalog's equality, which that index cannot serve, so it scans the
+// table for every key. Warnings says so at startup and InstallSQL in a note;
+// the table is still captured. Keys compared with PostgreSQL's own operators
+// (integer, text, varchar, a domain over text, text under text_pattern_ops)
+// are not warned about.
+func TestInspectWarnsOfAKeyComparedOutsidePgCatalog(t *testing.T) {
+	db, stet := ownDatabase(t)
+	su := superuser(t, db)
+	mustExec(t, su,
+		`create extension citext`,
+		`create domain public.code_d as text`,
+		`create table public.by_email (email public.citext primary key)`,
+		`create table public.by_id (id int primary key)`,
+		`create table public.by_text (code text primary key)`,
+		`create table public.by_varchar (code varchar(10) primary key)`,
+		`create table public.by_domain (code public.code_d primary key)`,
+		`create table public.by_pattern (code text not null)`,
+		`create unique index on public.by_pattern (code text_pattern_ops)`)
+	ts := inspect(t, stet, map[string]string{
+		"public.by_email": "email", "public.by_id": "id", "public.by_text": "code", "public.by_varchar": "code",
+		"public.by_domain": "code", "public.by_pattern": "code",
+	})
+	for _, tb := range ts {
+		if tb.Problem != "" {
+			t.Errorf("%s: problem %q, want none", tb.Key, tb.Problem)
+		}
+		if want := tb.Key == "public.by_email"; (tb.KeyScan != "") != want {
+			t.Errorf("%s: KeyScan %q, want one: %v", tb.Key, tb.KeyScan, want)
+		}
+	}
+	email := byKey(ts)["public.by_email"]
+	for _, p := range []string{"email", "citext", "public.=(citext, citext)", "pg_catalog"} {
+		if !strings.Contains(email.KeyScan, p) {
+			t.Errorf("KeyScan %q does not say %q", email.KeyScan, p)
+		}
+	}
+	var scans []string
+	for _, w := range undo.Warnings(ts) {
+		if strings.Contains(w, "scan") {
+			scans = append(scans, w)
+		}
+	}
+	if len(scans) != 1 || !strings.Contains(scans[0], "undo.tables.public.by_email:") || !strings.Contains(scans[0], "public.=(citext, citext)") ||
+		!strings.Contains(scans[0], "for every key") {
+		t.Errorf("warnings about a scan: %q, want one for public.by_email naming the operator", scans)
+	}
+	sql, err := undo.InstallSQL(stetRole, ts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(sql, "-- note: stet.undo will scan public.by_email"); n != 1 {
+		t.Errorf("the install SQL has %d notes about scanning public.by_email, want 1:\n%s", n, sql)
+	}
+	if strings.Contains(sql, "will scan public.by_id") || !strings.Contains(sql, "ON public.by_email\n") {
+		t.Errorf("the install SQL warns of a key it should not, or leaves public.by_email out:\n%s", sql)
+	}
+}

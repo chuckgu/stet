@@ -1154,6 +1154,51 @@ func TestCheckFollowsRoleMembership(t *testing.T) {
 	})
 }
 
+// An agent role that owns a table of undo.tables is warned about as the owner
+// of a gated table is: it can drop or disable the capture triggers, and its
+// writes then leave no record. The check looks at undo.tables as well as
+// tables, and at a table under both once.
+func TestCheckWarnsWhenAnAgentOwnsAnUndoTable(t *testing.T) {
+	pg := testPG(t)
+	ctx := context.Background()
+	db := cleanDatabase(t, pg)
+	pool := stetPoolIn(t, pg, db)
+	admin := connectTo(t, pg, db, "stet_scram", "scram-pw")
+	gated := freshTable(t, admin, 1)
+	su := connectTo(t, pg, db, "postgres", "postgres-pw")
+	owned := freshTable(t, su, 1)
+	both := freshTable(t, su, 1)
+	mustExec(t, su, "alter table "+owned+" owner to stet_md5")
+	mustExec(t, su, "alter table "+both+" owner to stet_md5")
+
+	cfg := enforceConfig("stet_md5", gated)
+	cfg.Tables[both] = cfg.Tables[gated]
+	cfg.Undo = &config.Undo{Tables: map[string]string{owned: "id", both: "id", gated: "id", "public.undo_gone": "id"}, MaxRows: 10000, Keep: time.Hour}
+	warnings, err := check(ctx, pool, cfg)
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	t.Logf("warnings: %q", warnings)
+	if _, ok := warningWith(warnings, `agent role "stet_md5" owns table `+owned+":", "capture triggers", "ALTER TABLE"); !ok {
+		t.Errorf("no warning that the agent owns %s, which is under undo.tables only", owned)
+	}
+	n := 0
+	for _, w := range warnings {
+		if strings.Contains(w, "owns table "+both+":") {
+			n++
+		}
+		if strings.Contains(w, "owns table "+gated) {
+			t.Errorf("a warning that the agent owns %s, which Stet's account owns: %s", gated, w)
+		}
+	}
+	if n != 1 {
+		t.Errorf("%d warnings that the agent owns %s, which is gated and under undo.tables; want one", n, both)
+	}
+	if _, ok := warningWith(warnings, "public.undo_gone", "could not be checked", "undo.tables"); !ok {
+		t.Errorf("no warning that the owner of public.undo_gone, which is not there, could not be checked")
+	}
+}
+
 // An agent role that may create objects can write a gated table through a
 // temporary view or a function it creates, which no statement Stet judges
 // shows (ruling 29): enforce warns of TEMPORARY and CREATE on the database

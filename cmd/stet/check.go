@@ -215,13 +215,14 @@ func (c *checker) stetSuperuser() {
 type ownedTable struct {
 	key, owner string
 	ownerOID   uint32
+	undoOnly   bool // under undo.tables and not gated
 }
 
 // agentRoles warns about each agent role what spec 8 asks the operator to
 // set up and Stet can see: the role exists, is not a superuser, has no right
 // on the stet schema, may create no objects (createRights), does not own a
-// gated table, and has no role-level search_path other than Stet's. own are
-// roles already refused as Stet's own.
+// gated table or a table of undo.tables, and has no role-level search_path
+// other than Stet's. own are roles already refused as Stet's own.
 func (c *checker) agentRoles(own map[string]bool) {
 	if len(c.cfg.AgentRoles) == 0 {
 		return
@@ -239,12 +240,27 @@ func (c *checker) agentRoles(own map[string]bool) {
 	}
 }
 
-// gatedTables finds the owner of each gated table, named as the gate names
-// it in SQL. A table Stet cannot find is a warning, once.
+// gatedTables finds the owner of each gated table, and of each table under
+// undo.tables that is not gated (undoOnly), named as the gate names it in
+// SQL. A table Stet cannot find is a warning, once.
 func (c *checker) gatedTables() []ownedTable {
+	keys := c.tableKeys()
+	gated := len(keys)
+	if c.cfg.Undo != nil {
+		for key := range c.cfg.Undo.Tables {
+			if _, ok := c.cfg.Tables[key]; !ok {
+				keys = append(keys, key)
+			}
+		}
+		slices.Sort(keys[gated:])
+	}
 	var out []ownedTable
-	for _, key := range c.tableKeys() {
-		t := ownedTable{key: key}
+	for i, key := range keys {
+		t := ownedTable{key: key, undoOnly: i >= gated}
+		clause := "tables"
+		if t.undoOnly {
+			clause = "undo.tables"
+		}
 		err := c.read(func(tx pgx.Tx) error {
 			return tx.QueryRow(c.ctx, `select c.relowner, pg_get_userbyid(c.relowner)
 				from pg_class c where c.oid = to_regclass($1)`, ident(key)).Scan(&t.ownerOID, &t.owner)
@@ -252,9 +268,9 @@ func (c *checker) gatedTables() []ownedTable {
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):
 			c.warn("whether an agent role owns table %s could not be checked: Stet's account does not find it "+
-				"on its search_path; fix: create the table, or name it in tables as Stet's connection sees it", key)
+				"on its search_path; fix: create the table, or name it in %s as Stet's connection sees it", key, clause)
 		case err != nil:
-			c.warn("whether an agent role owns table %s could not be checked: %v", key, err)
+			c.warn("whether an agent role owns table %s (%s) could not be checked: %v", key, clause, err)
 		default:
 			out = append(out, t)
 		}
@@ -342,7 +358,10 @@ func (c *checker) agentRole(role string, tables []ownedTable, stetPath, database
 			return tx.QueryRow(c.ctx, "select pg_has_role($1::oid, $2::oid, 'MEMBER'), "+viaRole("$1::oid", "$2::oid"),
 				oid, t.ownerOID).Scan(&owns, &via)
 		})
-		const why = "an owner can alter it, add triggers and grant itself any right outside what Stet judges"
+		why := "an owner can alter it, add triggers and grant itself any right outside what Stet judges"
+		if t.undoOnly {
+			why = "an owner can drop or disable its capture triggers, and its writes then leave no record to undo"
+		}
 		switch {
 		case err != nil:
 			c.warn("whether agent role %q owns table %s could not be checked: %v", role, t.key, err)

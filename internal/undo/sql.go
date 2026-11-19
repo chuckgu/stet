@@ -31,7 +31,8 @@ const lockTimeout = "5s"
 // takes a lock that waits for, and blocks, writes to the table, not reads;
 // DROP TRIGGER would block reads too, so the SQL drops nothing, and a
 // trigger of another name is left alone. It needs PostgreSQL 14 or later
-// (RequireServer). After the transaction, notes name the tables whose rows
+// (RequireServer). After the transaction, notes name the tables whose key
+// undo cannot look up through its index (KeyScan) and the tables whose rows
 // the table's deletes change uncaptured. Owners and tables are in
 // byte order of owner and key. Identifiers are quoted where they must be and
 // the arguments are string literals, so no name can end the identifier or
@@ -96,6 +97,9 @@ func InstallSQL(stetRole string, ts []Table) (string, error) {
 		}
 		b.WriteString("COMMIT;\n")
 		for _, t := range g.tables {
+			if t.KeyScan != "" {
+				fmt.Fprintf(&b, "-- note: stet.undo will scan %s for every key it restores: %s.\n", comment(t.qualified()), comment(t.KeyScan))
+			}
 			for _, child := range t.Children {
 				fmt.Fprintf(&b, "-- note: %s references %s with ON DELETE CASCADE, SET NULL or SET DEFAULT and is not under undo.tables:\n",
 					comment(child), comment(t.qualified()))
@@ -158,7 +162,14 @@ func (g ownerGroup) begin(b *strings.Builder, n int) {
 	for i, t := range g.tables {
 		names[i] = t.qualified()
 	}
-	fmt.Fprintf(b, "-- %d. Run as %s (the owner of %s).\n", n, comment(quoteIdent(g.owner)), comment(strings.Join(names, ", ")))
+	beginOwner(b, n, g.owner, names)
+}
+
+// beginOwner writes the head of the part, numbered n, that owner runs for
+// its tables, whose names are SQL: who runs it, and the start of its
+// transaction with its lock_timeout.
+func beginOwner(b *strings.Builder, n int, owner string, tables []string) {
+	fmt.Fprintf(b, "-- %d. Run as %s (the owner of %s).\n", n, comment(quoteIdent(owner)), comment(strings.Join(tables, ", ")))
 	fmt.Fprintf(b, "BEGIN;\nSET LOCAL lock_timeout = '%s';\n", lockTimeout)
 }
 

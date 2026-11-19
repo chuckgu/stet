@@ -224,3 +224,83 @@ func TestUndoSQLGrantRefusesAnUndoThatIsNotStets(t *testing.T) {
 		t.Errorf("with another role's stet.undo: %v, printed %q; want the error of a database without undo, and nothing", err, out.String())
 	}
 }
+
+// With a config that has no undo clause, stet undo-sql -drop finds its tables
+// in the catalog: it prints the SQL that drops every trigger calling
+// stet.capture(), under the four names or another, one transaction per
+// owner, and changes nothing. In a database without such a trigger it fails
+// and prints nothing. Without -drop a config without the clause is refused as
+// before, with -grant too.
+func TestUndoSQLDropWithoutAnUndoClause(t *testing.T) {
+	pg := testPG(t)
+	ctx := context.Background()
+	owner := createRole(t, superuser(t, pg), "owner", "nologin")
+	db := cleanDatabase(t, pg)
+	stetPoolIn(t, pg, db)
+	in := connectTo(t, pg, db, "postgres", "postgres-pw")
+	mustExec(t, in, "create table public.deals (id int primary key)")
+	mustExec(t, in, "create table public.notes (id int primary key)")
+	mustExec(t, in, "create table public.plain (id int primary key)")
+	captureOn(t, in, "public.deals", "public.deals", "id")
+	mustExec(t, in, `create trigger old_capture after insert on public.notes referencing new table as stet_new
+		for each statement execute function stet.capture('notes', 'id')`)
+	mustExec(t, in, "alter table public.deals owner to "+owner)
+	triggers := func() (n int) {
+		t.Helper()
+		if err := in.QueryRow(ctx, `select count(*) from pg_trigger where not tgisinternal`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	before := triggers()
+
+	path := undoSQLConfig(t, pg, db, "")
+	var out bytes.Buffer
+	if err := runUndoSQL([]string{"-config", path, "-drop"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	s := out.String()
+	for _, p := range []string{
+		"no undo clause",
+		"Run as " + owner + " (the owner of public.deals).\n",
+		"DROP TRIGGER IF EXISTS stet_capture_ins ON public.deals;\n",
+		"DROP TRIGGER IF EXISTS stet_capture_upd ON public.deals;\n",
+		"DROP TRIGGER IF EXISTS stet_capture_del ON public.deals;\n",
+		"DROP TRIGGER IF EXISTS stet_capture_trunc ON public.deals;\n",
+		"Run as postgres (the owner of public.notes).\n",
+		"DROP TRIGGER IF EXISTS old_capture ON public.notes;\n",
+		"SET LOCAL lock_timeout = '5s';\n",
+	} {
+		if !strings.Contains(s, p) {
+			t.Errorf("stet undo-sql -drop without an undo clause does not print %q:\n%s", p, s)
+		}
+	}
+	if strings.Contains(s, "public.plain") || strings.Contains(s, "CREATE") || strings.Contains(s, "GRANT") ||
+		strings.Count(s, "DROP TRIGGER") != 5 {
+		t.Errorf("stet undo-sql -drop without an undo clause printed:\n%s", s)
+	}
+	if n := triggers(); n != before {
+		t.Errorf("%d triggers in the database after stet undo-sql -drop, %d before: it only prints", n, before)
+	}
+
+	fails := func(name, want string, args ...string) {
+		t.Helper()
+		out.Reset()
+		err := runUndoSQL(args, &out)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %v, want an error saying %q", name, err, want)
+		}
+		if out.Len() != 0 {
+			t.Errorf("%s: printed %q, want nothing", name, out.String())
+		}
+	}
+	fails("install without an undo clause", "has no undo clause", "-config", path)
+	fails("-grant without an undo clause", "has no undo clause", "-config", path, "-grant", "reviewer")
+	none := cleanDatabase(t, pg)
+	stetPoolIn(t, pg, none)
+	fails("-drop with no capture trigger", "no table of this database has a trigger that calls stet.capture()",
+		"-config", undoSQLConfig(t, pg, none, ""), "-drop")
+	bare := cleanDatabase(t, pg)
+	fails("-drop with no stet schema", "no table of this database has a trigger that calls stet.capture()",
+		"-config", undoSQLConfig(t, pg, bare, ""), "-drop")
+}

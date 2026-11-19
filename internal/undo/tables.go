@@ -20,8 +20,8 @@ import (
 	"github.com/stetdb/stet/internal/store"
 )
 
-// Table is one table of undo.tables as the database has it. Triggers and
-// Children are looked at only for a table without a Problem.
+// Table is one table of undo.tables as the database has it. Triggers,
+// Children and KeyScan are looked at only for a table without a Problem.
 type Table struct {
 	Key, PK             string // the config key and the key column
 	Schema, Name, Owner string // "" when the table was not found
@@ -29,6 +29,7 @@ type Table struct {
 	Problem             string   // why capture cannot be installed on it; "" when it can
 	Triggers            []string // what is wrong with its capture triggers, one line each; empty when all four are right
 	Children            []string // schema-qualified tables that reference it with ON DELETE CASCADE, SET NULL or SET DEFAULT and are not in undo.tables
+	KeyScan             string   // why undo cannot look a row up through the key's index and scans the table instead; "" when it can
 
 	// noTriggers: the relation is of a kind that cannot have triggers (an
 	// index, a sequence, a materialized view, a system table), so DropSQL
@@ -123,8 +124,59 @@ func Inspect(ctx context.Context, q store.Querier, cfg *config.Config) ([]Table,
 		if err := inspectChildren(ctx, q, t, oids); err != nil {
 			return nil, fmt.Errorf("undo.tables.%s: %w", oneLine(t.Key), err)
 		}
+		if err := inspectKey(ctx, q, t); err != nil {
+			return nil, fmt.Errorf("undo.tables.%s: %w", oneLine(t.Key), err)
+		}
 	}
 	return ts, nil
+}
+
+// inspectKey fills in KeyScan when undo cannot look t's rows up through the
+// key's index. stet.undo and stet.undo_plan find a row with
+// OPERATOR(pg_catalog.=) on the key column (spec 7), so that no operator a
+// session can put in its way is chosen. An index serves that lookup only if
+// its operator class compares with an operator of pg_catalog: for a type
+// whose equality is elsewhere (citext's, an extension's), pg_catalog's
+// equality is another comparison, reached through a cast, and every lookup
+// scans the table. The indexes looked at are those that make the column a
+// key (look); one that compares with pg_catalog's operator is enough.
+func inspectKey(ctx context.Context, q store.Querier, t *Table) error {
+	var (
+		keyType   string
+		operators []string
+		own       bool
+	)
+	err := q.QueryRow(ctx, `
+		select format_type(a.atttypid, a.atttypmod), eq.names, eq.own
+		  from pg_attribute a
+		 cross join lateral (
+		       select coalesce(array_agg(distinct format('%I.%s(%s, %s)', n.nspname, o.oprname,
+		                                                 format_type(o.oprleft, null), format_type(o.oprright, null))), '{}') as names,
+		              coalesce(bool_or(n.nspname = 'pg_catalog'), false) as own
+		         from pg_index x
+		         join pg_opclass oc on oc.oid = x.indclass[0]
+		         join pg_amop ao on ao.amopfamily = oc.opcfamily and ao.amoplefttype = oc.opcintype
+		                        and ao.amoprighttype = oc.opcintype and ao.amopstrategy = 3
+		         join pg_operator o on o.oid = ao.amopopr
+		         join pg_namespace n on n.oid = o.oprnamespace
+		        where x.indrelid = a.attrelid and x.indisunique and x.indisvalid and x.indimmediate
+		          and x.indnkeyatts = 1 and x.indkey[0] = a.attnum
+		          and x.indpred is null and x.indexprs is null
+		          and (x.indisprimary or a.attnotnull)) eq
+		 where a.attrelid = $1 and a.attname = $2 and a.attnum > 0 and not a.attisdropped`, t.OID, t.PK).Scan(&keyType, &operators, &own)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil // the column went between the two reads; the next start says so
+	}
+	if err != nil {
+		return err
+	}
+	if own || len(operators) == 0 {
+		return nil
+	}
+	t.KeyScan = fmt.Sprintf("its key column %s is of type %s, whose index compares with %s, not with an operator of pg_catalog, "+
+		"and undo looks rows up with pg_catalog's equality, which that index does not serve",
+		quoteIdent(t.PK), keyType, strings.Join(operators, ", "))
+	return nil
 }
 
 // look finds t's table and fills in what it is, or the Problem.
@@ -527,8 +579,9 @@ const fix = "run stet undo-sql and have the table's owner run its output"
 // order, the problem that keeps it from being captured, or else what is
 // wrong with its four capture triggers (one line, whose fix is the output of
 // stet undo-sql), each other trigger that calls stet.capture() (one line
-// each, whose fix is for the owner to drop it), and the tables whose rows its
-// deletes change uncaptured. Each line names the table's key.
+// each, whose fix is for the owner to drop it), a key that undo cannot look
+// up through its index, and the tables whose rows its deletes change
+// uncaptured. Each line names the table's key.
 func Warnings(ts []Table) []string {
 	var out []string
 	add := func(format string, a ...any) { out = append(out, oneLine(fmt.Sprintf(format, a...))) }
@@ -558,6 +611,10 @@ func Warnings(ts []Table) []string {
 		for _, line := range others {
 			add("undo.tables.%s: trigger %s; fix: have the table's owner drop it; the output of stet undo-sql does not",
 				t.Key, line)
+		}
+		if t.KeyScan != "" {
+			add("undo.tables.%s: %s: stet.undo and stet.undo_plan scan the table for every key, so undoing its changes "+
+				"takes time in proportion to the keys times the table's size; its writes are captured as usual", t.Key, t.KeyScan)
 		}
 		if len(t.Children) > 0 {
 			add("undo.tables.%s: tables that reference it with ON DELETE CASCADE, SET NULL or SET DEFAULT are not in "+
