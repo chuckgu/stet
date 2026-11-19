@@ -3,6 +3,7 @@ package store_test
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -1134,4 +1135,269 @@ func TestCaptureIgnoresTemporaryTablesNamedOAndN(t *testing.T) {
 	checkLines(t, changes, insert, changeLine{Op: "insert", Key: "4", After: deal("4", "Umbrella", "40")})
 	checkLines(t, changes, update, changeLine{Op: "update", Key: "1", Before: deal("1", "Acme", "10"), After: deal("1", "Acme", "11")})
 	checkLines(t, changes, del, changeLine{Op: "delete", Key: "2", Before: deal("2", "Globex", "20")})
+}
+
+// settingsRow is the row of stet.capture_settings, with its xmin, which
+// changes only when the row is written.
+type settingsRow struct {
+	Roles     []string
+	NullRoles bool
+	MaxRows   int64
+	XMin      string
+}
+
+// captureSettings reads the row of stet.capture_settings; ok is false when
+// there is none.
+func captureSettings(t *testing.T, pool *pgxpool.Pool) (r settingsRow, ok bool) {
+	t.Helper()
+	err := pool.QueryRow(context.Background(), `select roles, roles is null, max_rows, xmin::text from stet.capture_settings`).
+		Scan(&r.Roles, &r.NullRoles, &r.MaxRows, &r.XMin)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return r, false
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r, true
+}
+
+// SyncCaptureSettings puts the row in when there is none, changes it when it
+// differs, the order of the roles included, and does not write it (its xmin
+// stays) when it already says the same. No roles is NULL: every session.
+func TestSyncCaptureSettings(t *testing.T) {
+	pool, _ := captureDB(t)
+	st := store.New(pool)
+	sync := func(roles []string, maxRows int64) settingsRow {
+		t.Helper()
+		if err := st.SyncCaptureSettings(context.Background(), roles, maxRows); err != nil {
+			t.Fatalf("SyncCaptureSettings(%q, %d): %v", roles, maxRows, err)
+		}
+		r, ok := captureSettings(t, pool)
+		if !ok {
+			t.Fatalf("SyncCaptureSettings(%q, %d) left no row", roles, maxRows)
+		}
+		return r
+	}
+	want := func(what string, r settingsRow, roles []string, maxRows int64) {
+		t.Helper()
+		if !slices.Equal(r.Roles, roles) || r.NullRoles != (roles == nil) || r.MaxRows != maxRows {
+			t.Errorf("%s: roles %q (NULL %v), max_rows %d; want %q (NULL %v), %d",
+				what, r.Roles, r.NullRoles, r.MaxRows, roles, roles == nil, maxRows)
+		}
+	}
+	if _, ok := captureSettings(t, pool); ok {
+		t.Fatal("captureDB left a row in stet.capture_settings")
+	}
+
+	first := sync([]string{"agent_a", "agent_b"}, 7)
+	want("into an empty table", first, []string{"agent_a", "agent_b"}, 7)
+
+	same := sync([]string{"agent_a", "agent_b"}, 7)
+	want("the same again", same, []string{"agent_a", "agent_b"}, 7)
+	if same.XMin != first.XMin {
+		t.Errorf("the same settings were written again: xmin %s, was %s", same.XMin, first.XMin)
+	}
+
+	reordered := sync([]string{"agent_b", "agent_a"}, 7)
+	want("the roles reordered", reordered, []string{"agent_b", "agent_a"}, 7)
+	if reordered.XMin == same.XMin {
+		t.Error("the roles in another order were not written")
+	}
+
+	more := sync([]string{"agent_b", "agent_a"}, 8)
+	want("another max_rows", more, []string{"agent_b", "agent_a"}, 8)
+
+	every := sync(nil, 8)
+	want("no roles", every, nil, 8)
+	if again := sync([]string{}, 8); again.XMin != every.XMin {
+		t.Errorf("empty roles after nil were written again: xmin %s, was %s", again.XMin, every.XMin)
+	} else {
+		want("empty roles", again, nil, 8)
+	}
+
+	var rows int
+	if err := pool.QueryRow(context.Background(), `select count(*) from stet.capture_settings`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Errorf("stet.capture_settings has %d rows, want 1", rows)
+	}
+}
+
+// An agent's transaction whose write was captured has read the settings and
+// stays open; changing them does not wait for it (spec 11, the locks).
+func TestSyncCaptureSettingsDoesNotWaitForAnOpenCapture(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	su := superuserIn(t, db)
+	dealsTable(t, su)
+	st := store.New(pool)
+	if err := st.SyncCaptureSettings(ctx, []string{"stet_md5"}, 100); err != nil {
+		t.Fatal(err)
+	}
+	agent := agentIn(t, db)
+	tx, err := agent.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	mustExec(t, tx, `update public.deals set amount = 11 where id = 1`)
+	var locked bool
+	if err := su.QueryRow(ctx, `select exists (select from pg_locks where pid = $1 and granted
+		and relation = 'stet.capture_settings'::regclass)`, agent.PgConn().PID()).Scan(&locked); err != nil {
+		t.Fatal(err)
+	}
+	if !locked {
+		t.Fatal("the agent's open transaction holds no lock on stet.capture_settings: its write was not captured")
+	}
+
+	for _, s := range []struct {
+		roles   []string
+		maxRows int64
+	}{{[]string{"stet_md5", "other"}, 100}, {nil, 50}} {
+		sctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		err := st.SyncCaptureSettings(sctx, s.roles, s.maxRows)
+		cancel()
+		if err != nil {
+			t.Fatalf("SyncCaptureSettings(%q, %d) with a capture open: %v", s.roles, s.maxRows, err)
+		}
+	}
+	if r, _ := captureSettings(t, pool); !r.NullRoles || r.MaxRows != 50 {
+		t.Errorf("roles %q (NULL %v), max_rows %d; want NULL, 50", r.Roles, r.NullRoles, r.MaxRows)
+	}
+}
+
+// recordSets puts n change sets recorded age (an SQL interval) ago into
+// stet.change_sets as su, the superuser, each with two lines in
+// stet.changes, and returns their ids in order.
+func recordSets(t *testing.T, su *pgx.Conn, n int, age string) []int64 {
+	t.Helper()
+	rows, err := su.Query(context.Background(), `
+		with s as (
+		  insert into stet.change_sets (at, stmt_at, pid, login_role, agent_role, target_table, key_column, relid, op)
+		  select clock_timestamp() - $2::interval, clock_timestamp() - $2::interval, 0, 'stet_md5', 'stet_md5',
+		         'deals', 'id', 0, 'update'
+		  from generate_series(1, $1::int) g order by g
+		  returning id
+		), c as (
+		  insert into stet.changes (set_id, key, before, after)
+		  select s.id, k::text, '{}', '{}' from s, generate_series(1, 2) k
+		)
+		select id from s order by id`, n, age)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ids
+}
+
+// setsLeft counts the sets of ids still in stet.change_sets, and their lines
+// in stet.changes.
+func setsLeft(t *testing.T, pool *pgxpool.Pool, ids []int64) (sets, lines int) {
+	t.Helper()
+	if err := pool.QueryRow(context.Background(), `select (select count(*) from stet.change_sets where id = any ($1)),
+		(select count(*) from stet.changes where set_id = any ($1))`, ids).Scan(&sets, &lines); err != nil {
+		t.Fatal(err)
+	}
+	return sets, lines
+}
+
+// PurgeChanges deletes the change sets recorded more than keep ago, with
+// their lines, and keeps the newer ones. It looks only at the limit oldest
+// sets by id, so an old set behind newer ones waits, and it reports how many
+// sets it deleted.
+func TestPurgeChanges(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	su := superuserIn(t, db)
+	st := store.New(pool)
+	purge := func(limit int, want int64) {
+		t.Helper()
+		n, err := st.PurgeChanges(ctx, time.Hour, limit)
+		if err != nil {
+			t.Fatalf("PurgeChanges(1h, %d): %v", limit, err)
+		}
+		if n != want {
+			t.Errorf("PurgeChanges(1h, %d) = %d, want %d", limit, n, want)
+		}
+	}
+	left := func(what string, ids []int64, wantSets int) {
+		t.Helper()
+		if sets, lines := setsLeft(t, pool, ids); sets != wantSets || lines != 2*wantSets {
+			t.Errorf("%s: %d sets and %d lines left, want %d and %d", what, sets, lines, wantSets, 2*wantSets)
+		}
+	}
+
+	old := recordSets(t, su, 5, "2 hours")
+	recent := recordSets(t, su, 2, "50 minutes")
+
+	purge(3, 3)
+	left("the three oldest", old[:3], 0)
+	left("the other old ones", old[3:], 2)
+
+	purge(3, 2) // looks at the two old ones left and the first recent one
+	left("the old ones", old, 0)
+	left("the recent ones", recent, 2)
+
+	purge(3, 0)
+	left("the recent ones", recent, 2)
+
+	late := recordSets(t, su, 1, "2 hours")
+	purge(2, 0) // looks only at the two recent ones before it
+	left("an old set behind two recent ones", late, 1)
+	purge(3, 1)
+	left("an old set behind two recent ones", late, 0)
+	left("the recent ones", recent, 2)
+}
+
+// A purge whose context ends while it waits for a lock stops on the server
+// too, and deletes nothing once the lock is let go: what the purger's Close
+// waits for is over when the call has returned.
+func TestPurgeChangesGivenUpOnDeletesNothing(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	su := superuserIn(t, db)
+	st := store.New(pool)
+	old := recordSets(t, su, 3, "2 hours")
+
+	lock := superuserIn(t, db)
+	tx, err := lock.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	mustExec(t, tx, `lock table stet.change_sets in share mode`)
+
+	dctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	_, err = st.PurgeChanges(dctx, time.Hour, 10)
+	cancel()
+	if err == nil {
+		t.Fatal("PurgeChanges returned no error while stet.change_sets was locked past its deadline")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var waiting int
+		if err := su.QueryRow(ctx, `select count(*) from pg_stat_activity
+			where datname = $1 and usename = 'stet_scram' and wait_event_type = 'Lock'`, db).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the purge still waits for the lock on the server %s after its deadline", 3*time.Second)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	left, lines := setsLeft(t, pool, old)
+	if left != 3 || lines != 6 {
+		t.Errorf("%d sets and %d lines left after the purge gave up, want 3 and 6", left, lines)
+	}
 }

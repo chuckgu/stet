@@ -1,7 +1,8 @@
 // Package undo looks up the tables of undo.tables in the database, says what
 // keeps each from being captured, and prints the SQL their owners run to
 // install the capture triggers (docs/spec-v0.2-undo.md 4, 9). Stet installs
-// nothing on a customer's table: it only prints.
+// nothing on a customer's table: it only prints. A Purger deletes the change
+// records older than undo.keep (spec 9).
 package undo
 
 import (

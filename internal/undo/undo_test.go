@@ -1,12 +1,15 @@
 package undo_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1180,4 +1183,235 @@ func TestRequireServer(t *testing.T) {
 			t.Errorf("RequireServer(%d) = %v, want an error saying PostgreSQL 14 or later and %s", v, err, says)
 		}
 	}
+}
+
+// syncBuffer is a log destination a test reads while a Purger writes to it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// newLog is a logger writing to a buffer the test can read.
+func newLog() (*slog.Logger, *syncBuffer) {
+	buf := &syncBuffer{}
+	return slog.New(slog.NewTextHandler(buf, nil)), buf
+}
+
+// recordSets puts n change sets recorded age (an SQL interval) ago into
+// stet.change_sets as su, the superuser, each with two lines in
+// stet.changes, and returns their ids in order.
+func recordSets(t *testing.T, su *pgx.Conn, n int, age string) []int64 {
+	t.Helper()
+	rows, err := su.Query(context.Background(), `
+		with s as (
+		  insert into stet.change_sets (at, stmt_at, pid, login_role, agent_role, target_table, key_column, relid, op)
+		  select clock_timestamp() - $2::interval, clock_timestamp() - $2::interval, 0, 'stet_md5', 'stet_md5',
+		         'deals', 'id', 0, 'update'
+		  from generate_series(1, $1::int) g order by g
+		  returning id
+		), c as (
+		  insert into stet.changes (set_id, key, before, after)
+		  select s.id, k::text, '{}', '{}' from s, generate_series(1, 2) k
+		)
+		select id from s order by id`, n, age)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ids
+}
+
+// setsLeft counts the sets of ids still in stet.change_sets, and their lines
+// in stet.changes.
+func setsLeft(t *testing.T, stet *pgxpool.Pool, ids []int64) (sets, lines int) {
+	t.Helper()
+	if err := stet.QueryRow(context.Background(), `select (select count(*) from stet.change_sets where id = any ($1)),
+		(select count(*) from stet.changes where set_id = any ($1))`, ids).Scan(&sets, &lines); err != nil {
+		t.Fatal(err)
+	}
+	return sets, lines
+}
+
+// waitGone waits up to d until none of ids, nor their lines, is left.
+func waitGone(t *testing.T, stet *pgxpool.Pool, ids []int64, d time.Duration, log fmt.Stringer) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for {
+		sets, lines := setsLeft(t, stet, ids)
+		if sets == 0 && lines == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d sets and %d lines are left after %s; log:\n%s", sets, len(ids), lines, d, log)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// lockSets has a transaction of the superuser's lock stet.change_sets so
+// that no set can be deleted until the returned release is called (or the
+// test ends).
+func lockSets(t *testing.T, db string) (release func()) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := superuser(t, db).Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { tx.Rollback(context.Background()) })
+	mustExec(t, tx, `lock table stet.change_sets in share mode`)
+	return func() {
+		if err := tx.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// waitPurgeWaits waits until Stet's account waits for a lock in database db:
+// a purge has begun its delete and waits for lockSets's lock.
+func waitPurgeWaits(t *testing.T, db string, log fmt.Stringer) {
+	t.Helper()
+	su := superuser(t, db)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting bool
+		if err := su.QueryRow(context.Background(), `select exists (select from pg_stat_activity
+			where datname = $1 and usename = $2 and wait_event_type = 'Lock')`, db, stetRole).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no purge waits for the lock; log:\n%s", log)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A Purger purges as soon as it starts, 10,000 sets at a time until a delete
+// takes fewer: 25,000 old sets all go before the next wake-up, an hour away.
+// It keeps the sets newer than keep, purges again at each wake-up, and once
+// Close has returned purges nothing more.
+func TestPurgerPurgesAtStartAndStops(t *testing.T) {
+	db, stet := ownDatabase(t)
+	su := superuser(t, db)
+	st := store.New(stet)
+	log, buf := newLog()
+
+	old := recordSets(t, su, 25_000, "2 hours")
+	recent := recordSets(t, su, 3, "50 minutes")
+	p := undo.NewPurger(st, time.Hour, log)
+	p.Start()
+	waitGone(t, stet, old, 30*time.Second, buf)
+	p.Close()
+	if sets, lines := setsLeft(t, stet, recent); sets != 3 || lines != 6 {
+		t.Errorf("%d recent sets and %d lines left, want 3 and 6", sets, lines)
+	}
+
+	restore := undo.SetPurgeEvery(20 * time.Millisecond)
+	defer restore()
+	p = undo.NewPurger(st, time.Hour, log)
+	p.Start()
+	waitGone(t, stet, recordSets(t, su, 2, "2 hours"), 5*time.Second, buf) // recorded after the purge at start
+	p.Close()
+	after := recordSets(t, su, 2, "2 hours")
+	time.Sleep(300 * time.Millisecond) // many wake-ups, had it not stopped
+	if sets, _ := setsLeft(t, stet, after); sets != 2 {
+		t.Errorf("%d of 2 old sets recorded after Close are left: the purger went on", sets)
+	}
+	if strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("the log has a warning:\n%s", buf)
+	}
+}
+
+// Close waits for a purge in progress, which is then finished; a purge that
+// cannot finish holds Close no longer than its bound.
+func TestPurgerCloseWaitsForAPurgeInProgress(t *testing.T) {
+	db, stet := ownDatabase(t)
+	su := superuser(t, db)
+	st := store.New(stet)
+	log, buf := newLog()
+
+	old := recordSets(t, su, 3, "2 hours")
+	release := lockSets(t, db)
+	p := undo.NewPurger(st, time.Hour, log)
+	p.Start()
+	waitPurgeWaits(t, db, buf)
+	closed := make(chan struct{})
+	go func() {
+		p.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatalf("Close returned while a purge was in progress; log:\n%s", buf)
+	case <-time.After(300 * time.Millisecond):
+	}
+	release()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Close did not return once the purge could go on; log:\n%s", buf)
+	}
+	if sets, lines := setsLeft(t, stet, old); sets != 0 || lines != 0 {
+		t.Errorf("%d sets and %d lines left: the purge in progress at Close was not finished", sets, lines)
+	}
+
+	restore := undo.SetPurgeTimeout(500 * time.Millisecond)
+	defer restore()
+	old = recordSets(t, su, 3, "2 hours")
+	lockSets(t, db) // released when the test ends
+	p = undo.NewPurger(st, time.Hour, log)
+	p.Start()
+	waitPurgeWaits(t, db, buf)
+	began := time.Now()
+	p.Close()
+	if took := time.Since(began); took > 3*time.Second {
+		t.Errorf("Close took %s with the purge's bound at 500ms", took)
+	}
+	if sets, _ := setsLeft(t, stet, old); sets != 3 {
+		t.Errorf("%d of 3 sets left after a purge that could not finish", sets)
+	}
+}
+
+// A purge that fails is logged as a warning, and the next wake-up purges.
+func TestPurgerLogsAFailureAndCarriesOn(t *testing.T) {
+	defer undo.SetPurgeTimeout(200 * time.Millisecond)()
+	defer undo.SetPurgeEvery(100 * time.Millisecond)()
+	db, stet := ownDatabase(t)
+	log, buf := newLog()
+
+	old := recordSets(t, superuser(t, db), 3, "2 hours")
+	release := lockSets(t, db)
+	p := undo.NewPurger(store.New(stet), time.Hour, log)
+	p.Start()
+	defer p.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(buf.String(), "level=WARN") {
+		if time.Now().After(deadline) {
+			t.Fatalf("no warning while the purge cannot delete; log:\n%s", buf)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !strings.Contains(buf.String(), "not purged") {
+		t.Errorf("the warning does not say the records were not purged:\n%s", buf)
+	}
+	release()
+	waitGone(t, stet, old, 5*time.Second, buf)
 }

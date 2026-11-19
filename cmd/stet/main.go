@@ -10,7 +10,9 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/stetdb/stet/internal/apply"
@@ -20,6 +22,7 @@ import (
 	"github.com/stetdb/stet/internal/gate"
 	"github.com/stetdb/stet/internal/proxy"
 	"github.com/stetdb/stet/internal/store"
+	"github.com/stetdb/stet/internal/undo"
 )
 
 const usage = `usage: stet <command> [flags]
@@ -83,8 +86,9 @@ func runProxy(args []string) error {
 // run serves cfg on ln until ctx is done, then stops in order: the proxy
 // first, waiting for its sessions to report their last statements; then the
 // gate, which records what it still holds; then, in enforce mode, the
-// executor of approved held writes, waiting for the one it is applying; then
-// Stet's own pool.
+// executor of approved held writes, waiting for the one it is applying; then,
+// with undo, the purge of old change records, waiting for a delete in
+// progress; then Stet's own pool.
 func run(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog.Logger) error {
 	g, closeGate, err := openGate(ctx, cfg, log)
 	if err != nil {
@@ -123,16 +127,21 @@ func run(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog.Log
 // openGate opens Stet's pool, brings the stet schema up to date, checks the
 // database (check), and builds the gate over cfg's tables. In enforce mode it
 // also starts the executor of approved held writes (spec-v0.2-approve 7); in
-// shadow mode there is none, and no write is executed (rule 6). closeGate
-// closes the gate, then the executor, then the pool. With no table there is
-// no gate, no executor, no pool and no check: the proxy passes every session
-// through, in enforce mode too (spec correction B10), which is logged.
+// shadow mode there is none, and no write is executed (rule 6). With undo it
+// then does what Stet does at start for undo (startUndo), in both modes.
+// closeGate closes the gate, then the executor, then the purge of old change
+// records, then the pool.
+//
+// With no table there is no gate, no executor and no check: the proxy passes
+// every session through, in enforce mode too (spec correction B10), which is
+// logged. Then the pool is opened, and the schema brought up, only for undo
+// (ruling U7); without undo there is no pool either.
 func openGate(ctx context.Context, cfg *config.Config, log *slog.Logger) (g *gate.Gate, closeGate func(), err error) {
-	if len(cfg.Tables) == 0 {
-		if cfg.Mode == config.ModeEnforce {
-			log.Warn("mode is enforce but there are no gated tables: without a gate every session, the agents' " +
-				"included, is passed through unchecked; fix: list the tables to gate under tables")
-		}
+	if len(cfg.Tables) == 0 && cfg.Mode == config.ModeEnforce {
+		log.Warn("mode is enforce but there are no gated tables: without a gate every session, the agents' " +
+			"included, is passed through unchecked; fix: list the tables to gate under tables")
+	}
+	if len(cfg.Tables) == 0 && cfg.Undo == nil {
 		return nil, func() {}, nil
 	}
 	pool, err := openPool(ctx, cfg.Upstream)
@@ -147,32 +156,79 @@ func openGate(ctx context.Context, cfg *config.Config, log *slog.Logger) (g *gat
 	if err := st.Migrate(ctx); err != nil {
 		return fail(err)
 	}
-	warnings, err := check(ctx, pool, cfg)
-	for _, w := range warnings {
-		log.Warn(w)
-	}
-	if err != nil {
-		return fail(fmt.Errorf("not starting: %w", err))
-	}
-	d, err := decide.New(cfg.Model)
-	if err != nil {
-		return fail(err)
-	}
-	if g, err = gate.New(cfg, pool, st, d, log); err != nil {
-		return fail(err)
-	}
 	var applier *apply.Applier
-	if cfg.Mode == config.ModeEnforce {
-		applier = apply.New(cfg, pool, st, log)
-		applier.Start()
+	if len(cfg.Tables) > 0 {
+		warnings, err := check(ctx, pool, cfg)
+		for _, w := range warnings {
+			log.Warn(w)
+		}
+		if err != nil {
+			return fail(fmt.Errorf("not starting: %w", err))
+		}
+		d, err := decide.New(cfg.Model)
+		if err != nil {
+			return fail(err)
+		}
+		if g, err = gate.New(cfg, pool, st, d, log); err != nil {
+			return fail(err)
+		}
+		if cfg.Mode == config.ModeEnforce {
+			applier = apply.New(cfg, pool, st, log)
+			applier.Start()
+		}
+	}
+	var purger *undo.Purger
+	if cfg.Undo != nil {
+		purger = startUndo(ctx, cfg, pool, st, log)
 	}
 	return g, func() {
-		g.Close()
+		if g != nil {
+			g.Close()
+		}
 		if applier != nil {
 			applier.Close()
 		}
+		if purger != nil {
+			purger.Close()
+		}
 		pool.Close()
 	}, nil
+}
+
+// undoStartTimeout bounds startUndo's work with the database before it
+// starts the purge. A variable so a test can run it out of time.
+var undoStartTimeout = 10 * time.Second
+
+// startUndo does what Stet does at start when undo is configured
+// (spec-v0.2-undo 9), the same in both modes and outside every client's
+// session (rule 6): it makes stet.capture_settings say agents.roles and
+// undo.max_rows, warns about the tables of undo.tables whose writes are not
+// all captured, and starts the purge of change records older than undo.keep,
+// which it returns. None of it stops the start: what it cannot do or check is
+// a warning that says so.
+func startUndo(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, st *store.Store, log *slog.Logger) *undo.Purger {
+	ctx, cancel := context.WithTimeout(ctx, undoStartTimeout)
+	defer cancel()
+	if err := st.SyncCaptureSettings(ctx, cfg.AgentRoles, cfg.Undo.MaxRows); err != nil {
+		log.Warn("could not set stet.capture_settings from agents.roles and undo.max_rows; capture keeps the "+
+			"settings the table has (with no row: every session, 10000 rows a statement)", "err", err)
+	}
+	var ts []undo.Table
+	err := readOnly(ctx, pool, func(tx pgx.Tx) error {
+		var err error
+		ts, err = undo.Inspect(ctx, tx, cfg)
+		return err
+	})
+	if err != nil {
+		log.Warn("could not check undo.tables, so it is not known whether each table is there, has the capture "+
+			"triggers stet undo-sql prints, and has no uncaptured tables referencing it", "err", err)
+	}
+	for _, w := range undo.Warnings(ts) {
+		log.Warn(w)
+	}
+	p := undo.NewPurger(st, cfg.Undo.Keep, log)
+	p.Start()
+	return p
 }
 
 // openPool connects Stet's own sessions: state reads and decision writes.
