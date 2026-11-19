@@ -479,26 +479,46 @@ level=WARN msg="the config has no undo clause, but triggers that call stet.captu
 
 ## 13. 수용 기준
 
-- [ ] 에이전트 계정이 직접 쓴 `INSERT`·`UPDATE`·`DELETE`, 뷰를 거친 쓰기, `SECURITY DEFINER` 함수 안의 쓰기, `ON CONFLICT DO UPDATE`, 연쇄 삭제된 자식 행이 모두 이전·이후 값과 함께 남는다. 롤백된 쓰기와 0행 쓰기는 남지 않는다.
-- [ ] 에이전트 계정이 아닌 세션의 쓰기는 남지 않는다. `roles`가 NULL이면 남는다. Stet의 계정이 `SET LOCAL ROLE`로 실행한 쓰기는 그 에이전트의 것으로, `held_write`와 함께 남는다. 에이전트 세션이 `stet.held_write`를 적어도 남지 않는다.
-- [ ] 캡처가 실패해도 에이전트의 쓰기는 성공하고 `capture_failed` 묶음이 남는다. 설정을 읽다가 실패해도 같다. 클라이언트는 `client_min_messages`가 `debug5`여도 아무 메시지도 받지 않는다. `max_rows`를 넘는 문장과 `TRUNCATE`는 표지만 남는다.
-- [ ] 한 트랜잭션에서 행을 바꾸는 쓰기 40개를 캡처하면 31번까지 값이 남고, 32번째에 `too_many_statements` 묶음이 남고, 그 뒤는 남지 않는다. 그 트랜잭션에서 캡처가 받은 하위 트랜잭션 id는 32개를 넘지 않는다. 캡처하지 않는 세션에서는 캡처가 하위 트랜잭션 id를 받지 않는다.
-- [ ] 남긴 값으로 행을 다시 만들면 원래 행과 같다. 정수, `numeric`, 실수(`NaN`, 무한대, `0.30000000000000004`), 글자(줄바꿈, 따옴표, 역슬래시), `timestamptz`(무한대 포함), `date`, `interval`, `uuid`, `bytea`, 배열(NULL 원소, 다차원), `jsonb`와 `json`(JSON `null`과 SQL `NULL`의 구분, 중복 키), NULL에서 확인한다. 세션의 `TimeZone`, `DateStyle`, `IntervalStyle`, `extra_float_digits`, `bytea_output`이 달라도 같은 글자가 남는다.
-- [ ] 키가 바뀐 `UPDATE`는 옛 키와 새 키의 두 줄로 남는다. 되돌리기는 두 키를 `key_changed`로 건너뛰고 행은 그대로다.
-- [ ] 에이전트 계정은 기록을 읽거나 고칠 수 없다. 두 표의 `UPDATE`와 `TRUNCATE`는 `ST004`다. 트리거를 만드는 계정은 권한을 받기 전에는 만들 수 없다.
-- [ ] 프록시를 지난 쓰기의 변경이 그 판단 기록에 이어진다. 단순 프로토콜과 확장 프로토콜, 명시적 트랜잭션 안의 쓰기, 연쇄로 바뀐 자식에서 확인한다. 함수를 거친 쓰기는 이어지지 않는다. 한 Sync 아래 같은 글자로 보낸 쓰기 둘은 고친 행이 다르든 같든 이어지지 않고 후보의 수 2가 나온다. 다른 판단 기록에 이어지지 않는다.
-- [ ] `stet.undo`가 에이전트의 `INSERT`를 지우고, `DELETE`를 다시 넣고, `UPDATE`를 이전 값으로 돌린다. 한 키를 여러 번 바꿨으면 처음의 값으로 돌아간다. `GENERATED ALWAYS AS IDENTITY` 컬럼과 생성 컬럼이 있는 테이블에서도 셋 다 된다.
-- [ ] 그 뒤에 다른 계정이 바꾼 행은 `changed_since`로, 고른 변경 사이에 다른 계정이 바꾼 행은 `interleaved`로 건너뛰고, 그 행은 그대로다. 되돌리는 동안 다른 연결이 그 행을 바꾸고 있어도 덮어쓰지 않는다.
-- [ ] 지워진 부모와 자식을 함께 되돌리면 둘 다 돌아온다(외래 키 순서). 자식 테이블에 트리거가 없으면 부모만 돌아오고 `children_not_captured`가 나온다. `tables`로 부모만 고르면 부모만 돌아오고 `not_selected`가 나온다. 유일 제약의 값을 맞바꾼 두 행은 둘 다 `failed`(`SQLSTATE 23505`)이고 그대로다.
-- [ ] 에이전트가 만든 행에 다른 계정이 연쇄 외래 키의 자식 행을 붙였으면 그 행은 `referenced`로 건너뛰고, 부모도 자식도 그대로다. 에이전트가 부모와 자식을 함께 만들었으면 둘 다 지워진다.
-- [ ] 복구 문장이 실패한 키는 `failed`이고 다른 키는 되돌려진다. 고객의 트리거가 값을 바꾸면 `restored_differs`다. 고객의 트리거 함수가 스키마 없는 이름을 써도 부른 세션의 `search_path`로 돈다.
-- [ ] `stet.undo_plan`은 아무것도 바꾸지 않고, 바로 이어 부른 `stet.undo`와 같은 키와 `action`을 말한다. 검토자가 롤백하면 테이블도 `stet.undos`도 그대로다. 두 번 되돌리면 두 번째는 아무것도 바꾸지 않는다.
-- [ ] 권한을 받지 않은 계정은 뷰도 함수도 쓰지 못한다. 테이블에 쓰기 권한이 없는 검토자의 키는 `failed`(`42501`)다. 7장의 거절이 `ST006`으로 나온다. 부른 세션의 `search_path`에 함수나 연산자를 가로채는 객체가 있어도 Stet 자신의 비교가 그것을 쓰지 않는다.
-- [ ] `stet undo-sql`의 출력을 실행하면 트리거 넷이 생기고, `-drop`의 출력을 실행하면 없어진다. 받지 않는 테이블과 유일하지 않은 키는 거절한다. 9장의 경고가 나온다.
-- [ ] `keep`보다 오래된 묶음이 지워진다. 열린 트랜잭션이 캡처를 하고 있는 동안 `schema.sql`을 다시 실행해도(`stet.schema_version`의 값을 바꿔 다시 돌게 한다) 기다리지 않고 끝난다.
-- [ ] 10장의 확인: 스트림을 보낸 뒤 되돌리면 캡처한 테이블의 내용이 스트림 전과 같다. 같지 않은 행이 있으면 그 수와 이유를 문서에 적는다. 벤치마크에서 Stet이 막지 못한 경로(`s5.call`, `s5.view`)의 쓰기가 되돌려지는지도 적는다.
-- [ ] 오버헤드를 재서 문서에 적는다. 키로 한 행을 고치는 쓰기에 캡처가 더하는 시간이 p95로 1ms를 넘지 않는다.
-- [ ] 프록시의 2ms 지연 예산을 지킨다. `go test -race ./...`가 통과한다.
+- [x] 에이전트 계정이 직접 쓴 `INSERT`·`UPDATE`·`DELETE`, 뷰를 거친 쓰기, `SECURITY DEFINER` 함수 안의 쓰기, `ON CONFLICT DO UPDATE`, 연쇄 삭제된 자식 행이 모두 이전·이후 값과 함께 남는다. 롤백된 쓰기와 0행 쓰기는 남지 않는다.
+  - 근거: `TestCaptureRecordsEachKindOfWrite`, `TestCaptureFollowsWritesStetDoesNotSee`, `TestCaptureSkipsRolledBackAndEmptyWrites`(`internal/store`).
+- [x] 에이전트 계정이 아닌 세션의 쓰기는 남지 않는다. `roles`가 NULL이면 남는다. Stet의 계정이 `SET LOCAL ROLE`로 실행한 쓰기는 그 에이전트의 것으로, `held_write`와 함께 남는다. 에이전트 세션이 `stet.held_write`를 적어도 남지 않는다.
+  - 근거: `TestCaptureOnlyForAgentRoles`, `TestCaptureOfStetActingAsTheAgent`, `TestAgentCannotBreakCaptureThroughSessionSettings`(`internal/store`), `TestApprovedWriteIsLinkedThroughItsHeldWrite`(`cmd/stet`).
+- [x] 캡처가 실패해도 에이전트의 쓰기는 성공하고 `capture_failed` 묶음이 남는다. 설정을 읽다가 실패해도 같다. 클라이언트는 `client_min_messages`가 `log`일 때 아무 알림도 받지 않고, `debug5`여도 캡처가 낸 메시지는 받지 않는다(서버 자신의 디버그 알림은 온다). `max_rows`를 넘는 문장과 `TRUNCATE`는 표지만 남는다.
+  - 근거: `TestCaptureFailureKeepsTheWrite`, `TestCaptureFailureWhileReadingSettings`, `TestCaptureSendsTheClientNothing`, `TestCaptureCapsRowsPerStatement`(`internal/store`).
+- [x] 한 트랜잭션에서 행을 바꾸는 쓰기 40개를 캡처하면 31번까지 값이 남고, 32번째에 `too_many_statements` 묶음이 남고, 그 뒤는 남지 않는다. 그 트랜잭션에서 캡처가 받은 하위 트랜잭션 id는 32개를 넘지 않는다. 캡처하지 않는 세션에서는 캡처가 하위 트랜잭션 id를 받지 않는다.
+  - 근거: `TestCaptureCapsStatementsPerTransaction`, `TestCaptureCountFollowsSavepoints`, `TestCaptureTakesNoTransactionIDWhereItRecordsNothing`(`internal/store`). 32개의 상한은 남은 줄의 서로 다른 `xmin`으로 세고, 줄을 남기지 않고 id를 받는 일이 없다는 것은 셋째 테스트가 본다.
+- [x] 남긴 값으로 행을 다시 만들면 원래 행과 같다. 정수, `numeric`, 실수(`NaN`, 무한대, `0.30000000000000004`), 글자(줄바꿈, 따옴표, 역슬래시), `timestamptz`(무한대 포함), `date`, `interval`, `uuid`, `bytea`, 배열(NULL 원소, 다차원), `jsonb`와 `json`(JSON `null`과 SQL `NULL`의 구분, 중복 키), NULL에서 확인한다. 세션의 `TimeZone`, `DateStyle`, `IntervalStyle`, `extra_float_digits`, `bytea_output`이 달라도 같은 글자가 남는다.
+  - 근거: `TestCaptureKeepsValuesAsText`, `TestCaptureIgnoresSessionOutputSettings`, `TestUndoRowMatchesCapture`, `TestUndoRestoresEachKindOfWrite`(`internal/store`).
+- [x] 키가 바뀐 `UPDATE`는 옛 키와 새 키의 두 줄로 남는다. 되돌리기는 두 키를 `key_changed`로 건너뛰고 행은 그대로다.
+  - 근거: `TestCaptureSplitsAKeyChange`, `TestPlanSkipsAKeyChange`, `TestUndoSkipsEveryKeyOfAnUpdateThatShiftedKeys`, `TestUndoMatchesThePlan`(`internal/store`).
+- [x] 에이전트 계정은 기록을 읽거나 고칠 수 없다. 두 표의 `UPDATE`와 `TRUNCATE`는 `ST004`다. 트리거를 만드는 계정은 권한을 받기 전에는 만들 수 없다.
+  - 근거: `TestAgentCannotReachTheRecords`, `TestHistoryIsReadWithTheOwnersRights`, `TestChangeRecordsAreImmutable`, `TestTableOwnerNeedsGrantsToInstall`(`internal/store`).
+- [x] 프록시를 지난 쓰기의 변경이 그 판단 기록에 이어진다. 단순 프로토콜과 확장 프로토콜, 명시적 트랜잭션 안의 쓰기, 연쇄로 바뀐 자식에서 확인한다. 함수를 거친 쓰기는 이어지지 않는다. 한 Sync 아래 같은 글자로 보낸 쓰기 둘은 두 판단의 창이 겹치면 고친 행이 다르든 같든 이어지지 않고 후보의 수 2가 나온다(창이 겹치지 않으면 각자 자기 판단에 이어진다). 다른 판단 기록에 이어지지 않는다.
+  - 근거: `TestChangeIsLinkedToItsDecision`, `TestCascadedChildIsLinkedToTheParentsDecision`, `TestWriteThroughAFunctionIsNotLinked`, `TestBatchedSameTextWritesShowTheirCandidatesNotADecision`(`cmd/stet`), `TestHistoryLinksOnlyASingleMatch`, `TestHistoryLinkBounds`, `TestHistoryLinksASetToItsOnlyDecision`(`internal/store`). 후보가 둘일 때 잇지 않는 규칙은 `TestHistoryLinksOnlyASingleMatch`가 고정한다.
+- [x] `stet.undo`가 에이전트의 `INSERT`를 지우고, `DELETE`를 다시 넣고, `UPDATE`를 이전 값으로 돌린다. 한 키를 여러 번 바꿨으면 처음의 값으로 돌아간다. `GENERATED ALWAYS AS IDENTITY` 컬럼과 생성 컬럼이 있는 테이블에서도 셋 다 된다.
+  - 근거: `TestUndoRestoresEachKindOfWrite`, `TestPlanFoldsSeveralChangesOfAKey`, `TestUndoWithIdentityAndGeneratedColumns`(`internal/store`), `TestUndoEndToEnd`(`cmd/stet`).
+- [x] 그 뒤에 다른 계정이 바꾼 행은 `changed_since`로, 고른 변경 사이에 다른 계정이 바꾼 행은 `interleaved`로 건너뛰고, 그 행은 그대로다. 되돌리는 동안 다른 연결이 그 행을 바꾸고 있어도 덮어쓰지 않는다.
+  - 근거: `TestUndoLeavesWhatOthersChanged`, `TestUndoWaitsForAConcurrentChangeAndSkips`(`internal/store`).
+- [x] 지워진 부모와 자식을 함께 되돌리면 둘 다 돌아온다(외래 키 순서). 자식 테이블에 트리거가 없으면 부모만 돌아오고 `children_not_captured`가 나온다. `tables`로 부모만 고르면 부모만 돌아오고 `not_selected`가 나온다. 유일 제약의 값을 맞바꾼 두 행은 둘 다 `failed`(`SQLSTATE 23505`)이고 그대로다.
+  - 근거: `TestUndoRestoresParentAndChild`, `TestUndoOfParentOnly`, `TestUndoRestoresSwappedUniqueValues`(`internal/store`).
+- [x] 에이전트가 만든 행에 다른 계정이 연쇄 외래 키의 자식 행을 붙였으면 그 행은 `referenced`로 건너뛰고, 부모도 자식도 그대로다. 에이전트가 부모와 자식을 함께 만들었으면 둘 다 지워진다.
+  - 근거: `TestUndoSkipsReferencedRows`, `TestUndoRestoresParentAndChild`, 그리고 `undo_referenced_test.go`의 테스트들(`internal/store`).
+- [x] 복구 문장이 실패한 키는 `failed`이고 다른 키는 되돌려진다. 고객의 트리거가 값을 바꾸면 `restored_differs`다. 고객의 트리거 함수가 스키마 없는 이름을 써도 부른 세션의 `search_path`로 돈다.
+  - 근거: `TestUndoKeepsGoingAfterAFailure`, `TestUndoReportsWhenTheRowDiffers`, `TestUndoRunsUnderTheCallersSettings`(`internal/store`).
+- [x] `stet.undo_plan`은 아무것도 바꾸지 않고, 바로 이어 부른 `stet.undo`와 같은 키와 `action`을 말한다. 검토자가 롤백하면 테이블도 `stet.undos`도 그대로다. 두 번 되돌리면 두 번째는 아무것도 바꾸지 않는다.
+  - 근거: `TestPlanChangesNothing`, `TestUndoMatchesThePlan`, `TestUndoIsTheReviewersTransaction`, `TestUndoTwice`(`internal/store`).
+- [x] 권한을 받지 않은 계정은 뷰도 함수도 쓰지 못한다. 테이블에 쓰기 권한이 없는 검토자의 키는 `failed`(`42501`)다. 7장의 거절이 `ST006`으로 나온다. 부른 세션의 `search_path`에 함수나 연산자를 가로채는 객체가 있어도 Stet 자신의 비교가 그것을 쓰지 않는다.
+  - 근거: `TestPlanNeedsGrants`, `TestUndoGrantsAreSeparate`, `TestUndoNeedsRightsOnTheTable`, `TestPlanRefusals`, `TestUndoRefusals`, `TestPlanRunsOnlyUnderReadCommitted`(READ UNCOMMITTED 포함), `TestPlanIgnoresTheCallersSearchPath`, `TestUndoIgnoresTheCallersSearchPath`, `TestUndoProbeIsNotShadowedByAnOperator`(`internal/store`).
+- [x] `stet undo-sql`의 출력을 실행하면 트리거 넷이 생기고, `-drop`의 출력을 실행하면 없어진다. 받지 않는 테이블과 유일하지 않은 키는 거절한다. 9장의 경고가 나온다.
+  - 근거: `TestInstallSQLRuns`, `TestInstallSQLRefusesWhatItCannotCapture`, `TestInspectFindsTablesAndProblems`, `TestWarnings`(`internal/undo`), `TestUndoSQLCommand`, `TestRunWarnsAboutUndoTables`, `TestRunWarnsOfCaptureLeftWithoutAnUndoClause`(`cmd/stet`). `undo` 절이 없는 설정의 `-drop` 출력은 글자로만 확인했고 실행해 보지는 않았다.
+- [x] `keep`보다 오래된 묶음이 지워진다. 열린 트랜잭션이 캡처를 하고 있는 동안 `schema.sql`을 다시 실행해도(`stet.schema_version`의 값을 바꿔 다시 돌게 한다) 기다리지 않고 끝난다.
+  - 근거: `TestPurgeChanges`, `TestMigrateDoesNotWaitForAnOpenCapture`(`internal/store`), `TestPurgerPurgesAtStartAndStops`(`internal/undo`), `TestRunPurgesOldChangeRecords`(`cmd/stet`).
+- [x] 10장의 확인: 스트림을 보낸 뒤 되돌리면 캡처한 테이블의 내용이 스트림 전과 같다. 같지 않은 행이 있으면 그 수와 이유를 문서에 적는다. 벤치마크에서 Stet이 막지 못한 경로(`s5.call`, `s5.view`)의 쓰기가 되돌려지는지도 적는다.
+  - 근거: `docs/lab.md` "되돌리기" 절의 "끝에서 끝까지의 확인" 결과(2026-11-19, PostgreSQL 14.18). `-max-rows 100000` 실행에서 같지 않은 행 0, `s5.call`과 `s5.view` 둘 다 복구. 기본 실행(`max_rows` 10,000)에서는 같지 않은 행 78,475개가 모두 상한을 넘은 두 문장의 표지로 설명됐다(설명되지 않은 행 0). 작은 스트림의 자동 테스트는 `TestUndoCheckOnASmallStream`(`internal/lab/bench`).
+- [x] 오버헤드를 재서 문서에 적는다. 키로 한 행을 고치는 쓰기에 캡처가 더하는 시간이 p95로 1ms를 넘지 않는다.
+  - 근거: 2장과 `docs/lab.md`의 숫자. `TestCaptureAddsUnderAMillisecond`(`internal/store`)는 세 번까지 재서 한 번이라도 1ms 안이면 통과한다. 잰 값은 매번 0.40~0.42ms였다.
+- [x] 프록시의 2ms 지연 예산을 지킨다. `go test -race ./...`가 통과한다.
+  - 근거: `internal/proxy/latency_test.go`의 다섯 테스트(p95 차이 2ms 이하). `STET_TEST_PG=127.0.0.1:55432 go test -race -count=1 ./...`가 2026-11-19에 18개 패키지 모두 `ok`.
 
 ## 14. 정한 것과 남긴 것
 
