@@ -153,7 +153,7 @@ func planOf(t *testing.T, conn queryer, role string, args ...any) []undoRow {
 type selected struct {
 	TargetTable string
 	RelID       uint32
-	KeyColumn   string
+	KeyColumn   *string
 	Key         *string
 	B, A        map[string]any
 	ChangeIDs   []int64
@@ -162,6 +162,7 @@ type selected struct {
 	Interleaved *bool
 	Skipped     *string
 	AlsoChanged []string
+	Withheld    *string
 }
 
 // trySelection reads stet.undo_selection(role, since, until, tables) on conn,
@@ -169,12 +170,47 @@ type selected struct {
 func trySelection(conn queryer, role, since, until, tables any) ([]selected, error) {
 	rows, err := conn.Query(context.Background(), `
 		select target_table, relid, key_column, key, b, a, change_ids, first_change, key_changed, interleaved,
-		       skipped, also_changed
+		       skipped, also_changed, withheld
 		from stet.undo_selection($1, $2, $3, $4) with ordinality order by ordinality`, role, since, until, tables)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, pgx.RowToStructByPos[selected])
+}
+
+// checkWithheld checks that stet.undo_selection, read on conn with any of
+// several arguments, shows the agent's changes to table only as one line,
+// without a key, a key column, a value, a change or a flag, with reason as
+// its withheld.
+func checkWithheld(t *testing.T, conn queryer, table, reason string, since time.Time) {
+	t.Helper()
+	for _, args := range [][3]any{
+		{since, nil, nil},
+		{since, nil, []string{table}},
+		{time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC), nil, nil},
+		{since, since.Add(24 * time.Hour), []string{table, "nope"}},
+	} {
+		sel, err := trySelection(conn, "stet_md5", args[0], args[1], args[2])
+		if err != nil {
+			t.Fatal(err)
+		}
+		var lines []selected
+		for _, s := range sel {
+			if s.TargetTable == table {
+				lines = append(lines, s)
+			}
+		}
+		if len(lines) != 1 {
+			t.Errorf("stet.undo_selection%v shows %d lines of %s, want one: %+v", args, len(lines), table, lines)
+			continue
+		}
+		l := lines[0]
+		if l.KeyColumn != nil || l.Key != nil || l.B != nil || l.A != nil || l.ChangeIDs != nil || l.FirstChange != nil ||
+			l.KeyChanged != nil || l.Interleaved != nil || l.Skipped != nil || l.AlsoChanged != nil || deref(l.Withheld) != reason {
+			t.Errorf("stet.undo_selection%v shows %s as %+v (withheld %v), want nothing but withheld %q",
+				args, table, l, deref(l.Withheld), reason)
+		}
+	}
 }
 
 // changeIDsOf are the ids of the changes capture recorded for key of the
@@ -417,9 +453,10 @@ func TestPlanSkipsAKeyChange(t *testing.T) {
 // A change that no longer fits its table is not restored: columns_changed
 // when a column was added, dropped or renamed, or the key column is gone
 // even where no image is left to compare; table_gone when the table was
-// dropped, even if one of the same name and shape was made again. The new
-// table's own changes are a key of their own, not folded into the old
-// table's. A table that was only renamed is still the same table.
+// dropped, even if one of the same name and shape was made again: one line
+// for the vanished table, without keys (plan ruling R11). The new table's own
+// changes are a key of their own, not folded into the old table's. A table
+// that was only renamed is still the same table.
 func TestPlanSkipsWhatNoLongerFitsTheTable(t *testing.T) {
 	pool, db := captureDB(t)
 	owner := superuserIn(t, db)
@@ -451,7 +488,7 @@ func TestPlanSkipsWhatNoLongerFitsTheTable(t *testing.T) {
 	checkShown(t, "changed tables", planOf(t, rv, "stet_md5", since),
 		`added "1" - skipped columns_changed -`,
 		`dropped "1" - skipped columns_changed -`,
-		`gone "1" - skipped table_gone -`,
+		`gone - - skipped table_gone -`,
 		`gone "1" update would_restore - -`,
 		`rekeyed "9" - skipped columns_changed -`,
 		`renamed "1" update would_restore - -`,
@@ -460,7 +497,7 @@ func TestPlanSkipsWhatNoLongerFitsTheTable(t *testing.T) {
 
 // A key that more than one check catches is skipped for the first in spec
 // 7's order: table_gone, columns_changed, key_changed, interleaved,
-// changed_since, no_net_change.
+// changed_since, no_net_change. A table that is gone shows as one line.
 func TestPlanCheckOrder(t *testing.T) {
 	pool, db := captureDB(t)
 	owner := superuserIn(t, db)
@@ -504,7 +541,7 @@ func TestPlanCheckOrder(t *testing.T) {
 		`k4 "1" - skipped interleaved -`,
 		`k5 "1" - skipped changed_since -`,
 		`k6 "1" - skipped columns_changed -`, `k6 "101" - skipped columns_changed -`,
-		`k7 "1" - skipped table_gone -`, `k7 "101" - skipped table_gone -`)
+		`k7 - - skipped table_gone -`)
 }
 
 // A selected set that recorded no values shows as one line without a key,
@@ -736,11 +773,12 @@ func TestPlanRefusals(t *testing.T) {
 	}
 }
 
-// A role without the grants cannot call the plan (42501). A reviewer with
-// them plans without any right on Stet's tables. A table it cannot read gives
-// no error: its keys are skipped with the server's 42501 as the reason. The
-// selection shows the values capture recorded only of tables the session can
-// read, as its login role or a role it can SET ROLE to.
+// PUBLIC cannot execute any function of the plan, and a role without the
+// grants cannot call it (42501). A reviewer with them plans without any right
+// on Stet's tables. A table it cannot read gives no error and shows as one
+// line, skipped with 42501 and no key (plan ruling R11); no helper called
+// directly gives it a key or a value of that table. What the session can read
+// as its login role or a role it can SET ROLE to, it sees.
 func TestPlanNeedsGrants(t *testing.T) {
 	pool, db := captureDB(t)
 	ctx := context.Background()
@@ -751,6 +789,15 @@ func TestPlanNeedsGrants(t *testing.T) {
 	since := dbClock(t, pool)
 	mustExec(t, agentIn(t, db), `update public.deals set n = 10 where id = 1`, `update public.accounts set n = 10 where id = 1`)
 
+	for _, f := range planFunctions {
+		var public bool
+		if err := owner.QueryRow(ctx, `select has_function_privilege('public', $1, 'execute')`, f).Scan(&public); err != nil {
+			t.Fatal(err)
+		}
+		if public {
+			t.Errorf("PUBLIC may execute %s", f)
+		}
+	}
 	usageOnly, planOnly := loginRole(t, "usage"), loginRole(t, "planonly")
 	grant(t, db, usageOnly, "grant usage on schema stet to "+usageOnly)
 	grant(t, db, planOnly, "grant usage on schema stet to "+planOnly,
@@ -771,21 +818,27 @@ func TestPlanNeedsGrants(t *testing.T) {
 		_, err := rv.Exec(ctx, "select from "+table+" limit 1")
 		wantCode(t, err, "42501", "the reviewer reading "+table)
 	}
-	checkShown(t, "a table the reviewer cannot read", planOf(t, rv, "stet_md5", since),
-		`accounts "1" - skipped SQLSTATE 42501: permission denied for table accounts -`,
+	denied := "SQLSTATE 42501: permission denied for table accounts"
+	got := planOf(t, rv, "stet_md5", since)
+	checkShown(t, "a table the reviewer cannot read", got,
+		`accounts - - skipped `+denied+` -`,
 		`deals "1" update would_restore - -`)
-
-	sel, err := trySelection(rv, "stet_md5", since, nil, nil)
+	if got[0].ChangeIDs != nil {
+		t.Errorf("the line of a table the reviewer cannot read names changes %v, want none", got[0].ChangeIDs)
+	}
+	checkWithheld(t, rv, "accounts", denied, since)
+	sel, err := trySelection(rv, "stet_md5", since, nil, []string{"deals"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	images := map[string]bool{}
-	for _, s := range sel {
-		images[s.TargetTable] = s.B != nil || s.A != nil
+	if len(sel) != 1 || sel[0].B == nil || sel[0].A == nil {
+		t.Errorf("the selection of a table the reviewer can read: %+v, want one key with its values", sel)
 	}
-	if want := map[string]bool{"deals": true, "accounts": false}; !reflect.DeepEqual(images, want) {
-		t.Errorf("the selection shows values (by table) %v, want %v", images, want)
-	}
+	accounts := relidOf(t, owner, "public.accounts")
+	_, err = rv.Exec(ctx, `select stet.undo_row($1, 'id', '1', false)`, accounts)
+	wantCode(t, err, "42501", "stet.undo_row on a table the reviewer cannot read")
+	_, err = rv.Exec(ctx, `select * from stet.undo_judge($1, 'id', '1', null, null, false, false, false)`, accounts)
+	wantCode(t, err, "42501", "stet.undo_judge on a table the reviewer cannot read")
 
 	// A login role that does not inherit, reading through a role it SETs ROLE
 	// to: the selection shows it the values of what that role can read.
@@ -793,12 +846,56 @@ func TestPlanNeedsGrants(t *testing.T) {
 	grant(t, db, reader, "grant usage on schema stet to "+reader,
 		"grant execute on function "+strings.Join(planFunctions, ", ")+" to "+reader,
 		"grant select on public.deals, public.accounts to "+reader)
-	mustExec(t, superuserIn(t, "stet_test"), "alter role "+noinherit+" noinherit", "grant "+reader+" to "+noinherit)
+	mustExec(t, owner, "alter role "+noinherit+" noinherit", "grant "+reader+" to "+noinherit)
 	through := connectAs(t, db, noinherit)
 	mustExec(t, through, "set role "+reader)
 	checkShown(t, "a reviewer through SET ROLE", planOf(t, through, "stet_md5", since),
 		`accounts "1" update would_restore - -`,
 		`deals "1" update would_restore - -`)
+}
+
+// A table whose row-level security would apply to the session (no role it
+// is or can SET ROLE to owns the table without FORCE ROW LEVEL SECURITY or
+// has BYPASSRLS) is withheld like a table it cannot read: one line, no key, no
+// value (plan ruling R11). Its owner, without FORCE, and a role with
+// BYPASSRLS see the keys, here natural ones.
+func TestPlanWithholdsATableUnderRowLevelSecurity(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	owner := superuserIn(t, db)
+	setCapture(t, pool, []string{"stet_md5"}, 10000)
+	mustExec(t, owner,
+		`create table public.people (id int primary key, email text unique not null, n int)`,
+		`insert into public.people values (1, 'a@example.com', 1), (2, 'b@example.com', 2)`)
+	installCapture(t, owner, "public.people", "people", "email")
+	since := dbClock(t, pool)
+	mustExec(t, agentIn(t, db), `update public.people set n = 10 where id = 1`, `delete from public.people where id = 2`)
+	mustExec(t, owner, `alter table public.people enable row level security`, `create policy nobody on public.people using (false)`)
+	relid := relidOf(t, owner, "public.people")
+	const denied = "SQLSTATE 42501: permission denied for table people"
+	withheld := `people - - skipped ` + denied + ` -`
+	keys := []string{`people "a@example.com" update would_restore - -`, `people "b@example.com" insert would_restore - -`}
+
+	plain := undoReviewer(t, db, "public.people")
+	checkShown(t, "a reviewer the policy hides the rows from", planOf(t, plain, "stet_md5", since), withheld)
+	checkWithheld(t, plain, "people", denied, since)
+	var hidden *string
+	if err := plain.QueryRow(ctx, `select stet.undo_row($1, 'email', 'a@example.com', false)::text`, relid).Scan(&hidden); err != nil {
+		t.Fatal(err)
+	}
+	if hidden != nil {
+		t.Errorf("stet.undo_row read a row the policy hides: %s", *hidden)
+	}
+
+	tableOwner, bypass := undoReviewer(t, db), undoReviewer(t, db, "public.people")
+	mustExec(t, owner, "alter table public.people owner to "+roleOf(t, tableOwner), "alter role "+roleOf(t, bypass)+" bypassrls")
+	checkShown(t, "the table's owner", planOf(t, tableOwner, "stet_md5", since), keys...)
+	checkShown(t, "a role with BYPASSRLS", planOf(t, bypass, "stet_md5", since), keys...)
+
+	mustExec(t, owner, `alter table public.people force row level security`)
+	checkShown(t, "the table's owner under FORCE ROW LEVEL SECURITY", planOf(t, tableOwner, "stet_md5", since), withheld)
+	checkWithheld(t, tableOwner, "people", denied, since)
+	checkShown(t, "BYPASSRLS under FORCE ROW LEVEL SECURITY", planOf(t, bypass, "stet_md5", since), keys...)
 }
 
 // Stet's own reads and comparisons do not use what the caller's search_path
@@ -1063,11 +1160,17 @@ func TestPlanFindsKeysOfEachType(t *testing.T) {
 	}
 }
 
-// In a REPEATABLE READ transaction, reading pg_attribute follows the
-// transaction's snapshot, so a column added or dropped after it is not seen
-// there. The row is not read with that stale list of columns: the key is
-// skipped with the error. A dropped column named like a function that takes a
-// row (to_jsonb) is not read as a call of that function on the row.
+// In a REPEATABLE READ transaction, reading the catalog follows the
+// transaction's snapshot, while names in SQL resolve in the catalog as it is
+// now. A column added or dropped after the snapshot is not seen in the
+// snapshot: the row is not read with that stale list of columns, the key is
+// skipped with the error. That holds when the highest column was dropped
+// before, too, and a dropped column named like a function that takes a row
+// (to_jsonb) is not read as a call of that function on the row. A table
+// renamed after the snapshot, with another table given its old name, is still
+// read as the table relid names, under its new name. A table dropped and made
+// again after it is gone. A table whose row-level security was enabled after
+// it is withheld (ruling R11).
 func TestPlanSeesColumnsChangedAfterItsSnapshot(t *testing.T) {
 	pool, db := captureDB(t)
 	ctx := context.Background()
@@ -1077,33 +1180,98 @@ func TestPlanSeesColumnsChangedAfterItsSnapshot(t *testing.T) {
 		`create table public.grown (id int primary key, n int)`,
 		`insert into public.grown values (1, 1)`,
 		`create table public.shrunk (id int primary key, to_jsonb text, n int)`,
-		`insert into public.shrunk values (1, 'x', 1)`)
-	installCapture(t, owner, "public.grown", "grown", "id")
-	installCapture(t, owner, "public.shrunk", "shrunk", "id")
+		`insert into public.shrunk values (1, 'x', 1)`,
+		`create table public.g (id int primary key, n int, x int)`,
+		`insert into public.g values (1, 1, 1)`,
+		`alter table public.g drop column x`,
+		`create table public.t (id int primary key, n int)`,
+		`insert into public.t values (1, 1)`,
+		`create table public.t_new (id int primary key, n int)`,
+		`insert into public.t_new values (1, 999)`,
+		`create table public.re (id int primary key, n int)`,
+		`insert into public.re values (1, 1)`,
+		`create table public.hid (id int primary key, n int)`,
+		`insert into public.hid values (1, 1)`)
+	for _, table := range []string{"grown", "shrunk", "g", "t", "re", "hid"} {
+		installCapture(t, owner, "public."+table, table, "id")
+	}
 	since := dbClock(t, pool)
-	mustExec(t, agentIn(t, db), `update public.grown set n = 10 where id = 1`, `update public.shrunk set n = 10 where id = 1`)
+	mustExec(t, agentIn(t, db),
+		`update public.grown set n = 10 where id = 1`,
+		`update public.shrunk set n = 10 where id = 1`,
+		`update public.g set n = 10 where id = 1`,
+		`update public.t set n = 10 where id = 1`,
+		`delete from public.re where id = 1`,
+		`update public.hid set n = 10 where id = 1`)
+	relid, gone := relidOf(t, owner, "public.t"), relidOf(t, owner, "public.re")
 
-	rv := undoReviewer(t, db, "public.grown", "public.shrunk")
+	rv := undoReviewer(t, db, "public.grown", "public.shrunk", "public.g", "public.t", "public.t_new", "public.re", "public.hid")
 	tx, err := rv.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(ctx)
 	mustExec(t, tx, `select txid_current_snapshot()`)
-	mustExec(t, owner, `alter table public.grown add column extra int`, `alter table public.shrunk drop column to_jsonb`)
-	got := planOf(t, tx, "stet_md5", since)
-	if len(got) != 2 ||
-		got[0].String() != `grown "1" - skipped SQLSTATE 55000: the columns of public.grown changed after this transaction's snapshot -` ||
-		!strings.HasPrefix(got[1].String(), `shrunk "1" - skipped SQLSTATE 42703: `) {
-		t.Errorf("under REPEATABLE READ the plan says\n  %s\nwant grown skipped with 55000 and shrunk with 42703",
-			strings.Join(shown(got), "\n  "))
+	mustExec(t, owner,
+		`alter table public.grown add column extra int`,
+		`alter table public.shrunk drop column to_jsonb`,
+		`alter table public.g add column y int`,
+		`alter table public.t rename to t_old`,
+		`alter table public.t_new rename to t`,
+		`drop table public.re`,
+		`create table public.re (id int primary key, n int)`,
+		"grant select on public.re to "+roleOf(t, rv),
+		`alter table public.hid enable row level security`,
+		`create policy nobody on public.hid using (false)`)
+	got := shown(planOf(t, tx, "stet_md5", since))
+	want := []string{
+		`g "1" - skipped SQLSTATE 55000: the columns of public.g changed after this transaction's snapshot -`,
+		`grown "1" - skipped SQLSTATE 55000: the columns of public.grown changed after this transaction's snapshot -`,
+		`hid - - skipped SQLSTATE 42501: permission denied for table hid -`,
+		`re - - skipped table_gone -`,
+		`shrunk "1" - skipped SQLSTATE 42703: `,
+		`t "1" update would_restore - -`,
+	}
+	same := len(got) == len(want)
+	for i := 0; same && i < len(got); i++ {
+		// The 42703 message is PostgreSQL's; only its start is pinned.
+		same = got[i] == want[i] || strings.HasSuffix(want[i], ": ") && strings.HasPrefix(got[i], want[i])
+	}
+	if !same {
+		t.Errorf("under REPEATABLE READ the plan says\n  %s\nwant\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
+	}
+	mustExec(t, tx, `savepoint before_row`)
+	var row *string
+	if err := tx.QueryRow(ctx, `select stet.undo_row($1, 'id', '1', false)::text`, relid).Scan(&row); err != nil {
+		t.Fatal(err)
+	}
+	if deref(row) != `{"n": "10", "id": "1"}` {
+		t.Errorf("under REPEATABLE READ stet.undo_row for the renamed table read %v, want its own row n = 10", deref(row))
+	}
+	_, err = tx.Exec(ctx, `select stet.undo_row($1, 'id', '1', false)`, gone)
+	wantCode(t, err, "42P01", "under REPEATABLE READ stet.undo_row for a table dropped after the snapshot")
+	if _, err := tx.Exec(ctx, `rollback to savepoint before_row`); err != nil {
+		t.Fatal(err)
+	}
+	// stet.undo calls the judge directly: a table dropped after the snapshot is table_gone there too.
+	var action, reason *string
+	if err := tx.QueryRow(ctx, `select action, reason from stet.undo_judge($1, 'id', '1', '{"id": "1", "n": "1"}', null, false, false, false)`,
+		gone).Scan(&action, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if action != nil || deref(reason) != "table_gone" {
+		t.Errorf("under REPEATABLE READ stet.undo_judge for a dropped table says %v %v, want table_gone", deref(action), deref(reason))
 	}
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
 	checkShown(t, "in a new transaction", planOf(t, rv, "stet_md5", since),
+		`g "1" - skipped columns_changed -`,
 		`grown "1" - skipped columns_changed -`,
-		`shrunk "1" - skipped columns_changed -`)
+		`hid - - skipped SQLSTATE 42501: permission denied for table hid -`,
+		`re - - skipped table_gone -`,
+		`shrunk "1" - skipped columns_changed -`,
+		`t "1" update would_restore - -`)
 }
 
 // A plan over 5,000 keys of one table, among 20,000 rows, takes seconds: each
