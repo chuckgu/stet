@@ -346,7 +346,7 @@ CREATE TABLE IF NOT EXISTS stet.changes (
 -- 캡처 함수가 읽는 설정. 한 줄뿐이고 Stet이 시작할 때 설정 파일에서 맞춘다
 CREATE TABLE IF NOT EXISTS stet.capture_settings (
   one       boolean PRIMARY KEY DEFAULT true CHECK (one),
-  roles     text[],                            -- 캡처할 계정. NULL이면 모든 세션
+  roles     text[],                            -- 캡처할 계정. NULL이면 모든 세션. Stet의 계정이 접속한 세션은 거르지 않는다
   max_rows  bigint NOT NULL                    -- 한 문장이 이보다 많은 행을 바꾸면 값을 남기지 않는다
 );
 
@@ -574,7 +574,8 @@ BEGIN
       -- 없어 그 이름이 pg_temp의 릴레이션으로 읽힌다. 그래서 세션의 임시 스키마에 그 이름의 릴레이션이 있으면 읽지 않는다.
       -- 이 확인부터 전이 테이블을 마지막으로 읽는 문장까지는 고객의 코드가 돌 수 있는 것을 두지 않는다. 그 사이의 문장은
       -- stet의 표에 넣는 것, 카탈로그를 읽는 것, 내장 함수와 타입의 출력 함수(C, superuser만 만든다)뿐이다.
-      -- 세는 문장과 값을 읽는 문장은 따로 이름을 찾지만, 그 사이에도 고객의 코드는 돌지 않는다.
+      -- 세는 문장과 값을 읽는 문장은 따로 이름을 찾지만, 그 사이에도 고객의 코드는 돌지 않는다. 한 행이 여러 번 바뀌었는지
+      -- 보는 문장과 그 판들을 줄이는 문장도 전이 테이블만 읽고, 글자와 jsonb를 내장 연산자로 견준다.
       IF EXISTS (SELECT FROM pg_catalog.pg_class c
                   WHERE c.relnamespace = pg_catalog.pg_my_temp_schema() AND c.relname IN ('stet_old', 'stet_new')) THEN
         RAISE EXCEPTION 'this session has a temporary relation named stet_old or stet_new; stet.capture() does not read its '
