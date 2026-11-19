@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -24,23 +26,29 @@ import (
 // yet another role (writerIn), whose writes capture does not record. The
 // superuser stands for the tables' owner.
 
-// undoFunctions are the functions a role needs EXECUTE on to call stet.undo:
-// the plan's (planFunctions) and stet.undo's own (spec 7, 권한).
-var undoFunctions = append(slices.Clone(planFunctions),
-	"stet.undo(text, timestamptz, timestamptz, text[], text)",
-	"stet.undo_lines(text, timestamptz, timestamptz, text[])",
-	"stet.undo_next(jsonb, integer[], text[], text[], text[], integer)",
-	"stet.undo_referenced(oid, text, jsonb, jsonb)",
-	"stet.undo_statement(oid, text, text, text, jsonb, jsonb)",
-	"stet.undo_outcome(oid, text, text, jsonb, bigint, oid)",
-	"stet.undo_failure(text, text)",
-	"stet.undo_result(jsonb, integer[], text[], text[], text[], text[])",
-	"stet.undo_unpack(jsonb)",
-	"stet.undo_record(text, timestamptz, timestamptz, text[], text, jsonb)",
-)
+// undoFunctionsIn are the functions a role needs EXECUTE on to call
+// stet.undo in db (spec 7, 권한): every function of the stet schema whose
+// name begins with undo, the plan's and stet.undo's own, as db's catalog
+// names them. Read from the catalog, a helper added later is granted too;
+// TestUndoGrantCommentNamesEveryFunction checks the list against the grants
+// schema.sql documents and revokes.
+func undoFunctionsIn(t *testing.T, db string) []string {
+	t.Helper()
+	rows, err := superuserIn(t, db).Query(context.Background(), `
+		select p.oid::regprocedure::text from pg_proc p
+		where p.pronamespace = 'stet'::regnamespace and p.proname like 'undo%' order by 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	functions, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return functions
+}
 
 // undoer creates a login role with what a reviewer needs to call stet.undo in
-// db: USAGE on the stet schema, EXECUTE on undoFunctions, and SELECT, INSERT,
+// db: USAGE on the stet schema, EXECUTE on undoFunctionsIn, and SELECT, INSERT,
 // UPDATE and DELETE on each of tables (SQL names). It returns a connection as
 // that role. The role has no right on Stet's tables.
 func undoer(t *testing.T, db string, tables ...string) *pgx.Conn {
@@ -48,7 +56,7 @@ func undoer(t *testing.T, db string, tables ...string) *pgx.Conn {
 	name := loginRole(t, "reviewer")
 	grants := []string{
 		"grant usage on schema stet to " + name,
-		"grant execute on function " + strings.Join(undoFunctions, ", ") + " to " + name,
+		"grant execute on function " + strings.Join(undoFunctionsIn(t, db), ", ") + " to " + name,
 	}
 	for _, table := range tables {
 		grants = append(grants, "grant select, insert, update, delete on "+table+" to "+name)
@@ -824,7 +832,7 @@ func TestUndoSetsOnlyTheColumnsThatDiffer(t *testing.T) {
 		`create trigger frozen before update of note on public.deals for each row when (new.id = 1) execute function public.frozen()`)
 	rv := loginRole(t, "reviewer")
 	grant(t, db, rv, "grant usage on schema stet to "+rv,
-		"grant execute on function "+strings.Join(undoFunctions, ", ")+" to "+rv,
+		"grant execute on function "+strings.Join(undoFunctionsIn(t, db), ", ")+" to "+rv,
 		"grant select on public.deals to "+rv, "grant update (n) on public.deals to "+rv)
 	checkUndo(t, "only what differs", undoOf(t, connectAs(t, db, rv), "stet_md5", since),
 		`deals "1" update restored - -`,
@@ -1284,7 +1292,11 @@ func TestUndoGrantsAreSeparate(t *testing.T) {
 	since := dbClock(t, pool)
 	mustExec(t, agentIn(t, db), `update public.deals set n = 10 where id = 1`)
 
-	for _, f := range undoFunctions {
+	functions := undoFunctionsIn(t, db)
+	if len(functions) < len(planFunctions)+11 {
+		t.Fatalf("the catalog has %d undo functions: %v", len(functions), functions)
+	}
+	for _, f := range functions {
 		var public bool
 		if err := owner.QueryRow(ctx, `select has_function_privilege('public', $1, 'execute')`, f).Scan(&public); err != nil {
 			t.Fatal(err)
@@ -1682,4 +1694,444 @@ func TestHistoryFindsTheUndoThroughAnIndex(t *testing.T) {
 	if n := countOf(t, pool, `select count(*) from stet.history where target_table = 'many' and undo_id is not null`); n != 3000 {
 		t.Errorf("stet.history shows %d changes undone, want 3000", n)
 	}
+}
+
+// The grants schema.sql documents for reviewers, and the REVOKE at its end,
+// name exactly the functions of the stet schema whose names begin with undo:
+// a helper added later cannot be left out of either.
+func TestUndoGrantCommentNamesEveryFunction(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	schema, err := os.ReadFile("schema.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := string(schema)
+	start := strings.Index(sql, "-- 되돌리기의 함수들은 PUBLIC이 부를 수 없다")
+	if start < 0 {
+		t.Fatal("schema.sql has no grant comment for the undo functions")
+	}
+	block := sql[start:]
+	revoke := strings.Index(block, "REVOKE EXECUTE ON FUNCTION")
+	if revoke < 0 {
+		t.Fatal("schema.sql has no REVOKE after the grant comment for the undo functions")
+	}
+	signature := regexp.MustCompile(`stet\.undo\w*\([^)]*\)`)
+	canonical := func(what, text string) []string {
+		t.Helper()
+		var out []string
+		for _, s := range signature.FindAllString(text, -1) {
+			var c string
+			if err := pool.QueryRow(ctx, `select $1::regprocedure::text`, s).Scan(&c); err != nil {
+				t.Fatalf("%s names %s: %v", what, s, err)
+			}
+			out = append(out, c)
+		}
+		slices.Sort(out)
+		return slices.Compact(out)
+	}
+	var granted strings.Builder
+	for _, m := range regexp.MustCompile(`(?s)GRANT EXECUTE ON FUNCTION (.*?) TO reviewer;`).FindAllStringSubmatch(block[:revoke], -1) {
+		granted.WriteString(m[1])
+	}
+	statement := block[revoke : revoke+strings.Index(block[revoke:], ";")]
+	want := undoFunctionsIn(t, db)
+	if got := canonical("the grant comment", granted.String()); !slices.Equal(got, want) {
+		t.Errorf("the grant comment names\n  %s\nthe catalog has\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
+	}
+	if got := canonical("the REVOKE", statement); !slices.Equal(got, want) {
+		t.Errorf("the REVOKE names\n  %s\nthe catalog has\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
+	}
+}
+
+// A row that references the agent's row through a unique key of the same
+// table that is NULL in the referencing row's own key, of one column or of
+// two, is a child all the same: the agent's row is skipped, referenced, and
+// both rows stay. Leaving the agent's row itself out of its children must not
+// leave out a row whose key is NULL (three-valued logic).
+func TestUndoSkipsRowsReferencedThroughANullableKey(t *testing.T) {
+	pool, db := captureDB(t)
+	owner := superuserIn(t, db)
+	setCapture(t, pool, []string{"stet_md5"}, 10000)
+	mustExec(t, owner,
+		`create table public.nodes (id int primary key, code text unique,
+		   parent_code text references public.nodes (code) on delete cascade)`,
+		`create table public.twins (id int primary key, x int, y int, px int, py int, unique (x, y),
+		   foreign key (px, py) references public.twins (x, y) on delete cascade)`)
+	installCapture(t, owner, "public.nodes", "nodes", "id")
+	installCapture(t, owner, "public.twins", "twins", "id")
+	since := dbClock(t, pool)
+	mustExec(t, agentIn(t, db),
+		`insert into public.nodes values (1, 'a', null)`,
+		`insert into public.twins values (1, 1, 1, null, null)`)
+	mustExec(t, writerIn(t, db, "public.nodes", "public.twins"),
+		`insert into public.nodes values (2, null, 'a')`,
+		`insert into public.twins values (2, 1, null, 1, 1)`)
+
+	rv := undoer(t, db, "public.nodes", "public.twins")
+	checkUndo(t, "children whose own key is NULL", undoOf(t, rv, "stet_md5", since),
+		`nodes "1" - skipped referenced: public.nodes -`,
+		`twins "1" - skipped referenced: public.twins -`)
+	checkContent(t, owner, "after the undo", "public.nodes", "(1,a,)\n(2,,a)")
+	checkContent(t, owner, "after the undo", "public.twins", "(1,1,1,,)\n(2,1,,1,1)")
+}
+
+// A key undo skips leaves no lock behind: once stet.undo has returned, in the
+// reviewer's still open transaction, another session can lock the rows of
+// keys that were changed_since, no_net_change or referenced (and of one that
+// failed), but not the row of a key that was restored. The skip leaves the
+// key's block through a private SQLSTATE, ST007; a customer trigger that
+// raises that very code makes its key failed, with the trigger's message.
+func TestUndoReleasesTheLocksOfSkippedKeys(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	owner := superuserIn(t, db)
+	setCapture(t, pool, []string{"stet_md5"}, 10000)
+	keyedTable(t, owner, "deals", 4)
+	keyedTable(t, owner, "parents", 1)
+	mustExec(t, owner, `create table public.kids (id int primary key, parent int references public.parents on delete cascade)`)
+	since := dbClock(t, pool)
+	agent := agentIn(t, db)
+	mustExec(t, agent,
+		`update public.deals set n = 10 where id = 1`,
+		`update public.deals set n = 20 where id = 2`,
+		`update public.deals set n = 2 where id = 2`,
+		`update public.deals set n = 30 where id = 3`,
+		`insert into public.parents values (2, 'r2', 2)`,
+		`update public.deals set n = 40 where id = 4`)
+	mustExec(t, writerIn(t, db, "public.deals", "public.kids"),
+		`update public.deals set n = 100 where id = 1`,
+		`insert into public.kids values (10, 2)`)
+	mustExec(t, owner,
+		`create function public.mimic() returns trigger language plpgsql as $$
+		 begin raise exception 'deal 4 says ST007' using errcode = 'ST007'; end $$`,
+		`create trigger mimic before update on public.deals for each row when (new.id = 4) execute function public.mimic()`)
+
+	rv := undoer(t, db, "public.deals", "public.parents")
+	grant(t, db, roleOf(t, rv), "grant select on public.kids to "+roleOf(t, rv))
+	tx, err := rv.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	checkUndo(t, "skipped, restored and failed keys", undoOf(t, tx, "stet_md5", since),
+		`deals "1" - skipped changed_since -`,
+		`deals "2" - skipped no_net_change -`,
+		`deals "3" update restored - -`,
+		`deals "4" update failed SQLSTATE ST007: deal 4 says ST007 -`,
+		`parents "2" - skipped referenced: public.kids -`)
+	for _, c := range []struct {
+		table string
+		id    int
+		free  bool
+	}{{"deals", 1, true}, {"deals", 2, true}, {"deals", 3, false}, {"deals", 4, true}, {"parents", 2, true}} {
+		_, err := owner.Exec(ctx, fmt.Sprintf("select from public.%s where id = %d for update nowait", c.table, c.id))
+		if c.free && err != nil {
+			t.Errorf("another session cannot lock %s %d while the reviewer's transaction is open: %v", c.table, c.id, err)
+		}
+		if !c.free {
+			wantCode(t, err, "55P03", fmt.Sprintf("another session locking the restored %s %d", c.table, c.id))
+		}
+	}
+}
+
+// Every restored line is true when stet.undo returns. The owner's trigger on
+// one table changes, when a later key of it is restored, a row of another
+// table that an earlier key restored, and puts back a row an earlier key
+// deleted: both earlier lines are restored_differs.
+func TestUndoChecksEveryRestoredLineAtTheEnd(t *testing.T) {
+	pool, db := captureDB(t)
+	owner := superuserIn(t, db)
+	setCapture(t, pool, []string{"stet_md5"}, 10000)
+	keyedTable(t, owner, "alpha", 2)
+	keyedTable(t, owner, "beta", 2)
+	since := dbClock(t, pool)
+	mustExec(t, agentIn(t, db),
+		`update public.alpha set n = 10 where id = 1`,
+		`insert into public.alpha values (3, 'r3', 3)`,
+		`update public.beta set n = 20 where id = 1`)
+	mustExec(t, owner,
+		`create function public.meddle() returns trigger language plpgsql as $$
+		 begin
+		   update public.alpha set n = 999 where id = 1;
+		   insert into public.alpha values (3, 'back', 3);
+		   return null;
+		 end $$`,
+		`create trigger meddle after update on public.beta for each row execute function public.meddle()`)
+
+	rv := undoer(t, db, "public.alpha", "public.beta")
+	checkUndo(t, "rows a later restore changed", undoOf(t, rv, "stet_md5", since),
+		`alpha "1" update restored_differs - -`,
+		`alpha "3" delete restored_differs - -`,
+		`beta "1" update restored - -`)
+	checkContent(t, owner, "after the undo", "public.alpha", "(1,r1,999)\n(2,r2,2)\n(3,back,3)")
+}
+
+// A partition is not a table undo restores (capture on partitions is not
+// supported): stet.undo_lock refuses it with 0A000, so the plan skips its
+// keys and stet.undo fails them, and nothing changes.
+func TestUndoRefusesAPartition(t *testing.T) {
+	pool, db := captureDB(t)
+	owner := superuserIn(t, db)
+	setCapture(t, pool, []string{"stet_md5"}, 10000)
+	mustExec(t, owner,
+		`create table public.parts (id int, n int) partition by range (id)`,
+		`create table public.parts_1 partition of public.parts for values from (0) to (100)`,
+		`alter table public.parts_1 add primary key (id)`,
+		`insert into public.parts values (1, 1)`)
+	installCapture(t, owner, "public.parts_1", "parts_1", "id")
+	since := dbClock(t, pool)
+	mustExec(t, agentIn(t, db), `update public.parts_1 set n = 10 where id = 1`)
+
+	rv := undoer(t, db, "public.parts_1")
+	refused := `SQLSTATE 0A000: public.parts_1 is a partition of public.parts; undo does not restore partitions`
+	checkShown(t, "the plan of a partition", planOf(t, rv, "stet_md5", since), `parts_1 "1" - skipped `+refused+` -`)
+	checkUndo(t, "the undo of a partition", undoOf(t, rv, "stet_md5", since), `parts_1 "1" - failed `+refused+` -`)
+	checkContent(t, owner, "after the undo", "public.parts_1", "(1,10)")
+}
+
+// stet.undo_record records each item as it is given, but marks a change
+// undone in stet.history (stet.undone_changes) only when it is a change of
+// the agent_role it is given, recorded within since and until, of one of the
+// tables it is given, and of the line's own target_table and key: a reviewer
+// calling it directly cannot mark another account's change, a change of
+// another table or time, one that does not exist, or one under a line of
+// another table.
+func TestUndoRecordMarksOnlyTheSelectedChangesUndone(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	owner := superuserIn(t, db)
+	setCapture(t, pool, nil, 10000)
+	keyedTable(t, owner, "deals", 3)
+	keyedTable(t, owner, "accounts", 1)
+	agent := agentIn(t, db)
+	mustExec(t, agent, `update public.deals set n = 30 where id = 3`)
+	since := dbClock(t, pool)
+	mustExec(t, agent, `update public.deals set n = 10 where id = 1`, `update public.accounts set n = 10 where id = 1`,
+		`update public.accounts set n = 11 where id = 1`)
+	mustExec(t, owner, `update public.deals set n = 20 where id = 2`)
+	until := dbClock(t, pool)
+	mustExec(t, agent, `update public.deals set n = 11 where id = 1`)
+	early, selected, ownerS := changeIDsOf(t, pool, "deals", "3")[0], changeIDsOf(t, pool, "deals", "1")[0],
+		changeIDsOf(t, pool, "deals", "2")[0]
+	late := changeIDsOf(t, pool, "deals", "1")[1]
+	other, misnamed := changeIDsOf(t, pool, "accounts", "1")[0], changeIDsOf(t, pool, "accounts", "1")[1]
+	type named struct {
+		table, key string
+		id         int64
+	}
+	lines := []named{
+		{"deals", "3", early}, {"deals", "1", selected}, {"accounts", "1", other}, {"deals", "2", ownerS},
+		{"deals", "1", late}, {"deals", "1", late + 1000}, {"deals", "1", misnamed},
+	}
+	var ids []int64
+	var items []map[string]any
+	for _, l := range lines {
+		ids = append(ids, l.id)
+		items = append(items, map[string]any{"target_table": l.table, "key": l.key, "action": "update", "outcome": "restored",
+			"reason": nil, "warning": nil, "change_ids": []int64{l.id}})
+	}
+	encoded, err := json.Marshal(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rv := undoer(t, db)
+	for _, c := range []struct {
+		tables any
+		want   []int64
+	}{
+		{[]string{"deals"}, []int64{selected}},
+		{nil, []int64{selected, other}},
+	} {
+		var id int64
+		if err := rv.QueryRow(ctx, `select stet.undo_record('stet_md5', $1, $2, $3, null, $4)`, since, until, c.tables,
+			string(encoded)).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		var marked []int64
+		if err := pool.QueryRow(ctx, `select coalesce(array_agg(change_id order by change_id), '{}') from stet.undone_changes
+			where undo_id = $1`, id).Scan(&marked); err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(marked, c.want) {
+			t.Errorf("tables %v: stet.undone_changes marks %v undone, want %v (of %v)", c.tables, marked, c.want, ids)
+		}
+		got := itemsOf(t, pool, id)
+		if len(got) != len(ids) {
+			t.Fatalf("tables %v: %d items recorded, want %d", c.tables, len(got), len(ids))
+		}
+		for i, item := range got {
+			if !slices.Equal(item.ChangeIDs, []int64{ids[i]}) {
+				t.Errorf("tables %v: item %d names %v, want %v as given", c.tables, i, item.ChangeIDs, ids[i])
+			}
+		}
+	}
+}
+
+// While the reviewer's transaction holds the row of a parent undo deleted,
+// another session's insert of a child that references it waits; once the
+// reviewer commits, the insert fails with a foreign-key violation. This is the
+// PostgreSQL behaviour the referenced check relies on: no child can appear
+// between the check, made under the row's lock, and the reviewer's commit.
+func TestUndoHoldsANewChildUntilItCommits(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	owner := superuserIn(t, db)
+	setCapture(t, pool, []string{"stet_md5"}, 10000)
+	keyedTable(t, owner, "parents", 1)
+	mustExec(t, owner, `create table public.kids (id int primary key, parent int references public.parents on delete cascade)`)
+	since := dbClock(t, pool)
+	mustExec(t, agentIn(t, db), `insert into public.parents values (2, 'r2', 2)`)
+	rv := undoer(t, db, "public.parents")
+	grant(t, db, roleOf(t, rv), "grant select on public.kids to "+roleOf(t, rv))
+	other := writerIn(t, db, "public.parents", "public.kids")
+
+	tx, err := rv.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	checkUndo(t, "the parent", undoOf(t, tx, "stet_md5", since), `parents "2" delete restored - -`)
+	done := make(chan error, 1)
+	go func() {
+		_, err := other.Exec(ctx, `insert into public.kids values (10, 2)`)
+		done <- err
+	}()
+	if !waitsForALock(t, owner, other.PgConn().PID(), done) {
+		t.Fatalf("the child's insert did not wait for the parent's row: %v", <-done)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	wantCode(t, <-done, "23503", "the child's insert after the reviewer committed the parent's delete")
+	checkContent(t, owner, "the children", "public.kids", "")
+	checkContent(t, owner, "the parents", "public.parents", "(1,r1,1)")
+}
+
+// A restore statement names its table, and runs against whatever that name
+// means when it runs. Another session renames schemas between the moment
+// stet.undo_statement makes the statement and the moment it runs, so that the
+// name means another table: the statement changes no row of that other table
+// (it is limited to relid's tableoid), and stet.undo_outcome, given the
+// statement it ran, refuses with 55000, so the key is failed and not recorded
+// as undone. Staged by calling, in one READ COMMITTED transaction, the
+// helpers stet.undo calls, in its order.
+func TestUndoOutcomeRefusesAStatementThatNamedAnotherTable(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	owner := superuserIn(t, db)
+	setCapture(t, pool, []string{"stet_md5"}, 10000)
+	mustExec(t, owner,
+		`create schema crm`, `create schema crm2`,
+		`create table crm.deals (id int primary key, note text, n int)`,
+		`insert into crm.deals values (1, 'r1', 1)`,
+		`create table crm2.deals (id int primary key, note text, n int)`,
+		`insert into crm2.deals values (1, 'theirs', 1000)`)
+	installCapture(t, owner, "crm.deals", "deals", "id")
+	relid := relidOf(t, owner, "crm.deals")
+	since := dbClock(t, pool)
+	mustExec(t, agentIn(t, db), `update crm.deals set n = 10 where id = 1`)
+	rv := undoer(t, db, "crm.deals", "crm2.deals")
+	grant(t, db, roleOf(t, rv), "grant usage on schema crm, crm2 to "+roleOf(t, rv))
+
+	tx, err := rv.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	sel, err := trySelection(tx, "stet_md5", since, nil, nil)
+	if err != nil || len(sel) != 1 {
+		t.Fatalf("the selection: %+v, %v", sel, err)
+	}
+	s := sel[0]
+	var action *string
+	if err := tx.QueryRow(ctx, `select action from stet.undo_judge($1, $2, $3, $4, $5, $6, $7, true)`,
+		s.RelID, s.KeyColumn, s.Key, s.B, s.A, s.KeyChanged, s.Interleaved).Scan(&action); err != nil || deref(action) != "update" {
+		t.Fatalf("the judgement: %v, %v", deref(action), err)
+	}
+	var stmt string
+	if err := tx.QueryRow(ctx, `select stet.undo_statement($1, $2, $3, 'update', $4, $5)`, s.RelID, s.KeyColumn, s.Key, s.B, s.A).
+		Scan(&stmt); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, owner, `alter schema crm rename to crm_old`, `alter schema crm2 rename to crm`)
+	tag, err := tx.Exec(ctx, stmt)
+	if err != nil {
+		t.Fatalf("%s: %v", stmt, err)
+	}
+	if tag.RowsAffected() != 0 {
+		t.Errorf("%s changed %d rows of the table the name now means", stmt, tag.RowsAffected())
+	}
+	_, err = tx.Exec(ctx, `select stet.undo_outcome($1, $2, $3, 'update', $4, $5, $6, $7, null)`,
+		relid, s.KeyColumn, s.Key, s.B, s.A, stmt, tag.RowsAffected())
+	wantCode(t, err, "55000", "stet.undo_outcome of a statement whose table name was taken by another table")
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	checkContent(t, owner, "the table the name meant", "crm_old.deals", "(1,r1,10)")
+	checkContent(t, owner, "the table the name means now", "crm.deals", "(1,theirs,1000)")
+}
+
+// stet.undo_outcome checks a key's restore inside the key's block, so that
+// what it refuses is rolled back with the restore: B and the row after the
+// statement are compared (restored, restored_differs); the statement it is
+// given must be the one stet.undo_statement makes now (55000); it must have
+// changed at most one row (21000), of relid's table (55000); and the key must
+// name one row (21000, a key column that is not unique). Called directly, in
+// one READ COMMITTED transaction, as stet.undo calls it.
+func TestUndoOutcomeChecksTheRowItRestored(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	owner := superuserIn(t, db)
+	setCapture(t, pool, []string{"stet_md5"}, 10000)
+	keyedTable(t, owner, "deals", 2)
+	mustExec(t, owner, `create table public.tags (id int primary key, tag text, n int)`,
+		`insert into public.tags values (1, 'x', 1), (2, 'x', 2)`)
+	since := dbClock(t, pool)
+	mustExec(t, agentIn(t, db), `update public.deals set n = 10 where id = 1`)
+	relid, other, tags := relidOf(t, owner, "public.deals"), relidOf(t, owner, "stet.undos"), relidOf(t, owner, "public.tags")
+	rv := undoer(t, db, "public.deals", "public.tags")
+	tx, err := rv.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	sel, err := trySelection(tx, "stet_md5", since, nil, nil)
+	if err != nil || len(sel) != 1 {
+		t.Fatalf("the selection: %+v, %v", sel, err)
+	}
+	s := sel[0]
+	var stmt string
+	if err := tx.QueryRow(ctx, `select stet.undo_statement($1, 'id', '1', 'update', $2, $3)`, relid, s.B, s.A).Scan(&stmt); err != nil {
+		t.Fatal(err)
+	}
+	outcome := func(statement any, changed, written any) (string, error) {
+		var o string
+		mustExec(t, tx, `savepoint outcome`)
+		err := tx.QueryRow(ctx, `select stet.undo_outcome($1, 'id', '1', 'update', $2, $3, $4, $5, $6)`,
+			relid, s.B, s.A, statement, changed, written).Scan(&o)
+		mustExec(t, tx, `rollback to savepoint outcome`)
+		return o, err
+	}
+	if o, err := outcome(stmt, 0, nil); err != nil || o != "restored_differs" {
+		t.Errorf("before the statement ran: %q, %v; want restored_differs (the row is still A)", o, err)
+	}
+	_, err = outcome("UPDATE ONLY public.other r SET n = '1'", 0, nil)
+	wantCode(t, err, "55000", "a statement stet.undo_statement does not make")
+	_, err = outcome(stmt, 2, relid)
+	wantCode(t, err, "21000", "a statement that changed two rows")
+	_, err = outcome(stmt, 1, other)
+	wantCode(t, err, "55000", "a statement that wrote to another table")
+	mustExec(t, tx, stmt)
+	if o, err := outcome(stmt, 1, relid); err != nil || o != "restored" {
+		t.Errorf("after the statement ran: %q, %v; want restored", o, err)
+	}
+	// A table whose capture key column, tag, is not unique: two rows have the key x.
+	b, a := map[string]any{"id": "1", "tag": "x", "n": "1"}, map[string]any{"id": "1", "tag": "x", "n": "10"}
+	var tagged string
+	if err := tx.QueryRow(ctx, `select stet.undo_statement($1, 'tag', 'x', 'update', $2, $3)`, tags, b, a).Scan(&tagged); err != nil {
+		t.Fatal(err)
+	}
+	_, err = tx.Exec(ctx, `select stet.undo_outcome($1, 'tag', 'x', 'update', $2, $3, $4, 1, $1)`, tags, b, a, tagged)
+	wantCode(t, err, "21000", "a key that names two rows")
 }

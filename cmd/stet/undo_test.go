@@ -397,26 +397,22 @@ func TestRunStartsWhenTheUndoStepsFail(t *testing.T) {
 	}
 }
 
-// undoFunctions are the functions a reviewer needs EXECUTE on to plan and
-// undo (the comment above the REVOKE at the end of schema.sql).
-var undoFunctions = []string{
-	"stet.undo_plan(text, timestamptz, timestamptz, text[])",
-	"stet.undo_selection(text, timestamptz, timestamptz, text[])",
-	"stet.undo_lock(oid)",
-	"stet.undo_row(oid, text, text, boolean)",
-	"stet.undo_judge(oid, text, text, jsonb, jsonb, boolean, boolean, boolean)",
-	"stet.undo_warning(oid, text, text[])",
-	"stet.undo_refuse(text, timestamptz, timestamptz)",
-	"stet.undo(text, timestamptz, timestamptz, text[], text)",
-	"stet.undo_lines(text, timestamptz, timestamptz, text[])",
-	"stet.undo_next(jsonb, integer[], text[], text[], text[], integer)",
-	"stet.undo_referenced(oid, text, jsonb, jsonb)",
-	"stet.undo_statement(oid, text, text, text, jsonb, jsonb)",
-	"stet.undo_outcome(oid, text, text, jsonb, bigint, oid)",
-	"stet.undo_failure(text, text)",
-	"stet.undo_result(jsonb, integer[], text[], text[], text[], text[])",
-	"stet.undo_unpack(jsonb)",
-	"stet.undo_record(text, timestamptz, timestamptz, text[], text, jsonb)",
+// undoFunctionsIn are the functions a reviewer needs EXECUTE on to plan and
+// undo in the database conn is in: every function of the stet schema whose
+// name begins with undo, as the catalog names them (the store package's
+// tests check the list against the grants schema.sql documents).
+func undoFunctionsIn(t *testing.T, conn *pgx.Conn) []string {
+	t.Helper()
+	rows, err := conn.Query(context.Background(), `select p.oid::regprocedure::text from pg_proc p
+		where p.pronamespace = 'stet'::regnamespace and p.proname like 'undo%' order by 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	functions, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return functions
 }
 
 // The whole flow of spec-v0.2-undo 3, with Stet in shadow mode and no model:
@@ -463,7 +459,7 @@ func TestUndoEndToEnd(t *testing.T) {
 	for _, sql := range []string{
 		"grant usage on schema stet to " + reviewer,
 		"grant select on stet.history to " + reviewer,
-		"grant execute on function " + strings.Join(undoFunctions, ", ") + " to " + reviewer,
+		"grant execute on function " + strings.Join(undoFunctionsIn(t, in), ", ") + " to " + reviewer,
 		"grant select, insert, update, delete on " + table + " to " + reviewer,
 	} {
 		mustExec(t, in, sql)
