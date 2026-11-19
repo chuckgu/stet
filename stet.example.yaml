@@ -77,3 +77,23 @@ tables:
     reads:                   # 선택. 있으면 (값 없이 reads:만 써도) 이 테이블의 읽기를 기록한다
       log_above: 1000        # 선택. 한 읽기가 이보다 많은 행을 보내면 따로 기록한다 (없으면 집계만). 커서와 나눠 가져가는 포털은 합계로 본다
     unsupported: reject
+
+# 되돌리기(docs/spec-v0.2-undo.md). 에이전트 계정(agents.roles. 섀도에서 없으면 모든 세션)이 바꾼 행의 이전·이후
+# 값을 DB의 트리거가 쓰기와 같은 트랜잭션에서 남기고, 검토자가 계정·시간·테이블로 골라 되돌린다. 두 모드에서 같다.
+# 켜는 순서(docs/lab.md의 "되돌리기"):
+#   1. 아래 절을 적고 Stet을 한 번 시작한다. Stet이 stet 스키마를 만들고 캡처 설정을 맞춘다.
+#   2. stet undo-sql -config stet.yaml 이 설치 SQL을 출력한다. 묶음마다 머리에 적힌 계정(Stet의 계정, 테이블
+#      소유자)이 실행한다. Stet은 고객의 테이블에 아무것도 설치하지 않는다. PostgreSQL 14 이상이 필요하다.
+#   3. stet undo-sql -config stet.yaml -grant reviewer 가 검토자에게 줄 권한을 출력한다. Stet의 계정이 실행한다.
+#      되돌릴 테이블의 SELECT·INSERT·UPDATE·DELETE와, 그 테이블을 연쇄 외래 키로 가리키는 테이블의 SELECT는
+#      테이블 소유자가 준다.
+# 검토자는 READ COMMITTED 트랜잭션에서 stet.undo_plan('<계정>', '<언제부터>')로 무엇이 되돌려질지 보고,
+# stet.undo(...)로 되돌린 뒤 결과의 줄을 보고 COMMIT하거나 ROLLBACK한다.
+# Stet은 시작할 때 트리거가 없거나 출력과 다른 테이블을 경고하고 stet undo-sql을 실행하라고 말한다.
+# undo:
+#   tables:                  # 필수. 되돌리기를 켤 테이블. 키 컬럼은 기본 키이거나 NOT NULL이고 유일한 컬럼 하나다
+#     contacts:              # tables의 키. 키 컬럼은 거기서 가져온다
+#     public.deal_notes:     # 게이트 대상이 아닌 테이블(연쇄로 바뀌는 자식 등). 키 컬럼을 적는다
+#       pk: id
+#   max_rows: 10000          # 한 문장이 이보다 많은 행을 바꾸면 값 없이 표지만 남긴다. 1 이상 1,000,000 이하. 기본 10000
+#   keep: 30d                # 변경 기록을 두는 기간. 1h 이상. 기본 30d. 한 시간마다 오래된 것을 지운다

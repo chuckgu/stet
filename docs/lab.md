@@ -511,6 +511,7 @@ hard negative 유형별 막은 건수:
 | `choose` | 연습 실행에서 hoop 설정 후보 여섯의 J를 내고 하나를 고른다 |
 | `hoop-config` | `lab/bench/hoop.yaml`에서 후보나 참고 arm의 hoop 설정을 새 파일로 만든다 |
 | `stet-config` | `lab/bench/stet.yaml`에서 `upstream`의 데이터베이스만 바꾼 사본을 새 파일로 만든다 |
+| `undo-check` | 되돌리기를 끝에서 끝까지 확인한다. 템플릿을 복제해 캡처를 설치하고, V·X 세트를 `none` arm처럼 보내고, 에이전트마다 되돌린 뒤 모든 테이블을 전과 비교한다(아래 "되돌리기") |
 
 **설정** (`lab/bench/`. 동결 커밋 뒤에는 바꾸지 않는다)
 
@@ -562,6 +563,106 @@ bin/stet-lab bench collect -practice -arm stet
 - arm의 데이터베이스의 `lab` 스키마: `lab.writes`(스트림과 라벨), `lab.outcomes`(클라이언트가 본 결과), `lab.attacks`(X 공격마다 실행 여부), `lab.proxy`(프록시가 남긴 판단을 쓰기에 이은 것), `lab.meta`(`collect`의 합계). 에이전트 계정은 `lab`을 읽지 못한다.
 - `~/.local/share/stet/bench-2026-11/`: `hoop.digest`, `hoop/`(실행별 hoop 설정과 감사 로그 `audit-<실행 이름>/`), `llm/`(기록기 파일), `stet/`(실행별 Stet 설정과 로그), `dumps/`(arm별 덤프), `report/`(채점 결과와 터미널 출력). 녹화는 임시 디렉터리에 두지 않는다.
 - 결과 문서 `docs/benchmark-hoop.md`는 실행 뒤에 생긴다.
+
+## 되돌리기
+
+작성: 2026-11-19. 설계와 수용 기준은 [스펙](spec-v0.2-undo.md)에 있다. 에이전트 계정이 바꾼 행의 이전·이후 값을 DB의 트리거가 남기고, 검토자가 계정·시간·테이블로 골라 되돌린다. 모델을 부르지 않는다.
+
+**켜는 순서**
+
+1. 설정에 `undo` 절을 적는다(`stet.example.yaml`의 주석, 스펙 9장). 게이트 대상이 아닌 테이블은 키 컬럼(`pk`)을 적는다.
+2. 그 설정으로 Stet을 한 번 시작한다. Stet이 `stet` 스키마(캡처 함수, 기록 표, 되돌리기 함수)를 만들고 `stet.capture_settings`를 맞춘다. 트리거가 아직 없으므로 테이블마다 트리거가 출력과 다르다는 경고가 나온다.
+3. 설치 SQL을 출력한다. 이 명령은 아무것도 실행하지 않는다.
+
+```bash
+bin/stet undo-sql -config stet.yaml > undo-install.sql
+```
+
+출력은 `-- N. Run as <계정> (...)`으로 시작하는 묶음들이다. 첫 묶음은 Stet의 계정이 실행할 `GRANT`이고(테이블 소유자가 Stet의 계정이 아닐 때만 있다), 나머지는 테이블 소유자마다 한 트랜잭션이다. 캡처하지 않는 연쇄 자식 테이블이 있으면 끝에 주석으로 알린다.
+
+```sql
+-- 1. Run as stet (the account Stet connects as).
+GRANT USAGE ON SCHEMA stet TO crm_owner;
+GRANT EXECUTE ON FUNCTION stet.capture() TO crm_owner;
+
+-- 2. Run as crm_owner (the owner of public.contacts).
+BEGIN;
+SET LOCAL lock_timeout = '5s';
+CREATE OR REPLACE TRIGGER stet_capture_ins AFTER INSERT ON public.contacts
+  REFERENCING NEW TABLE AS stet_new
+  FOR EACH STATEMENT EXECUTE FUNCTION stet.capture('contacts', 'id');
+-- (stet_capture_upd, stet_capture_del, stet_capture_trunc도 같은 꼴)
+COMMIT;
+```
+
+4. 묶음마다 머리에 적힌 계정이 실행한다. 다시 실행해도 된다. 그 테이블에 쓰고 있는 열린 트랜잭션이 있으면 5초 뒤 실패하고 아무것도 바뀌지 않으므로, 그 트랜잭션이 끝난 뒤 다시 실행한다.
+5. 검토자에게 줄 권한을 출력하고, Stet의 계정이 실행한다. 역할은 운영자가 만든다(아직 없어도 출력은 된다).
+
+```bash
+bin/stet undo-sql -config stet.yaml -grant reviewer > undo-grant.sql
+```
+
+`stet` 스키마의 `USAGE`, `stet.history`의 `SELECT`, `stet.undo*` 함수 18개의 `EXECUTE`다. 되돌릴 테이블의 `SELECT`·`INSERT`·`UPDATE`·`DELETE`와, 그 테이블을 연쇄 외래 키로 가리키는 테이블의 `SELECT`는 테이블 소유자가 준다(출력의 끝 주석).
+
+6. Stet을 다시 시작할 필요는 없다. 캡처는 트리거가 생긴 때부터 돈다. 다음에 시작할 때 되돌리기의 경고가 없으면 맞게 설치된 것이다.
+
+**검토와 되돌리기** (검토자의 세션)
+
+```sql
+-- 한 에이전트의 최근 변경과 그 판단
+SELECT at, target_table, op, key, before, after, skipped, decision_id, decision_candidates, verdict, undo_id
+  FROM stet.history
+ WHERE agent_role = 'agent_enricher' AND at >= now() - interval '1 hour'
+ ORDER BY at, change_id;
+
+-- 무엇이 되돌려지고 무엇이 건너뛰어질지 본 뒤 되돌린다. READ COMMITTED 트랜잭션에서만 돈다
+BEGIN ISOLATION LEVEL READ COMMITTED;
+SELECT * FROM stet.undo_plan('agent_enricher', '2026-11-19 09:00+09');
+SELECT * FROM stet.undo('agent_enricher', '2026-11-19 09:00+09', NULL, ARRAY['contacts'], 'enrichment run was wrong');
+COMMIT;   -- 결과의 줄을 보고. 아니면 ROLLBACK
+```
+
+- 결과는 키마다 한 줄이다. `stet.undo_plan`의 `outcome`은 `would_restore`, `skipped`, `not_captured`이고, `stet.undo`의 것은 `restored`, `restored_differs`, `skipped`, `failed`, `not_captured`다. `reason`은 건너뛰거나 실패한 이유(`changed_since`, `referenced: …`, `SQLSTATE …`), `warning`은 되돌리되 알아야 하는 것(`children_not_captured`, `not_selected`)이다.
+- 롤백하면 테이블도 기록(`stet.undos`)도 그대로다. 커밋하면 `stet.history`의 `undo_id`와 `undone_at`에 보인다.
+- 키가 많은 되돌리기는 시간 범위나 `tables`로 나눠 부르고, 결과를 본 뒤 트랜잭션을 오래 열어 두지 않는다(스펙 11장).
+
+**잰 시간** (PostgreSQL 14.18, 이 컴퓨터의 테스트 서버)
+
+캡처의 오버헤드는 `TestCaptureAddsUnderAMillisecond`로 쟀다. 14개 컬럼 1,000행의 테이블에서 키로 한 행을 고치는 `UPDATE`를 세 종류(트리거 없는 테이블, 트리거가 있는 테이블에 캡처하지 않는 세션, 트리거가 있는 테이블에 에이전트)로 번갈아 2,000번씩 보내고 왕복 시간을 쟀다. 클라이언트는 `go test -race`로 돌았다. 세 번 잰 값이다.
+
+| | 평균 | p95 |
+|---|---|---|
+| 트리거 없음 | 94~96µs | 110~125µs |
+| 트리거 있음, 캡처하지 않는 세션 | 104~114µs | 123~131µs |
+| 캡처함 | 387~398µs | 512~524µs |
+
+- 캡처가 더하는 시간은 p95로 0.39~0.41ms다(수용 기준은 1ms 이하). 다른 패키지의 테스트가 함께 돌면 서버가 바빠 더 나올 수 있어서, 테스트는 세 번까지 재고 한 번이라도 1ms 안이면 통과한다.
+- `stet.undo_plan`: 한 테이블의 5,000키에 약 0.52초.
+- `stet.undo`: 한 문장이 바꾼 5,000키를 모두 되돌리는 데 2.74~2.78초(`TestUndoOfManyKeys`, `-race` 없이 세 번).
+- `stet.history`: 판단 기록 70,102건, 묶음 20,202개, 변경 60,202건의 데이터베이스에서, 판단 기록 50,100건이 있는 백엔드의 최근 묶음 100개 0.43~0.51ms, 오래된 묶음 100개 52ms, 뷰 전체의 `count(*)` 123~134ms.
+- 보존 기간의 지우기: 줄이 하나씩인 묶음 10,000개에 약 20ms.
+
+**끝에서 끝까지의 확인** (`stet-lab bench undo-check`, 스펙 10장)
+
+벤치마크의 템플릿과 역할이 있어야 한다(`bin/stet-lab bench prepare`). 없으면 그렇게 말하고 아무것도 만들지 않는다. 모델을 부르지 않고 키를 읽지 않는다.
+
+```bash
+go build -o bin/stet-lab ./cmd/stet-lab
+bin/stet-lab bench undo-check                                         # max_rows 10,000 (Stet의 기본값)
+bin/stet-lab bench undo-check -name crm_undo_check_m -max-rows 100000
+```
+
+- 템플릿 `crm_base`(`-practice`면 `crm_practice`)를 `-name`(기본 `crm_undo_check`)으로 복제하고, 다시 복제하면 `_2`, `_3`이 붙는다. 이미 있는 이름이면 바로 멈춘다(`bench drop -name`으로 지운다). 끝나면 복제본을 지운다(`-keep`이면 남긴다).
+- 캡처하는 테이블은 `-config`(기본 `lab/bench/stet.yaml`)의 게이트 대상 테이블(`contacts`, `deals`)과 그것을 연쇄 외래 키로 가리키는 자식이다. 따라가는 경로는 `-paths`(기본 `s5.call,s5.view`)다.
+- `none` arm의 속도와 쉼(쪼개기 묶음 앞의 70초 포함)으로 보낸다. `-fast`는 속도 제한과 쉼 없이 보낸다(도구를 확인하는 용도이고, `none` arm의 보내기가 아니다).
+- 진행은 표준 에러, 결과는 표준 출력이다. 복제본마다 보낸 문장 수(실행, 막힘, DB 거부, 모름), 남은 묶음 수, 계정마다 되돌리기의 줄 수(결과와 이유별)와 걸린 시간, 테이블마다 같은 행·다른 행·없어진 행·더 있는 행의 수와 다른 행의 이유, 되돌리기 순서에 따라 달라질 수 있어 그대로 받아들인 줄(`23503`, `23505`, `0A000`, `referenced`)의 목록, 따라간 경로가 바꾼 행이 돌아왔는지를 쓴다.
+- 같지 않은 행의 이유는 시스템이 알린 것으로만 댄다. 그 키를 되돌리지 못했다고 스스로 말하는 줄(`failed`, `restored_differs`, `referenced` 등), 기록에서 근거를 찾은 `changed_since`와 `interleaved`(그 뒤나 그 사이에 되돌려지지 않은 변경이 있다), 그 테이블의 값을 남기지 않은 묶음이다. 근거를 찾지 못한 행은 설명되지 않은 행이고, 하나라도 있으면 종료 코드 1이다.
+
+**두 실행을 읽는 법.** X 세트에는 테이블 전체를 바꾸는 공격이 둘 있다. `s4.update_no_where`는 `contacts`의 모든 행을 고치고, `s4.range_delete`는 `deals`의 모든 행을 지운다. 기본 실행(`max_rows` 10,000)에서 둘은 상한을 넘어 값 없이 표지만 남긴다. 그래서 그 실행의 `contacts`에서는 그 표지 하나가 모든 행의 다름을 설명할 수 있고, "설명되지 않은 행 0"은 모든 차이에 시스템이 알린 이유가 있다는 뜻일 뿐 캡처가 빠뜨린 것이 없다는 뜻이 아니다. 되돌리기가 행을 실제로 돌려놓는지는 `-max-rows 100000` 실행이 보인다. 거기서는 두 공격도 값과 함께 남는다.
+
+**결과**
+
+<!-- TASK10-RESULTS -->
 
 ## 합성 CRM
 
