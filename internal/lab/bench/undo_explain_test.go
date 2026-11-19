@@ -27,6 +27,7 @@ func TestExplainerAcceptsOnlyEvidenceOfWhatWasNotUndone(t *testing.T) {
 	type line struct {
 		agent, outcome, reason string // reason "" is NULL
 		keyless                bool
+		key                    string // "7" when empty
 	}
 	for _, c := range []struct {
 		name       string
@@ -146,6 +147,26 @@ func TestExplainerAcceptsOnlyEvidenceOfWhatWasNotUndone(t *testing.T) {
 			lines:   []line{{agent: "a", outcome: "skipped", reason: "changed_since"}},
 			detail:  "the history holds no captured change of the key by a"},
 
+		// One decision per key: an agent's undo returns one line for a key it changed, and for a table either
+		// lines of keys or one line withholding it, never both.
+		{name: "two lines of one agent for the key", order: []string{"a"}, changes: []change{{"a", 1}},
+			lines: []line{{agent: "a", outcome: "failed", reason: "SQLSTATE 23503: violates foreign key constraint"},
+				{agent: "a", outcome: "restored"}},
+			detail: "a's undo returned 2 lines for the key"},
+		{name: "a line of the key beside a line withholding its table", order: []string{"a"}, changes: []change{{"a", 1}},
+			lines: []line{{agent: "a", outcome: "restored_differs"},
+				{agent: "a", outcome: "skipped", reason: "SQLSTATE 42501: permission denied for table contacts", keyless: true}},
+			detail: "a's undo returned lines of keys of the table and a line withholding it"},
+		{name: "a line withholding the table beside a line of another key", order: []string{"a"}, changes: []change{{"a", 1}},
+			lines: []line{{agent: "a", outcome: "restored", key: "8"},
+				{agent: "a", outcome: "skipped", reason: "table_gone", keyless: true}},
+			detail: "a's undo returned lines of keys of the table and a line withholding it"},
+		{name: "one agent's line of the key and another's line withholding the table", order: []string{"b", "a"},
+			changes: []change{{"a", 1}, {"b", 2}},
+			lines: []line{{agent: "a", outcome: "restored_differs"},
+				{agent: "b", outcome: "skipped", reason: "table_gone", keyless: true}},
+			reason: "a: restored_differs; b: skipped table_gone"},
+
 		// Lines that say nothing is left to undo.
 		{name: "no_net_change", order: []string{"a"}, changes: []change{{"a", 1}},
 			lines:  []line{{agent: "a", outcome: "skipped", reason: "no_net_change"}},
@@ -196,7 +217,11 @@ func TestExplainerAcceptsOnlyEvidenceOfWhatWasNotUndone(t *testing.T) {
 						continue
 					}
 					ul := UndoLine{Table: "contacts", Outcome: l.outcome}
-					if !l.keyless {
+					switch {
+					case l.keyless:
+					case l.key != "":
+						ul.Key = text(l.key)
+					default:
 						ul.Key = text("7")
 					}
 					if l.reason != "" {

@@ -5,6 +5,7 @@ package bench
 
 import (
 	"cmp"
+	"fmt"
 	"slices"
 	"strings"
 	"time"
@@ -69,15 +70,18 @@ type explainer struct {
 	lines map[string]map[string][]agentLine // table key -> key -> its lines
 	// withheld: table key -> agent -> its lines without a key other than not_captured. stet.undo returns such a
 	// line (table_gone, SQLSTATE 42501) for a table it withheld whole, in place of a line for each of its keys.
-	withheld   map[string]map[string][]agentLine
+	withheld map[string]map[string][]agentLine
+	// keyed: table key -> agent -> the number of its lines that have a key. An agent's undo returns lines of keys
+	// for a table or one line withholding it, not both.
+	keyed      map[string]map[string]int
 	h          undoHistory
 	uncaptured []string       // the roles that sent statements and are not captured
 	order      map[string]int // agent -> its place in the order undone
 }
 
 func newExplainer(undone []AgentUndo, h undoHistory, uncaptured []string) explainer {
-	e := explainer{lines: map[string]map[string][]agentLine{}, withheld: map[string]map[string][]agentLine{}, h: h,
-		uncaptured: uncaptured, order: map[string]int{}}
+	e := explainer{lines: map[string]map[string][]agentLine{}, withheld: map[string]map[string][]agentLine{},
+		keyed: map[string]map[string]int{}, h: h, uncaptured: uncaptured, order: map[string]int{}}
 	for i, u := range undone {
 		e.order[u.Agent] = i
 		for _, l := range u.Lines {
@@ -94,8 +98,10 @@ func newExplainer(undone []AgentUndo, h undoHistory, uncaptured []string) explai
 			}
 			if e.lines[l.Table] == nil {
 				e.lines[l.Table] = map[string][]agentLine{}
+				e.keyed[l.Table] = map[string]int{}
 			}
 			e.lines[l.Table][*l.Key] = append(e.lines[l.Table][*l.Key], al)
+			e.keyed[l.Table][u.Agent]++
 		}
 	}
 	return e
@@ -106,9 +112,11 @@ func newExplainer(undone []AgentUndo, h undoHistory, uncaptured []string) explai
 //
 //   - The table is not captured: nothing of it is undone.
 //   - What stet.undo returned must match the history (spec 7: one decision per selected key). Every agent with a
-//     captured change of the key has a line of the key, or a line without a key withholding the table (table_gone,
-//     SQLSTATE 42501); every line of the key has a captured change of it by its agent. Otherwise the row is
-//     unexplained: a decision missing or without its change is a broken contract, which is what the check is for.
+//     captured change of the key has one line of the key, or a line without a key withholding the table (table_gone,
+//     SQLSTATE 42501), and not both kinds for one table; every line of the key has a captured change of it by its
+//     agent. Otherwise the row is unexplained: a decision missing, doubled or without its change is a broken
+//     contract, which is what the check is for. (A table dropped and made again under its key within one agent's
+//     selection would give both kinds; the check's streams make no table.)
 //   - A line that reports the key's changes could not be undone accounts for it: failed, restored_differs, the
 //     refusals by design (referenced, key_changed, columns_changed, a SQLSTATE), and a line withholding the table
 //     from the undo of an agent that changed the key.
@@ -137,9 +145,26 @@ func (e explainer) explain(t compared, key string) explanation {
 			broken = append(broken, "a captured change of "+agent+" that its undo returned no line for")
 		}
 	}
+	of := map[string]int{} // agent -> its lines of the key
 	for _, l := range lines {
+		of[l.agent]++
 		if _, _, ok := e.span(changes, l.agent); !ok {
 			broken = append(broken, l.describe()+", but the history holds no captured change of the key by "+l.agent)
+		}
+	}
+	involved := changers(changes)
+	for _, l := range lines {
+		if !slices.Contains(involved, l.agent) {
+			involved = append(involved, l.agent)
+		}
+	}
+	for _, agent := range involved {
+		if n := of[agent]; n > 1 {
+			broken = append(broken, fmt.Sprintf("%s's undo returned %d lines for the key, not one", agent, n))
+		}
+		if e.keyed[t.key][agent] > 0 && len(e.withheld[t.key][agent]) > 0 {
+			broken = append(broken, agent+"'s undo returned lines of keys of the table and a line withholding it ("+
+				e.withheld[t.key][agent][0].describe()+")")
 		}
 	}
 	if len(broken) > 0 {
@@ -285,7 +310,8 @@ func (e explainer) between(table, key, agent string, first, last time.Time) []st
 	return ev
 }
 
-// line is agent's line for the key.
+// line is agent's line for the key: its first, should it have several, which explain reports as a broken
+// contract.
 func (e explainer) line(table, key, agent string) (agentLine, bool) {
 	for _, l := range e.lines[table][key] {
 		if l.agent == agent {
