@@ -26,6 +26,7 @@ const usage = `usage: stet <command> [flags]
 
 commands:
   proxy      run the pgwire proxy (stet proxy -config stet.yaml)
+  undo-sql   print the SQL a table owner runs to capture undo.tables (stet undo-sql -config stet.yaml [-drop])
   bench-jev  time single Jev calls (needs TYPESAFE_API_KEY)
 `
 
@@ -40,6 +41,8 @@ func main() {
 	switch os.Args[1] {
 	case "proxy":
 		err = runProxy(os.Args[2:])
+	case "undo-sql":
+		err = runUndoSQL(os.Args[2:], os.Stdout)
 	case "bench-jev":
 		err = runBenchJev(os.Args[2:])
 	default:
