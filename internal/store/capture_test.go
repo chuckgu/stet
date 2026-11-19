@@ -640,6 +640,68 @@ func TestCaptureOfStetActingAsTheAgent(t *testing.T) {
 	}
 }
 
+// In a session of Stet's own account capture does not go by roles: a write
+// made there is recorded whatever the role at that moment. An approved
+// statement runs as the agent in Stet's session, and a function it calls can
+// reset the role, write, and set the role back; that write is recorded under
+// Stet's account, with the held write. Under roles alone it left nothing.
+func TestCaptureRecordsEveryWriteOfStetsOwnSession(t *testing.T) {
+	pool, db := captureDB(t)
+	ctx := context.Background()
+	owner := superuserIn(t, db)
+	dealsTable(t, owner)
+	stetMayActAsTheAgent(t, db)
+	setCapture(t, pool, []string{"stet_md5"}, 10000)
+	// The agent's function: it writes with the role reset, as the account
+	// Stet connects with, and puts the role back.
+	mustExec(t, owner, `create function public.sneak() returns void language plpgsql as $$
+		begin
+			perform set_config('role', 'none', true);
+			update public.deals set name = 'sneaked' where id = 2;
+			perform set_config('role', 'stet_md5', true);
+		end $$`)
+	held := store.NewID()
+	const (
+		approved = `select public.sneak()`
+		direct   = `update public.deals set name = 'by stet itself' where id = 3`
+	)
+	err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		for _, sql := range []string{`set local role stet_md5`, `select set_config('stet.held_write', '` + held + `', true)`, approved} {
+			if _, err := tx.Exec(ctx, sql); err != nil {
+				return fmt.Errorf("%s: %w", sql, err)
+			}
+		}
+		var user string
+		if err := tx.QueryRow(ctx, `select current_user`).Scan(&user); err != nil || user != "stet_md5" {
+			return fmt.Errorf("after the statement current_user is %q (%v), want stet_md5", user, err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, direct); err != nil {
+		t.Fatal(err)
+	}
+
+	changes := changesOf(t, pool, "deals")
+	checkLines(t, changes, approved,
+		changeLine{Op: "update", Key: "2", Before: deal("2", "Globex", "20"), After: deal("2", "sneaked", "20")})
+	checkLines(t, changes, direct,
+		changeLine{Op: "update", Key: "3", Before: deal("3", "Initech", "30"), After: deal("3", "by stet itself", "30")})
+	for sql, wantHeld := range map[string]any{approved: held, direct: "NULL"} {
+		sets := setsOf(changes, sql)
+		if len(sets) != 1 {
+			t.Errorf("%s: %d sets, want 1", sql, len(sets))
+			continue
+		}
+		if s := sets[0]; s.AgentRole != "stet_scram" || s.LoginRole != "stet_scram" || deref(s.HeldWrite) != wantHeld {
+			t.Errorf("%s: agent_role %q, login_role %q, held_write %v; want stet_scram, stet_scram, %v",
+				sql, s.AgentRole, s.LoginRole, deref(s.HeldWrite), wantHeld)
+		}
+	}
+}
+
 // The images hold each value as its text, from which the value comes back
 // as it was: a row put back from the images of its deletion equals the row.
 func TestCaptureKeepsValuesAsText(t *testing.T) {
@@ -808,6 +870,106 @@ func TestCaptureSplitsAKeyChange(t *testing.T) {
 	if sets := setsOf(changes, sql); len(sets) != 1 || deref(sets[0].Rows) != int64(2) {
 		t.Errorf("%d sets, want one with rows 2", len(sets))
 	}
+}
+
+// tasksOfUsers creates public.users (1 to 4) and public.tasks, whose rows
+// reference users through three foreign keys that set the column to NULL when
+// the user is deleted, and installs capture on both. One DELETE of several
+// users then changes a task once for each of its foreign keys that named one
+// of them.
+func tasksOfUsers(t *testing.T, owner *pgx.Conn) {
+	t.Helper()
+	mustExec(t, owner,
+		`create table public.users (id int primary key, name text)`,
+		`insert into public.users values (1, 'ann'), (2, 'bo'), (3, 'cy'), (4, 'di')`,
+		`create table public.tasks (id int primary key, title text,
+			owner_id int references public.users on delete set null,
+			created_by int references public.users on delete set null,
+			reviewer_id int references public.users on delete set null)`,
+		`insert into public.tasks values (10, 'three', 1, 2, 3), (11, 'two', 1, 2, 4), (12, 'one', 1, 4, 4), (13, 'none', 4, 4, 4)`)
+	installCapture(t, owner, "public.users", "users", "id")
+	installCapture(t, owner, "public.tasks", "tasks", "id")
+}
+
+// task is an image of a row of the tasks table of tasksOfUsers; a nil column
+// is NULL.
+func task(id, title string, owner, creator, reviewer any) map[string]any {
+	return image("id", id, "title", title, "owner_id", owner, "created_by", creator, "reviewer_id", reviewer)
+}
+
+// A row one statement changes several times is one line: the row before the
+// statement and the row after it. Deleting three users sets a task's three
+// foreign keys to NULL one after the other, and the transition tables hold
+// every version in between; none of those is recorded, and rows counts the
+// task once.
+func TestCaptureRecordsARowChangedSeveralTimesOnce(t *testing.T) {
+	pool, db := captureDB(t)
+	owner := superuserIn(t, db)
+	tasksOfUsers(t, owner)
+	const sql = `delete from public.users where id in (1, 2, 3)`
+	mustExec(t, agentIn(t, db), sql)
+
+	changes := changesOf(t, pool, "tasks")
+	checkLines(t, changes, sql,
+		changeLine{Op: "update", Key: "10", Before: task("10", "three", "1", "2", "3"), After: task("10", "three", nil, nil, nil)},
+		changeLine{Op: "update", Key: "11", Before: task("11", "two", "1", "2", "4"), After: task("11", "two", nil, nil, "4")},
+		changeLine{Op: "update", Key: "12", Before: task("12", "one", "1", "4", "4"), After: task("12", "one", nil, "4", "4")})
+	if sets := setsOf(changes, sql); len(sets) != 1 || deref(sets[0].Rows) != int64(3) || sets[0].Skipped != nil {
+		t.Errorf("%d sets for the tasks, want one with rows 3 and values: %+v", len(sets), sets)
+	}
+}
+
+// Versions of a key that cancel out leave no line: what the statement took
+// away under that key it also put back. A statement all of whose keys cancel
+// out leaves nothing. Capture goes by the key's images, so two rows that
+// trade their values under a key column that is not unique stand for a row
+// changed and changed back.
+func TestCaptureLeavesNoLineForVersionsThatCancelOut(t *testing.T) {
+	pool, db := captureDB(t)
+	owner := superuserIn(t, db)
+	mustExec(t, owner,
+		`create table public.pairs (k int, v int)`,
+		`insert into public.pairs values (7, 0), (7, 1), (8, 5)`)
+	installCapture(t, owner, "public.pairs", "pairs", "k")
+	const (
+		some = `update public.pairs set v = case k when 7 then 1 - v else v + 1 end`
+		all  = `update public.pairs set v = 1 - v where k = 7`
+	)
+	mustExec(t, agentIn(t, db), some, all)
+
+	changes := changesOf(t, pool, "pairs")
+	checkLines(t, changes, some, changeLine{Op: "update", Key: "8", Before: image("k", "8", "v", "5"), After: image("k", "8", "v", "6")})
+	if sets := setsOf(changes, some); len(sets) != 1 || deref(sets[0].Rows) != int64(1) {
+		t.Errorf("%d sets for the statement one of whose keys cancels out, want one with rows 1: %+v", len(sets), sets)
+	}
+	if sets := setsOf(changes, all); len(sets) != 0 {
+		t.Errorf("the statement all of whose keys cancel out left %+v, want nothing", sets)
+	}
+}
+
+// When a key's versions do not reduce to one row before and one after (the
+// key column is not unique and the statement changed two of its rows),
+// capture records no value: the write goes through and leaves a
+// capture_failed set. A statement that changes one such row is one line.
+func TestCaptureRefusesAKeyWithSeveralRows(t *testing.T) {
+	pool, db := captureDB(t)
+	owner := superuserIn(t, db)
+	mustExec(t, owner,
+		`create table public.pairs (k int, v int)`,
+		`insert into public.pairs values (7, 0), (7, 1), (8, 5)`,
+		`create table public.singles (k int, v int)`,
+		`insert into public.singles values (7, 0), (7, 1)`)
+	installCapture(t, owner, "public.pairs", "pairs", "k")
+	installCapture(t, owner, "public.singles", "singles", "k")
+	agent := agentIn(t, db)
+	_, err := agent.Exec(context.Background(), `update public.pairs set v = v + 10`)
+	wantCaptureFailed(t, pool, err, relidOf(t, owner, "public.pairs"), "21000")
+	checkContent(t, owner, "after the write", "public.pairs", "(7,10)\n(7,11)\n(8,15)")
+
+	const one = `update public.singles set v = 10 where v = 0`
+	mustExec(t, agent, one)
+	checkLines(t, changesOf(t, pool, "singles"), one,
+		changeLine{Op: "update", Key: "7", Before: image("k", "7", "v", "0"), After: image("k", "7", "v", "10")})
 }
 
 // Names that need quoting: a schema and table with capitals and a space, a

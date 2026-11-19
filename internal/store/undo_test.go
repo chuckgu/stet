@@ -257,6 +257,32 @@ func TestUndoRestoresEachKindOfWrite(t *testing.T) {
 	checkContent(t, owner, "after the undo", "public.vals", before)
 }
 
+// A row one statement of the agent's changed several times is restored: the
+// users it deleted come back, and each task whose foreign keys the cascades
+// set to NULL one after the other gets all of them back. The task's line was
+// one, from the row before the statement to the row after it, so no key is
+// skipped as interleaved.
+func TestUndoRestoresARowChangedSeveralTimesByOneStatement(t *testing.T) {
+	pool, db := captureDB(t)
+	owner := superuserIn(t, db)
+	setCapture(t, pool, []string{"stet_md5"}, 10000)
+	tasksOfUsers(t, owner)
+	users, tasks := contentOf(t, owner, "public.users"), contentOf(t, owner, "public.tasks")
+	since := dbClock(t, pool)
+	mustExec(t, agentIn(t, db), `delete from public.users where id in (1, 2, 3)`)
+
+	rv := undoer(t, db, "public.users", "public.tasks")
+	checkShownInAnyOrder(t, "the rows three cascades changed", undoOf(t, rv, "stet_md5", since),
+		`tasks "10" update restored - -`,
+		`tasks "11" update restored - -`,
+		`tasks "12" update restored - -`,
+		`users "1" insert restored - -`,
+		`users "2" insert restored - -`,
+		`users "3" insert restored - -`)
+	checkContent(t, owner, "after the undo", "public.users", users)
+	checkContent(t, owner, "after the undo", "public.tasks", tasks)
+}
+
 // A table keyed by a GENERATED ALWAYS AS IDENTITY column, with a generated
 // column: the row the agent inserted is deleted, the one it deleted comes back
 // under its own identity value, and the one it updated is put back, its

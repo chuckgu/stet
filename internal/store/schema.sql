@@ -469,6 +469,7 @@ DECLARE
   capture_roles text[];
   cap           bigint;
   agent         text := session_user;
+  own           boolean := false;  -- Stet의 계정이 접속한 세션이다
   held_text     text;
   held          uuid;
   old_table     name;
@@ -479,6 +480,12 @@ DECLARE
   names         text[];
   img           text;
   keyval        text;
+  several       boolean := false;  -- UPDATE가 한 키의 행을 여러 번 바꿨다
+  versions      text;
+  line_count    bigint;
+  key_count     bigint;
+  after_count   bigint;
+  twice         text;
   done          integer;        -- 이 트랜잭션에서 캡처가 표에 쓴 횟수. 세기 전에는 NULL
   counting      boolean := false;  -- 세기 시작했다. done이 NULL이면 세는 것이 실패했다
   tx            bigint;
@@ -493,6 +500,7 @@ BEGIN
     --    7. 그때만 stet.held_write를 읽는다. 다른 계정의 세션에서는 에이전트가 스스로 적을 수 있는 값이다. Stet의 세션에서도
     --    승인된 문장(에이전트가 쓴 것)이 바꿀 수 있으므로(11장), uuid의 모양이 아니면 NULL로 남긴다.
     IF session_user = current_user THEN
+      own := true;
       agent := coalesce(nullif(current_setting('role'), 'none'), session_user);
       held_text := current_setting('stet.held_write', true);
       IF left(held_text, 37) ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
@@ -507,8 +515,11 @@ BEGIN
       cap := 10000;
     END IF;
 
-    -- 3. 캡처할 계정이 아니면 아무것도 하지 않는다.
-    IF capture_roles IS NOT NULL AND (agent = ANY (capture_roles)) IS NOT TRUE THEN
+    -- 3. 캡처할 계정이 아니면 아무것도 하지 않는다. Stet의 계정이 접속한 세션은 roles로 거르지 않는다. 승인된 문장은 그
+    --    세션에서 에이전트의 역할로 도는데, 그 문장이 부른 함수는 역할을 none으로 돌려 쓰고 다시 맞춰 둘 수 있다. roles로
+    --    거르면 그 쓰기가 묶음도 표지도 없이 커밋된다. 그래서 그 세션의 쓰기는 그때의 역할로, 역할이 none이면 Stet의
+    --    계정으로 남긴다(2).
+    IF capture_roles IS NOT NULL AND NOT own AND (agent = ANY (capture_roles)) IS NOT TRUE THEN
       RETURN NULL;
     END IF;
 
@@ -578,6 +589,63 @@ BEGIN
       skip := 'too_many_statements';
     END IF;
 
+    -- 6. 값을 남길 문장의 재료. 값은 jsonb_object(컬럼 이름의 배열, 값의 글자의 배열)이다. 지워진 컬럼은 뺀다.
+    IF skip IS NULL THEN
+      SELECT array_agg(a.attname::text ORDER BY a.attnum),
+             'jsonb_object($2, ARRAY[' || string_agg(format(text_of, a.attname), ', ' ORDER BY a.attnum) || '])'
+        INTO names, img
+        FROM pg_catalog.pg_attribute a
+       WHERE a.attrelid = TG_RELID AND a.attnum > 0 AND NOT a.attisdropped;
+      keyval := format(text_of, TG_ARGV[1]);
+      -- 한 문장이 한 행을 여러 번 바꾸면(같은 문장이 지운 행들을 그 행의 외래 키 여럿이 가리켜 SET NULL이 잇달아 돈다 등)
+      -- 전이 테이블에 그 키의 판마다 한 줄이 있다. 한 행만 바꾼 문장에는 그런 키가 없으므로 묻지 않는다. 있으면 그 문장이
+      -- 남길 줄을 먼저 센다(아래의 versions). rows는 남기는 줄로 센다: 뒤의 값이 있는 줄의 수이고, 여러 번 바뀐 행도 한 번이다.
+      IF TG_OP = 'UPDATE' AND changed > 1 THEN
+        EXECUTE format('SELECT EXISTS (SELECT FROM stet_old r GROUP BY %1$s HAVING count(*) > 1)
+                            OR EXISTS (SELECT FROM stet_new r GROUP BY %1$s HAVING count(*) > 1)', keyval)
+           INTO several;
+      END IF;
+      IF several THEN
+        -- b와 a는 이전 행들과 이후 행들, m은 어느 한쪽에 두 번 이상 나오는 키다. m에 없는 키는 아래의 보통 길과 똑같이
+        -- 키로 묶는다. m의 키는 키마다, 이전 그림들에서 이후 그림들을 하나씩 지우고(EXCEPT ALL) 이후 그림들에서 이전
+        -- 그림들을 하나씩 지운다. 사이의 판은 한 번은 이후로, 한 번은 이전으로 나오므로 사라지고, 남는 것이 문장 전의
+        -- 행과 문장 뒤의 행이다. 바뀌었다가 돌아온 키는 아무것도 남지 않아 줄이 없다. 한쪽에 둘 이상 남는 키는 한 행의
+        -- 판들이 아니다(키 컬럼이 유일하지 않다). 그때는 에러를 내어 표지를 남긴다. 키가 NULL인 행은 m에 넣지 않고
+        -- 보통 길로 보내, 지금처럼 줄을 넣을 때 실패하게 한다.
+        versions := format(
+          'WITH b AS MATERIALIZED (SELECT %1$s AS k, %2$s AS img FROM stet_old r),
+                a AS MATERIALIZED (SELECT %1$s AS k, %2$s AS img FROM stet_new r),
+                m AS MATERIALIZED (SELECT b.k FROM b WHERE b.k IS NOT NULL GROUP BY b.k HAVING count(*) > 1
+                                   UNION
+                                   SELECT a.k FROM a WHERE a.k IS NOT NULL GROUP BY a.k HAVING count(*) > 1),
+                l AS MATERIALIZED (
+                  SELECT k, b1.img AS before, a1.img AS after
+                    FROM (SELECT b.k, b.img FROM b WHERE b.k IS NULL OR b.k NOT IN (SELECT m.k FROM m)) b1
+                    FULL JOIN (SELECT a.k, a.img FROM a WHERE a.k IS NULL OR a.k NOT IN (SELECT m.k FROM m)) a1 USING (k)
+                  UNION ALL
+                  SELECT k, b2.img, a2.img
+                    FROM (SELECT b.k, b.img FROM b WHERE b.k IN (SELECT m.k FROM m)
+                          EXCEPT ALL
+                          SELECT a.k, a.img FROM a WHERE a.k IN (SELECT m.k FROM m)) b2
+                    FULL JOIN (SELECT a.k, a.img FROM a WHERE a.k IN (SELECT m.k FROM m)
+                               EXCEPT ALL
+                               SELECT b.k, b.img FROM b WHERE b.k IN (SELECT m.k FROM m)) a2 USING (k)) ', keyval, img);
+        EXECUTE versions || 'SELECT count(*), count(DISTINCT l.k) + count(*) FILTER (WHERE l.k IS NULL),
+                                    count(*) FILTER (WHERE l.after IS NOT NULL),
+                                    (SELECT d.k FROM l d WHERE d.k IS NOT NULL GROUP BY d.k HAVING count(*) > 1 LIMIT 1)
+                               FROM l'
+           INTO line_count, key_count, after_count, twice USING set_id, names;
+        IF line_count <> key_count THEN
+          RAISE EXCEPTION 'the statement changed several rows of %.% that have % as their %, so what it recorded would not be one row before and one after for that key',
+            TG_TABLE_SCHEMA, TG_TABLE_NAME, quote_literal(twice), quote_ident(TG_ARGV[1]) USING ERRCODE = 'cardinality_violation';
+        END IF;
+        IF line_count = 0 THEN
+          RETURN NULL;
+        END IF;
+        changed := after_count;
+      END IF;
+    END IF;
+
     -- 6. 묶음 하나
     INSERT INTO stet.change_sets (at, stmt_at, txid, pid, login_role, agent_role, app, held_write,
                                   target_table, key_column, relid, op, query, rows, skipped)
@@ -586,19 +654,16 @@ BEGIN
             TG_ARGV[0], TG_ARGV[1], TG_RELID, lower(TG_OP), current_query(), changed, skip)
     RETURNING id INTO set_id;
 
-    -- 6. 행마다 한 줄. 값은 jsonb_object(컬럼 이름의 배열, 값의 글자의 배열)이다. 지워진 컬럼은 뺀다.
+    -- 6. 키마다 한 줄.
     IF skip IS NULL THEN
-      SELECT array_agg(a.attname::text ORDER BY a.attnum),
-             'jsonb_object($2, ARRAY[' || string_agg(format(text_of, a.attname), ', ' ORDER BY a.attnum) || '])'
-        INTO names, img
-        FROM pg_catalog.pg_attribute a
-       WHERE a.attrelid = TG_RELID AND a.attnum > 0 AND NOT a.attisdropped;
-      keyval := format(text_of, TG_ARGV[1]);
       IF TG_OP = 'INSERT' THEN
         EXECUTE format('INSERT INTO stet.changes (set_id, key, after) SELECT $1, %s, %s FROM stet_new r', keyval, img)
           USING set_id, names;
       ELSIF TG_OP = 'DELETE' THEN
         EXECUTE format('INSERT INTO stet.changes (set_id, key, before) SELECT $1, %s, %s FROM stet_old r', keyval, img)
+          USING set_id, names;
+      ELSIF several THEN
+        EXECUTE versions || 'INSERT INTO stet.changes (set_id, key, before, after) SELECT $1, l.k, l.before, l.after FROM l'
           USING set_id, names;
       ELSE
         -- 이전 행들과 이후 행들을 키로 묶는다. 키가 바뀐 행은 옛 키의 줄(before만)과 새 키의 줄(after만)이 된다.
