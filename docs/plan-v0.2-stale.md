@@ -47,7 +47,7 @@
 | S4 | 8장 "`stale`이면 `reasons`에 `stale_read`가 있다" | 섀도는 더러운 트랜잭션 안의 쓰기도 상태를 읽고, 규칙 순서는 `in_transaction`이 먼저다 | `read_check`는 어느 규칙이 정했든 비교한 대로 적는다. `stale_read`는 낡음 규칙이 정했을 때만 `reasons`에 든다 (9) |
 | S5 | 4장 "결과에 키가 없으면 조건절에서 얻는다" | 분류기는 테이블을 이름으로 맞춘다(다른 스키마의 같은 이름도 맞는다). 조건절의 키를 설정의 테이블에서 조회하면 읽지 않은 행을 읽었다고 기억할 수 있다 | 조건절의 키는 결과에 그 테이블(OID)의 컬럼이 하나 이상 있을 때만 쓴다. `SELECT count(*) … WHERE id = $1`은 기억하지 않는다 (6, 8) |
 | S6 | 7장이 연결이 끊긴 쓰기를 말하지 않는다 | 답이 오기 전에 끊긴 쓰기는 실행되고 커밋됐을 수 있다 | 끝난 트랜잭션 안의 쓰기처럼 다룬다. 그 행(또는 테이블)의 기억을 지우고 표시를 지운다 (9) |
-| S7 | 13장 "닫힌 지점의 메시지가 지나갈 때마다 알리기" | `WouldBlock`은 세션과 이유마다 한 번 부르고 로그를 낸다. 준비해 둔 `DO` 블록의 Execute와 SQL `EXECUTE`는 지금 알리지 않는다 | `WouldBlock`은 그대로 두고 `Unseen`을 새로 둔다. 섀도 세션에서 들여다보지 못하는 메시지가 갈 때마다 부른다. SQL `EXECUTE`가 든 문장도 그렇게 본다(준비된 쓰기일 수 있다). 그 메시지의 답이 오고 세션이 유휴가 되면 `TxEnded`를 부른다 (5) |
+| S7 | 13장 "닫힌 지점의 메시지가 지나갈 때마다 알리기" | `WouldBlock`은 세션과 이유마다 한 번 부르고 로그를 낸다. 준비해 둔 `DO` 블록의 Execute와 SQL `EXECUTE`는 지금 알리지 않는다 | `WouldBlock`은 그대로 두고 `Unseen`을 새로 둔다. 섀도 세션에서 들여다보지 못하는 메시지가 갈 때마다 부른다. SQL `EXECUTE`가 든 문장도 그렇게 본다(준비된 쓰기일 수 있다). 그 메시지의 답이 오고 세션이 유휴가 되면 `TxEnded`를 부른다. `TxEnded`는 이번에 정리되는 `Unseen`의 수를 함께 넘긴다. 답을 기다리지 않고 연달아 보내는 클라이언트에서 앞 메시지의 끝이 뒤 메시지의 표시를 지우지 않게 한다 (5, 9) |
 | S8 | 5장 "지운 것에는 시각을 남기고" | 자기 쓰기 뒤에 기억을 고칠 때도, 그 쓰기보다 먼저 끝난 읽기의 늦은 조회 결과가 옛 버전을 넣을 수 있다 | 고칠 때도 같은 시각을 남긴다. "쓰는 중" 표시는 고치기 조회가 끝날 때 지운다 (7, 9) |
 | S9 | 7장 "그 접속 계정의 그 테이블 기억을 모두 지운다" | 분류기는 첫 게이트 대상 쓰기의 테이블만 준다. `multi_statement`, `nested_write`, `with`, `truncate`는 다른 테이블도 쓸 수 있다 | 그 네 이유의 쓰기는 그 계정의 모든 테이블에 표시하고 지운다 (9) |
 | S10 | 7장 "승인되어 실행된 쓰기 … 단일 행이면 그 행" | 실행부가 아는 키는 에이전트가 적은 글자다. 기억의 키(서버의 글자)와 다를 수 있다 | 실행부는 문장을 실행하기 전에 게이트에 알리고(테이블 단위 표시), 끝나면 그 계정의 그 테이블 기억을 지운다 (10) |
@@ -277,13 +277,17 @@ Keys  int64 // keys taken
 // (Statement.Executes). It is called every time, before the message goes
 // upstream, and must not block.
 Unseen(s SessionInfo)
-// TxEnded tells the gate that nothing s sent is still uncommitted or
-// unanswered: the server reported s idle, or s ended, after a watched write
-// that was sent ran inside a transaction (its End had Outcome.InTransaction),
-// or after a message Unseen was told of. It is called once per such
+// TxEnded tells the gate that what s sent in the units the server has
+// answered is committed or rolled back: the server reported s idle, or s
+// ended, after a watched write that was sent ran inside a transaction (its
+// End had Outcome.InTransaction), or after a message Unseen was told of.
+// unseen is how many of the Unseen calls for s this call settles: those of
+// the messages in the units answered since the session's last TxEnded. A
+// pipelined unit not yet answered is not covered. It is called once per such
 // ReadyForQuery, after the End calls of the units it answers, and once when
-// the connection ends while one is still owed. It must not block.
-TxEnded(s SessionInfo)
+// the connection ends while one is still owed (unseen then counts every call
+// not yet settled). It must not block.
+TxEnded(s SessionInfo, unseen int)
 // Tracked reports, for the table with OID table, the attribute number of the
 // key column whose values the gate remembers reads by, and how its binary
 // form is read. ok is false for any other table. The proxy calls it on the
@@ -602,8 +606,8 @@ func (g *Gate) Applying(role, table string) (done func())
 4. **거절.** enforce의 `act`가 `ST003`을 돌려주고 `d.Refused == "ST003"`이다. `facts`의 `RowGone`은 `stale`이고 `Version == nil`일 때 참이다. `recheck`에서 다시 판단한 것이 `stale`이면 이유는 `["stale_read", "rejudged"]`이고 다시 버전을 읽지 않는다.
 5. **표시.** `stale`을 켠 테이블에 쓰는, 접속 계정을 아는 쓰기가 서버로 갈 때(섀도는 언제나, enforce는 보내기로 정했을 때) 표시한다. 자기 비교가 끝난 뒤에 한다. 행 표시: `Gated` `UPDATE`·`DELETE`이고 행이 지금 있다. 표시 없음: `Gated` `UPDATE`·`DELETE`인데 행이 지금 없다, 키 값을 주지 않은 `Gated` `INSERT`. 모든 테이블 표시(S9): 이유가 `multi_statement`, `nested_write`, `with`, `truncate`. 테이블 표시: 그 밖의 모든 쓰기(키 값을 준 `INSERT` 포함).
 6. **`End`.** 거절된 쓰기는 표시가 없다. 실행되지 않았으면(`Executed`도 `Lost`도 아님) `released`. 트랜잭션 밖에서 실행됐으면: 행 표시의 `UPDATE`는 `refresh`로 그 행의 버전을 조회하고 결과로 `refreshed`를 부른다(`ok`가 거짓이면 `forgotten`). `DELETE`는 `forgotten`. 키 값을 준 `INSERT`는 에이전트가 적은 키 글자로 `refresh`해 `refreshedRow`를 부르고 표시를 `released`로 끝낸다(`ok`가 거짓이면 `forgotten`). 그 밖의 표시는 `forgotten`. 트랜잭션 안에서 실행됐으면 표시를 그 세션의 것으로 적어 둔다. `Lost`이면 `forgotten`(S6).
-7. **`TxEnded`.** 그 세션이 적어 둔 표시를 모두 `forgotten`으로 끝낸다. 그 세션이 `Unseen`을 불렀으면 그 표시도 `forgotten`으로 끝낸다.
-8. **`Unseen`.** 접속 계정을 알면 그 계정의 모든 테이블에 표시하고(세션마다 하나면 된다) 그 계정의 기억을 모두 지운다. `TxEnded`가 끝낸다.
+7. **`TxEnded`.** 그 세션이 적어 둔 표시(트랜잭션 안에서 실행된 쓰기의 것)를 모두 `forgotten`으로 끝낸다. `unseen`이 0보다 크면 그 접속 계정의 기억을 모두 지우고, 그 세션의 남은 `Unseen` 수에서 뺀다. 남은 수가 0이 되면 그 세션의 `Unseen` 표시를 `forgotten`으로 끝낸다.
+8. **`Unseen`.** 접속 계정을 알면 그 계정의 모든 테이블에 표시하고(세션마다 하나이고, 그 세션의 남은 `Unseen` 수를 센다) 그 계정의 기억을 모두 지운다. `TxEnded`가 수를 맞춰 끝낸다. 접속 계정을 모르는 세션의 `Unseen`과 그것을 정리하는 `TxEnded`는 아무것도 하지 않는다.
 9. **`Applying`.** 테이블 표시를 하고, `done`에서 `forgotten`으로 끝낸다. 그 테이블이 `stale`을 켜지 않았으면 아무것도 하지 않는다.
 10. 표시는 어떤 길로도 남지 않는다. 표시한 쓰기는 `End`가, 트랜잭션 안의 것은 `TxEnded`가, `Unseen`은 `TxEnded`가 끝낸다(프록시가 연결이 끊겨도 부른다).
 
@@ -628,7 +632,7 @@ func (g *Gate) Applying(role, table string) (done func())
   - `TestRowChangedWhileJudged` (enforce): 읽은 기억이 있는 쓰기를 판단하는 동안(`rowVersion` 훅) 행이 바뀐다 → `reject`, `["stale_read", "rejudged"]`, `ST003`. 읽은 기억이 없으면 지금처럼 다시 판단한다.
   - `TestInTransactionComesFirst`: 더러운 트랜잭션 안의 낡은 쓰기 → 판정은 `unsupported`, `in_transaction`이고 `read_check.result == "stale"`이다(섀도). enforce에서는 `not_checked`다.
   - `TestOtherRoleCannotMakeStale`: 계정 X가 그 행을 읽고, 쓰고, 어떤 `stet.on_behalf_of`를 적어도, 계정 Y가 방금 읽은 행에 쓰는 것은 X가 바꾸지 않는 한 `fresh`다. X가 Y의 업무 이름을 적고 읽어도 Y의 낡은 쓰기는 `stale`이다.
-  - `TestUnseenForgets` (섀도): 읽기 → `DO` 블록으로 그 행을 고침 → 쓰기 → `no_read`. `DO`가 가 있는 동안의 쓰기는 `own_write`.
+  - `TestUnseenForgets` (섀도): 읽기 → `DO` 블록으로 그 행을 고침 → 쓰기 → `no_read`. `DO`가 가 있는 동안의 쓰기는 `own_write`. `Unseen` 둘 뒤에 `TxEnded(…, 1)`이 오면 표시가 남고(`own_write`), 다음 `TxEnded(…, 1)`에서 끝난다.
   - `TestApplying`: 읽기 → `done := g.Applying(role, table)` → 그동안 쓰기는 `own_write` → `done()` → `no_read`.
   - `TestNotChecked`: `INSERT`, 여러 행 쓰기, 접속 계정을 모르는 세션, 추적하지 않는 `stale` 테이블(키 타입 `date`) → `not_checked`. `stale`을 켜지 않은 테이블 → `read_check`가 NULL.
   - `TestRowAbsentStateUnchanged`: 추적하는 테이블에서 없는 행에 쓰는 것의 `state`와 `state_version`이 `stale`을 켜기 전과 같다.
