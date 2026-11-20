@@ -49,7 +49,15 @@ type readMemory struct {
 	all     byRead        // every entry held: live, or cleared and not yet taken out
 	live    int           // entries not cleared; what len and the limits count
 	evicts  int64         // entries the size limits threw away since evicted last ran
-	graving []*roleMemory // roles that may hold cleared entries, in the order they got them
+	graving []*roleMemory // roles queued when they got cleared entries, one place each until sweep takes them off
+
+	// taken counts the entries taken out of the order by read time, so tests
+	// can bound the work a call does under the lock without a clock.
+	taken int64
+	// afterBatch, set only by tests, is called with the lock free after each
+	// batch of keys learned has taken, with how many keys it has learned so
+	// far.
+	afterBatch func(t *ticket, learned int)
 }
 
 const (
@@ -107,7 +115,7 @@ type roleMemory struct {
 	pending map[*ticket]struct{} // the role's tickets not yet ended
 	clears  []clearing           // scopes cleared while a ticket was pending
 	graves  []*entrySet          // cleared sets whose entries are still held, oldest first
-	queued  bool                 // in readMemory.graving
+	queued  bool                 // has a place in readMemory.graving; the record stays until it is taken off
 }
 
 // tableMemory is what one login role holds of one table.
@@ -170,8 +178,13 @@ func (t *tableMemory) idle() bool {
 	return len(t.rows) == 0 && len(t.marks) == 0 && len(t.keyless) == 0 && t.known == nil
 }
 
+// idle reports whether the role's record holds nothing. A record with a place
+// in the queue of roles holding cleared entries is not idle: it goes when
+// sweep takes it off the queue. Otherwise it could go while still queued, the
+// role's next read would make a new record and queue that too, and the queue
+// would grow by a place each time.
 func (r *roleMemory) idle() bool {
-	return len(r.tables) == 0 && len(r.marks) == 0 && len(r.pending) == 0 && r.all.len() == 0
+	return len(r.tables) == 0 && len(r.marks) == 0 && len(r.pending) == 0 && r.all.len() == 0 && !r.queued
 }
 
 // of is task's entry; nil when it has none.
@@ -244,8 +257,12 @@ func (m *readMemory) learned(t *ticket, versions map[string]string) {
 	}
 	for lo := 0; lo < len(found)+len(missing); lo += learnBatch {
 		m.mu.Lock()
-		m.learnKeys(t, versions, found, missing, lo, min(lo+learnBatch, len(found)+len(missing)))
+		hi := min(lo+learnBatch, len(found)+len(missing))
+		m.learnKeys(t, versions, found, missing, lo, hi)
 		m.mu.Unlock()
+		if m.afterBatch != nil {
+			m.afterBatch(t, hi)
+		}
 		// A call waiting for the lock is woken by the unlock, but would
 		// rarely get it before this loop takes it again; let it run.
 		runtime.Gosched()
@@ -938,6 +955,7 @@ func (m *readMemory) fix(e *entry) {
 // entry also leaves its row and the counts, and its set, once empty, its
 // table.
 func (m *readMemory) take(e *entry) {
+	m.taken++
 	m.all.remove(e.pos[0])
 	e.role.all.remove(e.pos[1])
 	set := e.set

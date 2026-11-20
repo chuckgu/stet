@@ -1007,10 +1007,10 @@ func TestBookkeepingEndsWithWhatItServes(t *testing.T) {
 	wantNoRecords(t, m)
 }
 
-// TestConcurrentUse has many goroutines mix every call, with limits small
-// enough that evictions happen and forgets of tables and roles leave cleared
-// entries to be taken out later, and checks the memory's invariants as it
-// goes (consistent).
+// TestConcurrentUse has many goroutines mix every call at random, and checks
+// the memory's invariants as it goes (consistent). One more goroutine reaches
+// the limits and the deferred removal by construction while they run, so the
+// run cannot miss what it is there to exercise.
 func TestConcurrentUse(t *testing.T) {
 	m := newReadMemory(memoryTables, 200, time.Now) // a role keeps 50
 	roles := []string{"r0", "r1", "r2", "r3", "r4", "r5"}
@@ -1115,19 +1115,76 @@ func TestConcurrentUse(t *testing.T) {
 			}
 		})
 	}
+	// Its reads end an hour ahead, so every other role's entries are older
+	// and the global limit never takes one of its. Each round reads 10 rows
+	// more than a role's quarter, so at least 10 are evicted, then forgets
+	// the role: its quarter is detached, clearSweep of it taken out at once,
+	// and the rest left held for later additions to take out.
+	wg.Go(func() {
+		fill := party{"fill", ""}
+		for round := range 20 {
+			keys, versions := someRows(fmt.Sprintf("%d-", round), m.perRole+10)
+			m.learned(m.reading(fill, "deals", keys, time.Now().Add(time.Hour)), versions)
+			if left := m.forgetLeaving(fill.role); left != m.perRole-clearSweep {
+				t.Errorf("round %d: the forget left %d cleared entries held, want %d", round, left, m.perRole-clearSweep)
+				return
+			}
+			sawCleared.Store(true)
+		}
+	})
 	wg.Wait()
 	if err := m.consistent(); err != nil {
 		t.Error(err)
 	}
-	if evicted.Load()+m.evicted() == 0 || !sawCleared.Load() {
+	if evicted.Load()+m.evicted() < 200 || !sawCleared.Load() {
 		t.Errorf("evicted %d, saw cleared entries held %v: the run did not reach the limits or the deferred removal", evicted.Load(), sawCleared.Load())
 	}
 
-	for _, role := range roles {
+	for _, role := range append(roles, "fill") {
 		m.forget(role, "", "")
 	}
 	m.drain()
 	wantNoRecords(t, m)
+}
+
+// someRows makes n keys starting with prefix and a version v1 for each.
+func someRows(prefix string, n int) ([]string, map[string]string) {
+	keys, versions := make([]string, n), make(map[string]string, n)
+	for i := range keys {
+		keys[i] = prefix + strconv.Itoa(i)
+		versions[keys[i]] = "v1"
+	}
+	return keys, versions
+}
+
+// forgetLeaving forgets role's entries as forget does, and reports, in the
+// same hold of the lock, how many of them are left held to be taken out by
+// later additions.
+func (m *readMemory) forgetLeaving(role string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rr := m.roles[role]
+	if rr == nil {
+		return 0
+	}
+	m.clear(rr, "", "", m.now())
+	return rr.all.len() - rr.live
+}
+
+// queued reports how many places the queue of roles holding cleared entries
+// has, and how many role records there are.
+func (m *readMemory) queued() (places, roles int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.graving), len(m.roles)
+}
+
+// takenSoFar reports how many entries have been taken out of the order by
+// read time.
+func (m *readMemory) takenSoFar() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.taken
 }
 
 // counts reports the entries held, live or cleared, and the live ones, at
@@ -1204,14 +1261,25 @@ func (m *readMemory) consistent() error {
 		if n != rr.live {
 			return fmt.Errorf("%s: its count says %d, %d entries are live", name, rr.live, n)
 		}
+		if rr.all.len() > rr.live && !rr.queued {
+			return fmt.Errorf("%s holds cleared entries and is not queued", name)
+		}
+	}
+	queued := map[*roleMemory]bool{}
+	for _, g := range m.graving {
+		if queued[g] || !g.queued || m.roles[g.name] != g {
+			return fmt.Errorf("%s has a place in the queue it should not: twice, unmarked, or after its record went", g.name)
+		}
+		queued[g] = true
 	}
 	return nil
 }
 
 // The memory has one lock, and the read path takes it before the client's
-// next statement. These tests hold calls whose work could grow with what is
-// remembered to a time far above what they need, so that they do not flake
-// under -race, and log what they measured.
+// next statement. The tests below bound the work a call does under the lock
+// by counting it (entries taken out of the order by read time, and batches of
+// learned), not by a clock, so a slow runner cannot fail them; they log the
+// times they measured.
 
 // fillRoles fills m with n entries of deals for each of roles, from reads a
 // microsecond apart, oldest first, and returns when the last read ended.
@@ -1258,22 +1326,19 @@ func longestWait(m *readMemory, f func()) (took, waited time.Duration) {
 	return took, waited
 }
 
-// limitBound is far above what the calls below need (well under a
-// millisecond without -race), and below what forgetting a role's 50,000
-// entries one by one took.
-const limitBound = 20 * time.Millisecond
-
-// A role-wide forget at the default limit, with one role at its quarter.
+// A role-wide forget at the default limit, with one role at its quarter, takes
+// at most clearSweep entries out under the lock, whatever the scope's size.
 func TestForgetOfALargeScopeHoldsTheLockBriefly(t *testing.T) {
 	m := newReadMemory(memoryTables, 200_000, (&testClock{t: memoryStart}).now)
 	fillRoles(m, []string{"r0", "r1", "r2", "r3"}, 50_000, memoryStart)
 	if n := m.len(); n != 200_000 {
 		t.Fatalf("len = %d, want 200000", n)
 	}
+	before := m.takenSoFar()
 	took, waited := longestWait(m, func() { m.forget("r0", "", "") })
 	t.Logf("forget of 50000 entries: %v, longest wait of another call %v", took, waited)
-	if took > limitBound || waited > limitBound {
-		t.Errorf("forget of 50000 entries took %v, held another call %v; want both under %v", took, waited, limitBound)
+	if taken := m.takenSoFar() - before; taken > clearSweep {
+		t.Errorf("the forget took %d entries out under the lock, want at most %d", taken, clearSweep)
 	}
 	if n := m.len(); n != 150_000 {
 		t.Errorf("len = %d after the forget, want 150000", n)
@@ -1306,23 +1371,80 @@ func TestLockHoldAtTheAllowedMaximum(t *testing.T) {
 }
 
 // A read of 1,000 rows learned at the default limit, each new entry throwing
-// away another.
+// away another, lets go of the lock every learnBatch keys, and takes at most
+// two entries out for each key it learns in a batch (one cleared, one
+// evicted).
 func TestLearnedWithEvictionsHoldsTheLockBriefly(t *testing.T) {
 	m := newReadMemory(memoryTables, 200_000, (&testClock{t: memoryStart}).now)
 	last := fillRoles(m, []string{"r0", "r1", "r2", "r3"}, 50_000, memoryStart)
-	keys := make([]string, 1000)
-	versions := map[string]string{}
-	for j := range keys {
-		keys[j] = "new" + strconv.Itoa(j)
-		versions[keys[j]] = "v1"
-	}
+	keys, versions := someRows("new", 1000)
 	tk := m.reading(party{"r1", ""}, "deals", keys, last.Add(time.Second))
+	batches, done, taken := 0, 0, m.takenSoFar()
+	m.afterBatch = func(_ *ticket, learned int) {
+		batches++
+		now := m.takenSoFar()
+		if now-taken > int64(2*(learned-done)) {
+			t.Errorf("a batch of %d keys took %d entries out under the lock, want at most %d", learned-done, now-taken, 2*(learned-done))
+		}
+		done, taken = learned, now
+	}
 	took, waited := longestWait(m, func() { m.learned(tk, versions) })
 	t.Logf("learned of 1000 keys with 1000 evictions: %v, longest wait of another call %v", took, waited)
-	if waited > limitBound {
-		t.Errorf("learned held another call %v, want under %v", waited, limitBound)
+	if want := (1000 + learnBatch - 1) / learnBatch; batches != want {
+		t.Errorf("learned took the lock %d times for 1000 keys, want %d", batches, want)
 	}
 	if n, e := m.len(), m.evicted(); n != 200_000 || e != 1000 {
 		t.Errorf("len, evicted = %d, %d; want 200000, 1000", n, e)
+	}
+}
+
+// Between two batches of learned, another call gets the lock; the read is
+// still pending on every row it read, and only the keys learned so far are in.
+func TestLearnedLetsGoOfTheLockBetweenBatches(t *testing.T) {
+	m, c := testMemory(1000)
+	p := party{"agent", "a"}
+	keys, versions := someRows("k", 100)
+	tk := m.reading(p, "deals", keys, c.tick())
+	var gaps []int
+	m.afterBatch = func(_ *ticket, learned int) {
+		gaps = append(gaps, learned)
+		if n := m.len(); n != learned {
+			t.Errorf("after %d keys learned, len = %d", learned, n)
+		}
+		for _, key := range []string{keys[0], keys[len(keys)-1]} {
+			if got := m.check(p, "deals", key, "v1", c.tick()).Result; got != decide.ReadPending {
+				t.Errorf("after %d keys learned, check of %s = %s, want read_pending", learned, key, got)
+			}
+		}
+	}
+	m.learned(tk, versions)
+	if want := []int{16, 32, 48, 64, 80, 96, 100}; !slices.Equal(gaps, want) {
+		t.Errorf("learned let go of the lock after %v keys, want %v", gaps, want)
+	}
+	m.afterBatch = nil
+	wantCheck(t, m, c, p, "deals", keys[0], "v1", "fresh read=v1 task=a")
+}
+
+// A role whose cleared entries all went by its own forget stays queued behind
+// a role with many, and keeps its record until the queue reaches it; its next
+// read uses the same record and does not queue it again. So the queue has at
+// most one place per role record. (Z with many cleared entries at the front;
+// X reads 33 rows and forgets the table twice, again and again.)
+func TestClearedQueueHoldsOnePlacePerRole(t *testing.T) {
+	m, c := testMemory(10_000) // a role keeps 2,500
+	keys, versions := someRows("z", 2000)
+	m.learned(m.reading(party{"Z", ""}, "deals", keys, c.tick()), versions)
+	m.forget("Z", "", "")
+	for round := range 50 {
+		keys, versions := someRows(fmt.Sprintf("x%d-", round), 33)
+		m.learned(m.reading(party{"X", ""}, "deals", keys, c.tick()), versions)
+		m.forget("X", "deals", "")
+		m.forget("X", "deals", "")
+		if places, roles := m.queued(); places > roles || places > 2 {
+			t.Fatalf("round %d: the queue has %d places for %d role records, want at most one each", round, places, roles)
+		}
+	}
+	if err := m.consistent(); err != nil {
+		t.Error(err)
 	}
 }
