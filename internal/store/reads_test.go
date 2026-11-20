@@ -45,6 +45,39 @@ func TestAddReadsSums(t *testing.T) {
 	}
 }
 
+func TestAddReadsSumsKeys(t *testing.T) {
+	s, pool := testStore(t)
+	ctx := context.Background()
+	minute := time.Now().Truncate(time.Minute)
+	split, merged := uniqueTable(t), uniqueTable(t)
+	t.Cleanup(func() { pool.Exec(ctx, `delete from stet.reads where target_table = any($1)`, []string{split, merged}) })
+
+	for _, b := range []store.ReadBucket{
+		{Bucket: minute, LoginRole: "agent_a", Table: split, Statements: 1, Rows: 3, MaxRows: 3, Keyed: 1, Keys: 3},
+		{Bucket: minute, LoginRole: "agent_a", Table: split, Statements: 1, Rows: 2, MaxRows: 2, Keyed: 1, Keys: 2},
+	} {
+		if err := s.AddReads(ctx, []store.ReadBucket{b}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.AddReads(ctx, []store.ReadBucket{
+		{Bucket: minute, LoginRole: "agent_a", Table: merged, Statements: 1, Rows: 3, MaxRows: 3, Keyed: 1, Keys: 3},
+		{Bucket: minute, LoginRole: "agent_a", Table: merged, Statements: 1, Rows: 2, MaxRows: 2, Keyed: 1, Keys: 2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []string{split, merged} {
+		var keyed, keys int64
+		if err := pool.QueryRow(ctx, `select keyed, keys from stet.reads
+			where bucket = $1 and login_role = 'agent_a' and target_table = $2`, minute, table).Scan(&keyed, &keys); err != nil {
+			t.Fatal(err)
+		}
+		if keyed != 2 || keys != 5 {
+			t.Errorf("keyed=%d keys=%d, want 2 and 5", keyed, keys)
+		}
+	}
+}
+
 func TestInsertReadLog(t *testing.T) {
 	s, pool := testStore(t)
 	ctx := context.Background()

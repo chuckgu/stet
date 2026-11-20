@@ -13,6 +13,8 @@ type ReadBucket struct {
 	Statements int64
 	Rows       int64
 	MaxRows    int64
+	Keyed      int64 // reads that gave at least one key
+	Keys       int64 // keys taken
 }
 
 // AddReads adds buckets to stet.reads in one statement, summing into rows
@@ -30,21 +32,26 @@ func (s *Store) AddReads(ctx context.Context, buckets []ReadBucket) error {
 	stmts := make([]int64, n)
 	rows := make([]int64, n)
 	maxRows := make([]int64, n)
+	keyed := make([]int64, n)
+	keys := make([]int64, n)
 	for i, b := range buckets {
 		at[i], roles[i], tables[i] = b.Bucket, b.LoginRole, b.Table
 		stmts[i], rows[i], maxRows[i] = b.Statements, b.Rows, b.MaxRows
+		keyed[i], keys[i] = b.Keyed, b.Keys
 	}
 	_, err := s.pool.Exec(ctx, `
-		insert into stet.reads (bucket, login_role, target_table, statements, rows, max_rows)
-		select bucket, login_role, target_table, sum(statements), sum(rows), max(max_rows)
-		from unnest($1::timestamptz[], $2::text[], $3::text[], $4::bigint[], $5::bigint[], $6::bigint[])
-		     as t(bucket, login_role, target_table, statements, rows, max_rows)
+		insert into stet.reads (bucket, login_role, target_table, statements, rows, max_rows, keyed, keys)
+		select bucket, login_role, target_table, sum(statements), sum(rows), max(max_rows), sum(keyed), sum(keys)
+		from unnest($1::timestamptz[], $2::text[], $3::text[], $4::bigint[], $5::bigint[], $6::bigint[], $7::bigint[], $8::bigint[])
+		     as t(bucket, login_role, target_table, statements, rows, max_rows, keyed, keys)
 		group by bucket, login_role, target_table
 		on conflict (bucket, login_role, target_table) do update set
 			statements = stet.reads.statements + excluded.statements,
 			rows       = stet.reads.rows + excluded.rows,
-			max_rows   = greatest(stet.reads.max_rows, excluded.max_rows)`,
-		at, roles, tables, stmts, rows, maxRows)
+			max_rows   = greatest(stet.reads.max_rows, excluded.max_rows),
+			keyed      = stet.reads.keyed + excluded.keyed,
+			keys       = stet.reads.keys + excluded.keys`,
+		at, roles, tables, stmts, rows, maxRows, keyed, keys)
 	return err
 }
 

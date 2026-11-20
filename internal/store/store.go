@@ -132,6 +132,8 @@ type Decision struct {
 	RowsAffected *int64  // rows the write changed in the gated table; nil when unknown
 	Cumulative   any     // stored as jsonb; nil is NULL
 
+	ReadCheck any // stored as jsonb (a decide.ReadCheck); nil is NULL
+
 	Refused *string // the SQLSTATE Stet answered with instead of sending the statement; nil when it was sent
 
 	// The session's server process and when the gate was told the write's
@@ -162,7 +164,7 @@ const insertDecision = `
 		state, state_version, model, model_version, questions, answers, policy_version,
 		verdict, reasons, executed, exec_error, latency_ms, model_latency_ms, cost_usd, impact,
 		login_role, rows_affected, cumulative, refused,
-		backend_pid, sent_after, done_before
+		backend_pid, sent_after, done_before, read_check
 	) values (
 		$1, $2, $3, $4, $5, $6,
 		$7, $8, $9::jsonb, $10, $11, $12::jsonb, $13::jsonb,
@@ -170,7 +172,8 @@ const insertDecision = `
 		$21, $22, $23, $24, $25, $26, $27, $28::jsonb,
 		$29, $30, $31::jsonb, $32,
 		$33, transaction_timestamp() - $34::bigint * interval '1 microsecond',
-		transaction_timestamp() - $35::bigint * interval '1 microsecond'
+		transaction_timestamp() - $35::bigint * interval '1 microsecond',
+		$36::jsonb
 	)`
 
 // Insert records d. Its backend pid and the window its write was on the
@@ -249,7 +252,7 @@ func (s *Store) Insert(ctx context.Context, d *Decision) error {
 		state, stateVersion, d.Model, d.ModelVersion, questions, answers, d.PolicyVersion,
 		d.Verdict, reasons, d.Executed, d.ExecError, d.LatencyMS, d.ModelLatencyMS, d.CostUSD, impact,
 		d.LoginRole, d.RowsAffected, cumulative, d.Refused,
-		pid, sentAgo, doneAgo,
+		pid, sentAgo, doneAgo, jsonArg(d.ReadCheck),
 	)...)
 	return err
 }

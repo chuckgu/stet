@@ -580,6 +580,55 @@ func TestInsertRecordsLoginRoleAndRows(t *testing.T) {
 	}
 }
 
+func TestInsertRecordsReadCheck(t *testing.T) {
+	s, pool := testStore(t)
+	ctx := context.Background()
+	d := sample(uniqueTable(t))
+	d.ReadCheck = map[string]any{"result": "stale", "read_version": "700", "version": "705", "read_age_ms": 1500, "read_on_behalf_of": nil}
+	if err := s.Insert(ctx, d); err != nil {
+		t.Fatal(err)
+	}
+	var result, readVersion, version, age string
+	var onBehalfNull bool
+	err := pool.QueryRow(ctx, `
+		select read_check->>'result', read_check->>'read_version', read_check->>'version', read_check->>'read_age_ms',
+		       jsonb_typeof(read_check->'read_on_behalf_of') = 'null'
+		from stet.decisions where id = $1`, d.ID).Scan(&result, &readVersion, &version, &age, &onBehalfNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != "stale" || readVersion != "700" || version != "705" || age != "1500" || !onBehalfNull {
+		t.Errorf("result=%q read_version=%q version=%q age=%q on_behalf_null=%v", result, readVersion, version, age, onBehalfNull)
+	}
+
+	n := sample(uniqueTable(t))
+	if err := s.Insert(ctx, n); err != nil {
+		t.Fatal(err)
+	}
+	var isNull bool
+	if err := pool.QueryRow(ctx, `select read_check is null from stet.decisions where id = $1`, n.ID).Scan(&isNull); err != nil {
+		t.Fatal(err)
+	}
+	if !isNull {
+		t.Error("read_check is set for a write that was not compared")
+	}
+}
+
+func TestReadCheckIsAppendOnly(t *testing.T) {
+	s, pool := testStore(t)
+	ctx := context.Background()
+	d := sample(uniqueTable(t))
+	d.ReadCheck = map[string]any{"result": "fresh"}
+	if err := s.Insert(ctx, d); err != nil {
+		t.Fatal(err)
+	}
+	_, err := pool.Exec(ctx, `update stet.decisions set read_check = '{"result":"stale"}' where id = $1`, d.ID)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "ST004" {
+		t.Errorf("err = %v, want SQLSTATE ST004", err)
+	}
+}
+
 // A decision records its session's backend pid and the window its write was
 // on the server, both times on the database's clock: Insert sends how long
 // ago CreatedAt and DoneAt were, never a time of Stet's own clock

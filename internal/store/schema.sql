@@ -76,6 +76,9 @@ CREATE INDEX IF NOT EXISTS decisions_role_idx ON stet.decisions (login_role, tar
 ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS backend_pid integer;      -- 그 세션의 서버 쪽 백엔드 pid
 ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS sent_after  timestamptz;  -- DB 시계. 문장은 이보다 뒤에 서버로 갔다
 ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS done_before timestamptz;  -- DB 시계. 문장의 결과는 이보다 앞에 나왔다
+-- 낡은 읽기 판단 (docs/spec-v0.2-stale.md 8장). 쓰기의 행을 그 업무가 읽은 버전과 견준 결과다. 줄을 넣을 때만 적는다(규칙 3).
+-- 견주지 않은 쓰기와 stale을 켜지 않은 테이블의 쓰기는 NULL이다.
+ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS read_check jsonb;
 -- stet.history가 묶음마다 후보를 찾는 인덱스. 창의 두 끝이 모두 인덱스 안에 있어 힙을 읽지 않고 거른다. done_before가
 -- 앞이므로 묶음의 stmt_at 이후로 끝난 것만 훑는다. 검토와 되돌리기는 대개 최근의 변경을 읽는다. 이 단계의 앞선 판을
 -- 실행한 데이터베이스에는 두 컬럼의 decisions_backend_idx가 남아 있다. 그것을 지운다. 같은 이름으로는 IF NOT EXISTS가
@@ -123,6 +126,9 @@ CREATE TABLE IF NOT EXISTS stet.reads (
   max_rows      bigint NOT NULL DEFAULT 0,     -- 한 읽기가 내보낸 가장 큰 행 수. 커서와 포털은 그때까지의 합계
   PRIMARY KEY (bucket, login_role, target_table)
 );
+-- 행의 키를 준 읽기 집계 (docs/spec-v0.2-stale.md 8장)
+ALTER TABLE stet.reads ADD COLUMN IF NOT EXISTS keyed bigint NOT NULL DEFAULT 0;  -- 키를 하나 이상 준 읽기 수
+ALTER TABLE stet.reads ADD COLUMN IF NOT EXISTS keys  bigint NOT NULL DEFAULT 0;  -- 가져간 키 수
 
 -- 큰 읽기 기록
 CREATE TABLE IF NOT EXISTS stet.read_log (
