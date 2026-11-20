@@ -4,8 +4,8 @@ package bench
 // benchmark's template, starts Stet inside this process in front of the clone, wired as cmd/stet wires it, with stale
 // on contacts and deals and no model, and runs the spec's fixed scenarios one after another: the agents' statements go
 // through Stet, the owner's changes straight to the server, and each scenario works on rows the owner inserted for it
-// alone. A scenario's result is what Stet recorded of its last write in stet.decisions. The result and its table are
-// in stale_result.go.
+// alone. A scenario's result is what Stet recorded of its last write in stet.decisions. The Stet it starts is in
+// stale_stet.go; the result and its table are in stale_result.go.
 
 import (
 	"cmp"
@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"slices"
 	"strings"
 	"sync"
@@ -23,15 +22,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/stetdb/stet/internal/apply"
 	"github.com/stetdb/stet/internal/config"
 	"github.com/stetdb/stet/internal/decide"
-	"github.com/stetdb/stet/internal/gate"
 	"github.com/stetdb/stet/internal/lab/tasks"
-	"github.com/stetdb/stet/internal/proxy"
-	"github.com/stetdb/stet/internal/store"
 )
 
 // StaleCheck says what CheckStale runs on.
@@ -106,7 +100,7 @@ type staleCase struct {
 
 // staleCases are the scenarios of spec 11 in its order. A read or a write of the agent's own waits for Stet's lookups
 // of row versions before the next step (Gate.StaleIdle), so that the result does not depend on timing, except where
-// the spec says the next step comes at once (곧바로): readNow and writeNow.
+// the spec says the next step comes at once (곧바로): readNow and writeNow, and lastNow for the step itself.
 var staleCases = []staleCase{
 	{id: "P1", modes: bothModes, want: []string{decide.ReadStale}, stale: true, steps: func(s *staleScenario) {
 		id := s.contact()
@@ -178,7 +172,7 @@ var staleCases = []staleCase{
 		v := s.agent(tasks.RoleV, "")
 		s.read(v, readContact, id)
 		s.writeNow(v, "first", setTitle, "the agent's first", id)
-		s.last(v, setTitle, "the agent's second", id)
+		s.lastNow(v, setTitle, "the agent's second", id)
 	}},
 	{id: "N3", modes: bothModes, want: []string{decide.ReadFresh}, steps: func(s *staleScenario) {
 		id, other := s.contact(), s.contact()
@@ -199,7 +193,7 @@ var staleCases = []staleCase{
 		s.change(ownerTitle, id)
 		s.refused(v, "refused", "ST003", setTitle, "set by the agent", id)
 		s.readNow(v, readContact, id)
-		s.last(v, setTitle, "set by the agent", id)
+		s.lastNow(v, setTitle, "set by the agent", id)
 	}},
 	{id: "N6", modes: bothModes, want: []string{decide.ReadNone}, steps: func(s *staleScenario) {
 		id, other := s.contact(), s.contact()
@@ -215,6 +209,8 @@ var staleCases = []staleCase{
 		s.write(v, "begin", "begin")
 		s.write(v, "in a transaction", setTitle, "set in a transaction", id)
 		s.write(v, "commit", "commit")
+		// The write in the transaction found the read remembered: what forgets it is the transaction's end.
+		s.recorded("in a transaction", decide.ReadFresh)
 		s.last(v, setTitle, "set by the agent", id)
 	}},
 	{id: "N8", modes: bothModes, want: []string{decide.ReadFresh, decide.ReadPending}, steps: func(s *staleScenario) {
@@ -223,7 +219,7 @@ var staleCases = []staleCase{
 		s.read(a, readContact, id)
 		s.change(ownerTitle, id)
 		s.readNow(b, readContact, id)
-		s.last(a, setTitle, "set by the agent", id)
+		s.lastNow(a, setTitle, "set by the agent", id)
 	}},
 	{id: "N9", modes: bothModes, want: []string{decide.ReadFresh, decide.ReadOwnWrite}, steps: func(s *staleScenario) {
 		id := s.contact()
@@ -237,7 +233,10 @@ var staleCases = []staleCase{
 		v := s.agent(tasks.RoleV, "")
 		s.read(v, readDeal, id)
 		s.write(v, "the limit", setStage, "won", other) // the role's one row a minute of deals
-		s.approve(s.refused(v, "held", "ST001", setStage, "lost", id))
+		held := s.refused(v, "held", "ST001", setStage, "lost", id)
+		// The held write found the read of deals remembered: what forgets it is the approved write's run.
+		s.recorded("held", decide.ReadFresh)
+		s.approve(held)
 		s.last(v, setStage, "open", id)
 	}},
 	{id: "N11", modes: shadowOnly, want: []string{decide.ReadNone}, steps: func(s *staleScenario) {
@@ -440,108 +439,6 @@ func (r *staleRun) mode(ctx context.Context, mode config.Mode, db string) (rows 
 	return rows, nil
 }
 
-// stetInProcess is Stet started inside this process, wired as cmd/stet's openGate and run wire it, without the
-// startup check and undo, which this config does not use.
-type stetInProcess struct {
-	addr string
-	gate *gate.Gate
-	// applied gets a value once the executor has run an approved held write and told the gate it is done (enforce).
-	applied chan struct{}
-	close   func() // stops the proxy, waiting for its sessions, then the gate, the executor and the pool
-}
-
-// startInProcess starts Stet with cfg: its pool as Stet's account, its schema brought up to date, the gate, in enforce
-// mode the executor of approved held writes, which tells the gate of each write it runs (Gate.Applying), and the
-// proxy on a free local port.
-func startInProcess(ctx context.Context, cfg *config.Config, log *slog.Logger) (*stetInProcess, error) {
-	pool, err := stetPool(ctx, cfg.Upstream)
-	if err != nil {
-		return nil, err
-	}
-	fail := func(err error) (*stetInProcess, error) {
-		pool.Close()
-		return nil, err
-	}
-	st := store.New(pool)
-	if err := st.Migrate(ctx); err != nil {
-		return fail(fmt.Errorf("create Stet's schema: %w", err))
-	}
-	d, err := decide.New(cfg.Model)
-	if err != nil {
-		return fail(err)
-	}
-	g, err := gate.New(cfg, pool, st, d, log)
-	if err != nil {
-		return fail(err)
-	}
-	s := &stetInProcess{gate: g, applied: make(chan struct{}, 1)}
-	enforce := cfg.Mode == config.ModeEnforce
-	var applier *apply.Applier
-	if enforce {
-		applier = apply.New(cfg, pool, st, log)
-		// g.Applying, as openGate wires it, with word to the check once the gate has been told the write is done: the
-		// executor commits the write's applied status before that, so the status alone would let N10's next write
-		// arrive while the table's mark still stands.
-		applier.Applying = func(role, table string) func() {
-			done := g.Applying(role, table)
-			return func() {
-				done()
-				select {
-				case s.applied <- struct{}{}:
-				default:
-				}
-			}
-		}
-		applier.Start()
-	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		g.Close()
-		if applier != nil {
-			applier.Close()
-		}
-		return fail(err)
-	}
-	srv := proxy.New(cfg.UpstreamAddr(), log, g, proxy.Policy{Agents: cfg.AgentRoles, Enforce: enforce})
-	served := make(chan error, 1)
-	go func() { served <- srv.Serve(ln) }()
-	s.addr = ln.Addr().String()
-	s.close = func() {
-		srv.Close() // waits for the sessions, which report to the gate as they end
-		<-served
-		g.Close()
-		if applier != nil {
-			applier.Close()
-		}
-		pool.Close()
-	}
-	return s, nil
-}
-
-// stetPool connects Stet's own sessions with the settings cmd/stet's openPool gives them: application_name stet, a
-// short lock_timeout, and DateStyle, IntervalStyle and extra_float_digits pinned, which the gate's reads and the
-// executor's connections rely on.
-func stetPool(ctx context.Context, upstream string) (*pgxpool.Pool, error) {
-	pc, err := pgxpool.ParseConfig(upstream)
-	if err != nil {
-		return nil, err
-	}
-	pc.ConnConfig.RuntimeParams["application_name"] = "stet"
-	pc.ConnConfig.RuntimeParams["lock_timeout"] = "200ms"
-	pc.ConnConfig.RuntimeParams["DateStyle"] = "ISO"
-	pc.ConnConfig.RuntimeParams["IntervalStyle"] = "postgres"
-	pc.ConnConfig.RuntimeParams["extra_float_digits"] = "1"
-	pool, err := pgxpool.NewWithConfig(ctx, pc)
-	if err != nil {
-		return nil, err
-	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("connect as Stet's account: %w", err)
-	}
-	return pool, nil
-}
-
 // staleMode is one mode's clone, with Stet in front of it.
 type staleMode struct {
 	names   Names
@@ -586,22 +483,24 @@ func (m *staleMode) run(ctx context.Context, sc staleCase) (StaleRow, error) {
 	return row, nil
 }
 
-// ok reports whether row is as the spec expects of the scenario: nothing kept it from running as its steps assume,
-// its last write's read_check is one the spec allows; a P row's last write was sent and recorded with stale_read in
-// shadow, and refused with ST003 in enforce; N5's ran.
+// ok reports whether row is as the spec expects of the scenario: nothing kept it from running as its steps assume, and
+// its last write's read_check is one the spec allows. A P row's last write was sent, with no error to the client, and
+// recorded with stale_read in shadow; in enforce it was refused with ST003, a reject with stale_read. An M or N row's
+// was neither rejected nor given stale_read; N5's ran.
 func (sc staleCase) ok(row StaleRow) bool {
 	if row.Note != "" || !slices.Contains(sc.want, row.Got) {
 		return false
 	}
+	staleRead := slices.Contains(row.Reasons, "stale_read")
 	switch {
 	case sc.stale && row.Mode == string(config.ModeShadow):
-		return row.Executed && slices.Contains(row.Reasons, "stale_read")
+		return row.Executed && staleRead && row.Code == ""
 	case sc.stale:
-		return !row.Executed && row.Code == "ST003"
-	case sc.runs:
-		return row.Executed
+		return !row.Executed && row.Code == "ST003" && row.Verdict == decide.Reject && staleRead
+	case staleRead || row.Verdict == decide.Reject:
+		return false
 	}
-	return true
+	return !sc.runs || row.Executed
 }
 
 // staleDecision is what Stet recorded of a write.
@@ -722,13 +621,18 @@ func (s *staleScenario) insert(sql string, args ...any) int {
 	return id
 }
 
-// change runs sql as the owner, straight to the server: a change Stet does not see.
+// change runs sql as the owner, straight to the server: a change Stet does not see. It must change exactly one row,
+// the scenario's: a change that missed would let a scenario come out fresh for the wrong reason.
 func (s *staleScenario) change(sql string, args ...any) {
 	if s.err != nil {
 		return
 	}
-	if _, err := s.owner.Exec(s.ctx, sql, args...); err != nil {
+	tag, err := s.owner.Exec(s.ctx, sql, args...)
+	switch {
+	case err != nil:
 		s.abort(fmt.Errorf("%s as %s: %w", sql, s.names.Owner(), err))
+	case tag.RowsAffected() != 1:
+		s.abort(fmt.Errorf("%s as %s changed %d rows, want 1", sql, s.names.Owner(), tag.RowsAffected()))
 	}
 }
 
@@ -808,6 +712,28 @@ func (s *staleScenario) refused(conn *pgx.Conn, step, code, sql string, args ...
 	return nil
 }
 
+// recorded requires Stet to have recorded the scenario's write step with read_check result want: a premise the
+// scenario's later steps rest on. A later no_read, say, shows that something forgot the read only if the read was
+// remembered in the first place.
+func (s *staleScenario) recorded(step, want string) {
+	if s.err != nil {
+		return
+	}
+	d, found, err := s.decision(s.ctx, s.marker(step))
+	switch {
+	case err != nil:
+		s.abort(fmt.Errorf("read the decision of %s: %w", step, err))
+	case !found:
+		s.fail("%s: no decision was recorded within %s", step, staleRecord)
+	case d.result == nil || *d.result != want:
+		got := "NULL"
+		if d.result != nil {
+			got = *d.result
+		}
+		s.fail("%s: read_check %s, %s [%s]; the scenario rests on %s", step, got, d.verdict, strings.Join(d.reasons, ", "), want)
+	}
+}
+
 // approve approves, as the owner, the held write the refusal names, and waits until the executor has run it and told
 // the gate, which then forgets what the role remembers of the table (spec 7).
 func (s *staleScenario) approve(refusal *pgconn.PgError) {
@@ -884,10 +810,21 @@ func (s *staleScenario) heldStatus(id string, done func(status string) bool) (st
 // last sends the scenario's last write through conn, whose decision is the scenario's result, and keeps what the
 // client got.
 func (s *staleScenario) last(conn *pgx.Conn, sql string, args ...any) {
+	s.lastIn(conn, nil, sql, args...)
+}
+
+// lastNow is last for a write the spec sends at once (곧바로): in one round trip, with no statement prepared first
+// (pgx.QueryExecModeExec, text values whose types the server infers), as soon after the step before as the driver
+// allows. Its text is new to the connection, so pgx's default would first prepare it in a round trip of its own.
+func (s *staleScenario) lastNow(conn *pgx.Conn, sql string, args ...any) {
+	s.lastIn(conn, []any{pgx.QueryExecModeExec}, sql, args...)
+}
+
+func (s *staleScenario) lastIn(conn *pgx.Conn, mode []any, sql string, args ...any) {
 	if s.err != nil {
 		return
 	}
-	_, err := conn.Exec(s.ctx, s.marker("")+" "+sql, args...)
+	_, err := conn.Exec(s.ctx, s.marker("")+" "+sql, append(mode, args...)...)
 	s.sent = true
 	var pe *pgconn.PgError
 	switch {

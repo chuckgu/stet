@@ -139,6 +139,87 @@ func TestCheckStale(t *testing.T) {
 	}
 }
 
+// TestStaleCaseOK: a row is as the spec expects only when its read_check is one the spec allows and nothing kept it
+// from running as its steps assume; a P row's last write was sent with no error and recorded with stale_read in shadow,
+// and refused with ST003 as a reject with stale_read in enforce; an M or N row's was not rejected and has no
+// stale_read; N5's ran.
+func TestStaleCaseOK(t *testing.T) {
+	p := staleCase{id: "P1", want: []string{"stale"}, stale: true}
+	n := staleCase{id: "N1", want: []string{"fresh"}}
+	n5 := staleCase{id: "N5", want: []string{"fresh", "read_pending"}, runs: true}
+	shadowP := StaleRow{ID: "P1", Mode: "shadow", Got: "stale", Verdict: "reject", Reasons: []string{"stale_read"}, Executed: true}
+	enforceP := StaleRow{ID: "P1", Mode: "enforce", Got: "stale", Verdict: "reject", Reasons: []string{"stale_read"}, Code: "ST003"}
+	fresh := StaleRow{ID: "N1", Mode: "enforce", Got: "fresh", Verdict: "commit", Executed: true}
+	with := func(r StaleRow, change func(*StaleRow)) StaleRow {
+		change(&r)
+		return r
+	}
+	for _, c := range []struct {
+		name string
+		sc   staleCase
+		row  StaleRow
+		want bool
+	}{
+		{"shadow P as expected", p, shadowP, true},
+		{"shadow P whose client got an error", p, with(shadowP, func(r *StaleRow) { r.Code = "57014" }), false},
+		{"shadow P without stale_read", p, with(shadowP, func(r *StaleRow) { r.Reasons = nil }), false},
+		{"shadow P not run", p, with(shadowP, func(r *StaleRow) { r.Executed = false }), false},
+		{"shadow P with another read_check", p, with(shadowP, func(r *StaleRow) { r.Got = "fresh" }), false},
+		{"enforce P as expected", p, enforceP, true},
+		{"enforce P held", p, with(enforceP, func(r *StaleRow) { r.Verdict = "hold" }), false},
+		{"enforce P refused for another reason", p, with(enforceP, func(r *StaleRow) { r.Reasons = []string{"unsupported"} }), false},
+		{"enforce P run", p, with(enforceP, func(r *StaleRow) { r.Executed, r.Code = true, "" }), false},
+		{"N as expected", n, fresh, true},
+		{"N rejected", n, with(fresh, func(r *StaleRow) { r.Verdict, r.Executed, r.Code = "reject", false, "ST003" }), false},
+		{"N with stale_read", n, with(fresh, func(r *StaleRow) { r.Reasons = []string{"in_transaction", "stale_read"} }), false},
+		{"N with another read_check", n, with(fresh, func(r *StaleRow) { r.Got = "no_read" }), false},
+		{"N with a note", n, with(fresh, func(r *StaleRow) { r.Note = "a step failed" }), false},
+		{"N held", n, with(fresh, func(r *StaleRow) { r.Verdict, r.Executed, r.Code = "hold", false, "ST001" }), true},
+		{"N5 run", n5, fresh, true},
+		{"N5 not run", n5, with(fresh, func(r *StaleRow) { r.Verdict, r.Executed, r.Code = "hold", false, "ST001" }), false},
+	} {
+		if got := c.sc.ok(c.row); got != c.want {
+			t.Errorf("%s: ok %v, want %v (%+v)", c.name, got, c.want, c.row)
+		}
+	}
+}
+
+// TestStaleOwnerChangeMustTouchOneRow: a change of the owner's that touches no row, or more than one, would let a
+// scenario come out fresh for the wrong reason, so it ends the check.
+func TestStaleOwnerChangeMustTouchOneRow(t *testing.T) {
+	a := testAdmin(t)
+	ctx := context.Background()
+	conn := connectAs(t, a, a.User, a.Password, "postgres")
+	for _, sql := range []string{
+		"create temp table contacts (id int primary key, title text)",
+		"insert into contacts values (1, 'as inserted'), (2, 'as inserted')",
+	} {
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	s := &staleScenario{staleMode: &staleMode{owner: conn}, ctx: ctx, id: "T"}
+	s.change(ownerTitle, 1)
+	if s.err != nil {
+		t.Fatalf("a change of one row: %v", s.err)
+	}
+	for _, c := range []struct {
+		sql  string
+		args []any
+		rows string
+	}{
+		{ownerTitle, []any{3}, "0 rows"},
+		{"update contacts set title = 'x' where id > $1", []any{0}, "2 rows"},
+		{"delete from contacts where id = $1", []any{3}, "0 rows"},
+	} {
+		s := &staleScenario{staleMode: &staleMode{owner: conn}, ctx: ctx, id: "T"}
+		s.change(c.sql, c.args...)
+		if s.err == nil || !s.fatal || !strings.Contains(s.err.Error(), c.rows) {
+			t.Errorf("%s %v: err %v, fatal %v; want the check ended, saying %s", c.sql, c.args, s.err, s.fatal, c.rows)
+		}
+	}
+}
+
 // TestStaleResultWrite: the result is a Markdown table with a row per scenario and mode, then what kept a row from
 // running as its steps assume, then the count.
 func TestStaleResultWrite(t *testing.T) {
