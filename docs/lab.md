@@ -741,6 +741,109 @@ bin/stet-lab bench undo-check -name crm_undo_check_m -max-rows 100000
 
 **되돌리기의 시간.** 되돌리기는 키마다 시간이 든다. 되돌린(`restored`) 키가 대부분인 실행 2의 호출은 키마다 0.41~0.76ms, 건너뛴 키가 대부분인 실행 1의 호출은 0.22~0.63ms다. 묶음 하나의 29,022키는 키마다 0.41ms, 묶음 417개에 걸친 52,981키는 0.72ms로, 키가 많은 묶음에 흩어져 있으면 조금 더 든다. 그동안 검토자의 트랜잭션은 되돌린 행의 잠금을 쥔다. 52,981키면 38초다. 그래서 큰 선택은 `tables`나 시간 범위로 나눠 되돌린다(스펙 11장). 이 확인을 처음 돌렸을 때는 첫 복제본의 52,981키가 3분 33초 걸렸고, 그것으로 되돌린 변경을 적는 `stet.undo_record`의 문장이 줄마다 그 테이블의 모든 묶음과 짝을 짓던 것을 찾아 변경을 기본 키로 하나씩 찾도록 고쳤다.
 
+## 낡은 쓰기
+
+작성: 2026-11-20. 설계와 수용 기준은 [스펙](spec-v0.2-stale.md)에 있다. 에이전트가 Stet을 거쳐 읽은 행의 버전(`xmin`)을 Stet이 자기 연결로 읽어 기억하고, 그 접속 계정이 나중에 그 행을 키로 고치거나 지울 때 읽은 뒤에 행이 바뀌었으면 거절한다(`reject`, 이유 `stale_read`). 누가 바꿨든 본다. 모델을 부르지 않는다.
+
+**켜는 방법.** 게이트 대상 테이블에 `stale`을 적는다. 값 없이 `stale:`만 적어도 켜진다.
+
+```yaml
+tables:
+  contacts:
+    pk: id
+    send_fields: [title, status, notes]
+    stale:            # 이 테이블의 낡은 쓰기를 본다
+      remember: 1h    # 선택. 읽은 버전을 기억하는 시간. 기본 1h, 1m 이상 24h 이하
+```
+
+- 기억하는 키 수의 상한은 전체 절 `stale: {max_keys: 200000}`이다(선택, 1,000 이상 10,000,000 이하). `stale`을 켠 테이블이 없으면 이 절은 설정 오류다.
+- 키 컬럼의 타입(도메인이면 그 밑의 타입)이 `int2`, `int4`, `int8`, `uuid`, `text`, `varchar`, `bpchar`, `name` 가운데 하나이고 정렬 규칙이 결정적이어야 한다. 아니면 Stet은 시작할 때 경고하고 그 테이블을 추적하지 않는다. 그 테이블의 읽기는 세기만 하고 쓰기는 `not_checked`다.
+- 섀도에서는 판정을 기록만 하고 쓰기는 그대로 간다. enforce에서는 낡은 쓰기를 보내지 않고 에이전트에게 `ST003`(`write refused by stet: the row was changed after it was read`, HINT `read the row again, then send the write again if it still applies`)을 돌려준다. 그 계정이 어느 연결로든 그 행을 다시 읽으면 풀린다.
+
+**재는 법** (스펙 8장). 섀도에서 낡은 쓰기의 비율은 판단 기록에서 나온다.
+
+```sql
+select read_check->>'result' as result, count(*)
+  from stet.decisions
+ where target_table = 'contacts' and read_check is not null and created_at >= now() - interval '7 days'
+ group by 1;
+```
+
+- `stale ÷ (stale + fresh)`가 "읽은 행에 쓴 것 가운데 낡은 것"이다.
+- `no_read`, `read_pending`, `own_write`는 Stet이 판정하지 않은 쓰기이고, 그 안에 놓친 낡은 쓰기가 있을 수 있다. `not_checked`는 대상이 아닌 쓰기다(여러 행 쓰기, `INSERT`, 키를 모르는 쓰기 등).
+- `stet.reads`의 `statements - keyed`는 키를 얻지 못한 읽기다. 이 수가 크면 그 에이전트의 읽기 모양을 Stet이 놓치고 있다.
+
+**끝에서 끝까지의 확인** (`stet-lab bench stale-check`, 스펙 11장)
+
+벤치마크의 템플릿과 역할이 있어야 한다(`bin/stet-lab bench prepare`). 없으면 그렇게 말하고 아무것도 만들지 않는다. 모델을 부르지 않고 키를 읽지 않는다.
+
+```bash
+go build -o bin/stet-lab ./cmd/stet-lab
+bin/stet-lab bench stale-check
+```
+
+- 모드마다 템플릿 `crm_base`(`-practice`면 `crm_practice`)를 `-name`(기본 `crm_stale_check`)에 `_shadow`, `_enforce`를 붙인 이름으로 복제한다. 둘 가운데 하나라도 이미 있으면 아무것도 만들지 않고 멈춘다(`bench drop -name`으로 지운다). 끝나면 복제본을 지운다(`-keep`이면 남긴다). 템플릿과 역할은 읽기만 한다.
+- Stet을 이 명령의 프로세스 안에서 `cmd/stet`과 같은 순서로 띄운다. Stet의 계정(`gate_svc`)의 풀, `stet` 스키마, 게이트, enforce면 승인된 보류 건의 실행부(게이트에 알리는 `Applying`을 이어서), 로컬의 빈 포트에 프록시다. 시작할 때의 점검과 되돌리기는 없다.
+- 설정은 코드에 있다. `contacts`와 `deals`에 `stale`, 모델 없음(`adapter: none`, `on_failure: pass`), 정책 없음, `agents.roles`는 에이전트 계정 넷이다. 질문은 `questions: [duplicate]`로 적었다. 중복 질문은 후보가 있는 `INSERT`에만 하고 후보가 없으므로, 이 확인의 어떤 쓰기에도 질문이 없다(빈 목록은 세 질문 모두라는 뜻이다). 그래서 결정론적 규칙이 정하지 않은 쓰기는 모델 없이 `commit`이다. `contacts`에는 `impact: {max_rows: 100}`(N6의 여러 행 쓰기가 enforce에서도 실행되게), `deals`에는 `impact: {max_rows: 1, cumulative: {max_rows: 1, window: 1m}}`(N10의 보류)를 둔다.
+- 스펙 11장의 표를 그 차례대로 돈다. 시나리오마다 소유자(`crm_owner`)가 Stet을 거치지 않고 새로 넣은 행에서 돌고, 시나리오끼리 행을 나누지 않는다. 에이전트의 문장은 Stet을 거쳐 `agent_v`로 보낸다(P1의 다른 에이전트는 `agent_i`). 소유자의 변경과 삭제는 서버에 직접 보낸다. 연결 A·B는 같은 계정의 두 연결이고, 업무는 `set stet.on_behalf_of`로 적는다.
+- 읽기와 쓰기는 pgx의 기본(확장 프로토콜, 준비된 문장, 정수 키는 바이너리)이고 키는 `where id = $1`로 준다. `DO` 블록, `begin`, `commit`은 단순 프로토콜이다. P4는 결과에 키가 없는 `select title from contacts where id = $1`, P5는 `contacts`와 `deals`를 별칭으로 조인한 읽기다.
+- 읽기와 에이전트 자신의 쓰기 뒤에는 Stet의 버전 조회가 끝나기를 기다린다(`Gate.StaleIdle`). 스펙이 "곧바로"라고 적은 걸음 앞(N2의 둘째 쓰기, N5의 다시 쓰기, N8의 쓰기)에서만 기다리지 않는다.
+- N10은 `deals`의 행을 읽고, 다른 `deals` 행에 한 번 써서 누적 한도를 채우고, 읽은 행에 써서 `ST001`로 보류된다. 복제본 안에서 Stet의 계정이 소유자에게 검토자 권한(`stet` 스키마의 주석에 적힌 `GRANT` 셋)을 주고, 소유자가 `stet.approve`를 부른다. 실행부가 그 쓰기를 실행하고 게이트에 알린 뒤에 그 행에 다시 쓴다. 실행부는 보류 건을 `applied`로 커밋한 다음에 게이트에 알리므로, 상태만 보고 쓰면 그 사이의 짧은 틈에 `own_write`가 나올 수 있다. 확인은 게이트에 알린 때를 기다린다.
+- 줄의 결과는 그 시나리오의 마지막 쓰기의 `stet.decisions` 줄이다. 문장 앞의 주석 `/* stale-check <줄> <모드> */`로 찾고, 줄이 생길 때까지 5초까지 기다린다. 줄이 맞으려면 `read_check.result`가 스펙이 허용한 것이어야 하고, P의 줄은 섀도에서 실행되고 `reasons`에 `stale_read`가, enforce에서는 실행되지 않고 클라이언트가 `ST003`을 받아야 하며, N5는 실행돼야 한다. 중간 걸음이 시나리오의 가정대로 되지 않으면(N5의 첫 쓰기가 거절되지 않았다, N10의 쓰기가 보류되지 않았다 등) 그 시나리오는 거기서 멈추고, 표 아래에 그 이유가 적히며, 그 줄은 맞지 않은 것이다.
+- 진행과 Stet의 경고는 표준 에러, 결과 표는 표준 출력이다. 맞지 않는 줄이 하나라도 있으면 종료 코드 1이다.
+
+**보이는 것과 보이지 않는 것**
+
+- 보이는 것: 실제 프록시, 게이트, 실행부를 거친 스펙 11장의 순서에서 판정과 기록이 스펙대로 나오는지. 누가 바꿨든(Stet을 거친 다른 에이전트, Stet을 거치지 않은 소유자, 삭제) 낡은 쓰기가 잡히고, 결과에 키가 없는 읽기(P4)와 조인·별칭 읽기(P5)도 기억되는지. 멀쩡한 쓰기(N1~N11)가 `stale`이 되지 않는지. 낡지 않은 쓰기가 누적 한도로 보류되고 승인되어 실행된 뒤에 그 계정의 기억이 지워지는지(N10).
+- 보이지 않는 것: 실제 업무에서 낡은 쓰기가 얼마나 잦은지. 그것은 섀도의 기록과 위의 재는 질의로만 안다.
+- 시간에 달린 길: 이 서버에서는 "곧바로" 줄(N2, N5, N8)이 모두 `fresh`였다. 조회가 다음 문장보다 먼저 끝났다는 뜻이고, 이 확인에서는 `read_pending`과 `own_write`의 길을 지나가지 않았다. 그 길은 `internal/gate`의 테스트가 조회를 막아 두고 확인한다(`TestWriteWhileLookupPending`, `TestOwnWrite`).
+- M1의 `fresh`는 알려진 놓침이다(스펙 12장). 업무를 적지 않은 같은 계정의 두 연결은 한 쪽으로 묶여, 다른 연결이 다시 읽은 것이 첫 연결의 낡은 쓰기를 가린다.
+- 다루지 않는 것: 답을 받기 전에 끊긴 연결(스펙 보정 S15), Stet의 확인과 서버의 실행 사이의 틈(스펙 2장), 여러 키 타입과 형식, 이름 있는 준비된 문장의 다시 실행, 쓰지 못하는 키 값(S13). 이것들은 `internal/proxy`와 `internal/gate`의 테스트가 본다(`TestLostWriteLeavesNoMark`, `TestKeyValueNotUsable` 등).
+
+**결과** (2026-11-20, PostgreSQL 14.18, 이 컴퓨터의 테스트 서버. `bin/stet-lab`은 커밋 `dd34158`에서 `go build -o bin/stet-lab ./cmd/stet-lab`으로 빌드했다)
+
+`bin/stet-lab bench stale-check`, 10:11:26 ~ 10:11:28 UTC(약 2초), 종료 코드 0. 35줄(섀도 17, enforce 18)이 모두 기대대로다. 기대와 다른 줄은 없다. Stet이 낸 경고는 섀도의 N11에서 `DO` 블록에 대한 `would be refused under enforce` 한 줄뿐이다. P6의 섀도 쓰기는 지워진 행에 보내져 0행으로 실행됐다. N10의 마지막 쓰기는 낡지 않아(`no_read`) 누적 한도로 다시 보류됐다(`ST001`).
+
+| scenario | mode | want | read_check | verdict | reasons | executed | sqlstate | ok |
+|---|---|---|---|---|---|---|---|---|
+| P1 | shadow | stale | stale | reject | stale_read | yes | - | ok |
+| P1 | enforce | stale | stale | reject | stale_read | no | ST003 | ok |
+| P2 | shadow | stale | stale | reject | stale_read | yes | - | ok |
+| P2 | enforce | stale | stale | reject | stale_read | no | ST003 | ok |
+| P3 | shadow | stale | stale | reject | stale_read | yes | - | ok |
+| P3 | enforce | stale | stale | reject | stale_read | no | ST003 | ok |
+| P4 | shadow | stale | stale | reject | stale_read | yes | - | ok |
+| P4 | enforce | stale | stale | reject | stale_read | no | ST003 | ok |
+| P5 | shadow | stale | stale | reject | stale_read | yes | - | ok |
+| P5 | enforce | stale | stale | reject | stale_read | no | ST003 | ok |
+| P6 | shadow | stale | stale | reject | stale_read | yes | - | ok |
+| P6 | enforce | stale | stale | reject | stale_read | no | ST003 | ok |
+| P7 | shadow | stale | stale | reject | stale_read | yes | - | ok |
+| P7 | enforce | stale | stale | reject | stale_read | no | ST003 | ok |
+| M1 | shadow | fresh | fresh | commit | - | yes | - | ok |
+| M1 | enforce | fresh | fresh | commit | - | yes | - | ok |
+| N1 | shadow | fresh | fresh | commit | - | yes | - | ok |
+| N1 | enforce | fresh | fresh | commit | - | yes | - | ok |
+| N2 | shadow | fresh or own_write | fresh | commit | - | yes | - | ok |
+| N2 | enforce | fresh or own_write | fresh | commit | - | yes | - | ok |
+| N3 | shadow | fresh | fresh | commit | - | yes | - | ok |
+| N3 | enforce | fresh | fresh | commit | - | yes | - | ok |
+| N4 | shadow | no_read | no_read | commit | - | yes | - | ok |
+| N4 | enforce | no_read | no_read | commit | - | yes | - | ok |
+| N5 | enforce | fresh or read_pending | fresh | commit | - | yes | - | ok |
+| N6 | shadow | no_read | no_read | commit | - | yes | - | ok |
+| N6 | enforce | no_read | no_read | commit | - | yes | - | ok |
+| N7 | shadow | no_read | no_read | commit | - | yes | - | ok |
+| N7 | enforce | no_read | no_read | commit | - | yes | - | ok |
+| N8 | shadow | fresh or read_pending | fresh | commit | - | yes | - | ok |
+| N8 | enforce | fresh or read_pending | fresh | commit | - | yes | - | ok |
+| N9 | shadow | fresh or own_write | fresh | commit | - | yes | - | ok |
+| N9 | enforce | fresh or own_write | fresh | commit | - | yes | - | ok |
+| N10 | enforce | no_read | no_read | hold | impact:cumulative | no | ST001 | ok |
+| N11 | shadow | no_read | no_read | commit | - | yes | - | ok |
+
+35 rows: 35 as expected, 0 not
+
 ## 합성 CRM
 
 - 규모: 계정 약 800개, 연락처 약 5,000개. 계정마다 딜 0~3개.
