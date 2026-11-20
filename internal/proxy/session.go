@@ -48,19 +48,30 @@ type Gate interface {
 	// (ruling 31).
 	WouldBlock(s SessionInfo, reason string)
 	// Unseen tells the gate that s, a session that does not enforce, is sending
-	// a message whose writes the proxy cannot see: one WouldBlock is told of, an
-	// Execute of a portal the proxy could not read or whose statement Inspect
-	// marked with Block, or SQL that runs a prepared statement by name
-	// (Statement.Executes). It is called every time, before the message goes
-	// upstream, and must not block.
+	// a message whose writes the proxy cannot see: one WouldBlock is told of;
+	// SQL that runs a prepared statement by name (Statement.Executes); or an
+	// Execute whose portal, under any meaning its names may have, runs a
+	// statement the proxy could not read, one Inspect marked with Block or one
+	// that runs a prepared statement by name, or may run a watched write other
+	// than its newest meaning, which Begin is not asked about and no End
+	// reports. It is called every time, before the message goes upstream, and
+	// must not block. One later TxEnded settles each call (see TxEnded).
 	Unseen(s SessionInfo)
-	// TxEnded tells the gate that nothing s sent is still uncommitted or
-	// unanswered: the server reported s idle, or s ended, after a watched write
-	// that was sent ran inside a transaction (its End had Outcome.InTransaction),
-	// or after a message Unseen was told of. It is called once per such
-	// ReadyForQuery, after the End calls of the units it answers, and once when
-	// the connection ends while one is still owed. It must not block.
-	TxEnded(s SessionInfo)
+	// TxEnded tells the gate that what s sent in the units the server has
+	// answered is committed or rolled back: the server reported s idle, or s
+	// ended, after a watched write that was sent ran inside a transaction (its
+	// End had Outcome.InTransaction), or after a message Unseen was told of.
+	// unseen is how many Unseen calls for s it settles: those for the messages
+	// of the units answered since the previous TxEnded. A unit sent behind
+	// them and not answered yet is not covered, although its Unseen calls may
+	// have come first: a later TxEnded settles its writes and its Unseen
+	// calls. TxEnded is called once per such ReadyForQuery, after the End
+	// calls of the units it answers, and once when the connection ends while
+	// one is still owed; that last call settles every Unseen call not settled
+	// before. So over a session's life the unseen counts add up to its Unseen
+	// calls, and each Unseen call comes before the TxEnded that settles it. It
+	// must not block.
+	TxEnded(s SessionInfo, unseen int)
 	// Tracked reports, for the table with OID table, the attribute number of the
 	// key column whose values the gate remembers reads by, and how its binary
 	// form is read. ok is false for any other table. The proxy calls it on the
@@ -257,11 +268,13 @@ type session struct {
 	// dirty: a unit answered since the last idle ReadyForQuery held a
 	// statement that is not clean. The units still waiting carry their own.
 	dirty bool
-	// owed: a unit answered since the last idle ReadyForQuery owes the gate a
-	// TxEnded (see unit.owes), which the next idle one pays, or abandon. The
-	// units still waiting carry their own.
-	owed    bool
-	cursors map[string]*declared // SQL cursors by name; nil until a DECLARE needs it
+	// owed: a unit answered since the last TxEnded owes the gate one (see
+	// unit.owes); unseenCalls: how many Unseen calls were made for the
+	// messages of those units. The next idle ReadyForQuery hands both over in
+	// one TxEnded, or abandon does. The units still waiting carry their own.
+	owed        bool
+	unseenCalls int
+	cursors     map[string]*declared // SQL cursors by name; nil until a DECLARE needs it
 	// unsettled holds the names in cursors whose newest entry can still change
 	// at a ReadyForQuery: all but held cursors that outlived their transaction.
 	unsettled map[string]struct{}
@@ -400,7 +413,7 @@ type unit struct {
 	query                     bool
 	dirty                     bool // it holds a statement that is not clean (see Statement.Clean)
 	sets                      bool // on an enforced session: it may hold a SET or RESET (see setPending)
-	unseen                    bool // on a session that does not enforce: the gate was told of a message of it through Unseen
+	unseen                    int  // on a session that does not enforce: the Unseen calls made for its messages
 	executes                  int  // Execute messages so far
 	completions               int  // CommandComplete, EmptyQueryResponse, PortalSuspended
 	err                       string
@@ -568,11 +581,11 @@ func (s *session) answeredUnsynced(done []answer) []answer {
 // leave takes a's unit, the head of s.units, out once the server has
 // answered it, with the transaction status after (the ReadyForQuery's, or 'T'
 // for an unsynced unit, whose implicit transaction goes on). Its table
-// changes the server completed hold and the rest are dropped; while a
-// transaction stays open its marks pass to the session; its cursor statements
-// are settled; its rows are tallied. Units leave in the order they were sent,
-// through here alone, so each unit's table changes are the oldest waiting
-// (see names). It runs with s.mu held.
+// changes the server completed hold and the rest are dropped; its marks pass
+// to the session (carry); its cursor statements are settled; its rows are
+// tallied. Units leave in the order they were sent, through here alone, so
+// each unit's table changes are the oldest waiting (see names). It runs with
+// s.mu held.
 func (s *session) leave(a answer, after byte) {
 	u := a.u
 	s.units = s.units[1:]
@@ -584,9 +597,7 @@ func (s *session) leave(a answer, after byte) {
 	}
 	s.stmts.answered(u, u.acks)
 	s.portals.answered(u, u.acks)
-	if after != 'I' {
-		s.carry(a)
-	}
+	s.carry(a, after)
 	if len(s.unsettled) > 0 {
 		s.cursorsAnswered(u, after)
 	}
@@ -648,8 +659,9 @@ func (s *session) acked(head *unit) {
 // not enforce, the closed points known at no extra cost (what could not be
 // read, what the gate marks with Block, a FunctionCall) go as they came, and
 // the gate is told through WouldBlock; it is told through Unseen of each of
-// them, and of each Query or Execute that may run what hides its writes (see
-// unseen, hidesWrites).
+// them, of each Query or Execute that may run what hides its writes (see
+// unseen, hidesWrites), and of each Execute that may run a watched write
+// other than its portal's newest meaning.
 func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, error) {
 	if s.enforce {
 		if err := s.admit(t); err != nil {
@@ -857,10 +869,15 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 			s.markDirty(u)
 			return s.block(u, pos, 'E', "", reason), nil
 		}
-		if !s.enforce && (!read || anyMeaning(b, ok, others, func(st Statement, unread bool) bool { return unread || hidesWrites(st) })) {
+		if !s.enforce && (!read ||
+			anyMeaning(b, ok, others, func(st Statement, unread bool) bool { return unread || hidesWrites(st) }) ||
+			anyOther(b, others, func(st Statement, _ bool) bool { return st.Watch })) {
 			// What it runs may write where the proxy cannot see: a portal or
 			// statement it could not read, or one that hides its writes, under
-			// any meaning the name may have.
+			// any meaning the name may have; or a watched write that is not its
+			// newest meaning, which the server may run in its place with no
+			// Begin, so no End (an enforced session refuses such an Execute:
+			// see executeBlock).
 			closedPoint := ""
 			if !read {
 				closedPoint = unreadable(body)
@@ -969,14 +986,18 @@ func (s *session) block(u *unit, pos int, t byte, name, reason string) []byte {
 // sending a message arriving in u whose writes the proxy cannot see: through
 // Unseen every time, and, when reason is not "", through WouldBlock the first
 // time for reason, that an enforced session would refuse it for reason, a
-// closed point the proxy knows at no extra cost (ruling 31). It marks u, so
-// that the gate is told through TxEnded once the transaction the message
-// runs in has ended (see unit.owes). The message is forwarded as it came;
-// nothing waits but the gate's calls, which do not block. It runs without
-// s.mu held.
+// closed point the proxy knows at no extra cost (ruling 31). It counts the
+// call in u, so that the TxEnded paid once the transaction the message runs
+// in has ended settles it (see unit.owes, carry). The message is forwarded
+// as it came; nothing waits but the gate's calls, which do not block. It runs
+// without s.mu held.
 func (s *session) unseen(u *unit, reason string) {
 	s.mu.Lock()
-	u.unseen = true
+	// Counted before the gate is called, and read only when u leaves: the
+	// server cannot answer u before this message is forwarded, which waits
+	// for Unseen to return. So the TxEnded that settles the call always comes
+	// after it, and no lock needs to span the call.
+	u.unseen++
 	first := reason != "" && s.firstTime(reason)
 	info := s.identity()
 	s.mu.Unlock()
@@ -1069,21 +1090,27 @@ func (s *session) markSets(u *unit) {
 	s.mu.Unlock()
 }
 
-// carry moves the transaction marks of a's unit, which is no longer waiting
-// while the transaction it ran in may still be open, to the session. It runs
-// with s.mu held.
-func (s *session) carry(a answer) {
-	s.dirty = s.dirty || a.u.dirty
+// carry moves the marks of a's unit, which is no longer waiting, to the
+// session, given the transaction status after it (see leave). Whether it
+// left the transaction dirty counts only while a transaction stays open.
+// What it owes the gate, and the Unseen calls made for it, always pass on:
+// the next idle ReadyForQuery hands them over in one TxEnded, the one
+// answering the unit when after is idle. It runs with s.mu held.
+func (s *session) carry(a answer, after byte) {
+	if after != 'I' {
+		s.dirty = s.dirty || a.u.dirty
+	}
 	s.owed = s.owed || a.u.owes(a.inTx)
+	s.unseenCalls += a.u.unseen
 }
 
 // owes reports whether u owes the gate a TxEnded once the transaction it ran
-// in has ended: the gate was told of a message of u through Unseen, or u sent
-// a watched write, one Begin did not refuse, that ran inside a transaction
-// (inTx, its Outcome.InTransaction). A write that ran on its own committed or
-// failed at its own ReadyForQuery, and a refused one never ran.
+// in has ended: Unseen was called for a message of u, or u sent a watched
+// write, one Begin did not refuse, that ran inside a transaction (inTx, its
+// Outcome.InTransaction). A write that ran on its own committed or failed at
+// its own ReadyForQuery, and a refused one never ran.
 func (u *unit) owes(inTx bool) bool {
-	return u.unseen || inTx && slices.ContainsFunc(u.writes, func(w watchedWrite) bool { return !w.refused })
+	return u.unseen > 0 || inTx && slices.ContainsFunc(u.writes, func(w watchedWrite) bool { return !w.refused })
 }
 
 // txDirty reports whether a statement that is not clean was sent since the
@@ -1313,6 +1340,7 @@ func (s *session) fromServer(t byte, body []byte) ([]byte, error) {
 	var out []byte
 	var err error
 	var ended bool       // the gate is owed a TxEnded (see readyForQuery)
+	var unseen int       // the Unseen calls it settles
 	var info SessionInfo // the session as the gate is told of it then
 	switch t {
 	case 'C', 'I', 's':
@@ -1348,7 +1376,7 @@ func (s *session) fromServer(t byte, body []byte) ([]byte, error) {
 			}
 		}
 	case 'Z':
-		if done, ended = s.readyForQuery(head, body, done); ended {
+		if done, ended, unseen = s.readyForQuery(head, body, done); ended {
 			info = s.identity()
 		}
 	case 'K':
@@ -1361,7 +1389,7 @@ func (s *session) fromServer(t byte, body []byte) ([]byte, error) {
 	s.mu.Unlock()
 	s.finishAll(done)
 	if ended {
-		s.reportTxEnded(info) // after the End calls of the units it answers
+		s.reportTxEnded(info, unseen) // after the End calls of the units it answers
 	}
 	return out, err
 }
@@ -1383,11 +1411,12 @@ func (s *session) backendKey(body []byte) {
 // and, when head is an unsynced unit that failed, the units the server
 // skipped behind it (see unit). It appends them to done. ended reports that
 // the gate is owed a TxEnded now: the server reports the session idle, and a
-// unit answered since the last idle ReadyForQuery, those it answers
-// included, owes one (unit.owes). A unit still waiting keeps its own, so an
-// idle answer to an earlier unit never pays for a later one. It runs on the
-// server side with s.mu held.
-func (s *session) readyForQuery(head *unit, body []byte, done []answer) (_ []answer, ended bool) {
+// unit answered since the last TxEnded, those it answers included, owes one
+// (unit.owes); unseen is how many Unseen calls were made for those units,
+// which that TxEnded settles. A unit still waiting keeps its own, so an idle
+// answer to an earlier unit neither pays for nor settles a later one. It
+// runs on the server side with s.mu held.
+func (s *session) readyForQuery(head *unit, body []byte, done []answer) (_ []answer, ended bool, unseen int) {
 	s.settle(head) // normally nothing is left; never carry rows into the next unit
 	status := byte('I')
 	if len(body) > 0 {
@@ -1403,7 +1432,7 @@ func (s *session) readyForQuery(head *unit, body []byte, done []answer) (_ []ans
 	}
 	if !s.ready {
 		s.ready = true
-		return done, false
+		return done, false, 0
 	}
 	if head != nil {
 		n := 1
@@ -1414,16 +1443,16 @@ func (s *session) readyForQuery(head *unit, body []byte, done []answer) (_ []ans
 		inTx := before != 'I' || status != 'I'
 		for _, u := range s.units[:n] {
 			a := answer{u, inTx || u.executes > 1 || u.joined || u.unsynced}
-			s.leave(a, status)
+			s.leave(a, status) // its marks pass to the session (carry)
 			done = append(done, a)
-			ended = ended || status == 'I' && u.owes(a.inTx)
 		}
 	}
 	if status == 'I' {
 		s.portals.forget() // the server drops every portal when a transaction ends
-		ended, s.owed = ended || s.owed, false
+		ended, unseen = s.owed, s.unseenCalls
+		s.owed, s.unseenCalls = false, 0
 	}
-	return done, ended
+	return done, ended, unseen
 }
 
 // settle moves the row messages sent since the last completion or error to
@@ -1496,12 +1525,13 @@ func (s *session) reportObserve(info SessionInfo, st Statement, o Outcome) {
 	s.gate.Observe(info, st, o)
 }
 
-// reportTxEnded tells the gate that nothing info's session sent is still
-// uncommitted or unanswered. Like reportEnd, it logs and recovers a panic in
-// the gate, so the session goes on reporting what comes after.
-func (s *session) reportTxEnded(info SessionInfo) {
+// reportTxEnded tells the gate that what info's session sent in the units
+// answered so far is committed or rolled back, settling unseen of its Unseen
+// calls. Like reportEnd, it logs and recovers a panic in the gate, so the
+// session goes on reporting what comes after.
+func (s *session) reportTxEnded(info SessionInfo, unseen int) {
 	defer s.recoverReport("TxEnded")
-	s.gate.TxEnded(info)
+	s.gate.TxEnded(info, unseen)
 }
 
 // recoverReport, deferred around a report to the gate, logs a panic in it as
@@ -1590,13 +1620,19 @@ func tagRows(body []byte) (int64, bool) {
 //
 // The connection's end also ends any transaction it left open, so once those
 // reports are made the gate is told so through TxEnded, if it is owed one:
-// by a unit answered since the last idle ReadyForQuery (owed), or by a unit
-// still waiting (unit.owes). A write that never reached the server owes
-// nothing.
+// by a unit answered since the last TxEnded (owed), or by a unit still
+// waiting (unit.owes). That TxEnded settles every Unseen call not settled
+// before: those the answered units carried (unseenCalls), and those of every
+// unit still waiting, the ones the server skipped included. A write that
+// never reached the server owes nothing.
 func (s *session) abandon() {
 	locked := s.mu.TryLock()
 	units := s.units
-	info, owed := s.identity(), s.owed
+	info, owed, unseen := s.identity(), s.owed, s.unseenCalls
+	// The server ends whatever transaction the connection left open, and
+	// nothing more will be sent in one: the session TxEnded is told of has
+	// none, whatever the last ReadyForQuery said.
+	info.TxOpen, info.TxDirty = false, false
 	s.units = nil
 	s.cursors, s.unsettled = nil, nil
 	status := s.status
@@ -1625,6 +1661,7 @@ func (s *session) abandon() {
 		u.tally()
 		inTx := status != 'I' || u.executes > 1 || u.joined || u.unsynced
 		owed = owed || u.owes(inTx)
+		unseen += u.unseen
 		for _, w := range u.writes {
 			if w.refused {
 				s.reportEnd(w.handle, u.refusedWrite(w, inTx, false))
@@ -1653,7 +1690,7 @@ func (s *session) abandon() {
 		s.reportEnd(w.handle, o)
 	}
 	if owed {
-		s.reportTxEnded(info)
+		s.reportTxEnded(info, unseen)
 	}
 }
 

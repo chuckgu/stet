@@ -54,7 +54,8 @@ type recordingGate struct {
 	would    []blockedCall // WouldBlock calls
 	unseen   []proxy.SessionInfo
 	txEnded  []proxy.SessionInfo
-	calls    []string // End, Unseen and TxEnded, in the order they were made
+	settled  []int    // the unseen count of each TxEnded
+	calls    []string // End, Unseen and TxEnded(n), in the order they were made
 }
 
 type blockedCall struct {
@@ -203,26 +204,27 @@ func (g *recordingGate) Unseen(info proxy.SessionInfo) {
 	g.calls = append(g.calls, "Unseen")
 }
 
-// TxEnded records the call.
-func (g *recordingGate) TxEnded(info proxy.SessionInfo) {
+// TxEnded records the call, with the count of Unseen calls it settles.
+func (g *recordingGate) TxEnded(info proxy.SessionInfo, unseen int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.txEnded = append(g.txEnded, info)
-	g.calls = append(g.calls, "TxEnded")
+	g.settled = append(g.settled, unseen)
+	g.calls = append(g.calls, fmt.Sprintf("TxEnded(%d)", unseen))
 }
 
 // Tracked tracks no table.
 func (g *recordingGate) Tracked(uint32) (uint16, proxy.KeyType, bool) { return 0, 0, false }
 
-// callLog returns the End, Unseen and TxEnded calls made so far, in order.
+// callLog returns the End, Unseen and TxEnded(n) calls made so far, in order.
 func (g *recordingGate) callLog() []string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return slices.Clone(g.calls)
 }
 
-// wantCalls fails the test unless the gate's End, Unseen and TxEnded calls so
-// far are want, in order. The gate hears of a statement before its
+// wantCalls fails the test unless the gate's End, Unseen and TxEnded(n) calls
+// so far are want, in order. The gate hears of a statement before its
 // ReadyForQuery is forwarded, so once the client has its answer the calls it
 // caused have been made.
 func (g *recordingGate) wantCalls(t *testing.T, when string, want ...string) {
@@ -248,6 +250,31 @@ func (g *recordingGate) wantTold(t *testing.T, user string) {
 		if info.TxOpen {
 			t.Errorf("TxEnded told of session %+v, want no transaction open", info)
 		}
+	}
+}
+
+// wantAllSettled fails the test unless the TxEnded calls so far settled
+// every Unseen call, each after it was made: at no point in the calls have
+// more been settled than made.
+func (g *recordingGate) wantAllSettled(t *testing.T) {
+	t.Helper()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	made, settled := 0, 0
+	for _, c := range g.calls {
+		var n int
+		switch _, err := fmt.Sscanf(c, "TxEnded(%d)", &n); {
+		case c == "Unseen":
+			made++
+		case err == nil:
+			settled += n
+		}
+		if settled > made {
+			t.Fatalf("calls %q settle an Unseen call before it was made", g.calls)
+		}
+	}
+	if settled != made {
+		t.Errorf("TxEnded settled %d Unseen calls, want all %d", settled, made)
 	}
 }
 
@@ -3627,9 +3654,9 @@ func TestTxEndedAfterWriteInTransaction(t *testing.T) {
 			mustExec(t, conn, "select 1")
 			g.wantCalls(t, "before "+end, "End")
 			mustExec(t, conn, end)
-			g.wantCalls(t, "after "+end, "End", "TxEnded")
+			g.wantCalls(t, "after "+end, "End", "TxEnded(0)")
 			mustExec(t, conn, "select 1")
-			g.wantCalls(t, "after a later select", "End", "TxEnded")
+			g.wantCalls(t, "after a later select", "End", "TxEnded(0)")
 
 			if _, os := g.outcomes(t, 1); !os[0].Executed || !os[0].InTransaction {
 				t.Errorf("update: %+v, want executed inside a transaction", os[0])
@@ -3675,9 +3702,9 @@ func TestTxEndedAfterImplicitTransaction(t *testing.T) {
 	if err := conn.SendBatch(testCtx(t), b).Close(); err != nil {
 		t.Fatal(err)
 	}
-	g.wantCalls(t, "after the batch", "End", "End", "TxEnded")
+	g.wantCalls(t, "after the batch", "End", "End", "TxEnded(0)")
 	mustExec(t, conn, "select 1")
-	g.wantCalls(t, "after a later select", "End", "End", "TxEnded")
+	g.wantCalls(t, "after a later select", "End", "End", "TxEnded(0)")
 	_, os := g.outcomes(t, 2)
 	for i, o := range os {
 		if !o.Executed || !o.InTransaction {
@@ -3700,12 +3727,12 @@ func TestTxEndedOncePerTransaction(t *testing.T) {
 		mustExec(t, conn, fmt.Sprintf("insert into %s values (%d, 'a')", table, i))
 	}
 	mustExec(t, conn, "commit")
-	g.wantCalls(t, "after the first transaction", "End", "End", "End", "TxEnded")
+	g.wantCalls(t, "after the first transaction", "End", "End", "End", "TxEnded(0)")
 	mustExec(t, conn, "begin")
 	mustExec(t, conn, "insert into "+table+" values (4, 'b')")
-	g.wantCalls(t, "inside the second transaction", "End", "End", "End", "TxEnded", "End")
+	g.wantCalls(t, "inside the second transaction", "End", "End", "End", "TxEnded(0)", "End")
 	mustExec(t, conn, "commit")
-	g.wantCalls(t, "after the second transaction", "End", "End", "End", "TxEnded", "End", "TxEnded")
+	g.wantCalls(t, "after the second transaction", "End", "End", "End", "TxEnded(0)", "End", "TxEnded(0)")
 	g.wantTold(t, "stet_scram")
 }
 
@@ -3725,7 +3752,7 @@ func TestNoTxEndedForRefusedWrite(t *testing.T) {
 	b := &pgx.Batch{}
 	b.Queue("insert into "+table+" values ($1, 'batch')", 2)
 	b.Queue("insert into "+table+" values ($1, 'batch')", 3)
-	conn.SendBatch(testCtx(t), b).Close()
+	wantHeld(t, conn.SendBatch(testCtx(t), b).Close())
 	mustExec(t, conn, "select 1")
 	g.wantCalls(t, "after refused writes", "End", "End", "End")
 }
@@ -3794,6 +3821,7 @@ func TestUnseenEveryTime(t *testing.T) {
 	}
 	g.wantBlocked(t, "stet_trust")
 	g.wantTold(t, "stet_trust")
+	g.wantAllSettled(t)
 }
 
 // A message Unseen was told of owes the gate a TxEnded once the server
@@ -3806,16 +3834,17 @@ func TestTxEndedAfterUnseen(t *testing.T) {
 	do := "do $$ begin perform 1; end $$"
 
 	mustExec(t, conn, do)
-	g.wantCalls(t, "after a DO block", "Unseen", "TxEnded")
+	g.wantCalls(t, "after a DO block", "Unseen", "TxEnded(1)")
 	mustExec(t, conn, "begin")
 	mustExec(t, conn, do)
 	mustExec(t, conn, "select 1")
-	g.wantCalls(t, "after a DO block in a transaction", "Unseen", "TxEnded", "Unseen")
+	g.wantCalls(t, "after a DO block in a transaction", "Unseen", "TxEnded(1)", "Unseen")
 	mustExec(t, conn, "commit")
-	g.wantCalls(t, "after commit", "Unseen", "TxEnded", "Unseen", "TxEnded")
+	g.wantCalls(t, "after commit", "Unseen", "TxEnded(1)", "Unseen", "TxEnded(1)")
 	mustExec(t, conn, "select 1")
-	g.wantCalls(t, "after a later select", "Unseen", "TxEnded", "Unseen", "TxEnded")
+	g.wantCalls(t, "after a later select", "Unseen", "TxEnded(1)", "Unseen", "TxEnded(1)")
 	g.wantTold(t, "stet_scram")
+	g.wantAllSettled(t)
 }
 
 // An enforced session refuses a DO block as before (Blocked), and the gate
@@ -3836,4 +3865,29 @@ func TestEnforcedSessionHasNoUnseen(t *testing.T) {
 	mustExec(t, conn, "execute r(1)")
 	g.wantBlocked(t, "stet_scram", proxy.BlockDo, proxy.BlockDo)
 	g.wantCalls(t, "after the refused DO blocks")
+}
+
+// Messages pipelined in one write: a DO block outside a transaction, then
+// BEGIN, a DO block and COMMIT. Both Unseen calls may come before the first
+// answer, but the TxEnded at the first DO block's ReadyForQuery settles that
+// one alone, and the one after COMMIT the other.
+func TestTxEndedSettlesOnlyTheUnseenItAnswers(t *testing.T) {
+	g := unseenGate("no_such_table")
+	addr, _ := startProxyWith(t, upstream(t), g, proxy.Policy{})
+	fe := rawSession(t, addr, "stet_trust", pgproto3.ProtocolVersionNumber)
+	do := "do $$ begin perform 1; end $$"
+
+	sendAll(t, fe, &pgproto3.Query{String: do}, &pgproto3.Query{String: "begin"},
+		&pgproto3.Query{String: do}, &pgproto3.Query{String: "commit"})
+	for range 4 {
+		untilReady(t, fe)
+	}
+	g.mu.Lock()
+	unseen, settled := len(g.unseen), slices.Clone(g.settled)
+	g.mu.Unlock()
+	if unseen != 2 || !slices.Equal(settled, []int{1, 1}) {
+		t.Errorf("Unseen %d times, TxEnded settling %v; want 2, and [1 1]", unseen, settled)
+	}
+	g.wantAllSettled(t)
+	g.wantTold(t, "stet_trust")
 }

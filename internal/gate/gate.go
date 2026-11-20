@@ -239,10 +239,11 @@ func (g *Gate) WouldBlock(s proxy.SessionInfo, reason string) {
 func (g *Gate) Unseen(proxy.SessionInfo) {}
 
 // TxEnded is told when a session's transaction that held a watched write, or
-// a message Unseen was told of, has ended. Stale-write detection is to settle
-// the rows those writes marked then (spec-v0.2-stale 7); until it does,
-// nothing is marked, and TxEnded does nothing.
-func (g *Gate) TxEnded(proxy.SessionInfo) {}
+// a message Unseen was told of, has ended, with how many of the session's
+// Unseen calls that settles. Stale-write detection is to settle the rows
+// those writes marked then (spec-v0.2-stale 7); until it does, nothing is
+// marked, and TxEnded does nothing.
+func (g *Gate) TxEnded(proxy.SessionInfo, int) {}
 
 // Tracked reports no table: until stale-write detection reads its tables'
 // key columns, the gate remembers no read by key.

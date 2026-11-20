@@ -15,8 +15,9 @@ import (
 // set, Begin refuses every write with it. Blocked records each reason, and
 // whether the proxy called it the first time for that reason, and answers
 // with an ST002 that names it. WouldBlock records each reason. calls lists
-// the End, Unseen and TxEnded calls in the order they were made. Tracked
-// tracks no table.
+// the End, Unseen and TxEnded calls in the order they were made, a TxEnded
+// with the count it settles ("TxEnded(1)"), and txEnded the session each
+// TxEnded was told of. Tracked tracks no table.
 type fakeGate struct {
 	n       int
 	ends    map[int]Outcome
@@ -25,6 +26,7 @@ type fakeGate struct {
 	firsts  []bool
 	would   []string
 	calls   []string
+	txEnded []SessionInfo
 }
 
 func newFakeGate() *fakeGate { return &fakeGate{ends: map[int]Outcome{}} }
@@ -46,11 +48,13 @@ func (g *fakeGate) Blocked(_ SessionInfo, reason string, first bool) Refusal {
 }
 func (g *fakeGate) WouldBlock(_ SessionInfo, reason string) { g.would = append(g.would, reason) }
 func (g *fakeGate) Unseen(SessionInfo)                      { g.calls = append(g.calls, "Unseen") }
-func (g *fakeGate) TxEnded(SessionInfo)                     { g.calls = append(g.calls, "TxEnded") }
-func (g *fakeGate) Tracked(uint32) (uint16, KeyType, bool)  { return 0, 0, false }
+func (g *fakeGate) TxEnded(info SessionInfo, unseen int) {
+	g.calls = append(g.calls, fmt.Sprintf("TxEnded(%d)", unseen))
+	g.txEnded = append(g.txEnded, info)
+}
+func (g *fakeGate) Tracked(uint32) (uint16, KeyType, bool) { return 0, 0, false }
 
-// count is how many times the gate was called as call ("End", "Unseen" or
-// "TxEnded").
+// count is how many times the gate was called as call ("End" or "Unseen").
 func (g *fakeGate) count(call string) int {
 	n := 0
 	for _, c := range g.calls {
@@ -963,23 +967,25 @@ func (g *fakeGate) wantCalls(t *testing.T, when string, want ...string) {
 
 // When the connection ends while a transaction that held a watched write, or
 // a message Unseen was told of, may still be open, the gate is told once,
-// after every End, that nothing of the session is uncommitted any more. A
-// write lost before its answer counts: it may have run. A write lost outside
-// a transaction owes nothing beyond its End, nor does a transaction the gate
-// was already told ended.
+// after every End, that it ended, with no transaction open, settling every
+// Unseen call not settled before. A write lost before its answer counts: it
+// may have run. A write lost outside a transaction owes nothing beyond its
+// End, nor does a transaction the gate was already told ended.
 func TestTxEndedWhenConnectionDrops(t *testing.T) {
 	for _, c := range []struct {
 		name, sent string
 		want       []string
 	}{
-		{"a write answered inside a transaction", "begin Z(T) insert Z(T)", []string{"End", "TxEnded"}},
-		{"a write lost inside a transaction", "begin Z(T) insert", []string{"End", "TxEnded"}},
-		{"writes lost under one Sync", "E:insert E:insert S", []string{"End", "End", "TxEnded"}},
-		{"a DO block answered inside a transaction", "begin Z(T) do Z(T)", []string{"Unseen", "TxEnded"}},
-		{"a DO block lost", "do", []string{"Unseen", "TxEnded"}},
+		{"a write answered inside a transaction", "begin Z(T) insert Z(T)", []string{"End", "TxEnded(0)"}},
+		{"a write lost inside a transaction", "begin Z(T) insert", []string{"End", "TxEnded(0)"}},
+		{"writes lost under one Sync", "E:insert E:insert S", []string{"End", "End", "TxEnded(0)"}},
+		{"a DO block answered inside a transaction", "begin Z(T) do Z(T)", []string{"Unseen", "TxEnded(1)"}},
+		{"a DO block lost", "do", []string{"Unseen", "TxEnded(1)"}},
 		{"a write lost outside a transaction", "insert", []string{"End"}},
 		{"a write answered outside a transaction", "insert Z(I)", []string{"End"}},
-		{"a transaction already ended", "begin Z(T) insert Z(T) commit Z(I)", []string{"End", "TxEnded"}},
+		{"a transaction already ended", "begin Z(T) insert Z(T) commit Z(I)", []string{"End", "TxEnded(0)"}},
+		{"a DO block answered inside a transaction and one sent behind it", "begin Z(T) do Z(T) do", []string{"Unseen", "Unseen", "TxEnded(2)"}},
+		{"a DO block settled, then one lost", "do Z(I) do", []string{"Unseen", "TxEnded(1)", "Unseen", "TxEnded(1)"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			g := doGate{&txGate{fakeGate: newFakeGate()}}
@@ -997,6 +1003,10 @@ func TestTxEndedWhenConnectionDrops(t *testing.T) {
 	if o := g.ends[0]; !o.Lost || !o.InTransaction {
 		t.Errorf("write lost inside a transaction: %+v, want lost inside a transaction", o)
 	}
+	// The connection's end ended the transaction too.
+	if len(g.txEnded) != 1 || g.txEnded[0].TxOpen || g.txEnded[0].TxDirty {
+		t.Errorf("TxEnded told of %+v, want one session with no transaction open and nothing sent in one", g.txEnded)
+	}
 }
 
 // The gate is told a transaction ended in the order the server answers, not
@@ -1012,11 +1022,11 @@ func TestTxEndedWaitsForItsOwnAnswer(t *testing.T) {
 	serve(s, &pgproto3.RowDescription{}, row, tag("SELECT 1"), ready)
 	g.wantCalls(t, "after the select")
 	serve(s, parseOK, bindOK, tag("INSERT 0 1"), parseOK, bindOK, tag("INSERT 0 1"), ready)
-	g.wantCalls(t, "after the writes under one Sync", "End", "End", "TxEnded")
+	g.wantCalls(t, "after the writes under one Sync", "End", "End", "TxEnded(0)")
 	serve(s, tag("BEGIN"), readyWith('T'), tag("INSERT 0 1"), readyWith('T'))
-	g.wantCalls(t, "after the write inside a transaction", "End", "End", "TxEnded", "End")
+	g.wantCalls(t, "after the write inside a transaction", "End", "End", "TxEnded(0)", "End")
 	serve(s, tag("COMMIT"), ready)
-	g.wantCalls(t, "after commit", "End", "End", "TxEnded", "End", "TxEnded")
+	g.wantCalls(t, "after commit", "End", "End", "TxEnded(0)", "End", "TxEnded(0)")
 }
 
 // A watched write in a unit the server answers with no ReadyForQuery of its
@@ -1033,7 +1043,7 @@ func TestTxEndedAfterAnUnsyncedWrite(t *testing.T) {
 		t.Errorf("write: %+v, want executed inside a transaction", o)
 	}
 	serve(s, ready)
-	g.wantCalls(t, "after the Query's ReadyForQuery", "End", "TxEnded")
+	g.wantCalls(t, "after the Query's ReadyForQuery", "End", "TxEnded(0)")
 }
 
 // hiddenGate is byNameGate that also marks the SQL "do" as a DO block.
@@ -1080,6 +1090,19 @@ func TestUnseenExecutes(t *testing.T) {
 			serve(s, parseOK, parseOK, bindOK, readyWith('T'))
 			send(s, bindMsg("p", "r"), syncMsg, execMsg("p"), syncMsg)
 		}, 2},
+		{"an Execute of a name that may still mean a watched write", func(s *session) {
+			send(s, parseMsg("s1", ins), syncMsg)
+			serve(s, parseOK, ready)
+			send(s, parseMsg("s1", "select 1"), syncMsg, bindMsg("", "s1"), execMsg(""), syncMsg)
+		}, 1},
+		{"an Execute of a portal that may still mean a watched write", func(s *session) {
+			send(s, parseMsg("w", ins), parseMsg("r", "select 1"), bindMsg("p", "w"), syncMsg)
+			serve(s, parseOK, parseOK, bindOK, readyWith('T'))
+			send(s, bindMsg("p", "r"), syncMsg, execMsg("p"), syncMsg)
+		}, 1},
+		{"an Execute of a watched write", func(s *session) {
+			send(s, parseMsg("w", ins), bindMsg("", "w"), execMsg(""), syncMsg)
+		}, 0},
 		{"a Query of SQL EXECUTE", func(s *session) { send(s, queryMsg("execute w")) }, 1},
 		{"a Query of FETCH", func(s *session) { send(s, queryMsg("fetch c")) }, 0},
 		{"an Execute of FETCH", func(s *session) {
@@ -1109,7 +1132,7 @@ func TestUnseenExecutes(t *testing.T) {
 // panicTxEndedGate is txGate whose TxEnded panics.
 type panicTxEndedGate struct{ *txGate }
 
-func (panicTxEndedGate) TxEnded(SessionInfo) { panic("test gate: TxEnded") }
+func (panicTxEndedGate) TxEnded(SessionInfo, int) { panic("test gate: TxEnded") }
 
 // A gate's TxEnded that panics takes nothing else with it: the session logs
 // the panic as an error and goes on reporting the statements after it, and
@@ -1134,5 +1157,64 @@ func TestAPanickingTxEndedDoesNotLoseTheOthers(t *testing.T) {
 	s.abandon()
 	if n := strings.Count(logs.String(), "test gate: TxEnded"); n != 2 || !strings.Contains(logs.String(), "level=ERROR") {
 		t.Errorf("log %q, want both panics as errors", logs.String())
+	}
+}
+
+// settledUnseen is the sum of the unseen counts g's TxEnded calls settled.
+func (g *fakeGate) settledUnseen() int {
+	n := 0
+	for _, c := range g.calls {
+		var k int
+		if _, err := fmt.Sscanf(c, "TxEnded(%d)", &k); err == nil {
+			n += k
+		}
+	}
+	return n
+}
+
+// Each TxEnded says how many Unseen calls it settles: those of the units the
+// server answered since the previous one. An Unseen call for a unit sent
+// behind them, made before their answer came, is left to a later TxEnded;
+// a unit of several unseen messages is settled in one; a TxEnded owed by
+// watched writes alone settles none. Over the session the counts add up to
+// the Unseen calls.
+func TestTxEndedCountsTheUnseenItSettles(t *testing.T) {
+	g := doGate{&txGate{fakeGate: newFakeGate()}}
+	s := readySession(g)
+	from := 0 // where the calls of the current part start
+	want := func(when string, calls ...string) {
+		t.Helper()
+		if got := g.calls[from:]; !slices.Equal(got, calls) {
+			t.Errorf("%s: gate called %q, want %q", when, got, calls)
+		}
+	}
+
+	send(s, queryMsg("do"), queryMsg("begin"), queryMsg("do"), queryMsg("commit"))
+	want("after both DO blocks were sent", "Unseen", "Unseen")
+	serve(s, tag("DO"), ready)
+	want("after the first DO block's answer", "Unseen", "Unseen", "TxEnded(1)")
+	serve(s, tag("BEGIN"), readyWith('T'), tag("DO"), readyWith('T'))
+	want("inside the transaction", "Unseen", "Unseen", "TxEnded(1)")
+	serve(s, tag("COMMIT"), ready)
+	want("after commit", "Unseen", "Unseen", "TxEnded(1)", "TxEnded(1)")
+
+	from = len(g.calls)
+	send(s, parseMsg("d", "do"), bindMsg("", "d"), execMsg(""), syncMsg)
+	serve(s, parseOK, bindOK, tag("DO"), ready)
+	want("after a Parse and an Execute of a DO block under one Sync", "Unseen", "Unseen", "TxEnded(2)")
+
+	from = len(g.calls)
+	send(s, queryMsg("begin"), queryMsg(ins), queryMsg("commit"), queryMsg("do"))
+	serve(s, tag("BEGIN"), readyWith('T'), tag("INSERT 0 1"), readyWith('T'), tag("COMMIT"), ready)
+	want("after a transaction with a write", "Unseen", "End", "TxEnded(0)")
+	serve(s, tag("DO"), ready)
+	want("after the DO block sent behind it", "Unseen", "End", "TxEnded(0)", "TxEnded(1)")
+
+	from = len(g.calls)
+	drive(s, "begin Z(T) do Z(T) do do")
+	s.abandon()
+	want("after the connection ended", "Unseen", "Unseen", "Unseen", "TxEnded(3)")
+	if got, want := g.settledUnseen(), g.count("Unseen"); got != want {
+		t.Errorf("TxEnded settled %d Unseen calls, want all %d", got, want)
 	}
 }
