@@ -76,6 +76,10 @@ type Gate struct {
 	insertHeld    func(context.Context, *store.HeldWrite) error
 	markDelivered func(ctx context.Context, id string, inTransaction bool) error
 	rowVersion    func(ctx context.Context, table, pk string) (string, error)
+	// stateRead, set only by tests, is called with the table once a write's
+	// current row is read and before it is compared with what its login
+	// role read.
+	stateRead func(table string)
 
 	warnedRoles sync.Map // client roles Stet could not assume, logged once each
 }
@@ -273,9 +277,12 @@ func (g *Gate) Unseen(s proxy.SessionInfo) { g.stale.unseen(s) }
 // a message Unseen was told of, has ended, with how many of the session's
 // Unseen calls that settles. What those writes and messages may have changed
 // is on the server now: what the login role read of it is forgotten, and
-// their marks end (spec-v0.2-stale 7). Whether the connection ended with
-// something unanswered (unanswered) is not looked at yet. It does not block.
-func (g *Gate) TxEnded(s proxy.SessionInfo, unseen int, unanswered bool) { g.stale.txEnded(s, unseen) }
+// their marks end (spec-v0.2-stale 7). When the connection ended with
+// something unanswered, which the server may still commit, the marks end
+// only after a grace, as a lost write's do. It does not block.
+func (g *Gate) TxEnded(s proxy.SessionInfo, unseen int, unanswered bool) {
+	g.stale.txEnded(s, unseen, unanswered)
+}
 
 // Tracked reports, for the table with OID table, the attribute number and
 // type of the key column the gate remembers its reads by, as the catalog said
@@ -828,6 +835,9 @@ func (g *Gate) assemble(ctx context.Context, p *pending) error {
 		if row != nil {
 			current = row
 			p.stateVersion = map[string]string{"xmin": xmin}
+		}
+		if g.stateRead != nil {
+			g.stateRead(p.res.Table)
 		}
 		// Right after the row is read: the comparison stands even if the
 		// rest of the state fails, and the stale rule comes before a state

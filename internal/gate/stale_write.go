@@ -20,8 +20,9 @@ import (
 // Applying, so no mark stays.
 
 // staleLostGrace is how long the mark of a write lost with its connection
-// stays (correction S15): such a write may still commit on the server after
-// the proxy reported it lost. A var so tests can shorten it.
+// stays, and those of a session whose connection ended with something
+// unanswered (correction S15): what they cover may still commit on the
+// server after the proxy reported it. A var so tests can shorten it.
 var staleLostGrace = time.Minute
 
 // settledKeep is how long the time own writes of a login role last ended is
@@ -35,9 +36,9 @@ var everyTable = []string{"multi_statement", "nested_write", "with", "truncate"}
 
 // ownWrites is what the write side keeps between calls: the marks of each
 // session's writes that ran inside a transaction not yet ended, its Unseen
-// calls not yet settled, the marks of writes lost with their connection, and
-// when own writes last ended. Every mark in it ends by TxEnded, a timer, or
-// close.
+// calls not yet settled, the marks waiting out a grace because what they
+// cover may still commit, and when own writes last ended. Every mark in it
+// ends by TxEnded, a timer, or close.
 type ownWrites struct {
 	mu       sync.Mutex
 	sessions map[string]*sessionWrites // by SessionInfo.ID; an entry goes once it holds nothing
@@ -55,9 +56,68 @@ type roleTable struct{ role, table string }
 
 // sessionWrites is what one session owes the memory.
 type sessionWrites struct {
-	inTx   []*writeMark // of writes that ran inside a transaction: ended by the next TxEnded
-	unseen int          // Unseen calls not yet settled by a TxEnded, also those made before the login role was known
-	mark   *writeMark   // the login role's mark on every table while unseen is not 0; nil when it had none
+	// The marks of writes that ran inside a transaction, ended by the next
+	// TxEnded: at most one on every table, one on some row of each table,
+	// and one on each row (hold).
+	all    *writeMark
+	tables map[string]*writeMark
+	rows   map[rowKey]*writeMark
+
+	unseen int        // Unseen calls not yet settled by a TxEnded, also those made before the login role was known
+	mark   *writeMark // the login role's mark on every table while unseen is not 0; nil when it had none
+}
+
+type rowKey struct{ table, key string }
+
+// hold keeps mk, the mark of a write that ran inside the session's
+// transaction, until the session's next TxEnded, unless a mark the session
+// keeps already covers it: mk then ends at once with nothing changed, and
+// the older mark forgets what mk covers when it ends. A table's mark covers
+// its rows', and a mark on every table covers all. So a transaction keeps a
+// mark for each row and table it wrote, not for each write, and ending it
+// ends few marks: ending a table's mark looks through the role's marks on
+// the table. It runs with ownWrites.mu held.
+func (sw *sessionWrites) hold(mem *readMemory, mk *writeMark) {
+	covered := sw.all != nil
+	switch {
+	case covered:
+	case mk.table == "":
+		sw.all = mk
+	case mk.key == "":
+		if covered = sw.tables[mk.table] != nil; !covered {
+			if sw.tables == nil {
+				sw.tables = map[string]*writeMark{}
+			}
+			sw.tables[mk.table] = mk
+		}
+	default:
+		k := rowKey{mk.table, mk.key}
+		if covered = sw.tables[mk.table] != nil || sw.rows[k] != nil; !covered {
+			if sw.rows == nil {
+				sw.rows = map[rowKey]*writeMark{}
+			}
+			sw.rows[k] = mk
+		}
+	}
+	if covered {
+		mem.released(mk)
+	}
+}
+
+// takeHeld returns the marks hold kept, and keeps none.
+func (sw *sessionWrites) takeHeld() []*writeMark {
+	var out []*writeMark
+	if sw.all != nil {
+		out = append(out, sw.all)
+	}
+	for _, mk := range sw.tables {
+		out = append(out, mk)
+	}
+	for _, mk := range sw.rows {
+		out = append(out, mk)
+	}
+	sw.all, sw.tables, sw.rows = nil, nil, nil
+	return out
 }
 
 func (w *ownWrites) session(id string) *sessionWrites {
@@ -199,10 +259,17 @@ func (s *stale) compare(p *pending, xmin string, sent time.Time) *decide.ReadChe
 // comparison that may have seen such a version is not judged; one that
 // could not have, is. The cost is a miss for a stale write whose role had
 // another write of the table end while its state was read.
+//
+// Only a write judged stale leaves the note the unlock rule of spec 6 goes
+// by: one answered read_pending leaves none.
 func (s *stale) compareRead(p party, table, key, version string, sent time.Time) decide.ReadCheck {
-	rc := s.mem.check(p, table, key, version, s.mem.now())
-	if rc.Result == decide.ReadStale && s.writes.settledSince(p.role, table, sent) {
-		return decide.ReadCheck{Result: decide.ReadPending, Version: rc.Version}
+	at := s.mem.now()
+	rc := s.mem.compare(p, table, key, version, at)
+	if rc.Result == decide.ReadStale {
+		if s.writes.settledSince(p.role, table, sent) {
+			return decide.ReadCheck{Result: decide.ReadPending, Version: rc.Version}
+		}
+		s.mem.noteStale(p.role, table, key, at)
 	}
 	return rc
 }
@@ -216,13 +283,14 @@ func (p *pending) compared() bool {
 // mark marks p's write as on its way, just before it goes upstream: in shadow
 // mode at the end of Begin, in enforce mode once Begin has decided to send
 // it, never for a write Begin refused, and after p's own comparison. Only a
-// write to a table with stale by a session whose login role is known is
-// marked: the memory is a login role's.
+// write by a session whose login role is known is marked, the memory being a
+// login role's, and only one that may write a table with stale: one to such
+// a table, or one that may write any table, whatever the table it names.
 func (s *stale) mark(p *pending) {
 	if s == nil || p.session.User == "" || p.mark != nil {
 		return
 	}
-	if _, ok := s.pks[p.res.Table]; !ok {
+	if _, ok := s.pks[p.res.Table]; !ok && !writesAnyTable(p.res) {
 		return
 	}
 	if table, key, ok := s.scope(p); ok {
@@ -230,24 +298,32 @@ func (s *stale) mark(p *pending) {
 	}
 }
 
+// writesAnyTable reports whether r may write other tables than the one it
+// names: its reason says so (correction S9), or it is a message of several
+// statements (a PREPARE among them gives it another reason).
+func writesAnyTable(r sqlparse.Result) bool {
+	return r.Statements > 1 || slices.Contains(everyTable, r.Reason)
+}
+
 // scope is what p's mark covers: the row key of table, some row of table
 // (key ""), or any table (table ""); ok is false when p needs none.
 //
-//   - Any table: a write whose reason says it may write other tables than the
-//     one named (correction S9), and so may any message of several
-//     statements (a PREPARE among them gives no such reason).
-//   - No mark: an UPDATE or DELETE whose row the state read found not there,
-//     its key being known as the server writes it; an INSERT that gives no
-//     key, or NULL or DEFAULT, whose new row has a key no read gave.
-//   - The row: an UPDATE or DELETE that was compared and whose row is there,
-//     unless it sets the key column, which moves the row to a key not known
-//     as the server writes it.
+//   - Any table: a write that may write other tables than the one it names
+//     (writesAnyTable).
+//   - No mark: an INSERT that gives no key, or NULL or DEFAULT, whose new
+//     row has a key no read gave.
+//   - The row: an UPDATE or DELETE that was compared, by its key as the
+//     server writes it, whether its row is there or not (it may be there by
+//     the time the write runs), unless it sets the key column, which moves
+//     the row to a key not known as the server writes it.
 //   - The table: any other write, an INSERT with a key included (its key as
-//     the server writes it is known only once it ran).
+//     the server writes it is known only once it ran), and an UPDATE or
+//     DELETE of a bpchar key's row that is not there: the cast wrote that
+//     key without the padding the role's reads of the row remember.
 func (s *stale) scope(p *pending) (table, key string, ok bool) {
 	r, w := p.res, p.res.Write
 	switch {
-	case r.Statements > 1 || slices.Contains(everyTable, r.Reason):
+	case writesAnyTable(r):
 		return "", "", true
 	case r.Kind != sqlparse.Gated || w == nil:
 		return r.Table, "", true
@@ -259,7 +335,9 @@ func (s *stale) scope(p *pending) (table, key string, ok bool) {
 	case !p.compared() || slices.Contains(w.Columns, s.pks[r.Table]):
 		return r.Table, "", true
 	case p.stateVersion == nil:
-		return "", "", false
+		if t, ok := s.table(r.Table); !ok || t.base == 1042 { // bpchar
+			return r.Table, "", true
+		}
 	}
 	return r.Table, p.key, true
 }
@@ -284,10 +362,13 @@ func (s *stale) insertKey(p *pending) (string, bool) {
 //
 //   - Lost: the write may still commit on the server. The mark stays for
 //     staleLostGrace, then what it covers is forgotten (corrections S6, S15).
-//   - Not run: the mark goes, nothing changes.
+//   - Not run: the mark goes, nothing changes; but a message of several
+//     statements that failed may have committed some of them before, and
+//     what its mark covers is forgotten.
 //   - Run inside a transaction: the mark stays until the session's next
 //     TxEnded, which forgets what it covers (spec 7): before the commit
-//     Stet's own connection sees the row's old version.
+//     Stet's own connection sees the row's old version. A mark the session
+//     already keeps may cover it (hold).
 //   - Run on its own: an UPDATE of a row looks the row's version up and
 //     refreshes what the role read of it; an INSERT with a key looks up the
 //     row it stored and refreshes that; anything else, a DELETE included,
@@ -300,13 +381,16 @@ func (s *stale) ended(p *pending, o proxy.Outcome) {
 	}
 	switch {
 	case o.Lost:
-		s.keepLost(mk)
+		s.writes.mu.Lock()
+		s.keepLostLocked(mk)
+		s.writes.mu.Unlock()
+	case !o.Executed && p.res.Statements > 1:
+		s.settle(mk.role, mk.table, func() { s.mem.forgotten(mk) })
 	case !o.Executed:
 		s.mem.released(mk)
 	case o.InTransaction:
 		s.writes.mu.Lock()
-		sw := s.writes.session(p.session.ID)
-		sw.inTx = append(sw.inTx, mk)
+		s.writes.session(p.session.ID).hold(s.mem, mk)
 		s.writes.mu.Unlock()
 	case mk.key != "" && p.res.Write.Op == "update":
 		s.refresh(mk.table, mk.key, func(serverKey, version string, ok bool) {
@@ -339,12 +423,13 @@ func (s *stale) ended(p *pending, o proxy.Outcome) {
 	}
 }
 
-// keepLost keeps mk, the mark of a write lost with its connection, for
-// staleLostGrace, then forgets what it covers. After close it forgets at once.
-func (s *stale) keepLost(mk *writeMark) {
+// keepLostLocked keeps mk, the mark of what a connection sent that the
+// server may still commit after the connection ended (a write lost with it,
+// or what TxEnded was told is unanswered), for staleLostGrace, then forgets
+// what it covers. After close it forgets at once. It runs with
+// s.writes.mu held.
+func (s *stale) keepLostLocked(mk *writeMark) {
 	w := &s.writes
-	w.mu.Lock()
-	defer w.mu.Unlock()
 	forget := func() { s.mem.forgotten(mk) }
 	if w.closed {
 		s.settleLocked(mk.role, mk.table, forget)
@@ -356,7 +441,7 @@ func (s *stale) keepLost(mk *writeMark) {
 	w.lost[mk] = time.AfterFunc(staleLostGrace, func() {
 		w.mu.Lock()
 		defer w.mu.Unlock()
-		if _, ok := w.lost[mk]; !ok { // close ended it
+		if _, ok := w.lost[mk]; !ok { // close or endLost ended it
 			return
 		}
 		delete(w.lost, mk)
@@ -364,14 +449,27 @@ func (s *stale) keepLost(mk *writeMark) {
 	})
 }
 
-// closeWrites ends at once the marks of lost writes still waiting out their
-// grace. No timer does anything after it: one that fired finds its mark gone,
-// under the lock close holds while it ends them.
+// closeWrites ends at once the marks still waiting out their grace, and
+// keeps any mark from waiting after it.
 func (s *stale) closeWrites() {
+	s.writes.mu.Lock()
+	defer s.writes.mu.Unlock()
+	s.writes.closed = true
+	s.endLostLocked()
+}
+
+// endLost ends at once, as their timers would, the marks still waiting out
+// their grace.
+func (s *stale) endLost() {
+	s.writes.mu.Lock()
+	defer s.writes.mu.Unlock()
+	s.endLostLocked()
+}
+
+// endLostLocked is endLost with s.writes.mu held. No timer does anything
+// after it: one that fired finds its mark gone, under the lock held here.
+func (s *stale) endLostLocked() {
 	w := &s.writes
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.closed = true
 	for mk, t := range w.lost {
 		t.Stop()
 		s.settleLocked(mk.role, mk.table, func() { s.mem.forgotten(mk) })
@@ -407,7 +505,14 @@ func (s *stale) unseen(sess proxy.SessionInfo) {
 // transaction end, and what they covered is forgotten; with unseen Unseen
 // calls settled, everything its login role read is forgotten, and once all of
 // the session's Unseen calls are settled its mark on every table ends.
-func (s *stale) txEnded(sess proxy.SessionInfo, unseen int) {
+//
+// unanswered says the connection ended with something it sent unanswered,
+// which the server may still commit a little later (a message waiting on a
+// lock, a COMMIT in flight). The marks that end then wait out staleLostGrace
+// first, as a lost write's does (correction S15), and forget what they cover
+// when they end: reads meanwhile may have learned versions from before. What
+// the role read is forgotten at once all the same.
+func (s *stale) txEnded(sess proxy.SessionInfo, unseen int, unanswered bool) {
 	if s == nil {
 		return
 	}
@@ -418,10 +523,16 @@ func (s *stale) txEnded(sess proxy.SessionInfo, unseen int) {
 	if sw == nil {
 		return
 	}
-	for _, mk := range sw.inTx {
-		s.settleLocked(mk.role, mk.table, func() { s.mem.forgotten(mk) })
+	end := func(mk *writeMark) {
+		if unanswered {
+			s.keepLostLocked(mk)
+		} else {
+			s.settleLocked(mk.role, mk.table, func() { s.mem.forgotten(mk) })
+		}
 	}
-	sw.inTx = nil
+	for _, mk := range sw.takeHeld() {
+		end(mk)
+	}
 	if unseen > 0 {
 		sw.unseen = max(0, sw.unseen-unseen)
 		var mk *writeMark
@@ -431,10 +542,10 @@ func (s *stale) txEnded(sess proxy.SessionInfo, unseen int) {
 			role = mk.role
 		}
 		if role != "" {
-			s.settleLocked(role, "", func() {
-				s.mem.forget(role, "", "")
-				s.mem.forgotten(mk)
-			})
+			s.settleLocked(role, "", func() { s.mem.forget(role, "", "") })
+		}
+		if mk != nil {
+			end(mk)
 		}
 	}
 	if sw.unseen == 0 && sw.mark == nil {

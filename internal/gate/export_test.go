@@ -9,6 +9,7 @@ import (
 
 	"github.com/stetdb/stet/internal/decide"
 	"github.com/stetdb/stet/internal/proxy"
+	"github.com/stetdb/stet/internal/sqlparse"
 	"github.com/stetdb/stet/internal/store"
 )
 
@@ -95,6 +96,53 @@ func SetStaleLostGrace(d time.Duration) (restore func()) {
 	staleLostGrace = d
 	return func() { staleLostGrace = old }
 }
+
+// ExpireLostMarks ends now, as their timers would, the marks of g waiting
+// out their grace.
+func ExpireLostMarks(g *Gate) { g.stale.endLost() }
+
+// HeldSessions is how many sessions g holds marks or Unseen calls for, until
+// a TxEnded settles them.
+func HeldSessions(g *Gate) int {
+	w := &g.stale.writes
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.sessions)
+}
+
+// MarkCount is how many marks of role's writes g's memory holds on table, its
+// rows included, and on every table.
+func MarkCount(g *Gate, role, table string) int {
+	m := g.stale.mem
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rr := m.roles[role]
+	if rr == nil {
+		return 0
+	}
+	n := len(rr.marks)
+	if tr := rr.tables[table]; tr != nil {
+		n += len(tr.marks)
+		for _, row := range tr.rows {
+			n += len(row.marks)
+		}
+	}
+	return n
+}
+
+// MarkAndEnd marks the write sql of s as Begin does just before sending it,
+// with no state read, and ends it as End does with the outcome o.
+func MarkAndEnd(g *Gate, s proxy.SessionInfo, sql string, o proxy.Outcome) {
+	p := &pending{session: s, sql: sql, res: g.Inspect(sql).Data.(sqlparse.Result)}
+	p.readCheck = g.stale.unchecked(p.res.Table)
+	g.stale.mark(p)
+	g.stale.ended(p, o)
+}
+
+// OnStateRead makes g call hook with the table each time a write's current
+// row is read, before the write is compared with what its login role read.
+// Call it before any write reaches g.
+func OnStateRead(g *Gate, hook func(table string)) { g.stateRead = hook }
 
 // OnRowVersion makes g call hook each time, just before it reads a row's
 // version again before a judged write is sent. Call it before any write

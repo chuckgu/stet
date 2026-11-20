@@ -6,6 +6,7 @@ import (
 	"os"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -100,10 +101,27 @@ func (e *env) read(t *testing.T, conn *pgx.Conn, table string, id any) {
 // wait for its lookup.
 func (e *env) readOnly(t *testing.T, conn *pgx.Conn, table string, id any) {
 	t.Helper()
+	e.readBy(t, conn, table, "id", id)
+}
+
+// readBy reads the row of table whose column col is key through conn, and
+// does not wait for its lookup.
+func (e *env) readBy(t *testing.T, conn *pgx.Conn, table, col string, key any) {
+	t.Helper()
 	var got any
-	if err := conn.QueryRow(context.Background(), "select id from "+table+" where id = $1", id).Scan(&got); err != nil {
-		t.Fatalf("read of %s %v: %v", table, id, err)
+	if err := conn.QueryRow(context.Background(), "select "+col+" from "+table+" where "+col+" = $1", key).Scan(&got); err != nil {
+		t.Fatalf("read of %s %v: %v", table, key, err)
 	}
+}
+
+// xminWhere is the version now of the row of table whose column col is key.
+func (e *env) xminWhere(t *testing.T, table, col, key string) string {
+	t.Helper()
+	var v string
+	if err := e.admin.QueryRow(context.Background(), "select xmin::text from "+table+" where "+col+" = $1", key).Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	return v
 }
 
 // idle waits until the gate has no lookup or refresh of row versions queued
@@ -162,6 +180,33 @@ func (e *env) checks(t *testing.T, table string, n int) []staleRow {
 	}
 }
 
+// checkOf waits for the decision on table whose statement holds marker, and
+// returns the latest such.
+func (e *env) checkOf(t *testing.T, table, marker string) staleRow {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		rows, err := e.admin.Query(context.Background(), `
+			select id::text, verdict, reasons, executed, refused, read_check
+			from stet.decisions where target_table = $1 and strpos(statement, $2) > 0
+			order by created_at desc limit 1`, table, marker)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := pgx.CollectRows(rows, pgx.RowToStructByPos[staleRow])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) == 1 {
+			return got[0]
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no decision on %s for a statement with %q", table, marker)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // wantRead checks a decision's read_check result.
 func wantRead(t *testing.T, i int, r staleRow, result string) {
 	t.Helper()
@@ -182,15 +227,15 @@ func wantDecided(t *testing.T, i int, r staleRow, verdict string, reasons ...str
 }
 
 // waitLocked waits until n sessions wait for a lock on a statement that
-// names table.
-func waitLocked(t *testing.T, su *pgx.Conn, table string, n int) {
+// holds the text pattern (a table's name, say).
+func waitLocked(t *testing.T, su *pgx.Conn, pattern string, n int) {
 	t.Helper()
 	waitUntil(t, fmt.Sprintf("%d statements wait for a lock", n), func() bool {
 		var got int
 		err := su.QueryRow(context.Background(), `
 			select count(*) from pg_stat_activity
 			where datname = current_database() and wait_event_type = 'Lock' and query like '%' || $1 || '%'`,
-			table).Scan(&got)
+			pattern).Scan(&got)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -550,7 +595,9 @@ func TestInsertWithKey(t *testing.T) {
 // so the change it may have made is not taken for another party's
 // (corrections S6, S15).
 func TestLostWriteLeavesNoMark(t *testing.T) {
-	defer gate.SetStaleLostGrace(2 * time.Second)()
+	// Long enough for any machine; the test ends it itself (ExpireLostMarks).
+	// TestLostMarksEnd shows the timer does.
+	defer gate.SetStaleLostGrace(time.Hour)()
 	e := setupStale(t, calm(), staleYAML)
 	su := superuser(t)
 	a := e.agent(t, "a")
@@ -576,28 +623,43 @@ func TestLostWriteLeavesNoMark(t *testing.T) {
 	}
 	mustExec(t, locker, "commit") // the lost write commits now
 	waitUntil(t, "the lost write committed", func() bool { return e.rowsWhere(t, "id = 1 and title = 'lost'") == 1 })
-	waitUntil(t, "the grace passed", func() bool { return check() != decide.ReadOwnWrite })
+	if got := check(); got != decide.ReadOwnWrite {
+		t.Errorf("within the grace, after the lost write committed: %s, want own_write", got)
+	}
+	gate.ExpireLostMarks(e.gate) // the grace passes
+	if got := check(); got == decide.ReadOwnWrite {
+		t.Errorf("after the grace: %s, want the mark gone", got)
+	}
 	mustExec(t, a, "update "+e.table+" set title = 'after' where id = 1")
 	wantRead(t, 1, e.checks(t, e.table, 2)[1], "no_read")
 }
 
-// Close ends the mark of a lost write at once.
-func TestCloseEndsLostMarks(t *testing.T) {
-	defer gate.SetStaleLostGrace(time.Hour)()
+// A lost write's mark ends when its grace has passed, and Close ends one at
+// once.
+func TestLostMarksEnd(t *testing.T) {
 	e := newStaleEnv(t)
 	deals := e.create(t, "deals", "(id int primary key, title text)")
-	e.insert(t, deals, "id", "1")
+	e.insert(t, deals, "id", "1", "2")
 	e.start(t, tableBlock(deals, "id", "stale: {}"))
 	agent := proxy.SessionInfo{ID: "s", User: "agent"}
-	h, _ := e.gate.Begin(agent, e.gate.Inspect("update "+deals+" set title = 'x' where id = 1"), nil)
-	e.gate.End(h, proxy.Outcome{Lost: true, Error: "connection closed"})
-	e.wantResult(t, "agent", "", deals, "1", "1", decide.ReadOwnWrite)
+	lose := func(id string, grace time.Duration) {
+		t.Helper()
+		defer gate.SetStaleLostGrace(grace)()
+		h, _ := e.gate.Begin(agent, e.gate.Inspect("update "+deals+" set title = 'x' where id = "+id), nil)
+		e.gate.End(h, proxy.Outcome{Lost: true, Error: "connection closed"})
+	}
+
+	lose("1", 50*time.Millisecond)
+	waitUntil(t, "the grace passed", func() bool { return e.check("agent", "", deals, "1", "1").Result != decide.ReadOwnWrite })
+
+	lose("2", time.Hour)
+	e.wantResult(t, "agent", "", deals, "2", "1", decide.ReadOwnWrite)
 	start := time.Now()
 	e.gate.Close()
 	if took := time.Since(start); took > 10*time.Second {
 		t.Errorf("Close took %v", took)
 	}
-	e.wantResult(t, "agent", "", deals, "1", "1", decide.ReadNone)
+	e.wantResult(t, "agent", "", deals, "2", "1", decide.ReadNone)
 }
 
 // A key value the server may read otherwise than the key column does is not
@@ -1049,5 +1111,342 @@ func TestOwnWriteEndedWhileStateRead(t *testing.T) {
 	e.idle(t)
 	if got := gate.CompareWrite(e.gate, "other", "", deals, "1", read, sent); got.Result != decide.ReadStale {
 		t.Errorf("another role's write ended during the state read: %+v, want stale", got)
+	}
+}
+
+// A write that may write other tables than the one the classifier names
+// marks every table of its login role, whether or not the named table has
+// stale (correction S9): its other statements may change a row the role
+// read, and the role's next write of that row is not stale. A message of
+// several statements is such a write even when a PREPARE gives it another
+// reason.
+func TestEveryTableWrites(t *testing.T) {
+	plain := otherTable(t, "plain", "(id int primary key, title text)")
+	e := setupStale(t, calm(), staleConfig("shadow", tableBlock(plain, "id")))
+	mustExec(t, e.admin, "insert into "+plain+" values (1, 'p')")
+	agent := e.agent(t, "a")
+	ctx := context.Background()
+	for i, sql := range []string{
+		"update " + plain + " set title = 'm' where id = 1; update " + e.table + " set title = 'm' where id = 1",
+		"with w as (update " + e.table + " set title = 'w' where id = 1 returning 1) update " + plain + " set title = 'w' where id = 1",
+		"prepare every_" + plain + " as update " + plain + " set title = $1 where id = 1; update " + e.table + " set title = 'p' where id = 1",
+	} {
+		e.read(t, agent, e.table, 1)
+		if err := agent.PgConn().Exec(ctx, sql).Close(); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		e.idle(t)
+		marker := fmt.Sprintf("'after %d'", i)
+		mustExec(t, agent, "update "+e.table+" set title = "+marker+" where id = 1")
+		if r := e.checkOf(t, e.table, marker); r.ReadCheck["result"] == "stale" {
+			t.Errorf("after %s: read_check %v, want it not stale", sql, r.ReadCheck)
+		}
+	}
+}
+
+// A message of several statements that failed may have committed some of
+// them first: what its mark covers is forgotten. A single statement that
+// failed changed nothing, and what its role read stays.
+func TestSeveralStatementsThatFailed(t *testing.T) {
+	e := setupStale(t, calm(), staleYAML)
+	agent := e.agent(t, "a")
+	ctx := context.Background()
+	e.read(t, agent, e.table, 1)
+	err := agent.PgConn().Exec(ctx, "begin; update "+e.table+" set title = 'committed' where id = 1; commit; select 1/0").Close()
+	if err == nil {
+		t.Fatal("the message did not fail")
+	}
+	if e.rowsWhere(t, "id = 1 and title = 'committed'") != 1 {
+		t.Fatal("its write was not committed")
+	}
+	e.idle(t)
+	mustExec(t, agent, "update "+e.table+" set title = 'first' where id = 1")
+	wantRead(t, 0, e.checkOf(t, e.table, "'first'"), "no_read")
+
+	e.read(t, agent, e.table, 2)
+	if _, err := agent.Exec(ctx, "update "+e.table+" set title = (1/0)::text where id = 2"); err == nil {
+		t.Fatal("the single statement did not fail")
+	}
+	e.idle(t)
+	mustExec(t, agent, "update "+e.table+" set title = 'second' where id = 2")
+	wantRead(t, 1, e.checkOf(t, e.table, "'second'"), "fresh")
+}
+
+// When a connection ends with something it sent unanswered, the server may
+// still commit it a little after the gate is told: the marks the session
+// holds, of an unseen message or of writes in its transaction, stay for
+// staleLostGrace as a lost write's does (correction S15), so the role's own
+// change is not taken for another party's; then what they cover is
+// forgotten once more.
+func TestUnansweredKeepsMarks(t *testing.T) {
+	defer gate.SetStaleLostGrace(time.Hour)()
+	ctx := context.Background()
+	// cut ends conn's connection and waits until the gate was told.
+	cut := func(t *testing.T, e *env, conn *pgx.Conn) {
+		t.Helper()
+		conn.PgConn().Conn().Close()
+		waitUntil(t, "the gate was told the connection ended", func() bool { return gate.HeldSessions(e.gate) == 0 })
+	}
+	// ownAfter has the role read row 1 again, before what conn sent commits,
+	// then lets it commit, and writes the row.
+	ownAfter := func(t *testing.T, e *env, a *pgx.Conn, commit func(), title string) {
+		t.Helper()
+		e.read(t, a, e.table, 1) // the version before
+		commit()
+		waitUntil(t, "it committed", func() bool { return e.rowsWhere(t, "id = 1 and title = '"+title+"'") == 1 })
+		mustExec(t, a, "update "+e.table+" set title = 'own' where id = 1")
+		wantRead(t, 0, e.checkOf(t, e.table, "'own'"), "own_write")
+		gate.ExpireLostMarks(e.gate)
+		mustExec(t, a, "update "+e.table+" set title = 'later' where id = 1")
+		wantRead(t, 1, e.checkOf(t, e.table, "'later'"), "no_read")
+	}
+
+	t.Run("a DO block", func(t *testing.T) {
+		e := setupStale(t, calm(), staleYAML)
+		su := superuser(t)
+		a, lost := e.agent(t, "a"), e.agent(t, "lost")
+		e.read(t, a, e.table, 1)
+		locker := direct(t)
+		mustExec(t, locker, "begin")
+		mustExec(t, locker, "select 1 from "+e.table+" where id = 1 for update")
+		lost.PgConn().Exec(ctx, "do $$ begin update "+e.table+" set title = 'do' where id = 1; end $$")
+		waitLocked(t, su, e.table, 1)
+		cut(t, e, lost)
+		ownAfter(t, e, a, func() { mustExec(t, locker, "commit") }, "do")
+	})
+
+	t.Run("a COMMIT", func(t *testing.T) {
+		e := setupStale(t, calm(), staleYAML)
+		su := superuser(t)
+		a, lost := e.agent(t, "a"), e.agent(t, "lost")
+		e.read(t, a, e.table, 1)
+		key := time.Now().UnixNano() % 1_000_000_000
+		wait := fmt.Sprintf("pg_advisory_lock(%d)", key)
+		locker := direct(t)
+		mustExec(t, locker, "select "+wait)
+		mustExec(t, lost, "begin")
+		mustExec(t, lost, "update "+e.table+" set title = 'tx' where id = 1")
+		lost.PgConn().Exec(ctx, "select "+wait+"; commit")
+		waitLocked(t, su, wait, 1)
+		cut(t, e, lost)
+		ownAfter(t, e, a, func() { mustExec(t, locker, fmt.Sprintf("select pg_advisory_unlock(%d)", key)) }, "tx")
+	})
+}
+
+// An UPDATE or DELETE of a row that is not there now marks that row's key:
+// the row may be there by the time the write runs. Of a bpchar key the text
+// of the key read as its type has no padding, so it names nothing the role
+// remembers; such a write marks the table.
+func TestAbsentRowIsMarked(t *testing.T) {
+	codes := otherTable(t, "codes", "(code char(5) primary key, title text)")
+	e := setupStale(t, calm(), staleConfig("shadow", tableBlock(codes, "code", "stale: {}")))
+	mustExec(t, e.admin, "insert into "+codes+" values ('ab', 't')")
+	agent := e.agent(t, "a")
+	check := func(table, key, version string) string {
+		return gate.CheckRead(e.gate, "stet_md5", "", table, key, version).Result
+	}
+
+	e.read(t, agent, e.table, 1)
+	mustExec(t, agent, "begin")
+	mustExec(t, agent, "update "+e.table+" set title = 'x' where id = 5")
+	if got := check(e.table, "5", ""); got != decide.ReadOwnWrite {
+		t.Errorf("the row not there, written: %s, want own_write", got)
+	}
+	if got := check(e.table, "1", e.xminOf(t, 1)); got != decide.ReadFresh {
+		t.Errorf("another row: %s, want fresh (a row mark, not a table mark)", got)
+	}
+	mustExec(t, agent, "commit")
+	if got := check(e.table, "5", ""); got == decide.ReadOwnWrite {
+		t.Errorf("after its transaction: %s, want the mark gone", got)
+	}
+
+	mustExec(t, agent, "begin")
+	mustExec(t, agent, "update "+codes+" set title = 'x' where code = 'zz'")
+	if got := check(codes, "ab   ", e.xminWhere(t, codes, "code", "ab")); got != decide.ReadOwnWrite {
+		t.Errorf("another row of a bpchar table: %s, want own_write (a table mark)", got)
+	}
+	mustExec(t, agent, "commit")
+	if got := check(codes, "ab   ", e.xminWhere(t, codes, "code", "ab")); got == decide.ReadOwnWrite {
+		t.Errorf("after its transaction: %s, want the mark gone", got)
+	}
+}
+
+// A session holds an in-transaction mark only for what its older ones do not
+// cover already: a transaction of ten thousand keyed INSERTs holds one table
+// mark, so ending it ends one mark, not ten thousand (ending a table mark
+// scans the table's marks, with every session waiting).
+func TestInTransactionMarksStayFew(t *testing.T) {
+	e := newStaleEnv(t)
+	deals := e.create(t, "deals", "(id int primary key, title text)")
+	e.start(t, tableBlock(deals, "id", "stale: {}"))
+	inTx := proxy.Outcome{Executed: true, InTransaction: true, Rows: ptr(int64(1))}
+	one := proxy.SessionInfo{ID: "one", User: "agent"}
+	for i := range 10000 {
+		gate.MarkAndEnd(e.gate, one, fmt.Sprintf("insert into %s (id) values (%d)", deals, i), inTx)
+	}
+	if n := gate.MarkCount(e.gate, "agent", deals); n != 1 {
+		t.Errorf("%d marks held after ten thousand INSERTs in one transaction, want 1", n)
+	}
+	// A mark on every table covers the table's.
+	two := proxy.SessionInfo{ID: "two", User: "agent"}
+	gate.MarkAndEnd(e.gate, two, "update "+deals+" set title = 'a' where id = 1; update "+deals+" set title = 'b' where id = 2", inTx)
+	for i := range 100 {
+		gate.MarkAndEnd(e.gate, two, fmt.Sprintf("insert into %s (id) values (%d)", deals, 20000+i), inTx)
+	}
+	if n := gate.MarkCount(e.gate, "agent", deals); n != 2 {
+		t.Errorf("%d marks held, want 2: one session's table mark and the other's on every table", n)
+	}
+	e.gate.TxEnded(one, 0, false)
+	e.gate.TxEnded(two, 0, false)
+	if n, s := gate.MarkCount(e.gate, "agent", deals), gate.HeldSessions(e.gate); n != 0 || s != 0 {
+		t.Errorf("after the transactions: %d marks, %d sessions held, want none", n, s)
+	}
+}
+
+// A char(n) key is remembered as the server writes it, padded, and a write
+// that names the row unpadded is compared with it (the state read gives the
+// row's own key): another party's change is stale, the role's own is not.
+func TestCharKey(t *testing.T) {
+	codes := otherTable(t, "codes", "(code char(5) primary key, title text)")
+	e := setupStale(t, calm(), staleConfig("shadow", tableBlock(codes, "code", "stale: {}")))
+	mustExec(t, e.admin, "insert into "+codes+" values ('ab', 't'), ('cd', 't')")
+	agent := e.agent(t, "a")
+	e.readBy(t, agent, codes, "code", "ab")
+	e.idle(t)
+	mustExec(t, e.admin, "update "+codes+" set title = 'changed' where code = 'ab'")
+	mustExec(t, agent, "update "+codes+" set title = 'x' where code = 'ab'")
+
+	e.readBy(t, agent, codes, "code", "cd")
+	e.idle(t)
+	mustExec(t, agent, "update "+codes+" set title = 'one' where code = 'cd'")
+	e.idle(t)
+	mustExec(t, agent, "update "+codes+" set title = 'two' where code = 'cd'")
+	rs := e.checks(t, codes, 3)
+	for i, want := range []string{"stale", "fresh", "fresh"} {
+		wantRead(t, i, rs[i], want)
+	}
+}
+
+// Order B of the read check's rule, through the proxy: the role's write W1
+// in a transaction commits after W2's state was read, the end of its
+// transaction forgets the row, and the role reads the row again (W1's
+// version) before W2 is compared. Only the role changed the row: W2 is not
+// stale.
+func TestOwnTransactionEndedWhileStateRead(t *testing.T) {
+	e := setupStale(t, calm(), staleYAML)
+	a, b, c := e.agent(t, "a"), e.agent(t, "b"), e.agent(t, "c")
+	ctx := context.Background()
+	var armed atomic.Bool
+	gate.OnStateRead(e.gate, func(table string) {
+		if !armed.CompareAndSwap(true, false) {
+			return
+		}
+		if _, err := a.Exec(ctx, "commit"); err != nil {
+			t.Errorf("commit: %v", err)
+			return
+		}
+		var id int
+		if err := c.QueryRow(ctx, "select id from "+e.table+" where id = $1", 1).Scan(&id); err != nil {
+			t.Errorf("read: %v", err)
+		}
+		ictx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := e.gate.StaleIdle(ictx); err != nil {
+			t.Errorf("lookups: %v", err)
+		}
+	})
+	e.read(t, a, e.table, 1)
+	mustExec(t, a, "begin")
+	mustExec(t, a, "update "+e.table+" set title = 'w1' where id = 1")
+	armed.Store(true)
+	mustExec(t, b, "update "+e.table+" set title = 'w2' where id = 1")
+	wantRead(t, 0, e.checkOf(t, e.table, "'w2'"), "read_pending")
+}
+
+// In enforce mode a write whose row its role's own other connection changed
+// while it was judged is judged again and is never stale: fresh once that
+// write's refresh ended, own_write while it has not.
+func TestOwnWriteWhileJudged(t *testing.T) {
+	for _, held := range []bool{false, true} {
+		t.Run(fmt.Sprintf("refresh held %v", held), func(t *testing.T) {
+			e := setupStale(t, calm(), staleConfig("enforce"))
+			h := holdLookups(t, e.gate)
+			a, b := e.agent(t, "a"), e.agent(t, "b")
+			ctx := context.Background()
+			var armed atomic.Bool
+			gate.OnRowVersion(e.gate, func(table, pk string) {
+				if !armed.CompareAndSwap(true, false) {
+					return
+				}
+				if held {
+					h.hold()
+				}
+				if _, err := b.Exec(ctx, "update "+e.table+" set title = 'b' where id = 1"); err != nil {
+					t.Errorf("the other connection's write: %v", err)
+				}
+				if !held {
+					ictx, cancel := context.WithTimeout(ctx, 5*time.Second)
+					defer cancel()
+					if err := e.gate.StaleIdle(ictx); err != nil {
+						t.Errorf("lookups: %v", err)
+					}
+				}
+			})
+			e.read(t, a, e.table, 1)
+			armed.Store(true)
+			mustExec(t, a, "update "+e.table+" set title = 'a' where id = 1")
+			h.release()
+			r := e.checkOf(t, e.table, "'a'")
+			wantDecided(t, 0, r, "commit", "rejudged")
+			want := "fresh"
+			if held {
+				want = "own_write"
+			}
+			wantRead(t, 0, r, want)
+		})
+	}
+}
+
+// The state read of a table that is tracked gives back an existing row as
+// the state read without the key type did: the same current row and version.
+func TestStateOfAnExistingRowUnchanged(t *testing.T) {
+	e := newStaleEnv(t)
+	deals := e.create(t, "deals", "(id int primary key, title text, n numeric, tags text[], meta jsonb, at timestamptz, gone text)")
+	mustExec(t, e.admin, "insert into "+deals+` values (1, 'it''s "x"', 1.50, '{a,"b c"}', '{"k": [1, null]}', '2026-11-20 10:00:00+00', null)`)
+	agent := proxy.SessionInfo{ID: "s", User: "agent"}
+	for _, clauses := range [][]string{nil, {"stale: {}"}} {
+		block := fmt.Sprintf("  %q:\n    pk: id\n    send_fields: [id, title, n, tags, meta, at, gone]\n", deals)
+		for _, c := range clauses {
+			block += "    " + c + "\n"
+		}
+		e.start(t, block)
+		h, refuse := e.gate.Begin(agent, e.gate.Inspect("update "+deals+" set title = 'x' where id = 1"), nil)
+		if refuse != nil {
+			t.Fatalf("refused: %+v", refuse)
+		}
+		e.gate.End(h, proxy.Outcome{Executed: true, Rows: ptr(int64(1))})
+		e.gate.Close()
+	}
+	rows, err := e.admin.Query(context.Background(), `
+		select state->'current', state_version from stet.decisions where target_table = $1 order by created_at`, deals)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type rec struct {
+		Current      map[string]any
+		StateVersion map[string]any
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowToStructByPos[rec])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("%d decisions, want 2", len(got))
+	}
+	if len(got[0].Current) != 7 || !reflect.DeepEqual(got[0], got[1]) {
+		t.Errorf("current and state_version %v, then %v; want the same, with every column", got[0], got[1])
+	}
+	if got[0].StateVersion["xmin"] != e.xmin(t, deals, "id", "1") {
+		t.Errorf("state_version %v, want the row's xmin", got[0].StateVersion)
 	}
 }
