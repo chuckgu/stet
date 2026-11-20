@@ -69,9 +69,19 @@ type Gate interface {
 	// calls of the units it answers, and once when the connection ends while
 	// one is still owed; that last call settles every Unseen call not settled
 	// before. So over a session's life the unseen counts add up to its Unseen
-	// calls, and each Unseen call comes before the TxEnded that settles it. It
-	// must not block.
-	TxEnded(s SessionInfo, unseen int)
+	// calls, and each Unseen call comes before the TxEnded that settles it.
+	//
+	// unanswered is true only for the call made when the connection ends, and
+	// only when a unit s sent was still waiting for the server's answer then:
+	// a message waiting on a lock, say, or a COMMIT in flight. The server may
+	// still run and commit what that unit holds a little after this call, so
+	// the gate cannot conclude that its changes are on the server yet, nor
+	// that they never will be. unanswered is false at an idle ReadyForQuery,
+	// and when the connection ended with every unit answered: the server rolls
+	// back at once a transaction the connection left open, so the gate may
+	// conclude that nothing s sent will commit after this call. It must not
+	// block.
+	TxEnded(s SessionInfo, unseen int, unanswered bool)
 	// Tracked reports, for the table with OID table, the attribute number of the
 	// key column whose values the gate remembers reads by, and how its binary
 	// form is read. ok is false for any other table. The proxy calls it on the
@@ -1594,7 +1604,7 @@ func (s *session) fromServer(t byte, body []byte) ([]byte, error) {
 	s.mu.Unlock()
 	s.finishAll(done)
 	if ended {
-		s.reportTxEnded(info, unseen) // after the End calls of the units it answers
+		s.reportTxEnded(info, unseen, false) // after the End calls of the units it answers
 	}
 	return out, err
 }
@@ -1741,11 +1751,12 @@ func (s *session) reportObserve(info SessionInfo, st Statement, o Outcome) {
 
 // reportTxEnded tells the gate that what info's session sent in the units
 // answered so far is committed or rolled back, settling unseen of its Unseen
-// calls. Like reportEnd, it logs and recovers a panic in the gate, so the
-// session goes on reporting what comes after.
-func (s *session) reportTxEnded(info SessionInfo, unseen int) {
+// calls; unanswered says, at the connection's end, that a unit sent was not
+// answered (see Gate.TxEnded). Like reportEnd, it logs and recovers a panic
+// in the gate, so the session goes on reporting what comes after.
+func (s *session) reportTxEnded(info SessionInfo, unseen int, unanswered bool) {
 	defer s.recoverReport("TxEnded")
-	s.gate.TxEnded(info, unseen)
+	s.gate.TxEnded(info, unseen, unanswered)
 }
 
 // recoverReport, deferred around a report to the gate, logs a panic in it as
@@ -1837,12 +1848,19 @@ func tagRows(body []byte) (int64, bool) {
 // by a unit answered since the last TxEnded (owed), or by a unit still
 // waiting (unit.owes). That TxEnded settles every Unseen call not settled
 // before: those the answered units carried (unseenCalls), and those of every
-// unit still waiting, the ones the server skipped included. A write that
-// never reached the server owes nothing.
+// unit still waiting, the ones the server skipped included. It says whether
+// a unit was still waiting (unanswered): the server may still run and commit
+// what it holds. A write that never reached the server owes nothing.
 func (s *session) abandon() {
 	locked := s.mu.TryLock()
 	units := s.units
 	info, owed, unseen := s.identity(), s.owed, s.unseenCalls
+	// A unit still waiting was sent and not answered: the server may be
+	// running it yet, a COMMIT or a message waiting on a lock, and commit
+	// it after the connection's end. One opened by a Flush and holding
+	// nothing yet counts too, which only keeps the gate waiting a little
+	// longer: the side that misses.
+	unanswered := len(units) > 0
 	// The server ends whatever transaction the connection left open, and
 	// nothing more will be sent in one: the session TxEnded is told of has
 	// none, whatever the last ReadyForQuery said.
@@ -1905,7 +1923,7 @@ func (s *session) abandon() {
 		s.reportEnd(w.handle, o)
 	}
 	if owed {
-		s.reportTxEnded(info, unseen)
+		s.reportTxEnded(info, unseen, unanswered)
 	}
 }
 

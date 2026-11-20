@@ -66,7 +66,7 @@ type recordingGate struct {
 	unseen   []proxy.SessionInfo
 	txEnded  []proxy.SessionInfo
 	settled  []int    // the unseen count of each TxEnded
-	calls    []string // End, Unseen and TxEnded(n), in the order they were made
+	calls    []string // End, Unseen and TxEnded(n, unanswered), in the order they were made
 }
 
 type blockedCall struct {
@@ -225,13 +225,14 @@ func (g *recordingGate) Unseen(info proxy.SessionInfo) {
 	g.calls = append(g.calls, "Unseen")
 }
 
-// TxEnded records the call, with the count of Unseen calls it settles.
-func (g *recordingGate) TxEnded(info proxy.SessionInfo, unseen int) {
+// TxEnded records the call, with the count of Unseen calls it settles and
+// whether something was unanswered.
+func (g *recordingGate) TxEnded(info proxy.SessionInfo, unseen int, unanswered bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.txEnded = append(g.txEnded, info)
 	g.settled = append(g.settled, unseen)
-	g.calls = append(g.calls, fmt.Sprintf("TxEnded(%d)", unseen))
+	g.calls = append(g.calls, fmt.Sprintf("TxEnded(%d, %t)", unseen, unanswered))
 }
 
 // trackedKey is the key column of a table the gate tracks.
@@ -246,14 +247,15 @@ func (g *recordingGate) Tracked(table uint32) (uint16, proxy.KeyType, bool) {
 	return k.attr, k.typ, ok
 }
 
-// callLog returns the End, Unseen and TxEnded(n) calls made so far, in order.
+// callLog returns the End, Unseen and TxEnded(n, unanswered) calls made so
+// far, in order.
 func (g *recordingGate) callLog() []string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return slices.Clone(g.calls)
 }
 
-// wantCalls fails the test unless the gate's End, Unseen and TxEnded(n) calls
+// wantCalls fails the test unless the gate's End, Unseen and TxEnded calls
 // so far are want, in order. The gate hears of a statement before its
 // ReadyForQuery is forwarded, so once the client has its answer the calls it
 // caused have been made.
@@ -293,7 +295,7 @@ func (g *recordingGate) wantAllSettled(t *testing.T) {
 	made, settled := 0, 0
 	for _, c := range g.calls {
 		var n int
-		switch _, err := fmt.Sscanf(c, "TxEnded(%d)", &n); {
+		switch _, err := fmt.Sscanf(c, "TxEnded(%d,", &n); {
 		case c == "Unseen":
 			made++
 		case err == nil:
@@ -3684,9 +3686,9 @@ func TestTxEndedAfterWriteInTransaction(t *testing.T) {
 			mustExec(t, conn, "select 1")
 			g.wantCalls(t, "before "+end, "End")
 			mustExec(t, conn, end)
-			g.wantCalls(t, "after "+end, "End", "TxEnded(0)")
+			g.wantCalls(t, "after "+end, "End", "TxEnded(0, false)")
 			mustExec(t, conn, "select 1")
-			g.wantCalls(t, "after a later select", "End", "TxEnded(0)")
+			g.wantCalls(t, "after a later select", "End", "TxEnded(0, false)")
 
 			if _, os := g.outcomes(t, 1); !os[0].Executed || !os[0].InTransaction {
 				t.Errorf("update: %+v, want executed inside a transaction", os[0])
@@ -3732,9 +3734,9 @@ func TestTxEndedAfterImplicitTransaction(t *testing.T) {
 	if err := conn.SendBatch(testCtx(t), b).Close(); err != nil {
 		t.Fatal(err)
 	}
-	g.wantCalls(t, "after the batch", "End", "End", "TxEnded(0)")
+	g.wantCalls(t, "after the batch", "End", "End", "TxEnded(0, false)")
 	mustExec(t, conn, "select 1")
-	g.wantCalls(t, "after a later select", "End", "End", "TxEnded(0)")
+	g.wantCalls(t, "after a later select", "End", "End", "TxEnded(0, false)")
 	_, os := g.outcomes(t, 2)
 	for i, o := range os {
 		if !o.Executed || !o.InTransaction {
@@ -3757,12 +3759,12 @@ func TestTxEndedOncePerTransaction(t *testing.T) {
 		mustExec(t, conn, fmt.Sprintf("insert into %s values (%d, 'a')", table, i))
 	}
 	mustExec(t, conn, "commit")
-	g.wantCalls(t, "after the first transaction", "End", "End", "End", "TxEnded(0)")
+	g.wantCalls(t, "after the first transaction", "End", "End", "End", "TxEnded(0, false)")
 	mustExec(t, conn, "begin")
 	mustExec(t, conn, "insert into "+table+" values (4, 'b')")
-	g.wantCalls(t, "inside the second transaction", "End", "End", "End", "TxEnded(0)", "End")
+	g.wantCalls(t, "inside the second transaction", "End", "End", "End", "TxEnded(0, false)", "End")
 	mustExec(t, conn, "commit")
-	g.wantCalls(t, "after the second transaction", "End", "End", "End", "TxEnded(0)", "End", "TxEnded(0)")
+	g.wantCalls(t, "after the second transaction", "End", "End", "End", "TxEnded(0, false)", "End", "TxEnded(0, false)")
 	g.wantTold(t, "stet_scram")
 }
 
@@ -3864,15 +3866,15 @@ func TestTxEndedAfterUnseen(t *testing.T) {
 	do := "do $$ begin perform 1; end $$"
 
 	mustExec(t, conn, do)
-	g.wantCalls(t, "after a DO block", "Unseen", "TxEnded(1)")
+	g.wantCalls(t, "after a DO block", "Unseen", "TxEnded(1, false)")
 	mustExec(t, conn, "begin")
 	mustExec(t, conn, do)
 	mustExec(t, conn, "select 1")
-	g.wantCalls(t, "after a DO block in a transaction", "Unseen", "TxEnded(1)", "Unseen")
+	g.wantCalls(t, "after a DO block in a transaction", "Unseen", "TxEnded(1, false)", "Unseen")
 	mustExec(t, conn, "commit")
-	g.wantCalls(t, "after commit", "Unseen", "TxEnded(1)", "Unseen", "TxEnded(1)")
+	g.wantCalls(t, "after commit", "Unseen", "TxEnded(1, false)", "Unseen", "TxEnded(1, false)")
 	mustExec(t, conn, "select 1")
-	g.wantCalls(t, "after a later select", "Unseen", "TxEnded(1)", "Unseen", "TxEnded(1)")
+	g.wantCalls(t, "after a later select", "Unseen", "TxEnded(1, false)", "Unseen", "TxEnded(1, false)")
 	g.wantTold(t, "stet_scram")
 	g.wantAllSettled(t)
 }

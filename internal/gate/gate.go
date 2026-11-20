@@ -273,8 +273,9 @@ func (g *Gate) Unseen(s proxy.SessionInfo) { g.stale.unseen(s) }
 // a message Unseen was told of, has ended, with how many of the session's
 // Unseen calls that settles. What those writes and messages may have changed
 // is on the server now: what the login role read of it is forgotten, and
-// their marks end (spec-v0.2-stale 7). It does not block.
-func (g *Gate) TxEnded(s proxy.SessionInfo, unseen int) { g.stale.txEnded(s, unseen) }
+// their marks end (spec-v0.2-stale 7). Whether the connection ended with
+// something unanswered (unanswered) is not looked at yet. It does not block.
+func (g *Gate) TxEnded(s proxy.SessionInfo, unseen int, unanswered bool) { g.stale.txEnded(s, unseen) }
 
 // Tracked reports, for the table with OID table, the attribute number and
 // type of the key column the gate remembers its reads by, as the catalog said

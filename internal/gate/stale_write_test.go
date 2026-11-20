@@ -881,11 +881,11 @@ func TestUnseenForgets(t *testing.T) {
 	check := func() string { return gate.CheckRead(e.gate, "stet_md5", "", e.table, "2", e.xminOf(t, 2)).Result }
 	e.gate.Unseen(info)
 	e.gate.Unseen(info)
-	e.gate.TxEnded(info, 1)
+	e.gate.TxEnded(info, 1, false)
 	if got := check(); got != decide.ReadOwnWrite {
 		t.Errorf("one of two Unseen calls settled: %s, want own_write", got)
 	}
-	e.gate.TxEnded(info, 1)
+	e.gate.TxEnded(info, 1, false)
 	if got := check(); got == decide.ReadOwnWrite {
 		t.Errorf("both Unseen calls settled: %s, want the mark gone", got)
 	}
@@ -895,11 +895,11 @@ func TestUnseenForgets(t *testing.T) {
 	known := proxy.SessionInfo{ID: "early", User: "stet_md5"}
 	e.gate.Unseen(early)
 	e.gate.Unseen(known)
-	e.gate.TxEnded(known, 1)
+	e.gate.TxEnded(known, 1, false)
 	if got := check(); got != decide.ReadOwnWrite {
 		t.Errorf("an early Unseen call settled: %s, want the later one's mark", got)
 	}
-	e.gate.TxEnded(known, 1)
+	e.gate.TxEnded(known, 1, false)
 	if got := check(); got == decide.ReadOwnWrite {
 		t.Errorf("both settled: %s, want the mark gone", got)
 	}
