@@ -913,3 +913,97 @@ func TestFingerprintIgnoresConstants(t *testing.T) {
 		t.Error("different statements share a fingerprint")
 	}
 }
+
+var readTables2 = Tables{PK: map[string]string{"contacts": "id", "deals": "id"}, Reads: true}
+
+func TestReadOnly(t *testing.T) {
+	cases := []struct {
+		sql  string
+		want bool
+	}{
+		{"select id, title from contacts where id = 7", true},
+		{"select title from contacts where id = 7 for update", true},
+		{"select 1", true},
+		{"values (1), (2)", true},
+		{"select 1 union select 2", true},
+		{"(select 1) union (select 2)", true},
+		{"with c as (select 1) select * from c", true},
+		{"select title into scratch from contacts where id = 7", false},
+		{"select 1 union select 2 into scratch", false},
+		{"(select 1 into scratch) union (select 2)", false},
+		{"with d as (delete from notes returning 1) select 1", false},
+		{"with d as (insert into notes values (1) returning 1) select 1", false},
+		{"with d as (update notes set a = 1 returning 1) select 1", false},
+		{"with d as (merge into notes using t on true when matched then do nothing) select 1", false},
+		{"(with d as (delete from notes returning 1) select 1) union (select 2)", false},
+		{"select 1 union (with d as (delete from notes returning 1) select 1)", false},
+		{"begin; select title from contacts where id = 7", true},
+		{"select 1; create temp table x (a int)", false},
+		{"explain select * from contacts", false},
+		{"copy contacts to stdout", false},
+		{"commit", false},
+		{"call p()", false},
+		{"fetch 1 from c", false},
+		{"set search_path = crm", true},
+		{"show timezone", true},
+		{"", true},
+		{"update contacts set title = 'x' where id = 7", false},
+		{"insert into deals (id) values (1)", false},
+	}
+	for _, c := range cases {
+		r, err := Classify(c.sql, readTables2)
+		if err != nil {
+			t.Errorf("%q: %v", c.sql, err)
+			continue
+		}
+		if r.ReadOnly != c.want {
+			t.Errorf("%q: ReadOnly = %v, want %v", c.sql, r.ReadOnly, c.want)
+		}
+	}
+}
+
+func TestReadKey(t *testing.T) {
+	lit7, p1, p2 := &Value{Kind: Literal, Text: "7"}, &Value{Kind: Param, Param: 1}, &Value{Kind: Param, Param: 2}
+	cases := []struct {
+		sql  string
+		want *Value
+	}{
+		{"select id, title from contacts where id = 7", lit7},
+		{"select title from contacts c where c.id = $1 and status = 'open'", p1},
+		{"select title from contacts where id in ($2)", p2},
+		{"select title from contacts where id = 7 or id = 8", nil},
+		{"select c.title from contacts c join deals d on d.contact_id = c.id where c.id = 7", nil},
+		{"select title from contacts where id = 7 union select title from contacts where id = 8", nil},
+		{"with contacts as (select 1 as id) select * from contacts where id = 1", nil},
+		{"select title from (select * from contacts) s where id = 7", nil},
+		{"select title from contacts where id = 7 for update", lit7},
+		{"select title into scratch from contacts where id = 7", nil},
+		{"with d as (delete from notes returning 1) select title from contacts where id = 7", nil},
+		{"begin; select title from contacts where id = 7", nil},
+		{"select title from contacts where id = 7; create temp table x (a int)", nil},
+		{"explain select * from contacts", nil},
+		{"copy contacts to stdout", nil},
+		{"commit", nil},
+		{"call p()", nil},
+		{"fetch 1 from c", nil},
+		{"set search_path = crm", nil},
+		{"show timezone", nil},
+		{"", nil},
+		{"update contacts set title = 'x' where id = 7", nil},
+		{"select title from contacts where id = 7 and id in (select id from deals)", nil},
+		{"select title from contacts where id in (select id from deals) and id = 7", nil},
+		{"select title from contacts where id = (select max(id) from deals)", nil},
+		{"with contacts as (select * from contacts) select title from contacts where id = 7", nil},
+		{"select title from contacts where id = 7 and exists (select 1 from deals)", nil},
+	}
+	for _, c := range cases {
+		r, err := Classify(c.sql, readTables2)
+		if err != nil {
+			t.Errorf("%q: %v", c.sql, err)
+			continue
+		}
+		if !reflect.DeepEqual(r.ReadKey, c.want) {
+			t.Errorf("%q: ReadKey = %+v, want %+v", c.sql, r.ReadKey, c.want)
+		}
+	}
+}

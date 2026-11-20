@@ -131,6 +131,19 @@ type Result struct {
 	// Reads are looked for only when Tables.Reads is set.
 	Reads []string
 
+	// ReadOnly: every statement is a SELECT (VALUES and set operations
+	// included) with no INTO and no data-modifying WITH query, or leaves the
+	// transaction clean (see Clean). True for SQL with no statement. A read
+	// sent after read-only messages alone sees no row version Stet's own
+	// connection cannot.
+	ReadOnly bool
+
+	// ReadKey is the value of `key = value` in the WHERE clause, as pkEquality
+	// reads it, when the SQL is one SELECT with no set operation whose FROM is
+	// exactly one plain reference to a gated table and Reads is that table
+	// alone; nil otherwise. Set only when Kind is Read.
+	ReadKey *Value
+
 	// Cursors lists what the statements do to SQL cursors, in statement
 	// order: each DECLARE CURSOR, FETCH, CLOSE, and DISCARD ALL (as CLOSE
 	// ALL). A DECLARE alone is Read or Pass by what its query reads; the
@@ -193,6 +206,7 @@ func Classify(sql string, tables Tables) (Result, error) {
 		executes []string
 		portals  []string
 		clean    = true
+		readOnly = true
 		sets     bool
 		do       bool
 		defines  bool
@@ -218,6 +232,7 @@ func Classify(sql string, tables Tables) (Result, error) {
 		}
 		executes = appendExecutes(executes, raw.Stmt)
 		clean = clean && leavesClean(raw.Stmt)
+		readOnly = readOnly && (leavesClean(raw.Stmt) || readOnlySelect(raw.Stmt.GetSelectStmt()))
 		sets = sets || raw.Stmt.GetVariableSetStmt() != nil
 		do = do || raw.Stmt.GetDoStmt() != nil
 		defines = defines || definesCode(raw.Stmt, m)
@@ -253,7 +268,60 @@ func Classify(sql string, tables Tables) (Result, error) {
 	r.OnBehalfOf, r.Cursors, r.Statements = obo, cursors, len(tree.Stmts)
 	r.Clean, r.Sets, r.Do, r.Executes, r.Portals = clean, sets, do, executes, portals
 	r.DefinesCode, r.CopyIn = defines, copyIn
+	r.ReadOnly = readOnly
+	if r.Kind == Read && readOnly {
+		r.ReadKey = readKey(tree.Stmts, m, r.Reads)
+	}
 	return r, nil
+}
+
+// readOnlySelect reports whether s, a top-level statement, is a SELECT that
+// changes nothing: no INTO, and no WITH query that is not itself such a
+// SELECT. The arms of a set operation and the queries of a WITH are checked
+// the same way, since the parse tree lets each carry its own INTO and WITH.
+// A nil s (not a SELECT) is not read-only. Functions a SELECT calls are not
+// looked into, as with every write Classify sees.
+func readOnlySelect(s *pg.SelectStmt) bool {
+	if s == nil || s.IntoClause != nil {
+		return false
+	}
+	for _, c := range s.GetWithClause().GetCtes() {
+		if !readOnlySelect(c.GetCommonTableExpr().GetCtequery().GetSelectStmt()) {
+			return false
+		}
+	}
+	return (s.Larg == nil || readOnlySelect(s.Larg)) && (s.Rarg == nil || readOnlySelect(s.Rarg))
+}
+
+// readKey returns the value of the primary key equality in the WHERE clause
+// of the only statement of stmts, when that is a plain SELECT from exactly one
+// reference to the gated table that reads is made of; nil otherwise.
+func readKey(stmts []*pg.RawStmt, m matchFunc, reads []string) *Value {
+	if len(stmts) != 1 || len(reads) != 1 {
+		return nil
+	}
+	s := stmts[0].Stmt.GetSelectStmt()
+	if s == nil || s.Op != pg.SetOperation_SETOP_NONE || len(s.FromClause) != 1 {
+		return nil
+	}
+	rv := s.FromClause[0].GetRangeVar()
+	t, ok := m(rv)
+	if !ok || t.key != reads[0] {
+		return nil
+	}
+	// A WITH query of the same name shadows the table: the FROM is not it.
+	if rv.Schemaname == "" && rv.Catalogname == "" {
+		for _, c := range s.GetWithClause().GetCtes() {
+			if c.GetCommonTableExpr().GetCtename() == rv.Relname {
+				return nil
+			}
+		}
+	}
+	v, ok := pkEquality(s.WhereClause, rv, t.pk)
+	if !ok {
+		return nil
+	}
+	return &v
 }
 
 // definesCode reports whether n, a top-level statement, defines code or an
