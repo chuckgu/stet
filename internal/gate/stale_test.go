@@ -743,6 +743,93 @@ func TestUntrackedTables(t *testing.T) {
 	}
 }
 
+// A key column whose collation is not deterministic lets one row answer to
+// several spellings of its key, while the memory knows a key by its bytes:
+// such a table is not tracked, whether the collation is the column's own or
+// its domain's, and also when a unique index on it is declared with another
+// collation. Its reads are counted only, and its writes not checked. A text
+// key of the default collation or of "C" is tracked.
+func TestNondeterministicKeyIsNotTracked(t *testing.T) {
+	e := newStaleEnv(t)
+	ctx := context.Background()
+	var icu int
+	if err := e.admin.QueryRow(ctx, "select count(*) from pg_collation where collprovider = 'i'").Scan(&icu); err != nil {
+		t.Fatal(err)
+	}
+	if icu == 0 {
+		t.Skip("the test server's PostgreSQL was built without ICU: it has no nondeterministic collation to test with")
+	}
+	schema := e.schema(t, "coll")
+	ci := schema + ".ci"
+	mustExec(t, e.admin, "create collation "+ci+" (provider = icu, locale = 'und-u-ks-level2', deterministic = false)")
+	mustExec(t, e.admin, "create domain "+schema+".ci_text as text collate "+ci)
+	folded := e.create(t, "folded", "(k text collate "+ci+" primary key, title text)")
+	viaDomain := e.create(t, "via_domain", "(k "+schema+".ci_text primary key, title text)")
+	cIndex := e.create(t, "c_index", "(k text collate "+ci+", title text)")
+	mustExec(t, e.admin, "create unique index on "+cIndex+` (k collate "C")`)
+	plain := e.create(t, "plain", "(k text primary key, title text)")
+	cKey := e.create(t, "c_key", `(k text collate "C" primary key, title text)`)
+	e.insert(t, folded, "k", "Abc")
+	e.insert(t, plain, "k", "Abc")
+	untracked, tracked := []string{folded, viaDomain, cIndex}, []string{plain, cKey}
+	var blocks []string
+	for _, table := range append(slices.Clone(untracked), tracked...) {
+		blocks = append(blocks, tableBlock(table, "k", "stale: {}"))
+	}
+	e.start(t, blocks...)
+	t.Cleanup(func() {
+		e.admin.Exec(context.Background(), "delete from stet.reads where target_table = any($1)", untracked)
+	})
+
+	for _, table := range untracked {
+		if w := e.warnings(t, table); len(w) != 1 || !strings.Contains(fmt.Sprint(w[0]["reason"]), "collation") {
+			t.Errorf("%s: warnings %v, want one that names the collation", table, w)
+		}
+		if _, _, ok := e.gate.Tracked(e.oid(t, table)); ok {
+			t.Errorf("%s is tracked", table)
+		}
+	}
+	for _, table := range tracked {
+		if w := e.warnings(t, table); len(w) != 0 {
+			t.Errorf("%s: warnings %v, want none", table, w)
+		}
+		if _, _, ok := e.gate.Tracked(e.oid(t, table)); !ok {
+			t.Errorf("%s is not tracked", table)
+		}
+	}
+
+	// A read is counted, and nothing of it is remembered.
+	agent := proxy.SessionInfo{ID: "s", User: "agent"}
+	st := e.gate.Inspect("select k, title from " + folded)
+	e.gate.Observe(agent, st, keyed(e.oid(t, folded), "Abc"))
+	e.wantResult(t, "agent", "", folded, "Abc", "1", decide.ReadNone)
+	e.idle(t)
+	e.gate.FlushReads()
+	if got := e.keyedReads(t, folded); !reflect.DeepEqual(got, map[string]keyCount{"agent": {Statements: 1}}) {
+		t.Errorf("stet.reads of %s = %+v, want one statement of agent with no key", folded, got)
+	}
+
+	// A write to it is not checked; one to a tracked table is.
+	for _, table := range []string{folded, plain} {
+		h, refuse := e.gate.Begin(agent, e.gate.Inspect("update "+table+" set title = 'x' where k = 'abc'"), nil)
+		if refuse != nil {
+			t.Fatalf("%s: the write was refused: %+v", table, refuse)
+		}
+		e.gate.End(h, proxy.Outcome{Executed: true, Rows: ptr(int64(1))})
+	}
+	e.gate.Close()
+	for table, want := range map[string]string{folded: decide.ReadNotChecked, plain: decide.ReadNone} {
+		var got *string
+		if err := e.admin.QueryRow(ctx, "select read_check->>'result' from stet.decisions where target_table = $1",
+			table).Scan(&got); err != nil {
+			t.Fatalf("%s: %v", table, err)
+		}
+		if got == nil || *got != want {
+			t.Errorf("%s: read_check result %v, want %s", table, deref(got), want)
+		}
+	}
+}
+
 // The catalog is read again every staleCatalogEvery: a table dropped and
 // made again is tracked by its new OID, one made after the start is tracked
 // once it is there, and one whose key type leaves the list is not tracked any

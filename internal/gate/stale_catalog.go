@@ -232,12 +232,14 @@ func sameTables(entries map[string]catalogEntry) {
 // column $2, the table's OID and kind as Stet's search_path resolves it (as
 // the gate's own SQL does), whether Stet's account may read it, the column's
 // number, its base type (through domains, however nested) by OID and as
-// tracked.typeName, and whether a unique index is on the column alone, not
-// partial and not on an expression.
+// tracked.typeName, whether the column's own collation is not deterministic
+// (a type with no collation, such as an integer, has collation 0, and a
+// column of a domain that sets one carries the domain's), and whether a
+// unique index is on the column alone, not partial and not on an expression.
 const catalogQuery = `
 with recursive
   rel as (select c.oid, c.relkind from pg_class c where c.oid = to_regclass($1)),
-  col as (select a.attnum, a.atttypid
+  col as (select a.attnum, a.atttypid, a.attcollation
             from pg_attribute a join rel on a.attrelid = rel.oid
            where a.attname = $2 and a.attnum > 0 and not a.attisdropped),
   base as (select t.oid, t.typtype, t.typbasetype from pg_type t join col on t.oid = col.atttypid
@@ -249,6 +251,9 @@ select rel.oid, rel.relkind::text, coalesce(has_table_privilege(rel.oid, 'SELECT
        (select format('%I.%I', n.nspname, t.typname)
           from pg_type t join pg_namespace n on n.oid = t.typnamespace where t.oid = b.oid),
        b.oid, format_type(b.oid, null),
+       coalesce((select not co.collisdeterministic from pg_collation co where co.oid = col.attcollation), false),
+       (select format('%I.%I', n.nspname, co.collname)
+          from pg_collation co join pg_namespace n on n.oid = co.collnamespace where co.oid = col.attcollation),
        exists (select from pg_index x
                 where x.indrelid = rel.oid and x.indisunique and x.indisvalid
                   and x.indnkeyatts = 1 and x.indkey[0] = col.attnum
@@ -266,11 +271,13 @@ func readTable(ctx context.Context, conn *pgxpool.Conn, table, pk string) (catal
 		oid, base         *uint32
 		relkind, typeName *string
 		baseName          *string
+		collation         *string
 		attnum            *int16
 		readable, unique  bool
+		nondeterministic  bool
 	)
 	err := conn.QueryRow(ctx, catalogQuery, ident(table), pk).Scan(&oid, &relkind, &readable, &attnum, &typeName,
-		&base, &baseName, &unique)
+		&base, &baseName, &nondeterministic, &collation, &unique)
 	if err != nil {
 		return catalogEntry{}, err
 	}
@@ -292,6 +299,13 @@ func readTable(ctx context.Context, conn *pgxpool.Conn, table, pk string) (catal
 	case typ == 0:
 		return catalogEntry{reason: fmt.Sprintf("its key column %s is of type %s; only keys of type int2, int4, "+
 			"int8, uuid, text, varchar, bpchar or name, or a domain over one, are tracked", col, deref(baseName))}, nil
+	case nondeterministic:
+		// One row then answers to several spellings of its key, while the
+		// memory and the marks know a key by its bytes: a role's own write
+		// under one spelling would not cover the row read under another.
+		return catalogEntry{reason: fmt.Sprintf("its key column %s has collation %s, which is not deterministic: "+
+			"one row answers to several spellings of its key, which stale-write detection, knowing a key by its "+
+			"bytes, would take for several rows", col, deref(collation))}, nil
 	case !unique:
 		return catalogEntry{reason: fmt.Sprintf("column %s of %s is not a key: no unique index is on it alone", col, name)}, nil
 	}
