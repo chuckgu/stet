@@ -60,7 +60,8 @@ type Gate struct {
 	log     *slog.Logger
 	recent  *recentLog
 	usage   *usage
-	reads   *readStats    // nil when no table records reads
+	reads   *readStats    // nil when no table records or remembers reads
+	stale   *stale        // nil when no table has stale
 	sem     chan struct{} // shadow mode's model calls, made after the write
 	// inflight holds a slot for each write being judged (limits.max_inflight):
 	// while its Begin reads state or measures, and in enforce mode until its
@@ -108,6 +109,7 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, d decide.Decid
 	g.rowVersion = g.readRowVersion
 	g.usage = newUsage(st.UsageBySecond, &g.wg)
 	readsOn := map[string]int{}
+	remember := map[string]time.Duration{} // the tables with stale
 	for key, t := range cfg.Tables {
 		g.tables[key] = t.PK
 		if t.CandidateSQL != "" {
@@ -116,33 +118,50 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *store.Store, d decide.Decid
 		if t.ContextSQL != "" {
 			g.ctxs[key] = compile(t.ContextSQL)
 		}
-		if t.Reads != nil {
+		switch {
+		case t.Reads != nil:
 			readsOn[key] = t.Reads.LogAbove
+		case t.Stale != nil:
+			// Counted in stet.reads, keyed or not, and never logged by
+			// itself (spec-v0.2-stale 8).
+			readsOn[key] = 0
+		}
+		if t.Stale != nil {
+			remember[key] = t.Stale.Remember
 		}
 	}
 	if g.reads = newReadStats(readsOn, st.AddReads); g.reads != nil {
 		go g.record(readFlushEvery)
 	}
-	// With no table recording reads, statements are not examined for them:
-	// that walk would cost every statement and record nothing.
+	if len(remember) > 0 {
+		g.stale = newStale(g, remember)
+	}
+	// With no table recording or remembering reads, statements are not
+	// examined for them: that walk would cost every statement and record
+	// nothing.
 	g.gated = sqlparse.Tables{PK: g.tables, Reads: g.reads != nil}
 	return g, nil
 }
 
-// Close writes the reads still held in memory and waits for decisions still
-// being judged and for loads of cumulative usage still running; no load
-// starts after it. Close the proxy first, and wait for it, so that no session
-// is still reporting: a read reported after Close is only counted in a log
-// line.
+// Close writes the reads still held in memory, stops the lookups of the
+// versions of rows read, and waits for decisions still being judged and for
+// loads of cumulative usage still running; no load starts after it. Close the
+// proxy first, and wait for it, so that no session is still reporting: a read
+// reported after Close is only counted in a log line, and nothing of it is
+// remembered.
 func (g *Gate) Close() {
 	g.closeReads()
+	g.stale.close()
 	g.usage.close()
 	g.wg.Wait()
 }
 
 // Inspect marks gated writes to be watched, and reads of tables that record
-// reads to be observed. A cursor statement always carries its cursor, so the
-// proxy can follow the names a DECLARE it observes binds.
+// or remember reads to be observed. A read of a table with stale that sends
+// only what Stet's own connection can see, and is no cursor statement, is
+// marked to have the keys of its rows taken (Track), and the bind value it
+// selects one row by kept (KeyParam). A cursor statement always carries its
+// cursor, so the proxy can follow the names a DECLARE it observes binds.
 //
 // SQL the classifier cannot read, SQL holding a DO block, whose writes cannot
 // be seen, and SQL that defines a function, procedure, rule or trigger, or a
@@ -168,7 +187,17 @@ func (g *Gate) Inspect(sql string) proxy.Statement {
 	}
 	if r.Kind == sqlparse.Read {
 		st.Observe = g.recordsAny(r.Reads)
+		// The proxy asks Tracked of each table the result has a column of,
+		// so a table the catalog does not track now gives no key.
+		if st.Observe && r.ReadOnly && len(r.Cursors) == 0 && g.stale.remembersAny(r.Reads) {
+			st.Track = true
+			// ReadKey is set only for a read of one table: this one.
+			if k := r.ReadKey; k != nil && k.Kind == sqlparse.Param {
+				st.KeyParam = k.Param
+			}
+		}
 	}
+	st.ReadOnly = r.ReadOnly
 	for _, c := range r.Cursors {
 		if op, ok := cursorOps[c.Op]; ok {
 			st.Cursors = append(st.Cursors, proxy.Cursor{Op: op, Name: c.Name, Hold: c.Hold})
@@ -246,9 +275,13 @@ func (g *Gate) Unseen(proxy.SessionInfo) {}
 // marked, and TxEnded does nothing.
 func (g *Gate) TxEnded(proxy.SessionInfo, int) {}
 
-// Tracked reports no table: until stale-write detection reads its tables'
-// key columns, the gate remembers no read by key.
-func (g *Gate) Tracked(uint32) (attr uint16, typ proxy.KeyType, ok bool) { return 0, 0, false }
+// Tracked reports, for the table with OID table, the attribute number and
+// type of the key column the gate remembers its reads by, as the catalog said
+// when it was last read (every staleCatalogEvery). It takes no lock.
+func (g *Gate) Tracked(table uint32) (attr uint16, typ proxy.KeyType, ok bool) {
+	t, ok := g.stale.byOID(table)
+	return t.attr, t.typ, ok
+}
 
 var cursorOps = map[sqlparse.CursorOp]proxy.CursorOp{
 	sqlparse.CursorDeclare:  proxy.CursorDeclare,

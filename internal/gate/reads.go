@@ -3,6 +3,7 @@ package gate
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,7 +34,10 @@ var readFlushEvery = time.Minute
 // buckets under mu and queues large reads without waiting. One goroutine
 // (record) does all the writing.
 type readStats struct {
-	logAbove map[string]int // tables whose reads are recorded → log_above; 0 aggregates only
+	// logAbove holds the tables whose reads are counted: those that record
+	// reads, → log_above, 0 aggregating only; and those that only remember
+	// reads (stale), → 0 (spec-v0.2-stale 8).
+	logAbove map[string]int
 
 	mu      sync.Mutex
 	buckets map[readKey]*readCount
@@ -62,6 +66,7 @@ type readKey struct {
 
 type readCount struct {
 	statements, rows, maxRows int64
+	keyed, keys               int64     // reads that gave the memory a key of the table, and the keys they gave
 	failing                   time.Time // when a write of it first failed; zero until then
 }
 
@@ -75,7 +80,7 @@ type readEvent struct {
 	err     string
 }
 
-// newReadStats returns nil when no table records reads.
+// newReadStats returns nil when no table records or remembers reads.
 func newReadStats(tables map[string]int, write func(context.Context, []store.ReadBucket) error) *readStats {
 	if len(tables) == 0 {
 		return nil
@@ -93,7 +98,7 @@ func newReadStats(tables map[string]int, write func(context.Context, []store.Rea
 }
 
 // recordsAny reports whether reads of any of the gated tables in keys are
-// recorded.
+// counted: the table records or remembers reads.
 func (g *Gate) recordsAny(keys []string) bool {
 	if g.reads == nil {
 		return false
@@ -107,10 +112,14 @@ func (g *Gate) recordsAny(keys []string) bool {
 }
 
 // Observe counts a read in the bucket of the minute it arrived, for each table
-// it read that records reads: one statement and the rows sent. A read that
-// sent more than the smallest of those tables' log_above is also logged,
-// once, naming every gated table it read. The proxy calls it before forwarding the read's
-// ReadyForQuery, so it does no I/O and never waits for the store.
+// it read that records or remembers reads: one statement, the rows sent, and,
+// when it gave the memory a key of the table, one keyed read and the keys. A
+// read that sent more than the smallest of those tables' log_above is also
+// logged, once, naming every gated table it read. Then the keys go to the
+// memory, which notes the read as pending and queues the lookup of the rows'
+// versions (spec-v0.2-stale 5). The proxy calls it before forwarding the
+// read's ReadyForQuery, so it does no I/O and never waits for the store or a
+// lookup.
 //
 // A read taken in parts (the FETCHes of one cursor, the Executes of one
 // row-limited portal) is one read for max_rows and log_above: o.Before is
@@ -122,6 +131,15 @@ func (g *Gate) Observe(s proxy.SessionInfo, st proxy.Statement, o proxy.Outcome)
 	if !ok || a == nil || len(r.Reads) == 0 {
 		return
 	}
+	keys := g.stale.reads(s, r, o)
+	g.countRead(s, st, r, o, keys)
+	g.stale.remember(s, keys)
+}
+
+// countRead is Observe's counting and logging of the read r, which gives the
+// memory keys.
+func (g *Gate) countRead(s proxy.SessionInfo, st proxy.Statement, r sqlparse.Result, o proxy.Outcome, keys []staleRead) {
+	a := g.reads
 	at := o.Arrived
 	if at.IsZero() { // the proxy always sets it
 		at = time.Now()
@@ -153,6 +171,10 @@ func (g *Gate) Observe(s proxy.SessionInfo, st proxy.Statement, o proxy.Outcome)
 		c.statements++
 		c.rows += o.Sent
 		c.maxRows = max(c.maxRows, total)
+		if i := slices.IndexFunc(keys, func(k staleRead) bool { return k.table == t }); i >= 0 {
+			c.keyed++
+			c.keys += keys[i].count()
+		}
 		if logAbove > 0 && (limit == 0 || int64(logAbove) < limit) {
 			limit = int64(logAbove)
 		}
@@ -257,7 +279,7 @@ func (g *Gate) flushReads(all, last bool) {
 		keys, counts = append(keys, k), append(counts, c)
 		buckets = append(buckets, store.ReadBucket{
 			Bucket: time.Unix(k.minute, 0), LoginRole: k.role, Table: k.table,
-			Statements: c.statements, Rows: c.rows, MaxRows: c.maxRows,
+			Statements: c.statements, Rows: c.rows, MaxRows: c.maxRows, Keyed: c.keyed, Keys: c.keys,
 		})
 	}
 	a.mu.Unlock()
@@ -291,6 +313,8 @@ func (g *Gate) flushReads(all, last bool) {
 			c.statements += newer.statements
 			c.rows += newer.rows
 			c.maxRows = max(c.maxRows, newer.maxRows)
+			c.keyed += newer.keyed
+			c.keys += newer.keys
 		}
 		a.buckets[k] = c
 	}

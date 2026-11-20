@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/stetdb/stet/internal/decide"
+	"github.com/stetdb/stet/internal/proxy"
 	"github.com/stetdb/stet/internal/store"
 )
 
@@ -21,6 +23,63 @@ func SetCountTimeout(d time.Duration) (restore func()) {
 // SetLogger replaces the gate's logger. Call it before any write reaches g.
 func SetLogger(g *Gate, l *slog.Logger) {
 	g.log = l
+	if g.stale != nil {
+		g.stale.log = l
+	}
+}
+
+// CheckRead is what g's memory of reads answers now for a write by role on
+// behalf of task (stet.on_behalf_of; "" for none) to the row key of table,
+// whose version now is version ("" when it is not there).
+func CheckRead(g *Gate, role, task, table, key, version string) decide.ReadCheck {
+	m := g.stale.mem
+	return m.check(party{role, task}, table, key, version, m.now())
+}
+
+// OnLookup makes g call hook before each lookup of row versions, with the
+// lookup's context, table and keys; when hook returns an error, the lookup
+// fails with it. Call it before the reads it is for reach g.
+func OnLookup(g *Gate, hook func(ctx context.Context, table string, keys []string) error) {
+	look := g.stale.lookup
+	g.stale.lookup = func(ctx context.Context, table string, keys []string) (map[string]string, error) {
+		if err := hook(ctx, table, keys); err != nil {
+			return nil, err
+		}
+		return look(ctx, table, keys)
+	}
+}
+
+// LookupVersions runs g's lookup of the versions of table's rows keys once,
+// under the lookups' time limit.
+func LookupVersions(g *Gate, table string, keys []string) (map[string]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), staleLookupTimeout)
+	defer cancel()
+	return g.stale.lookupVersions(ctx, table, keys)
+}
+
+// StaleTable is what g's catalog says of the config key table.
+func StaleTable(g *Gate, table string) (oid uint32, attr uint16, typ proxy.KeyType, typeName string, ok bool) {
+	t, ok := g.stale.table(table)
+	return t.oid, t.attr, t.typ, t.typeName, ok
+}
+
+// Refresh queues a refresh of the row key of table and waits for its answer.
+func Refresh(g *Gate, table, key string) (serverKey, version string, ok bool) {
+	done := make(chan struct{})
+	g.stale.refresh(table, key, func(k, v string, found bool) {
+		serverKey, version, ok = k, v, found
+		close(done)
+	})
+	<-done
+	return serverKey, version, ok
+}
+
+// SetStaleCatalogEvery changes how often gates created until restore is
+// called read the catalog again. Tests that use it must not run in parallel.
+func SetStaleCatalogEvery(d time.Duration) (restore func()) {
+	old := staleCatalogEvery
+	staleCatalogEvery = d
+	return func() { staleCatalogEvery = old }
 }
 
 // FlushReads writes every read bucket held in memory now, and the large
