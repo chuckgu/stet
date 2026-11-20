@@ -250,7 +250,7 @@ HINT:   update contacts.id=4812 instead of inserting a new row
 |---|---|
 | `ST001` | hold 또는 escalate (검토 대기) |
 | `ST002` | v0.1 미지원 형태 (트랜잭션 내 쓰기 등) |
-| `ST003` | 정책에 따른 reject |
+| `ST003` | 정책에 따른 reject. 처음으로 이 코드를 내는 것은 낡은 쓰기 탐지의 `stale_read`다([spec-v0.2-stale](spec-v0.2-stale.md) 6장) |
 | `ST004` | `stet.decisions` append-only 위반 (DB 트리거가 냄) |
 
 **보류 건 처리**: `stet.approve(held_write_id)` / `stet.reject(...)` 함수로 처리한다. 승인 시 원래 문장을 버전 확인과 함께 실행한다. 검토 UI는 매니지드 영역이다.

@@ -100,7 +100,7 @@ v0.1은 명시적 트랜잭션 안의 쓰기를 모두 판단하지 않았다(`i
 | `escalate` | `hold`와 같다 | `ST001` |
 | `unsupported` | 더러운 트랜잭션 안이거나 접속 계정을 모르면 보내지 않는다. 형태의 이유가 먼저 나왔어도 같다. 게이트 대상 테이블에 쓰는 SQL `PREPARE`(`prepare`)도 보내지 않는다(7장). 그 밖에는 테이블 설정 `unsupported`를 따른다(`reject`가 기본값이고, `pass`면 판단 없이 보낸다) | `ST002` |
 
-판정 `reject`는 지금의 규칙에서 나오지 않는다. 판정 함수가 돌려주는 것은 위 넷이다. `ST003`은 내지 않는다. 판정을 행동으로 옮기는 표가 모르는 판정이 오면 `ST002`로 막는다.
+판정 `reject`는 지금의 규칙에서 나오지 않는다. 판정 함수가 돌려주는 것은 위 넷이다. `ST003`은 내지 않는다(낡은 쓰기 탐지부터 `stale_read`의 `reject`에 이 코드를 낸다. [spec-v0.2-stale](spec-v0.2-stale.md) 6장). 판정을 행동으로 옮기는 표가 모르는 판정이 오면 `ST002`로 막는다.
 
 **에러의 문장.** 막는 에러의 문장은 첫 이유로 고른다(6장).
 
@@ -171,7 +171,7 @@ HINT:  narrow the WHERE clause, or ask a human to approve held_write ec210d65-54
 |---|---|---|
 | `ST001` | 검토 대기 | `hold`, `escalate` |
 | `ST002` | 판단할 수 없음 | `unsupported`, 7장의 닫힌 지점, 세션을 끝낼 때(FATAL) |
-| `ST003` | 정책에 따른 거부 | 내지 않는다 |
+| `ST003` | 정책에 따른 거부 | 이 단계에서는 내지 않는다. 낡은 쓰기 탐지의 `reject`(`stale_read`)가 낸다([spec-v0.2-stale](spec-v0.2-stale.md) 6장) |
 
 - 메시지는 영어다. 이유마다 한 문장과 `HINT`를 둔다. 문구의 표는 `internal/decide/act.go`에 있다. `ST002`의 `HINT`는 고칠 방법을 말한다(예: `in_transaction`의 "send this write as the first statement of its transaction, after the answer to the statement before it (ROLLBACK first if a transaction is open)"). `in_transaction`의 문장과 `HINT`는 그 이유로 막히는 세 경우에 모두 맞게 썼다. 이미 무언가를 바꾼 명시적 트랜잭션 안의 쓰기, 앞 문장의 답을 기다리지 않고 이어 보낸 쓰기, 한 Sync 아래 묶음의 두 번째 쓰기다(4장).
 - 판단 기록이 있는 거부는 `write held by stet: `나 `write refused by stet: `로 시작한다. 닫힌 지점은 막은 것의 이름으로 시작하고(`statement refused by stet: `, `message refused by stet: `, `function call refused by stet: `, `DO block refused by stet: `) `DETAIL`이 없다. 세션을 끝낼 때는 `connection closed by stet: `로 시작한다.
