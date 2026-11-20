@@ -6,6 +6,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -156,12 +157,13 @@ func TestPendingRead(t *testing.T) {
 	m.learned(tk, map[string]string{"1": "v2"})
 	wantCheck(t, m, c, a, "deals", "1", "v2", "fresh read=v2 task=a")
 
-	// A dropped lookup leaves the older version to decide.
+	// A dropped lookup does not leave the older version to decide: the read
+	// may have shown a newer one, and the row is forgotten.
 	remembered(m, c, a, "deals", "2", "v1")
 	tk = m.reading(a, "deals", []string{"2"}, c.tick())
 	wantCheck(t, m, c, a, "deals", "2", "v2", decide.ReadPending)
 	m.dropped(tk)
-	wantCheck(t, m, c, a, "deals", "2", "v2", "stale read=v1 task=a")
+	wantCheck(t, m, c, a, "deals", "2", "v2", decide.ReadNone)
 
 	// Another task's pending read is not compared with a's write; a pending
 	// read with no task is.
@@ -171,9 +173,11 @@ func TestPendingRead(t *testing.T) {
 	wantCheck(t, m, c, b, "deals", "3", "v1", decide.ReadPending)
 	tkNone := m.reading(none, "deals", []string{"3"}, c.tick())
 	wantCheck(t, m, c, a, "deals", "3", "v1", decide.ReadPending)
+	// Dropped, they take with them what the role held of the row, in every
+	// task.
 	m.dropped(tkB)
 	m.dropped(tkNone)
-	wantCheck(t, m, c, a, "deals", "3", "v1", "fresh read=v1 task=a")
+	wantCheck(t, m, c, a, "deals", "3", "v1", decide.ReadNone)
 
 	// A read without keys stands for every row of its table, for its party.
 	remembered(m, c, a, "deals", "4", "v1")
@@ -1193,7 +1197,7 @@ func (m *readMemory) forgetLeaving(role string) int {
 	if rr == nil {
 		return 0
 	}
-	m.clear(rr, "", "", m.now())
+	m.clear(rr, "", "", m.now(), nil)
 	return rr.all.len() - rr.live
 }
 
@@ -1473,4 +1477,355 @@ func TestClearedQueueHoldsOnePlacePerRole(t *testing.T) {
 	if err := m.consistent(); err != nil {
 		t.Error(err)
 	}
+}
+
+// The tests below pin what a read Stet saw but could not take in does to the
+// memory: the role may have seen a newer version of its rows than any entry
+// holds, so what the role held from before that read is forgotten, and the
+// answer is no_read, never an older entry's stale.
+
+// A read whose versions were never learned forgets what its role held of its
+// rows up to when it ended, in every task, and keeps what a later read left.
+func TestDroppedReadForgetsItsRows(t *testing.T) {
+	m, c := testMemory(1000)
+	a, b, none := party{"agent", "a"}, party{"agent", "b"}, party{"agent", ""}
+	other := party{"other", "a"}
+
+	remembered(m, c, a, "deals", "1", "v1")
+	remembered(m, c, b, "deals", "1", "v1")
+	remembered(m, c, none, "deals", "2", "v1")
+	remembered(m, c, a, "deals", "3", "v1")
+	remembered(m, c, a, "notes", "1", "v1")
+	remembered(m, c, other, "deals", "1", "v1")
+
+	// Another party changes rows 1 and 2; the role reads them again, and the
+	// lookup of that read is dropped.
+	tk := m.reading(a, "deals", []string{"1", "2"}, c.tick())
+	wantCheck(t, m, c, a, "deals", "1", "v2", decide.ReadPending)
+	later := remembered(m, c, b, "deals", "2", "v2") // a read that ended after it
+	m.dropped(tk)
+	for _, p := range []party{a, b, none} {
+		wantCheck(t, m, c, p, "deals", "1", "v2", decide.ReadNone)
+	}
+	wantCheck(t, m, c, a, "deals", "2", "v2", decide.ReadNone)
+	wantCheck(t, m, c, b, "deals", "2", "v2", "fresh read=v2 task=b")
+	if rc := m.check(none, "deals", "2", "v2", later.Add(time.Minute)); summary(rc) != "fresh read=v2 task=b" {
+		t.Errorf("a write of no task after the drop: %s, want the later read's fresh", summary(rc))
+	}
+	// Rows the read did not show, other tables and other roles keep theirs.
+	wantCheck(t, m, c, a, "deals", "3", "v1", "fresh read=v1 task=a")
+	wantCheck(t, m, c, a, "notes", "1", "v1", "fresh read=v1 task=a")
+	wantCheck(t, m, c, other, "deals", "1", "v2", "stale read=v1 task=a")
+
+	// A drop ends the ticket once; a second call changes nothing.
+	remembered(m, c, a, "deals", "1", "v2")
+	m.dropped(tk)
+	wantCheck(t, m, c, a, "deals", "1", "v2", "fresh read=v2 task=a")
+}
+
+// A dropped read of some row of a table (a key from a WHERE clause) forgets
+// what its role held of the table, and of no other table or role.
+func TestDroppedKeylessReadForgetsItsTable(t *testing.T) {
+	m, c := testMemory(1000)
+	a, b := party{"agent", "a"}, party{"agent", "b"}
+	other := party{"other", ""}
+	remembered(m, c, a, "deals", "1", "v1")
+	remembered(m, c, b, "deals", "2", "v1")
+	remembered(m, c, a, "notes", "1", "v1")
+	remembered(m, c, other, "deals", "1", "v1")
+
+	tk := m.reading(a, "deals", nil, c.tick())
+	late := m.reading(b, "deals", []string{"3"}, c.tick())
+	m.dropped(tk)
+	wantCheck(t, m, c, a, "deals", "1", "v2", decide.ReadNone)
+	wantCheck(t, m, c, b, "deals", "2", "v2", decide.ReadNone)
+	wantCheck(t, m, c, a, "notes", "1", "v1", "fresh read=v1 task=a")
+	wantCheck(t, m, c, other, "deals", "1", "v1", "fresh read=v1")
+	// A read that ended after the dropped one keeps what it learns.
+	m.learned(late, map[string]string{"3": "v1"})
+	wantCheck(t, m, c, b, "deals", "3", "v1", "fresh read=v1 task=b")
+	m.forget("agent", "", "")
+	m.forget("other", "", "")
+	wantNoRecords(t, m)
+}
+
+// The lookup of an older read that answers after a later read was dropped
+// does not bring the old version back: of a row both read, and, for an older
+// read of some row of the table, of any row.
+func TestLateLookupAfterADropDoesNotRevive(t *testing.T) {
+	m, c := testMemory(1000)
+	a, b := party{"agent", "a"}, party{"agent", "b"}
+
+	// An older read of rows 1 and 2, its lookup still out; a later read of
+	// row 1 is dropped.
+	older := m.reading(a, "deals", []string{"1", "2"}, c.tick())
+	tk := m.reading(b, "deals", []string{"1"}, c.tick())
+	m.dropped(tk)
+	m.learned(older, map[string]string{"1": "v1", "2": "v1"})
+	wantCheck(t, m, c, a, "deals", "1", "v2", decide.ReadNone)
+	wantCheck(t, m, c, a, "deals", "2", "v1", "fresh read=v1 task=a")
+
+	// A read that ended at the very time of the dropped one counts as before it.
+	at := c.tick()
+	same := m.reading(a, "deals", []string{"3"}, at)
+	m.dropped(m.reading(b, "deals", []string{"3"}, at))
+	m.learned(same, map[string]string{"3": "v1"})
+	wantCheck(t, m, c, a, "deals", "3", "v2", decide.ReadNone)
+
+	// A read that ended after the dropped one is kept, learned before the
+	// drop or after it.
+	tk = m.reading(b, "deals", []string{"4", "5"}, c.tick())
+	before := m.reading(a, "deals", []string{"4"}, c.tick())
+	after := m.reading(a, "deals", []string{"5"}, c.tick())
+	m.learned(before, map[string]string{"4": "v2"})
+	m.dropped(tk)
+	m.learned(after, map[string]string{"5": "v2"})
+	wantCheck(t, m, c, a, "deals", "4", "v2", "fresh read=v2 task=a")
+	wantCheck(t, m, c, a, "deals", "5", "v2", "fresh read=v2 task=a")
+
+	// An older read of some row of the table (a WHERE key): which row the
+	// dropped read showed is not held against it, so what it learns is not
+	// kept, and what the role held of that row up to it is forgotten too.
+	remembered(m, c, b, "deals", "6", "v1")
+	remembered(m, c, b, "deals", "7", "v1")
+	keyless := m.reading(a, "deals", nil, c.tick())
+	m.dropped(m.reading(b, "deals", []string{"6"}, c.tick()))
+	m.learned(keyless, map[string]string{"7": "v1"})
+	wantCheck(t, m, c, a, "deals", "7", "v2", decide.ReadNone)
+	wantCheck(t, m, c, b, "deals", "7", "v2", decide.ReadNone)
+	wantCheck(t, m, c, b, "deals", "6", "v2", decide.ReadNone)
+
+	// An entry an own write refreshed over a span that holds the dropped
+	// read's end may be older than what that read showed.
+	remembered(m, c, a, "deals", "8", "v1")
+	c.tick()
+	mk := m.writing("agent", "deals", "8") // commits v2; its lookup sees v2; then another party writes v3
+	tk = m.reading(a, "deals", []string{"8"}, c.tick())
+	c.tick()
+	m.refreshed(mk, "v2")
+	m.dropped(tk)
+	wantCheck(t, m, c, a, "deals", "8", "v3", decide.ReadNone)
+
+	m.forget("agent", "", "")
+	wantNoRecords(t, m)
+}
+
+// A dropped read of many rows lets go of the lock every learnBatch rows, and
+// stays pending on all of them until the last is forgotten.
+func TestDroppedLetsGoOfTheLockBetweenBatches(t *testing.T) {
+	m, c := testMemory(1000)
+	p := party{"agent", "a"}
+	keys, versions := someRows("k", 100)
+	m.learned(m.reading(p, "deals", keys, c.tick()), versions)
+	tk := m.reading(p, "deals", keys, c.tick())
+	var gaps []int
+	m.afterBatch = func(_ *ticket, done int) {
+		gaps = append(gaps, done)
+		if n := m.len(); n != 100-done {
+			t.Errorf("after %d rows dropped, len = %d", done, n)
+		}
+		for _, key := range []string{keys[0], keys[len(keys)-1]} {
+			if got := m.check(p, "deals", key, "v1", c.tick()).Result; got != decide.ReadPending {
+				t.Errorf("after %d rows dropped, check of %s = %s, want read_pending", done, key, got)
+			}
+		}
+	}
+	m.dropped(tk)
+	if want := []int{16, 32, 48, 64, 80, 96, 100}; !slices.Equal(gaps, want) {
+		t.Errorf("dropped let go of the lock after %v rows, want %v", gaps, want)
+	}
+	m.afterBatch = nil
+	wantCheck(t, m, c, p, "deals", keys[0], "v1", decide.ReadNone)
+	wantNoRecords(t, m)
+}
+
+// A read that showed rows it gave no key of forgets what its role held of the
+// table from before it, and keeps what its own lookup learns, although it
+// ended at the very time of the forget it caused.
+func TestPartialReadForgetsTheTableAndKeepsItsOwnKeys(t *testing.T) {
+	m, c := testMemory(1000)
+	a, b := party{"agent", "a"}, party{"agent", "b"}
+	other := party{"other", ""}
+	remembered(m, c, a, "deals", "1", "v1")
+	remembered(m, c, b, "deals", "2", "v1")
+	remembered(m, c, a, "notes", "1", "v1")
+	remembered(m, c, other, "deals", "1", "v1")
+	older := m.reading(b, "deals", []string{"3"}, c.tick())
+
+	tk := m.readingPartial(a, "deals", []string{"1", "9"}, c.tick())
+	wantCheck(t, m, c, a, "deals", "1", "v2", decide.ReadPending)
+	wantCheck(t, m, c, b, "deals", "2", "v2", decide.ReadNone)
+	m.learned(older, map[string]string{"3": "v1"})
+	m.learned(tk, map[string]string{"1": "v2", "9": "v1"})
+	wantCheck(t, m, c, a, "deals", "1", "v2", "fresh read=v2 task=a")
+	wantCheck(t, m, c, a, "deals", "9", "v1", "fresh read=v1 task=a")
+	wantCheck(t, m, c, b, "deals", "2", "v2", decide.ReadNone)
+	wantCheck(t, m, c, b, "deals", "3", "v1", decide.ReadNone)
+	wantCheck(t, m, c, a, "notes", "1", "v1", "fresh read=v1 task=a")
+	wantCheck(t, m, c, other, "deals", "1", "v1", "fresh read=v1")
+
+	// A later partial read cuts an earlier one whose lookup is still out,
+	// and keeps its own.
+	first := m.readingPartial(a, "deals", []string{"4"}, c.tick())
+	second := m.readingPartial(b, "deals", []string{"5"}, c.tick())
+	m.learned(first, map[string]string{"4": "v1"})
+	m.learned(second, map[string]string{"5": "v1"})
+	wantCheck(t, m, c, a, "deals", "4", "v1", decide.ReadNone)
+	wantCheck(t, m, c, b, "deals", "5", "v1", "fresh read=v1 task=b")
+
+	// Two that ended at the very same time cannot be ordered: each is cut by
+	// the other's forget, as any read is by a forget at the time it ended.
+	at := c.tick()
+	first = m.readingPartial(a, "deals", []string{"4"}, at)
+	second = m.readingPartial(b, "deals", []string{"5"}, at)
+	m.learned(first, map[string]string{"4": "v1"})
+	m.learned(second, map[string]string{"5": "v1"})
+	wantCheck(t, m, c, a, "deals", "4", "v1", decide.ReadNone)
+	wantCheck(t, m, c, b, "deals", "5", "v1", decide.ReadNone)
+
+	// Of some row of the table (a WHERE key).
+	remembered(m, c, a, "deals", "6", "v1")
+	tk = m.readingPartial(a, "deals", nil, c.tick())
+	wantCheck(t, m, c, a, "deals", "6", "v2", decide.ReadPending)
+	m.learned(tk, map[string]string{"7": "v1"})
+	wantCheck(t, m, c, a, "deals", "6", "v2", decide.ReadNone)
+	wantCheck(t, m, c, a, "deals", "7", "v1", "fresh read=v1 task=a")
+
+	m.forget("agent", "", "")
+	m.forget("other", "", "")
+	wantNoRecords(t, m)
+}
+
+// forgetAll forgets a table for every role, leaves its marks and other tables
+// alone, and keeps out the lookups still out.
+func TestForgetAllForgetsATableForEveryRole(t *testing.T) {
+	m, c := testMemory(1000)
+	x, y := party{"X", "a"}, party{"Y", ""}
+	remembered(m, c, x, "deals", "1", "v1")
+	remembered(m, c, y, "deals", "1", "v1")
+	remembered(m, c, y, "notes", "1", "v1")
+	tk := m.reading(x, "deals", []string{"2"}, c.tick())
+	mk := m.writing("Y", "deals", "3")
+	c.tick()
+	m.forgetAll("deals")
+	m.learned(tk, map[string]string{"2": "v1"})
+	wantCheck(t, m, c, x, "deals", "1", "v1", decide.ReadNone)
+	wantCheck(t, m, c, x, "deals", "2", "v1", decide.ReadNone)
+	wantCheck(t, m, c, y, "deals", "1", "v1", decide.ReadNone)
+	wantCheck(t, m, c, y, "deals", "3", "v1", decide.ReadOwnWrite)
+	wantCheck(t, m, c, y, "notes", "1", "v1", "fresh read=v1")
+	m.released(mk)
+	m.forget("Y", "", "")
+	wantNoRecords(t, m)
+}
+
+// One role holds at most staleRowTasks entries of one row, however many
+// tasks read it: the one read longest ago goes, and is counted.
+func TestRowHoldsAFewTasks(t *testing.T) {
+	m, c := testMemory(200_000)
+	task := func(i int) party { return party{"agent", "task-" + strconv.Itoa(i)} }
+	for i := range 1000 {
+		remembered(m, c, task(i), "deals", "1", "v1")
+	}
+	if n, e := m.len(), m.evicted(); n != staleRowTasks || e != 1000-staleRowTasks {
+		t.Errorf("len, evicted = %d, %d after 1000 tasks read one row; want %d, %d", n, e, staleRowTasks, 1000-staleRowTasks)
+	}
+	wantCheck(t, m, c, task(1000-staleRowTasks-1), "deals", "1", "v1", decide.ReadNone)
+	wantCheck(t, m, c, task(1000-staleRowTasks), "deals", "1", "v1", "fresh read=v1 task=task-"+strconv.Itoa(1000-staleRowTasks))
+	wantCheck(t, m, c, task(999), "deals", "1", "v1", "fresh read=v1 task=task-999")
+	if err := m.consistent(); err != nil {
+		t.Error(err)
+	}
+
+	// The work of the calls that walk the row is bounded by that number, not
+	// by how many tasks read it: counted in entries taken out, not in time.
+	before := m.takenSoFar()
+	remembered(m, c, task(1000), "deals", "1", "v1")
+	if taken := m.takenSoFar() - before; taken != 1 {
+		t.Errorf("one more task took %d entries out, want 1", taken)
+	}
+	before = m.takenSoFar()
+	m.forget("agent", "deals", "1")
+	if taken := m.takenSoFar() - before; taken != staleRowTasks {
+		t.Errorf("forgetting the row took %d entries out, want %d", taken, staleRowTasks)
+	}
+	wantNoRecords(t, m)
+}
+
+// When the entries read longest ago are tied in time, all of them go: with
+// one of two that disagree gone, the other alone would decide.
+func TestRowLimitDropsThroughATie(t *testing.T) {
+	m, c := testMemory(1000)
+	task := func(i int) party { return party{"agent", "task-" + strconv.Itoa(i)} }
+	at := c.tick()
+	m.learned(m.reading(task(0), "deals", []string{"1"}, at), map[string]string{"1": "v1"})
+	m.learned(m.reading(party{"agent", ""}, "deals", []string{"1"}, at), map[string]string{"1": "v2"})
+	for i := 1; i < staleRowTasks-1; i++ {
+		remembered(m, c, task(i), "deals", "1", "v2")
+	}
+	if n := m.len(); n != staleRowTasks {
+		t.Fatalf("len = %d, want %d", n, staleRowTasks)
+	}
+	// An older read's lookup is still out when the row passes its limit.
+	older := m.reading(task(0), "deals", []string{"1"}, at.Add(-time.Nanosecond))
+	remembered(m, c, task(staleRowTasks), "deals", "1", "v2")
+	if n, e := m.len(), m.evicted(); n != staleRowTasks-1 || e != 2 {
+		t.Errorf("len, evicted = %d, %d; want %d, 2: both of the tied entries go", n, e, staleRowTasks-1)
+	}
+	// Neither of the tied entries is left to decide alone, and a read older
+	// than them does not come back.
+	m.learned(older, map[string]string{"1": "v1"})
+	wantCheck(t, m, c, task(0), "deals", "1", "v2", decide.ReadNone)
+	wantCheck(t, m, c, task(1), "deals", "1", "v2", "fresh read=v2 task=task-1")
+}
+
+// The task a party is known by is cut to staleTaskLen bytes, at a character's
+// end, for reads and writes alike.
+func TestPartyOfCutsTheTask(t *testing.T) {
+	long := strings.Repeat("x", staleTaskLen)
+	if p, q := partyOf("agent", long+"-one"), partyOf("agent", long+"-two"); p != q || p.task != long {
+		t.Errorf("two tasks that differ after byte %d are two parties, or not cut there: %d and %d bytes", staleTaskLen, len(p.task), len(q.task))
+	}
+	if p := partyOf("agent", long[:staleTaskLen-1]+"y"); p.task != long[:staleTaskLen-1]+"y" {
+		t.Error("a task of exactly the limit was changed")
+	}
+	if p := partyOf("agent", "a"); p != (party{"agent", "a"}) {
+		t.Errorf("partyOf = %v", p)
+	}
+	// A character that straddles the limit is left out whole.
+	korean := strings.Repeat("x", staleTaskLen-1) + "가나"
+	if p := partyOf("agent", korean); p.task != korean[:staleTaskLen-1] {
+		t.Errorf("a task cut inside a character: %d bytes, want %d", len(p.task), staleTaskLen-1)
+	}
+
+	m, c := testMemory(1000)
+	remembered(m, c, partyOf("agent", long+"-one"), "deals", "1", "v1")
+	wantCheck(t, m, c, partyOf("agent", long+"-two"), "deals", "1", "v1", "fresh read=v1 task="+long)
+}
+
+// The unlock rule compares a task's write with other tasks' reads of the row
+// that ended since a write to it was judged stale. An entry an own write
+// refreshed is not such a read, also when the refresh and the judgment fall
+// on one tick of the clock: its version was seen before the judgment. (Found
+// by the simulation with many tasks: task a's write is judged stale at the
+// very time an own write's refresh stamped a's entry; task c, which read
+// nothing, was then compared with that entry.)
+func TestRefreshAtTheTimeOfAJudgmentDoesNotUnlock(t *testing.T) {
+	m, c := testMemory(1000)
+	a, other := party{"agent", "a"}, party{"agent", "c"}
+	remembered(m, c, a, "deals", "1", "v1")
+	c.tick()
+	mk := m.writing("agent", "deals", "1") // commits v2; then another party writes v3
+	at := c.tick()
+	m.refreshed(mk, "v2")
+	if got := summary(m.check(a, "deals", "1", "v3", at)); got != "stale read=v2 task=a" {
+		t.Fatalf("a's write = %q, want stale read=v2 task=a", got)
+	}
+	if got := summary(m.check(other, "deals", "1", "v3", at)); got != decide.ReadNone {
+		t.Errorf("a write of a task that read nothing = %q, want no_read", got)
+	}
+	// A read of the row that ends after the judgment unlocks as before.
+	remembered(m, c, party{"agent", "b"}, "deals", "1", "v3")
+	wantCheck(t, m, c, other, "deals", "1", "v3", "fresh read=v3 task=b")
+	wantCheck(t, m, c, a, "deals", "1", "v3", "fresh read=v3 task=b")
 }

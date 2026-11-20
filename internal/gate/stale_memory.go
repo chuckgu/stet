@@ -6,6 +6,7 @@ import (
 	"slices"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stetdb/stet/internal/decide"
 )
@@ -18,7 +19,11 @@ import (
 // entry it may share a party with, and called stale only when that entry's
 // version is not the row's now. Every approximation here errs toward not
 // judging: whatever cannot be ordered or is not known yet answers read_pending,
-// own_write or no_read, never stale.
+// own_write or no_read, never stale. So an entry stands only while it is the
+// newest thing the role is known to have seen of its row: a read of the row
+// whose versions were never learned (dropped), or that showed rows it gave no
+// key of (readingPartial, and forget for a read that gave none), forgets what
+// the role held from before it.
 //
 // It has one lock, and the read path takes it before the client's next
 // statement, so no call holds it for work that grows with what is remembered:
@@ -28,9 +33,10 @@ import (
 //
 // What it holds is bounded by what it serves:
 //   - entries, by maxKeys overall and maxKeys/4 per login role, the one read
-//     longest ago going first, and by each table's remember; entries cleared
-//     but not yet taken out count in neither, and with them the entries held
-//     stay within the same limits (sweep);
+//     longest ago going first, by staleRowTasks for one role's tasks on one
+//     row, and by each table's remember; entries cleared but not yet taken
+//     out count in neither, and with them the entries held stay within the
+//     same limits (sweep);
 //   - tickets and marks, by the calls that end them (learned or dropped;
 //     refreshed, forgotten or released);
 //   - the records of roles, tables and rows, which go as soon as they hold no
@@ -66,6 +72,14 @@ const (
 	// clearSweep is how many cleared entries a clear takes out at once; the
 	// rest go one with each entry added after (sweep).
 	clearSweep = 32
+	// staleRowTasks is how many entries, one per task, a login role holds of
+	// one row. The task is a value the agent writes (stet.on_behalf_of), and
+	// every call that touches a row walks its entries under the lock, so the
+	// number is bounded here and not by the role's quarter.
+	staleRowTasks = 16
+	// staleTaskLen is how many bytes of a task's text the memory groups by
+	// (partyOf).
+	staleTaskLen = 256
 )
 
 // newReadMemory makes an empty memory. remember maps each tracked table to how
@@ -84,6 +98,22 @@ func newReadMemory(remember map[string]time.Duration, maxKeys int, now func() ti
 // party is who read: a login role and its task (stet.on_behalf_of; "" for none).
 type party struct{ role, task string }
 
+// partyOf is the party of a session of role whose stet.on_behalf_of is task,
+// for reads and writes alike. The task is cut to its first staleTaskLen bytes,
+// at a character's end, so that a value an agent makes long takes no more
+// memory in every entry than that: two tasks that differ only later are one
+// party, whose reads are compared with each other's writes (misses only).
+func partyOf(role, task string) party {
+	if len(task) > staleTaskLen {
+		n := staleTaskLen
+		for n > staleTaskLen-utf8.UTFMax && !utf8.RuneStart(task[n]) {
+			n--
+		}
+		task = task[:n]
+	}
+	return party{role: role, task: task}
+}
+
 // ticket is a read whose versions are not known yet. It is pending until
 // learned or dropped ends it, and while pending the writes it may be compared
 // with answer read_pending.
@@ -94,6 +124,12 @@ type ticket struct {
 	keyless bool // the read stands for some row of table (a key from a WHERE clause)
 	readAt  time.Time
 	ended   bool // learned or dropped has been called; it stays pending until that call is done
+	// spoiled: a read of rows of table that ended at or after this one was
+	// dropped while this one, a keyless read, was pending. Which rows that
+	// read showed is not held against this one's lookup, so what this one
+	// learns of a row is not kept, and what the role held of that row up to
+	// this read is forgotten (learn).
+	spoiled bool
 }
 
 // writeMark is a write of a login role on its way: to the row key of table, to
@@ -130,6 +166,11 @@ type tableMemory struct {
 type rowMemory struct {
 	marks   []*writeMark
 	pending []*ticket
+	// cutAt is the latest time a dropped read of the row ended, while other
+	// reads of the row were pending: those that ended at or before it keep
+	// nothing of the row (dropped). It goes with the record, which stays as
+	// long as a read of the row is pending.
+	cutAt time.Time
 }
 
 // entrySet is a login role's entries of one table. Forgetting the table or
@@ -141,7 +182,8 @@ type entrySet struct {
 	cleared bool
 }
 
-// rowEntries is a login role's entries of one row, at most one per task.
+// rowEntries is a login role's entries of one row, at most one per task and
+// staleRowTasks in all.
 type rowEntries struct {
 	entries []*entry
 	staleAt time.Time // when a write of the role to the row was first judged stale; zero if never
@@ -166,10 +208,13 @@ type entry struct {
 }
 
 // clearing is a scope whose entries were forgotten or refreshed at a time: the
-// row key of table, table (key ""), or every table (table "").
+// row key of table, table (key ""), or every table (table ""). by is the read
+// whose noting cleared it (readingPartial), which it does not cut; nil for any
+// other.
 type clearing struct {
 	table, key string
 	at         time.Time
+	by         *ticket
 }
 
 func (r *rowMemory) idle() bool { return len(r.marks) == 0 && len(r.pending) == 0 }
@@ -205,11 +250,30 @@ func (re *rowEntries) of(task string) *entry {
 // times of clears rest on it: a clear that comes before this call cuts
 // nothing of this read, because its lookup reads the row after the clear.
 func (m *readMemory) reading(p party, table string, keys []string, readAt time.Time) *ticket {
+	return m.note(p, table, keys, readAt, false)
+}
+
+// readingPartial is reading for a read that also showed its client rows of
+// table it gave no key of (proxy.ReadKeys.Partial): which rows those were is
+// not known, and the client may have seen a newer version of any row than
+// the role's entries hold. So what the role held of table, in every task, is
+// forgotten first, as forget does it at readAt, and reads of the table still
+// pending that ended at or before readAt keep nothing. This read itself is
+// not cut by the forget it caused: what its own lookup learns of keys is kept.
+func (m *readMemory) readingPartial(p party, table string, keys []string, readAt time.Time) *ticket {
+	return m.note(p, table, keys, readAt, true)
+}
+
+// note is reading, and with partial readingPartial.
+func (m *readMemory) note(p party, table string, keys []string, readAt time.Time, partial bool) *ticket {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	t := &ticket{p: p, table: table, keys: slices.Clone(keys), keyless: keys == nil, readAt: readAt}
 	rr := m.roleOf(p.role)
-	rr.pending[t] = struct{}{}
+	rr.pending[t] = struct{}{} // before the clear, which keeps its time only while a read is pending
+	if partial {
+		m.clear(rr, table, "", readAt, t)
+	}
 	tr := rr.tableOf(table)
 	if t.keyless {
 		tr.keyless = append(tr.keyless, t)
@@ -281,7 +345,7 @@ func (m *readMemory) learnKeys(t *ticket, versions map[string]string, found, mis
 		return
 	}
 	now := m.now()
-	whole, rows := rr.clearedSince(t.table, t.readAt)
+	whole, rows := rr.clearedSince(t)
 	keep := !whole && !m.expired(t.table, t.readAt, now)
 	for i := lo; i < hi; i++ {
 		if i < len(found) {
@@ -294,8 +358,21 @@ func (m *readMemory) learnKeys(t *ticket, versions map[string]string, found, mis
 }
 
 // learn keeps what t found of the row key: version v. keep is false when the
-// row was cleared since t's read ended or t is past its table's remember.
+// row was cleared since t's read ended or t is past its table's remember; a
+// read of the row dropped since (rowMemory.cutAt) keeps it out as well.
+//
+// A spoiled t keeps nothing, and what the role held of the row up to t's read
+// is forgotten: t is the newest read of the row Stet knows of, and with its
+// version not kept, an older entry would decide in its place.
 func (m *readMemory) learn(rr *roleMemory, t *ticket, key, v string, keep bool, now time.Time) {
+	if t.spoiled {
+		m.forgetSeenBy(rr, t.table, key, t.readAt)
+		rr.leave(t.table, key, t.readAt, nil)
+		return
+	}
+	if row := rr.row(t.table, key); row != nil && !row.cutAt.IsZero() && !row.cutAt.Before(t.readAt) {
+		keep = false
+	}
 	re := rr.entriesOf(t.table, key)
 	if re != nil {
 		if end, ok := re.unordered(t.p.task, v, t.readAt); ok {
@@ -351,20 +428,99 @@ func (m *readMemory) unlearn(rr *roleMemory, t *ticket, key string) {
 	}
 }
 
-// dropped ends t with nothing learned.
+// dropped ends t with nothing learned: its lookup failed, ran out of time or
+// was never run. The read showed its client the rows as they were when it
+// ended, which may be newer than anything the role's entries hold, and Stet
+// does not know which version that was. So what the role held of t's rows
+// from up to when t ended is forgotten, in every task; for a read of some row
+// of the table (a key from a WHERE clause), what it held of the table. A
+// write of those rows then answers no_read, not an older entry's stale.
+//
+// What goes is every entry whose version may have been seen at or before
+// t's readAt: read then, or refreshed by an own write whose mark was made by
+// then. An entry seen after stays: it is newer than what t showed. Reads of
+// those rows still pending that ended at or before t keep nothing either, so
+// a late lookup does not bring an old version back: a read of the same row
+// through rowMemory.cutAt, a read of some row of the table by being spoiled,
+// and after a keyless t, every read of the table through the clear's time.
+//
+// Like learned it takes the lock for learnBatch rows at a time, and t stays
+// pending until the last, so its rows answer read_pending until they answer
+// no_read.
 func (m *readMemory) dropped(t *ticket) {
 	if t == nil {
 		return
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if t.ended {
+		m.mu.Unlock()
 		return
 	}
 	t.ended = true
+	if t.keyless {
+		defer m.mu.Unlock()
+		if rr := m.roles[t.p.role]; rr != nil {
+			m.clear(rr, t.table, "", t.readAt, nil)
+			m.endTicket(rr, t)
+		}
+		return
+	}
+	m.mu.Unlock()
+
+	for lo := 0; lo < len(t.keys); lo += learnBatch {
+		m.mu.Lock()
+		hi := min(lo+learnBatch, len(t.keys))
+		m.dropKeys(t, lo, hi)
+		m.mu.Unlock()
+		if m.afterBatch != nil {
+			m.afterBatch(t, hi)
+		}
+		runtime.Gosched() // as in learned
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if rr := m.roles[t.p.role]; rr != nil {
 		m.endTicket(rr, t)
 	}
+}
+
+// dropKeys forgets, for the dropped t, the rows lo to hi of its keys.
+func (m *readMemory) dropKeys(t *ticket, lo, hi int) {
+	rr := m.roles[t.p.role]
+	if rr == nil { // cannot happen: a pending ticket keeps its role
+		return
+	}
+	if tr := rr.tables[t.table]; tr != nil && lo == 0 {
+		for _, x := range tr.keyless {
+			if !x.readAt.After(t.readAt) {
+				x.spoiled = true
+			}
+		}
+	}
+	for _, key := range t.keys[lo:hi] {
+		m.forgetSeenBy(rr, t.table, key, t.readAt)
+		// Kept on the row's record, which lives exactly as long as a read
+		// that could be cut by it is pending, and not among the role's
+		// clears: a read of a thousand rows would leave a thousand times.
+		if row := rr.row(t.table, key); row != nil && t.readAt.After(row.cutAt) &&
+			slices.ContainsFunc(row.pending, func(x *ticket) bool { return x != t }) {
+			row.cutAt = t.readAt
+		}
+	}
+}
+
+// forgetSeenBy forgets every entry rr has of the row key of table whose
+// version may have been seen at or before at, whatever its task: one read by
+// then, or one an own write refreshed over a span that started by then.
+func (m *readMemory) forgetSeenBy(rr *roleMemory, table, key string, at time.Time) {
+	if re := rr.entriesOf(table, key); re != nil {
+		for i := len(re.entries) - 1; i >= 0; i-- {
+			if e := re.entries[i]; !e.since.After(at) {
+				m.take(e)
+			}
+		}
+	}
+	m.tidyRow(rr, table, key)
 }
 
 // endTicket takes t off what it was pending on, lets go of the times of
@@ -410,14 +566,15 @@ func (rr *roleMemory) settle() {
 	rr.clears = slices.DeleteFunc(rr.clears, func(c clearing) bool { return c.at.Before(oldest) })
 }
 
-// clearedSince reports which of table a read that ended at readAt may keep
-// nothing of, because it was cleared at or after readAt: the whole table, or
-// the rows in rows.
-func (rr *roleMemory) clearedSince(table string, readAt time.Time) (whole bool, rows map[string]bool) {
+// clearedSince reports which of t's table t may keep nothing of, because it
+// was cleared at or after t's read ended: the whole table, or the rows in
+// rows. The clear t's own noting made does not count (readingPartial).
+func (rr *roleMemory) clearedSince(t *ticket) (whole bool, rows map[string]bool) {
+	table, readAt := t.table, t.readAt
 	for _, c := range rr.clears {
 		switch {
-		case c.at.Before(readAt), c.table != "" && c.table != table:
-			// before the read ended, or of another table
+		case c.at.Before(readAt), c.table != "" && c.table != table, c.by == t:
+			// before the read ended, of another table, or the read's own
 		case c.table == "" || c.key == "":
 			return true, nil
 		default:
@@ -495,7 +652,10 @@ func (m *readMemory) compareLocked(p party, table, key, version string, at time.
 	// A write of task t is compared with the role's reads of t and of no task;
 	// a write of no task with all the role's reads. Once a write of the role
 	// to the row was judged stale, every read of the row by the role that
-	// ended since is compared too, whatever its task.
+	// ended since is compared too, whatever its task. An entry an own write
+	// refreshed counts from the start of its span (since), so it is no read
+	// that ended since a judgment made at the very time of the refresh: a
+	// refresh after a judgment drops the note, and this one came before.
 	re := rr.entriesOf(table, key)
 	var staleAt time.Time
 	if re != nil {
@@ -529,7 +689,7 @@ func (m *readMemory) compareLocked(p party, table, key, version string, at time.
 			m.take(e)
 			continue
 		}
-		if compared(e.task, e.readAt) && (newest == nil || prefer(e, newest, p.task, version)) {
+		if compared(e.task, e.since) && (newest == nil || prefer(e, newest, p.task, version)) {
 			newest = e
 		}
 	}
@@ -631,7 +791,7 @@ func (m *readMemory) refreshed(mark *writeMark, version string) {
 		return
 	}
 	if mark.key == "" {
-		m.clear(rr, mark.table, "", m.now())
+		m.clear(rr, mark.table, "", m.now(), nil)
 		return
 	}
 	m.refresh(rr, mark.table, mark.key, version, mark.since, m.now())
@@ -689,7 +849,7 @@ func (m *readMemory) refresh(rr *roleMemory, table, key, version string, since, 
 	}
 	re := rr.entriesOf(table, key)
 	if version == "" {
-		m.clear(rr, table, key, now)
+		m.clear(rr, table, key, now, nil)
 		return
 	}
 	if re != nil && re.disagrees(version, since, now) {
@@ -704,7 +864,7 @@ func (m *readMemory) refresh(rr *roleMemory, table, key, version string, since, 
 		re.staleAt = time.Time{}
 	}
 	m.tidyRow(rr, table, key)
-	rr.leave(table, key, now)
+	rr.leave(table, key, now, nil)
 }
 
 // disagrees reports whether an entry of the row was seen with a version other
@@ -731,7 +891,7 @@ func (m *readMemory) forgetThrough(rr *roleMemory, table, key string, end time.T
 		}
 	}
 	m.tidyRow(rr, table, key)
-	rr.leave(table, key, end)
+	rr.leave(table, key, end, nil)
 }
 
 // forgotten ends mark and forgets what it covers for role: the row, the
@@ -742,7 +902,7 @@ func (m *readMemory) forgotten(mark *writeMark) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if rr := m.endMark(mark); rr != nil {
-		m.clear(rr, mark.table, mark.key, m.now())
+		m.clear(rr, mark.table, mark.key, m.now(), nil)
 	}
 }
 
@@ -789,15 +949,32 @@ func (m *readMemory) forget(role, table, key string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if rr := m.roles[role]; rr != nil {
-		m.clear(rr, table, key, m.now())
+		m.clear(rr, table, key, m.now(), nil)
+	}
+}
+
+// forgetAll forgets, for every login role, its entries of table, as forget
+// does role by role, taking the lock for each: for when the table itself
+// changed under what was remembered of it (the catalog says it was rewritten
+// or is another table now). Marks stay.
+func (m *readMemory) forgetAll(table string) {
+	m.mu.Lock()
+	roles := make([]string, 0, len(m.roles))
+	for name := range m.roles {
+		roles = append(roles, name)
+	}
+	m.mu.Unlock()
+	for _, role := range roles {
+		m.forget(role, table, "")
 	}
 }
 
 // clear forgets rr's entries of the row key of table, of table (key ""), or
-// of every table (table ""), and leaves the time for pending reads. Marks and
-// pending reads stay. A table's entries are detached whole (detach), so the
-// work under the lock does not grow with how many there are.
-func (m *readMemory) clear(rr *roleMemory, table, key string, now time.Time) {
+// of every table (table ""), and leaves the time now for pending reads, of
+// which by, if not nil, is not cut. Marks and pending reads stay. A table's
+// entries are detached whole (detach), so the work under the lock does not
+// grow with how many there are.
+func (m *readMemory) clear(rr *roleMemory, table, key string, now time.Time, by *ticket) {
 	switch {
 	case table == "":
 		key = ""
@@ -824,7 +1001,7 @@ func (m *readMemory) clear(rr *roleMemory, table, key string, now time.Time) {
 		rr.queued = true
 	}
 	m.tidyRole(rr)
-	rr.leave(table, key, now)
+	rr.leave(table, key, now, by)
 }
 
 // detach clears tr's entries at once: they stop counting toward len and the
@@ -853,10 +1030,24 @@ func (m *readMemory) detach(rr *roleMemory, tr *tableMemory) {
 // cannot bring back a version from before it. Only lookups already queued
 // can, and those are the pending reads. Keeping the time longer would protect
 // nothing and would grow with every write of a role that reads nothing.
-func (rr *roleMemory) leave(table, key string, at time.Time) {
-	if len(rr.pending) > 0 {
-		rr.clears = append(rr.clears, clearing{table: table, key: key, at: at})
+//
+// by is the read whose noting made the clear, which is not cut by it; nil
+// for any other clear. A clear of the scope the last one cleared, no earlier
+// than it and sparing no read, takes its place: it cuts every read that one
+// cut, so a role whose reads forget a table again and again (a cursor's
+// FETCHes) keeps one time for it.
+func (rr *roleMemory) leave(table, key string, at time.Time, by *ticket) {
+	if len(rr.pending) == 0 {
+		return
 	}
+	c := clearing{table: table, key: key, at: at, by: by}
+	if n := len(rr.clears); n > 0 && by == nil {
+		if last := rr.clears[n-1]; last.table == table && last.key == key && last.by == nil && !at.Before(last.at) {
+			rr.clears[n-1] = c
+			return
+		}
+	}
+	rr.clears = append(rr.clears, c)
 }
 
 // evicted reports and resets what was thrown away for the limits.
@@ -903,8 +1094,34 @@ func (m *readMemory) add(rr *roleMemory, table, key, task, v string, readAt, now
 	rr.all.push(e)
 	m.live++
 	rr.live++
+	if len(re.entries) > staleRowTasks {
+		m.limitRow(rr, re, table, key, now)
+	}
 	m.sweep(rr, 1)
 	m.limit(rr, now)
+}
+
+// limitRow throws away, after the row key of table gained an entry past
+// staleRowTasks, the one read longest ago, and counts it with what the size
+// limits throw away. Entries tied with it in time go too, as when a slot is
+// read twice at one time (unordered): of two tied entries that disagree,
+// check prefers the one that agrees with the row, and the other left alone
+// would decide in its place. The time stays for reads still pending, as
+// forgetThrough leaves it, so a read older than what went, learned late, is
+// not left as the newest of its task. What had expired anyway is not counted.
+func (m *readMemory) limitRow(rr *roleMemory, re *rowEntries, table, key string, now time.Time) {
+	oldest := re.entries[0].readAt
+	for _, e := range re.entries[1:] {
+		if e.readAt.Before(oldest) {
+			oldest = e.readAt
+		}
+	}
+	for _, e := range re.entries {
+		if !e.readAt.After(oldest) && !m.expired(table, e.readAt, now) {
+			m.evicts++
+		}
+	}
+	m.forgetThrough(rr, table, key, oldest)
 }
 
 // sweep takes up to n cleared entries out of the order by read time: rr's own
