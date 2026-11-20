@@ -54,7 +54,10 @@
 | S12 | 4장 "준비된 문장마다 … 자리를 적어 두고" | 서버는 `search_path`나 역할이 바뀌면 준비된 문장을 조용히 다시 계획한다. 같은 이름의 테이블이 두 스키마에 있으면 같은 문장이 다른 테이블을 읽는데, 새 RowDescription은 오지 않는다(14.18에서 확인) | 적어 둔 자리는 이름이 가리키는 테이블이 바뀌었을 수 없는 동안만 쓴다. `search_path`·`role`·`session_authorization`의 `SET`/`RESET`, `RESET ALL`, `DISCARD ALL`(분류기의 `Resolves`)이나 들여다보지 못하는 메시지가 가거나, 그런 것이 든 트랜잭션이 끝나면 다시 Describe될 때까지 그 문장의 결과에서 키를 얻지 않는다. `SET stet.on_behalf_of` 같은 다른 `SET`은 해당하지 않는다. 한 단위가 드는 키는 16,000개까지다 (2, 6) |
 | S13 | 4장·6장이 키 값을 에이전트가 적은 글자 그대로 쓴다 | 서버는 키 값을 키 컬럼과 다른 타입으로 읽을 수 있다. 같은 `$n`이 문장의 다른 곳에도 쓰이거나 변환(`::char(4)`, `::varchar(3)`)이 붙으면 공백을 무시하거나 값을 자른다. Stet이 그 글자로 찾는 행과 서버가 고른 행이 달라진다(14.18에서 확인) | 키 값은 키 컬럼의 타입 그대로 읽힐 때만 쓴다(`keyUsable`). 같은 `$n`이 문장에 한 번만 나오고, 변환이 없거나 키와 같은 계열로의 변환(정수 키: `int2`·`int4`·`int8`, `uuid` 키: `uuid`, `text`·`varchar` 키: `text`나 길이 없는 `varchar`)이어야 한다. `bpchar`·`name` 키는 변환이 붙으면 쓰지 않는다. 글자 키의 리터럴에 역슬래시가 있으면 쓰지 않는다. 쓰지 않는 키의 읽기는 기억하지 않고, 쓰기는 `not_checked`다 (2, 8, 9) |
 | S14 | 7장 | 자기 쓰기 둘이 겹치고 고치기 조회의 결과가 뒤바뀐 순서로 오면 자기 변경을 낡았다고 본다. Stet의 시계로는 두 조회가 본 것의 순서를 가릴 수 없다 | 고치기는 그 쓰기의 표시가 생긴 때부터 고칠 때까지의 구간에 그 계정이 그 행의 다른 버전을 알게 된 것이 있으면, 고치지 않고 그 행의 기억을 지운다 (7) |
-| S15 | S6 | 답이 오기 전에 연결이 끊긴 쓰기는 서버에서 조금 뒤에 커밋될 수 있다. 곧바로 지우면 그 사이에 읽은 옛 버전이 기억에 남는다 | 끊긴 쓰기의 표시는 1분 동안 둔 뒤에 `forgotten`으로 끝낸다 (9) |
+| S15 | S6 | 답이 오기 전에 연결이 끊긴 쓰기는 서버에서 조금 뒤에 커밋될 수 있다. 곧바로 지우면 그 사이에 읽은 옛 버전이 기억에 남는다. 답을 못 받은 `DO` 블록이나 `COMMIT`도 같다 | 끊긴 쓰기의 표시는 1분 동안 둔 뒤에 `forgotten`으로 끝낸다. 프록시는 답을 못 받은 것이 있는 채로 연결이 끝났는지를 `TxEnded`에 함께 알리고, 그때는 그 세션의 표시도 1분 동안 둔다 (5, 9) |
+| S16 | 7장 "실패했으면 표시만 지운다" | 문장이 여럿인 메시지는 안에서 커밋한 뒤에 에러로 끝날 수 있다(`begin; update …; commit; select 1/0`). 프록시는 그것을 실행되지 않았다고 알린다 | 문장이 여럿인 메시지가 실행되지 않았다고 오면 표시만 지우지 않고 기억도 지운다 (9) |
+| S17 | 7장 | 지금 없는 행에 쓰는 `UPDATE`·`DELETE`가 서버에서 기다리는 동안 다른 쪽이 그 행을 넣을 수 있다 | 없는 행에도 그 키로 표시한다. `bpchar` 키는 없는 행의 글자에 채움이 없어 기억의 키와 맞지 않으므로 테이블 단위로 표시한다 (9) |
+| S18 | S1 | 키 컬럼의 정렬 규칙이 결정적이 아니면(대소문자를 구분하지 않는 ICU 규칙 등) 같은 행이 여러 철자로 불린다. 기억의 키는 글자 그대로라서 표시와 고치기가 빗나간다 | 그런 테이블은 추적하지 않는다(시작할 때 경고). 컬럼의 정렬 규칙을 본다 (8) |
 | S11 | 6장 "행이 지금 없으면 `stale`" | 지금의 상태 읽기는 행이 없으면 아무것도 돌려주지 않아, 기억의 키(서버의 글자)를 알 수 없다 | 추적하는 테이블의 상태 읽기는 행이 없어도 키의 글자를 돌려주는 모양으로 바꾼다. 질의 수는 그대로 하나다 (9) |
 
 **스펙이 구현에 맡겨 이 계획이 정한 것.** 프록시는 게이트에게 테이블 OID마다 키 컬럼의 번호와 타입을 묻는다(`Tracked`). 확장 프로토콜의 키 컬럼 자리는 Parse한 문장마다 하나인 칸에 두고 그 문장의 포털이 함께 쓴다. 조회 작업자는 둘이고 대기열은 1,024다. "읽기가 아닌 문장"은 분류기의 `ReadOnly`가 거짓인 메시지다. 승인 실행을 게이트에 알리는 길은 `Applier.Applying` 필드다. 실험실 확인은 Stet을 자기 프로세스 안에서 띄우고 `Gate.StaleIdle`로 조회가 끝나기를 기다린다.
@@ -290,8 +293,10 @@ Unseen(s SessionInfo)
 // pipelined unit not yet answered is not covered. It is called once per such
 // ReadyForQuery, after the End calls of the units it answers, and once when
 // the connection ends while one is still owed (unseen then counts every call
-// not yet settled). It must not block.
-TxEnded(s SessionInfo, unseen int)
+// not yet settled). unanswered is true only when the connection ended while
+// a unit s had sent was not yet answered: what it sent may still commit a
+// little later. It must not block.
+TxEnded(s SessionInfo, unseen int, unanswered bool)
 // Tracked reports, for the table with OID table, the attribute number of the
 // key column whose values the gate remembers reads by, and how its binary
 // form is read. ok is false for any other table. The proxy calls it on the
@@ -608,9 +613,9 @@ func (g *Gate) Applying(role, table string) (done func())
 2. **비교.** `assemble`이 현재 행을 읽은 뒤 `check`를 부른다(그래서 enforce의 다시 판단도 다시 비교한다). 대상은 `stale`을 켠 테이블의 `Gated` `UPDATE`·`DELETE`다. `not_checked`인 경우: 접속 계정을 모른다, 카탈로그가 그 테이블을 추적하지 않는다, 상태를 읽지 못했다, 키 값이 없다, 키 값이 `keyUsable`이 아니다(S13), `INSERT`와 `Measured`·`Unsupported` 쓰기, enforce가 상태를 읽기 전에 정한 쓰기(`unjudged`). `stale`을 켜지 않은 테이블은 `readCheck`가 nil이다.
 3. **판정.** `input`이 `ReadCheck`를 넘긴다. 섀도의 `judge`와 enforce의 `verdict`가 같은 규칙을 쓴다. `stale`이면 모델을 부르지 않는다. `judge`는 어느 규칙이 정했든 `d.ReadCheck`를 적는다(S4).
 4. **거절.** enforce의 `act`가 `ST003`을 돌려주고 `d.Refused == "ST003"`이다. `facts`의 `RowGone`은 `stale`이고 `Version == nil`일 때 참이다. `recheck`에서 다시 판단한 것이 `stale`이면 이유는 `["stale_read", "rejudged"]`이고 다시 버전을 읽지 않는다.
-5. **표시.** `stale`을 켠 테이블에 쓰는, 접속 계정을 아는 쓰기가 서버로 갈 때(섀도는 언제나, enforce는 보내기로 정했을 때) 표시한다. 자기 비교가 끝난 뒤에 한다. 행 표시: `Gated` `UPDATE`·`DELETE`이고 행이 지금 있다. 표시 없음: `Gated` `UPDATE`·`DELETE`인데 행이 지금 없다, 키 값을 주지 않은 `Gated` `INSERT`. 모든 테이블 표시(S9): 이유가 `multi_statement`, `nested_write`, `with`, `truncate`. 테이블 표시: 그 밖의 모든 쓰기(키 값을 준 `INSERT` 포함).
-6. **`End`.** 거절된 쓰기는 표시가 없다. 실행되지 않았으면(`Executed`도 `Lost`도 아님) `released`. 트랜잭션 밖에서 실행됐으면: 행 표시의 `UPDATE`는 `refresh`로 그 행의 버전을 조회하고 결과로 `refreshed`를 부른다(`ok`가 거짓이면 `forgotten`). `DELETE`는 `forgotten`. 키 값을 준 `INSERT`는 에이전트가 적은 키 글자로 `refresh`해 `refreshedRow`를 부르고 표시를 `released`로 끝낸다(`ok`가 거짓이면 `forgotten`). 그 밖의 표시는 `forgotten`. 트랜잭션 안에서 실행됐으면 표시를 그 세션의 것으로 적어 둔다. `Lost`이면 표시를 1분(`staleLostGrace`) 동안 둔 뒤 `forgotten`으로 끝낸다(S6, S15). 게이트가 닫히면 기다리지 않고 끝낸다.
-7. **`TxEnded`.** 그 세션이 적어 둔 표시(트랜잭션 안에서 실행된 쓰기의 것)를 모두 `forgotten`으로 끝낸다. `unseen`이 0보다 크면 그 접속 계정의 기억을 모두 지우고, 그 세션의 남은 `Unseen` 수에서 뺀다. 남은 수가 0이 되면 그 세션의 `Unseen` 표시를 `forgotten`으로 끝낸다.
+5. **표시.** `stale`을 켠 테이블에 쓰는, 접속 계정을 아는 쓰기가 서버로 갈 때(섀도는 언제나, enforce는 보내기로 정했을 때) 표시한다. 자기 비교가 끝난 뒤에 한다. 행 표시: `Gated` `UPDATE`·`DELETE`이고 행이 지금 있다. 행이 지금 없는 `Gated` `UPDATE`·`DELETE`도 그 키로 행 표시를 한다(`bpchar` 키면 테이블 표시, S17). 표시 없음: 키 값을 주지 않은 `Gated` `INSERT`. 모든 테이블 표시(S9): 이유가 `multi_statement`, `nested_write`, `with`, `truncate`. 테이블 표시: 그 밖의 모든 쓰기(키 값을 준 `INSERT` 포함).
+6. **`End`.** 거절된 쓰기는 표시가 없다. 실행되지 않았으면(`Executed`도 `Lost`도 아님) `released`. 다만 문장이 여럿인 메시지면 `forgotten`(S16). 트랜잭션 밖에서 실행됐으면: 행 표시의 `UPDATE`는 `refresh`로 그 행의 버전을 조회하고 결과로 `refreshed`를 부른다(`ok`가 거짓이면 `forgotten`). `DELETE`는 `forgotten`. 키 값을 준 `INSERT`는 에이전트가 적은 키 글자로 `refresh`해 `refreshedRow`를 부르고 표시를 `released`로 끝낸다(`ok`가 거짓이면 `forgotten`). 그 밖의 표시는 `forgotten`. 트랜잭션 안에서 실행됐으면 표시를 그 세션의 것으로 적어 둔다. `Lost`이면 표시를 1분(`staleLostGrace`) 동안 둔 뒤 `forgotten`으로 끝낸다(S6, S15). 게이트가 닫히면 기다리지 않고 끝낸다.
+7. **`TxEnded`.** 그 세션이 적어 둔 표시(트랜잭션 안에서 실행된 쓰기의 것. 세션마다 같은 범위의 표시는 하나만 둔다)를 모두 `forgotten`으로 끝낸다. `unanswered`가 참이면 그 표시들과 `Unseen` 표시를 `staleLostGrace` 동안 둔 뒤에 끝낸다(S15). `unseen`이 0보다 크면 그 접속 계정의 기억을 모두 지우고, 그 세션의 남은 `Unseen` 수에서 뺀다. 남은 수가 0이 되면 그 세션의 `Unseen` 표시를 `forgotten`으로 끝낸다.
 8. **`Unseen`.** 접속 계정을 알면 그 계정의 모든 테이블에 표시하고(세션마다 하나이고, 그 세션의 남은 `Unseen` 수를 센다) 그 계정의 기억을 모두 지운다. `TxEnded`가 수를 맞춰 끝낸다. 접속 계정을 모르는 세션의 `Unseen`과 그것을 정리하는 `TxEnded`는 아무것도 하지 않는다.
 9. **`Applying`.** 테이블 표시를 하고, `done`에서 `forgotten`으로 끝낸다. 그 테이블이 `stale`을 켜지 않았으면 아무것도 하지 않는다.
 10. 표시는 어떤 길로도 남지 않는다. 표시한 쓰기는 `End`가, 트랜잭션 안의 것은 `TxEnded`가, `Unseen`은 `TxEnded`가 끝낸다(프록시가 연결이 끊겨도 부른다).
