@@ -162,6 +162,9 @@ func knownDuplicate(reasons, ids []string) []string {
 // Gone: sent too, to match nothing. Changed: its state is read again and it
 // is judged once more, with "rejudged" after its reasons, and a commit is
 // checked once more; a row that changed again holds it (concurrent_change).
+// Read again, the row is compared again with what the write's login role
+// read, so a write of a row the role read before is rejected as stale
+// (spec-v0.2-stale 6), and its version is not read a third time.
 // A version that cannot be read is a state error, which on_failure decides.
 // The gap between the last read and the server running the write stays
 // (spec 13).
@@ -241,12 +244,14 @@ func (g *Gate) versionUnread(p *pending, err error) (string, []string) {
 }
 
 // act carries out a, the action for p's verdict v and its reasons (steps 6
-// and 7), and keeps them for the record. A write it forwards is sent. Any
-// other is refused, and a held one is stored first, so that the error can
-// name it.
+// and 7), and keeps them for the record. A write it forwards is sent, and
+// marked as its login role's own until its effect is known (spec-v0.2-stale
+// 7). Any other is refused, and a held one is stored first, so that the
+// error can name it.
 func (g *Gate) act(p *pending, v string, reasons []string, a decide.Action) *proxy.Refusal {
 	p.decided, p.verdict, p.reasons = true, v, reasons
 	if a.Forward {
+		g.stale.mark(p)
 		return nil
 	}
 	if a.Held {
@@ -280,6 +285,7 @@ func (g *Gate) facts(p *pending) decide.Facts {
 		Cumulative:    p.cumulative,
 		InTransaction: in.InTransaction,
 		NoLoginRole:   in.NoLoginRole,
+		RowGone:       p.readCheck != nil && p.readCheck.Result == decide.ReadStale && p.readCheck.Version == nil,
 	}
 }
 

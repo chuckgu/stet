@@ -72,6 +72,10 @@ type stale struct {
 	// none failed.
 	lastFailure atomic.Pointer[string]
 
+	// writes is what the write side keeps of marks between calls
+	// (stale_write.go).
+	writes ownWrites
+
 	ctx    context.Context // done once the gate closes: running lookups and catalog reads end
 	cancel context.CancelFunc
 	stop   chan struct{}
@@ -453,9 +457,10 @@ func (s *stale) report() {
 }
 
 // close stops the workers, ends what is left on the queue with nothing
-// learned, and logs what was not remembered. A lookup still running ends at
-// once: its context is cancelled. Observe and refresh do nothing to the
-// memory afterwards. It may be called more than once.
+// learned, ends the marks of lost writes still waiting out their grace, and
+// logs what was not remembered. A lookup still running ends at once: its
+// context is cancelled. Observe and refresh do nothing to the memory
+// afterwards. It may be called more than once.
 func (s *stale) close() {
 	if s == nil {
 		return
@@ -476,6 +481,7 @@ func (s *stale) close() {
 				drained = true
 			}
 		}
+		s.closeWrites()
 		s.report()
 	})
 }

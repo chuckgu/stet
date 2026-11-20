@@ -263,17 +263,18 @@ func (g *Gate) WouldBlock(s proxy.SessionInfo, reason string) {
 }
 
 // Unseen is told of each message a shadow session sends whose writes the
-// proxy cannot see. Stale-write detection is to forget what the session's
-// login role read then (spec-v0.2-stale 7); until it does, nothing is kept
-// to forget, and Unseen does nothing.
-func (g *Gate) Unseen(proxy.SessionInfo) {}
+// proxy cannot see. Until the TxEnded calls that settle it, the session's
+// login role's writes to every table with stale are its own, and what the
+// role read is forgotten when it is told and again when it is settled
+// (spec-v0.2-stale 7). It does not block.
+func (g *Gate) Unseen(s proxy.SessionInfo) { g.stale.unseen(s) }
 
 // TxEnded is told when a session's transaction that held a watched write, or
 // a message Unseen was told of, has ended, with how many of the session's
-// Unseen calls that settles. Stale-write detection is to settle the rows
-// those writes marked then (spec-v0.2-stale 7); until it does, nothing is
-// marked, and TxEnded does nothing.
-func (g *Gate) TxEnded(proxy.SessionInfo, int) {}
+// Unseen calls that settles. What those writes and messages may have changed
+// is on the server now: what the login role read of it is forgotten, and
+// their marks end (spec-v0.2-stale 7). It does not block.
+func (g *Gate) TxEnded(s proxy.SessionInfo, unseen int) { g.stale.txEnded(s, unseen) }
 
 // Tracked reports, for the table with OID table, the attribute number and
 // type of the key column the gate remembers its reads by, as the catalog said
@@ -305,6 +306,11 @@ type pending struct {
 
 	cumulative *decide.Cumulative // set when the table has a cumulative limit
 	reserved   bool               // the write holds a reservation in Gate.usage
+
+	// Stale-write detection (spec-v0.2-stale 6, 7; stale_write.go).
+	readCheck *decide.ReadCheck // nil when the table has no stale
+	key       string            // the row's key as the server writes it; "" when not known
+	mark      *writeMark        // the write's own mark while it is on its way
 
 	state        json.RawMessage
 	stateVersion map[string]string
@@ -345,6 +351,7 @@ func (g *Gate) Begin(s proxy.SessionInfo, st proxy.Statement, ps []proxy.Param) 
 	for _, x := range ps {
 		p.oids = append(p.oids, x.OID)
 	}
+	p.readCheck = g.stale.unchecked(p.res.Table)
 	if g.cfg.Mode == config.ModeEnforce {
 		refuse := g.enforce(p, ps)
 		p.added = time.Since(start)
@@ -358,6 +365,7 @@ func (g *Gate) Begin(s proxy.SessionInfo, st proxy.Statement, ps []proxy.Param) 
 	release := g.read(ctx, p, ps)
 	p.added = time.Since(start)
 	release()
+	g.stale.mark(p) // shadow mode sends every write
 	return p, nil
 }
 
@@ -493,6 +501,9 @@ func (g *Gate) End(h any, o proxy.Outcome) {
 	if p.reserved {
 		g.usage.settle(p.session.User, p.res.Table, p.id, rowsAffected(p.res, o), o.Executed, o.Lost)
 	}
+	// The write's mark is settled here too, not in the background: the
+	// TxEnded that follows a write inside a transaction must find it.
+	g.stale.ended(p, o)
 	g.wg.Add(1)
 	go func() {
 		defer g.wg.Done()
@@ -501,10 +512,11 @@ func (g *Gate) End(h any, o proxy.Outcome) {
 }
 
 // input is what the verdict rules know of a write before any model answer:
-// its shape, the transaction it arrived in, its login role, its measurement,
-// its cumulative usage, and whether its state was read. Shadow mode's judge
-// and enforce mode's Begin both decide from it, so the two modes apply one
-// set of rules (spec 3); decide.Verdict fixes their order.
+// its shape, the transaction it arrived in, its login role, how its row
+// compares with what the role read, its measurement, its cumulative usage,
+// and whether its state was read. Shadow mode's judge and enforce mode's
+// Begin both decide from it, so the two modes apply one set of rules (spec
+// 3); decide.Verdict fixes their order.
 func (g *Gate) input(p *pending) decide.Input {
 	t := g.cfg.Tables[p.res.Table]
 	in := decide.Input{
@@ -515,6 +527,7 @@ func (g *Gate) input(p *pending) decide.Input {
 		Cumulative:    p.cumulative,
 		InTransaction: p.session.TxDirty,
 		NoLoginRole:   p.session.User == "",
+		ReadCheck:     p.readCheck,
 	}
 	switch {
 	case p.res.Kind == sqlparse.Unsupported,
@@ -579,6 +592,11 @@ func (g *Gate) judge(p *pending, o proxy.Outcome) {
 	d.RowsAffected = rowsAffected(p.res, o)
 	if p.cumulative != nil {
 		d.Cumulative = p.cumulative
+	}
+	// As compared, whichever rule decided (correction S4); in enforce mode
+	// the last judgment's.
+	if p.readCheck != nil {
+		d.ReadCheck = p.readCheck
 	}
 	// Where and when the write was on the server, for linking what it
 	// changed (spec-v0.2-undo 5): from its arrival (p.at) to when End was
@@ -795,15 +813,27 @@ func (g *Gate) assemble(ctx context.Context, p *pending) error {
 		p.pk = valueText(*w.PK, p.params)
 	}
 
+	// Compared again in each assembly (enforce mode's recheck assembles a
+	// write again), and not compared when the current row is not read.
+	p.readCheck, p.key = g.stale.unchecked(p.res.Table), ""
 	var current map[string]any
 	if w.Op != "insert" && p.pk != nil {
-		row, xmin, err := g.currentRow(ctx, p.res.Table, t.PK, *p.pk)
+		typeName := g.stale.stateKey(p)
+		sent := time.Now()
+		row, xmin, key, err := g.currentRow(ctx, p.res.Table, t.PK, *p.pk, typeName)
 		if err != nil {
 			return fmt.Errorf("current row: %w", err)
 		}
 		if row != nil {
 			current = row
 			p.stateVersion = map[string]string{"xmin": xmin}
+		}
+		// Right after the row is read: the comparison stands even if the
+		// rest of the state fails, and the stale rule comes before a state
+		// error (spec 6).
+		if typeName != "" {
+			p.key = key
+			p.readCheck = g.stale.compare(p, xmin, sent)
 		}
 	}
 
@@ -945,15 +975,45 @@ func (g *Gate) paramTexts(ctx context.Context, sql string, ps []proxy.Param) ([]
 	return out, nil
 }
 
-func (g *Gate) currentRow(ctx context.Context, table, pkCol, pk string) (map[string]any, string, error) {
-	q := fmt.Sprintf("select to_jsonb(t)::text, t.xmin::text from %s as t where t.%s = $1",
-		ident(table), pgx.Identifier{pkCol}.Sanitize())
-	rows, err := g.queryText(ctx, q, []*string{&pk})
-	if err != nil || len(rows) == 0 {
-		return nil, "", err
+// currentRow reads the row of table whose key column pkCol is pk, and its
+// version (xmin); row is nil when it is not there.
+//
+// With typeName "" the key's text is left to the server to read as the
+// column compares it, as it always was. Otherwise pk is read as typeName,
+// the key column's base type, and the statement gives back one row whether
+// the table has the row or not (correction S11): the same row and xmin when
+// it is there, NULLs when it is not, and key, the key as the server writes
+// it, which reads of the row are remembered by: the row's own key when it is
+// there (so a char(n) key keeps its padding, as lookups give it), pk as
+// typeName writes it when it is not. A pk the type does not read is an error,
+// as it is for the statement without the type.
+func (g *Gate) currentRow(ctx context.Context, table, pkCol, pk, typeName string) (row map[string]any, xmin, key string, err error) {
+	col := pgx.Identifier{pkCol}.Sanitize()
+	q := fmt.Sprintf("select to_jsonb(t)::text, t.xmin::text from %s as t where t.%s = $1", ident(table), col)
+	if typeName != "" {
+		q = fmt.Sprintf("select to_jsonb(t)::text, t.xmin::text, coalesce(t.%[3]s, k.key) "+
+			"from (select $1::%[1]s as key) as k left join %[2]s as t on t.%[3]s = k.key", typeName, ident(table), col)
 	}
-	row, err := decodeObject(*rows[0][0])
-	return row, *rows[0][1], err
+	rows, err := g.queryText(ctx, q, []*string{&pk})
+	switch {
+	case err != nil:
+		return nil, "", "", err
+	case typeName == "":
+		if len(rows) == 0 {
+			return nil, "", "", nil
+		}
+	case len(rows) != 1 || rows[0][2] == nil:
+		// A key column with a unique index on it alone matches at most one
+		// row, and the key read is not NULL.
+		return nil, "", "", fmt.Errorf("the state read gave %d rows for one key", len(rows))
+	default:
+		key = *rows[0][2]
+		if rows[0][0] == nil {
+			return nil, "", key, nil
+		}
+	}
+	row, err = decodeObject(*rows[0][0])
+	return row, *rows[0][1], key, err
 }
 
 // context runs the table's context query, bound like candidates, and

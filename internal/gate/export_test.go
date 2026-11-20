@@ -36,6 +36,13 @@ func CheckRead(g *Gate, role, task, table, key, version string) decide.ReadCheck
 	return m.check(party{role, task}, table, key, version, m.now())
 }
 
+// CompareWrite is what a write by role on behalf of task to the row key of
+// table is found to be, when the state read sent at sent found its version
+// to be version ("" when the row is not there).
+func CompareWrite(g *Gate, role, task, table, key, version string, sent time.Time) decide.ReadCheck {
+	return g.stale.compareRead(party{role, task}, table, key, version, sent)
+}
+
 // OnLookup makes g call hook before each lookup of row versions, with the
 // lookup's context, table and keys; when hook returns an error, the lookup
 // fails with it. Call it before the reads it is for reach g.
@@ -78,6 +85,26 @@ func Refresh(g *Gate, table, key string) (serverKey, version string, ok bool) {
 	})
 	<-done
 	return serverKey, version, ok
+}
+
+// SetStaleLostGrace changes how long the mark of a write lost with its
+// connection stays, for writes lost until restore is called. Tests that use
+// it must not run in parallel.
+func SetStaleLostGrace(d time.Duration) (restore func()) {
+	old := staleLostGrace
+	staleLostGrace = d
+	return func() { staleLostGrace = old }
+}
+
+// OnRowVersion makes g call hook each time, just before it reads a row's
+// version again before a judged write is sent. Call it before any write
+// reaches g.
+func OnRowVersion(g *Gate, hook func(table, pk string)) {
+	read := g.rowVersion
+	g.rowVersion = func(ctx context.Context, table, pk string) (string, error) {
+		hook(table, pk)
+		return read(ctx, table, pk)
+	}
 }
 
 // SetStaleCatalogEvery changes how often gates created until restore is
