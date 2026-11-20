@@ -400,10 +400,13 @@ type bound struct {
 	atParse, atBind readUnder
 	// Of a tracked read whose statement's name had one meaning at the Bind
 	// (see bound.track): its statement's cell, the result format codes of
-	// the Bind, and the value it bound to Statement.KeyParam (nil for none).
+	// the Bind, the value it bound to Statement.KeyParam (nil for none), and
+	// session.resolution when the Bind arrived: the server plans the portal
+	// there (see resultCols).
 	cols    *resultCols
 	formats []int16
 	key     *Param
+	gen     uint64
 }
 
 // read is what a write run by an Execute of b was read under: its
@@ -511,15 +514,16 @@ type observedRead struct {
 	// statement's columns from cols, its portal's result formats, and param,
 	// the value its portal kept for Statement.KeyParam. keys is Outcome.Read:
 	// a Query's from its arrival, an Execute's once its answer found cols
-	// known, nil otherwise. gen is session.resolution when it arrived (see
-	// resultCols). Set and filled under s.mu; cols is read on the server side
-	// alone.
+	// known, nil otherwise. gen is session.resolution when it arrived, and
+	// bindGen when its portal's Bind did (see resultCols). Set and filled
+	// under s.mu; cols is read on the server side alone.
 	track   bool
 	cols    *resultCols
 	formats []int16
 	param   *Param
 	keys    *ReadKeys
 	gen     uint64
+	bindGen uint64
 }
 
 // unrecordedWrite is what the gate's Begin handed back for a write that is
@@ -871,6 +875,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		var ok bool
 		var others []prepared
 		var single bool // the statement's name has one meaning, whatever the server holds
+		var gen uint64  // the resolution the portal is planned under
 		var atParse, atBind readUnder
 		s.mu.Lock()
 		u, pos := s.count()
@@ -910,6 +915,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		if s.enforce {
 			atBind = s.readNow()
 		}
+		gen = s.resolution
 		s.mu.Unlock()
 		// Bind values are copied without the lock: the server side takes it
 		// for every completion it counts.
@@ -920,7 +926,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 			if single && ascii(m.PreparedStatement) && ascii(m.DestinationPortal) {
 				// Another meaning, even the same SQL parsed again, may have
 				// other columns: only a portal sure of its statement is tracked.
-				b.track(&m, p)
+				b.track(&m, p, gen)
 			}
 		}
 		s.mu.Lock()
@@ -1407,7 +1413,7 @@ func (s *session) observe(u *unit, idx int, st Statement, b *bound) {
 		case b == nil:
 			r.track, r.keys = true, &ReadKeys{}
 		case b.cols != nil:
-			r.track, r.cols, r.formats, r.param = true, b.cols, b.formats, b.key
+			r.track, r.cols, r.formats, r.param, r.bindGen = true, b.cols, b.formats, b.key, b.gen
 		}
 		if r.track && !u.tracked {
 			u.tracked = true

@@ -1029,6 +1029,22 @@ func TestInspectMarksWhatCannotBeInspected(t *testing.T) {
 	}
 }
 
+// Inspect passes on the classifier's Resolves: a SET of search_path may make
+// a prepared statement read another table; a SET of stet.on_behalf_of does
+// not.
+func TestInspectPassesResolves(t *testing.T) {
+	e := setup(t, calm())
+	for sql, want := range map[string]bool{
+		"set search_path = x":          true,
+		"set stet.on_behalf_of = 'x'":  false,
+		"select title from " + e.table: false,
+	} {
+		if got := e.gate.Inspect(sql).Resolves; got != want {
+			t.Errorf("Inspect(%q).Resolves = %v, want %v", sql, got, want)
+		}
+	}
+}
+
 // What defines code, or a view over a gated table, is marked whatever the
 // mode (ruling 29); a DO block keeps its own reason. A view over another
 // table is not marked.

@@ -130,11 +130,14 @@ func tracks(st Statement) bool {
 //
 // The server plans a statement again, with no new RowDescription, when what
 // its names mean changes (a SET of search_path, say), and may then read
-// another table with the same columns. So the cell serves an Execute only
-// when nothing that may change what the names mean came between the Describe
-// and the Execute: gen is session.resolution when the Describe arrived, which
-// must be the Execute's, and reverts is session.reverts when the answer was
-// read, which must be the same when the Execute's rows are.
+// another table with the same columns. A portal keeps the plan of its Bind,
+// and an Execute sends that plan's rows. So gen says under which resolution
+// (session.resolution) the columns held: when the Describe of the statement
+// arrived, or when the portal a Describe names was bound. The cell serves an
+// Execute only when gen is both its portal's Bind's and the Execute's own,
+// and reverts, session.reverts when the answer was read, is the same when
+// the Execute's rows are: nothing that may change what the names mean came
+// between.
 type resultCols struct {
 	known   bool     // a RowDescription for the statement was read
 	fields  int      // columns in each row
@@ -146,14 +149,15 @@ type resultCols struct {
 
 // keyCol is a result column that holds the key of a tracked table.
 type keyCol struct {
-	at     int // the column's index in a row
-	table  uint32
-	typ    KeyType
-	format int16 // the format the RowDescription gives it: a Query's rows come in it
+	at         int // the column's index in a row
+	table      uint32
+	typ        KeyType
+	descFormat int16 // the format code the RowDescription gives it: a Query's rows come in it
 }
 
-// cellAt is a Describe at pos of its unit whose answer fills cols; gen is
-// session.resolution when it arrived.
+// cellAt is a Describe at pos of its unit whose answer fills cols, under the
+// resolution gen: when it arrived, for a statement, or when the portal was
+// bound, for a portal.
 type cellAt struct {
 	pos  int
 	cols *resultCols
@@ -212,17 +216,17 @@ type rowDesc struct {
 // wanted reports whether the RowDescription's body is to be read.
 func (d rowDesc) wanted() bool { return d.cell != nil || d.unit != nil }
 
-// track gives b, the portal Bind m makes of p, what its Executes need to
-// take keys from their rows: p's cell, the result format codes m sets, and
-// the one value m binds to Statement.KeyParam, the only bind value an
-// observed read keeps (spec 4), unless it is longer than any key taken. The
-// caller makes sure the statement's name had no other meaning at the Bind
-// and that both names are ASCII.
-func (b *bound) track(m *pgproto3.Bind, p prepared) {
+// track gives b, the portal Bind m makes of p under the resolution gen, what
+// its Executes need to take keys from their rows: p's cell, the result format
+// codes m sets, gen, and the one value m binds to Statement.KeyParam, the
+// only bind value an observed read keeps (spec 4), unless it is longer than
+// any key taken. The caller makes sure the statement's name had no other
+// meaning at the Bind and that both names are ASCII.
+func (b *bound) track(m *pgproto3.Bind, p prepared, gen uint64) {
 	if p.cols == nil {
 		return
 	}
-	b.cols, b.formats = p.cols, slices.Clone(m.ResultFormatCodes)
+	b.cols, b.formats, b.gen = p.cols, slices.Clone(m.ResultFormatCodes), gen
 	if n := p.st.KeyParam; n > 0 && n <= len(m.Parameters) && len(m.Parameters[n-1]) <= maxKeyLen {
 		v := param(m, p.oids, n-1)
 		b.key = &v
@@ -235,12 +239,15 @@ func (b *bound) track(m *pgproto3.Bind, p prepared) {
 // whatever the server holds (names.get gives no other meaning), and that
 // statement has a cell. A name that is not ASCII is left out: the server may
 // know it by other bytes (see foreign). The answer is noted with the
-// resolution now (see resultCols). It runs with s.mu held.
+// resolution it describes (see resultCols): now, for a statement, which the
+// server plans again if what its names mean changed; the portal's Bind's,
+// for a portal, which keeps the plan of its Bind. It runs with s.mu held.
 func (s *session) describe(u *unit, pos int, kind byte, name string) {
 	if !ascii(name) {
 		return
 	}
 	var cols *resultCols
+	gen := s.resolution
 	switch kind {
 	case 'S':
 		if p, ok, others := s.stmts.get(u, name); ok && len(others) == 0 {
@@ -248,11 +255,11 @@ func (s *session) describe(u *unit, pos int, kind byte, name string) {
 		}
 	case 'P':
 		if b, ok, others := s.portals.get(u, name); ok && len(others) == 0 {
-			cols = b.cols
+			cols, gen = b.cols, b.gen
 		}
 	}
 	if cols != nil {
-		u.describes = append(u.describes, cellAt{pos: pos, cols: cols, gen: s.resolution})
+		u.describes = append(u.describes, cellAt{pos: pos, cols: cols, gen: gen})
 	}
 }
 
@@ -286,9 +293,9 @@ func (s *session) decide() {
 
 // decideRows decides the take for the answer to head now in progress: the
 // Execute after its last completion. When that Execute is a tracked read
-// whose statement's columns a Describe the server answered made known, and
-// nothing that may have changed what its names mean came between that
-// Describe and the Execute (see resultCols), the read gets its Read (its
+// whose statement's columns a Describe the server answered made known, under
+// the resolution its portal was bound under and that it arrived under, with
+// no revert since (see resultCols), the read gets its Read (its
 // Tables, and the KeyParam value its portal kept), and its rows are read for
 // keys when it has a key column and the unit may take more (maxUnitKeys).
 // Otherwise the rows give nothing, and an Execute's read keeps no Read. A
@@ -306,7 +313,7 @@ func (s *session) decideRows(head *unit) {
 		return
 	}
 	r := &head.reads[i]
-	if c := r.cols; !c.known || c.gen != r.gen || c.reverts != s.reverts {
+	if c := r.cols; !c.known || c.gen != r.bindGen || c.gen != r.gen || c.reverts != s.reverts {
 		return
 	}
 	r.keys = &ReadKeys{Tables: slices.Clone(r.cols.tables), Param: r.param}
@@ -391,7 +398,7 @@ func (s *session) rowDescription(body []byte) {
 	case d.unit != nil:
 		tk := &s.take
 		tk.unit, tk.read, tk.tables = d.unit, d.read, c.tables
-		tk.start(c, d.room, func(k keyCol) (int16, bool) { return k.format, true })
+		tk.start(c, d.room, func(k keyCol) (int16, bool) { return k.descFormat, true })
 	}
 }
 
@@ -446,7 +453,7 @@ func (s *session) columns(body []byte) resultCols {
 				c.tables = append(c.tables, table)
 			}
 			if attr == a.attr {
-				c.keys = append(c.keys, keyCol{at: i, table: table, typ: a.typ, format: format})
+				c.keys = append(c.keys, keyCol{at: i, table: table, typ: a.typ, descFormat: format})
 			}
 		}
 	}

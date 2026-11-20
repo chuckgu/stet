@@ -847,6 +847,7 @@ func TestTrackedReadBytesUnchanged(t *testing.T) {
 // transaction of a SET LOCAL, keep their keys; an Execute pipelined behind
 // the end of that transaction does not.
 func TestKeysForgottenWhenNamesMayResolveOtherwise(t *testing.T) {
+	t.Cleanup(proxy.SetMaxInspect(1024)) // before the proxy, so it is restored once the proxy closed
 	fn := backendPID(t)
 	tb := idTable(t, 3)
 	g := newKeyGate(tb)
@@ -862,33 +863,40 @@ func TestKeysForgottenWhenNamesMayResolveOtherwise(t *testing.T) {
 	exchange(t, fe, &pgproto3.Parse{Name: "s", Query: read}, &pgproto3.Describe{ObjectType: 'S', Name: "s"}, &pgproto3.Sync{})
 	run()
 	wantKeys(t, "described", g.observed(t, 1)[0].o, tb, "1")
-	query := func(sql string) pgproto3.FrontendMessage { return &pgproto3.Query{String: sql} }
+	// Each is sent and answered in turn.
+	type msgs = []pgproto3.FrontendMessage
+	query := func(sql string) msgs { return msgs{&pgproto3.Query{String: sql}} }
 	n := 1
 	for _, c := range []struct {
 		name           string
-		between, after []pgproto3.FrontendMessage
+		between, after []msgs
 		keys           bool
 	}{
-		{"set search_path", []pgproto3.FrontendMessage{query("set search_path = public")}, nil, false},
-		{"set role", []pgproto3.FrontendMessage{query("set role stet_scram")}, nil, false},
-		{"reset all", []pgproto3.FrontendMessage{query("reset all")}, nil, false},
+		{"set search_path", []msgs{query("set search_path = public")}, nil, false},
+		{"set role", []msgs{query("set role stet_scram")}, nil, false},
+		{"reset all", []msgs{query("reset all")}, nil, false},
 		{"set local search_path, then commit",
-			[]pgproto3.FrontendMessage{query("begin"), query("set local search_path = public"), query("commit")}, nil, false},
+			[]msgs{query("begin"), query("set local search_path = public"), query("commit")}, nil, false},
 		{"set search_path in a transaction still open",
-			[]pgproto3.FrontendMessage{query("begin"), query("set search_path = public")}, []pgproto3.FrontendMessage{query("commit")}, false},
-		{"a DO block", []pgproto3.FrontendMessage{query("do $$ begin perform 1; end $$")}, nil, false},
-		{"a FunctionCall", []pgproto3.FrontendMessage{&pgproto3.FunctionCall{Function: fn}}, nil, false},
-		{"set stet.on_behalf_of", []pgproto3.FrontendMessage{query("set stet.on_behalf_of = 'task-1'")}, nil, true},
-		{"set timezone", []pgproto3.FrontendMessage{query("set timezone = 'UTC'")}, nil, true},
+			[]msgs{query("begin"), query("set search_path = public")}, []msgs{query("commit")}, false},
+		{"a DO block", []msgs{query("do $$ begin perform 1; end $$")}, nil, false},
+		{"a FunctionCall", []msgs{{&pgproto3.FunctionCall{Function: fn}}}, nil, false},
+		{"a Query the proxy could not read", []msgs{query("select 1 /* " + strings.Repeat("x", 1100) + " */")}, nil, false},
+		{"SQL EXECUTE", []msgs{query("prepare w as select 1"), query("execute w")}, []msgs{query("deallocate w")}, false},
+		{"an Execute of a portal the proxy does not know",
+			[]msgs{query("declare c cursor with hold for select 1"), {&pgproto3.Execute{Portal: "c"}, &pgproto3.Sync{}}},
+			[]msgs{query("close c")}, false},
+		{"set stet.on_behalf_of", []msgs{query("set stet.on_behalf_of = 'task-1'")}, nil, true},
+		{"set timezone", []msgs{query("set timezone = 'UTC'")}, nil, true},
 	} {
 		for _, m := range c.between {
-			exchange(t, fe, m)
+			exchange(t, fe, m...)
 		}
 		run()
 		exchange(t, fe, &pgproto3.Describe{ObjectType: 'S', Name: "s"}, &pgproto3.Sync{})
 		run()
 		for _, m := range c.after {
-			exchange(t, fe, m)
+			exchange(t, fe, m...)
 		}
 		obs := g.observed(t, n+2)
 		if c.keys {
@@ -942,12 +950,13 @@ func rowsOf(t *testing.T, fe *pgproto3.Frontend, msgs ...pgproto3.FrontendMessag
 	}
 }
 
-// Tables of the same name in two schemas: a statement prepared and described
-// under one search_path, then run under the other, which the server plans
-// again against the other table with no new Parse or RowDescription. Its rows
-// are not keyed as the first table's; once described again they are keyed as
-// the second's.
-func TestKeysOfAStatementRunUnderAnotherSearchPath(t *testing.T) {
+// twoSchemas creates two schemas, each with a table accounts (id int primary
+// key, title text) whose rows are titled with the schema's name: ids 1 and 3
+// in the first, 2 and 4 in the second. It starts a proxy whose gate tracks
+// both tables by id and returns the gate, a frontend through the proxy, the
+// schemas and their tables' OIDs. The schemas are dropped when the test ends.
+func twoSchemas(t *testing.T) (*recordingGate, *pgproto3.Frontend, []string, []uint32) {
+	t.Helper()
 	stamp := time.Now().UnixNano()
 	admin := connect(t, upstream(t), "stet_scram", nil)
 	schemas := []string{fmt.Sprintf("keys_a_%d", stamp), fmt.Sprintf("keys_b_%d", stamp)}
@@ -956,7 +965,7 @@ func TestKeysOfAStatementRunUnderAnotherSearchPath(t *testing.T) {
 		mustExec(t, admin, "create schema "+schema)
 		t.Cleanup(func() { admin.Exec(context.Background(), "drop schema "+schema+" cascade") })
 		mustExec(t, admin, "create table "+schema+".accounts (id int primary key, title text)")
-		mustExec(t, admin, fmt.Sprintf("insert into %s.accounts values (%d, '%s')", schema, i+1, schema))
+		mustExec(t, admin, fmt.Sprintf("insert into %s.accounts values (%d, '%s'), (%d, '%[3]s')", schema, i+1, schema, i+3))
 		var oid int64
 		if err := admin.QueryRow(testCtx(t), "select ($1 || '.accounts')::regclass::oid::int8", schema).Scan(&oid); err != nil {
 			t.Fatal(err)
@@ -968,14 +977,37 @@ func TestKeysOfAStatementRunUnderAnotherSearchPath(t *testing.T) {
 	g.readOnly, g.resolves = readOnlyRE.MatchString, resolvesRE.MatchString
 	g.tracked = map[uint32]trackedKey{oids[0]: {attr: 1, typ: proxy.KeyInt4}, oids[1]: {attr: 1, typ: proxy.KeyInt4}}
 	addr, _ := startProxy(t, upstream(t), g)
-	fe := rawConn(t, addr)
+	return g, rawConn(t, addr), schemas, oids
+}
+
+// wantRows fails the test unless rows are the rows of schema with ids, in
+// that order.
+func wantRows(t *testing.T, what string, rows [][]string, schema string, ids ...string) {
+	t.Helper()
+	var want [][]string
+	for _, id := range ids {
+		want = append(want, []string{id, schema})
+	}
+	if !slices.EqualFunc(rows, want, slices.Equal) {
+		t.Fatalf("%s: rows %q, want %q", what, rows, want)
+	}
+}
+
+// Tables of the same name in two schemas: a statement prepared and described
+// under one search_path, then run under the other, which the server plans
+// again against the other table with no new Parse or RowDescription. Its rows
+// are not keyed as the first table's; once described again they are keyed as
+// the second's.
+func TestKeysOfAStatementRunUnderAnotherSearchPath(t *testing.T) {
+	g, fe, schemas, oids := twoSchemas(t)
 	run := func() [][]string {
 		t.Helper()
 		return rowsOf(t, fe, &pgproto3.Bind{PreparedStatement: "s"}, &pgproto3.Execute{}, &pgproto3.Sync{})
 	}
 
 	exchange(t, fe, &pgproto3.Query{String: "set search_path = " + schemas[0]})
-	exchange(t, fe, &pgproto3.Parse{Name: "s", Query: "select id, title from accounts"}, &pgproto3.Describe{ObjectType: 'S', Name: "s"}, &pgproto3.Sync{})
+	exchange(t, fe, &pgproto3.Parse{Name: "s", Query: "select id, title from accounts order by id limit 1"},
+		&pgproto3.Describe{ObjectType: 'S', Name: "s"}, &pgproto3.Sync{})
 	first := run()
 	exchange(t, fe, &pgproto3.Query{String: "set search_path = " + schemas[1]})
 	second := run()
@@ -1003,6 +1035,75 @@ func TestKeysOfAStatementRunUnderAnotherSearchPath(t *testing.T) {
 	wantRead(t, "under the second search_path, described again", obs[2].o, oids[1:], []string{fmt.Sprintf("%d:2", oids[1])})
 	wantRead(t, "in a transaction, under the first search_path", obs[3].o, oids[:1], []string{fmt.Sprintf("%d:1", oids[0])})
 	wantNoRead(t, "in a transaction, under the second search_path, not described again", obs[4].o)
+}
+
+// The server plans a portal at its Bind, and an Execute sends the rows of
+// that plan. A portal bound before a SET of search_path and run after it,
+// with its statement described after the SET, sends the first table's rows:
+// they are not keyed as the second table's (M1). A portal described after
+// the SET describes its own plan, of the first table: a new portal, bound
+// after the SET, reads the second table and is not keyed as the first's
+// (M2). Bound, described and run after the SET, a portal is keyed as the
+// second table's.
+func TestKeysOfAPortalAreThoseOfItsBind(t *testing.T) {
+	sql := "select id, title from accounts order by id limit 1"
+	again := func(t *testing.T, fe *pgproto3.Frontend) [][]string {
+		t.Helper()
+		return rowsOf(t, fe, &pgproto3.Bind{DestinationPortal: "q", PreparedStatement: "s"},
+			&pgproto3.Describe{ObjectType: 'P', Name: "q"}, &pgproto3.Execute{Portal: "q"}, &pgproto3.Sync{})
+	}
+
+	t.Run("M1: bound before the SET, statement described after it", func(t *testing.T) {
+		g, fe, schemas, oids := twoSchemas(t)
+		exchange(t, fe, &pgproto3.Query{String: "set search_path = " + schemas[0]})
+		exchange(t, fe, &pgproto3.Parse{Name: "s", Query: sql}, &pgproto3.Describe{ObjectType: 'S', Name: "s"}, &pgproto3.Sync{})
+		rows := rowsOf(t, fe, &pgproto3.Bind{DestinationPortal: "p", PreparedStatement: "s"},
+			&pgproto3.Parse{Name: "l", Query: "set search_path = " + schemas[1]}, &pgproto3.Bind{PreparedStatement: "l"},
+			&pgproto3.Execute{}, &pgproto3.Describe{ObjectType: 'S', Name: "s"}, &pgproto3.Execute{Portal: "p"}, &pgproto3.Sync{})
+		wantRows(t, "the portal bound before the SET", rows, schemas[0], "1")
+		wantRows(t, "bound, described and run after the SET", again(t, fe), schemas[1], "2")
+		obs := g.observed(t, 2)
+		wantNoRead(t, "the portal bound before the SET", obs[0].o)
+		wantRead(t, "bound, described and run after the SET", obs[1].o, oids[1:], []string{fmt.Sprintf("%d:2", oids[1])})
+	})
+
+	t.Run("M2: old portal described after the SET, new portal run", func(t *testing.T) {
+		g, fe, schemas, oids := twoSchemas(t)
+		exchange(t, fe, &pgproto3.Query{String: "set search_path = " + schemas[0]})
+		exchange(t, fe, &pgproto3.Parse{Name: "s", Query: sql}, &pgproto3.Sync{})
+		exchange(t, fe, &pgproto3.Query{String: "begin"})
+		exchange(t, fe, &pgproto3.Bind{DestinationPortal: "p", PreparedStatement: "s"}, &pgproto3.Sync{})
+		exchange(t, fe, &pgproto3.Query{String: "set search_path = " + schemas[1]})
+		exchange(t, fe, &pgproto3.Describe{ObjectType: 'P', Name: "p"}, &pgproto3.Sync{})
+		rows := rowsOf(t, fe, &pgproto3.Bind{PreparedStatement: "s"}, &pgproto3.Execute{}, &pgproto3.Sync{})
+		exchange(t, fe, &pgproto3.Query{String: "commit"})
+		wantRows(t, "a new portal bound after the SET", rows, schemas[1], "2")
+		wantRows(t, "bound, described and run after the SET", again(t, fe), schemas[1], "2")
+		obs := g.observed(t, 2)
+		wantNoRead(t, "a new portal bound after the SET", obs[0].o)
+		wantRead(t, "bound, described and run after the SET", obs[1].o, oids[1:], []string{fmt.Sprintf("%d:2", oids[1])})
+	})
+}
+
+// A portal read in parts keeps the plan of its Bind: after a SET of
+// search_path between two parts, the later part still sends the first
+// table's rows. Its keys are not taken: the Execute came after the SET, and
+// what the proxy compares does not tell that the portal's plan did not move.
+func TestKeysOfAPortalInPartsAcrossASet(t *testing.T) {
+	g, fe, schemas, oids := twoSchemas(t)
+	exchange(t, fe, &pgproto3.Query{String: "set search_path = " + schemas[0]})
+	exchange(t, fe, &pgproto3.Parse{Name: "s", Query: "select id, title from accounts order by id"},
+		&pgproto3.Describe{ObjectType: 'S', Name: "s"}, &pgproto3.Sync{})
+	exchange(t, fe, &pgproto3.Query{String: "begin"})
+	first := rowsOf(t, fe, &pgproto3.Bind{DestinationPortal: "p", PreparedStatement: "s"}, &pgproto3.Execute{Portal: "p", MaxRows: 1}, &pgproto3.Sync{})
+	exchange(t, fe, &pgproto3.Query{String: "set search_path = " + schemas[1]})
+	second := rowsOf(t, fe, &pgproto3.Execute{Portal: "p", MaxRows: 1}, &pgproto3.Sync{})
+	exchange(t, fe, &pgproto3.Query{String: "commit"})
+	wantRows(t, "the first part", first, schemas[0], "1")
+	wantRows(t, "the part after the SET", second, schemas[0], "3")
+	obs := g.observed(t, 2)
+	wantRead(t, "the first part", obs[0].o, oids[:1], []string{fmt.Sprintf("%d:1", oids[0])})
+	wantNoRead(t, "the part after the SET", obs[1].o)
 }
 
 // trackAnyway marks every observed read Track while leaving it not
