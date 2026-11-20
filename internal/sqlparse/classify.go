@@ -178,8 +178,8 @@ type Tables struct {
 	// PK maps a table name, optionally schema-qualified (the config key), to
 	// its primary key column.
 	PK map[string]string
-	// Reads says whether any of them records reads. Without it no statement
-	// is examined for reads, so none is Read.
+	// Reads says whether any of them records reads or remembers them (stale-write
+	// detection). Without it no statement is examined for reads, so none is Read.
 	Reads bool
 }
 
