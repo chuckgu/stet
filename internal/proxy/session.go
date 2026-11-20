@@ -258,8 +258,17 @@ type session struct {
 	enforce bool
 
 	// Touched only on the server side, and by abandon once both sides have
-	// stopped: row messages sent since the last completion or error.
+	// stopped: row messages sent since the last completion or error; the
+	// keys taken from them (see keyTake); what the body of the RowDescription
+	// being read is for.
 	sent int64
+	take keyTake
+	desc rowDesc
+
+	// tracking counts the units waiting that hold a read that may take keys
+	// (unit.tracked). While it is 0 the server side is shown no DataRow body,
+	// at the cost of one atomic load per row. Changed under mu.
+	tracking atomic.Int32
 
 	mu     sync.Mutex
 	units  []*unit // sent, not yet answered by ReadyForQuery; oldest first
@@ -268,6 +277,9 @@ type session struct {
 	// dirty: a unit answered since the last idle ReadyForQuery held a
 	// statement that is not clean. The units still waiting carry their own.
 	dirty bool
+	// notReadOnly: likewise, a unit answered since then held a message that
+	// is not read-only (see readOnlySoFar).
+	notReadOnly bool
 	// owed: a unit answered since the last TxEnded owes the gate one (see
 	// unit.owes); unseenCalls: how many Unseen calls were made for the
 	// messages of those units. The next idle ReadyForQuery hands both over in
@@ -344,6 +356,9 @@ type prepared struct {
 	// unread: set by a Parse the proxy could not read. What it runs is
 	// unknown.
 	unread bool
+	// cols: of a tracked read (see tracks) whose name is ASCII, the cell of
+	// its result columns, new with each Parse (see resultCols); nil otherwise.
+	cols *resultCols
 }
 
 // bound is what a portal means. A Bind of a statement Stet does not follow
@@ -365,6 +380,12 @@ type bound struct {
 	// statement's name had at the Bind, folded into one (see readUnder.with);
 	// atBind, when the Bind arrived.
 	atParse, atBind readUnder
+	// Of a tracked read whose statement's name had one meaning at the Bind
+	// (see bound.track): its statement's cell, the result format codes of
+	// the Bind, and the value it bound to Statement.KeyParam (nil for none).
+	cols    *resultCols
+	formats []int16
+	key     *Param
 }
 
 // read is what a write run by an Execute of b was read under: its
@@ -411,11 +432,14 @@ type unit struct {
 	stray                     bool
 	copies, copyEnds, strayAt int
 	query                     bool
-	dirty                     bool // it holds a statement that is not clean (see Statement.Clean)
-	sets                      bool // on an enforced session: it may hold a SET or RESET (see setPending)
-	unseen                    int  // on a session that does not enforce: the Unseen calls made for its messages
-	executes                  int  // Execute messages so far
-	completions               int  // CommandComplete, EmptyQueryResponse, PortalSuspended
+	dirty                     bool     // it holds a statement that is not clean (see Statement.Clean)
+	notReadOnly               bool     // it holds a message that is not read-only (see readOnlySoFar)
+	tracked                   bool     // it holds a read that may take keys (see session.tracking)
+	describes                 []cellAt // its Describes whose answer fills a cell (see describe)
+	sets                      bool     // on an enforced session: it may hold a SET or RESET (see setPending)
+	unseen                    int      // on a session that does not enforce: the Unseen calls made for its messages
+	executes                  int      // Execute messages so far
+	completions               int      // CommandComplete, EmptyQueryResponse, PortalSuspended
 	err                       string
 	errAt                     int // the Execute the error belongs to (1-based)
 	writes                    []watchedWrite
@@ -462,6 +486,18 @@ type observedRead struct {
 	// read was answered: tally sets it, in the order of the answers.
 	total  *int64
 	before int64
+	// track: the read may take keys from its answer (see observe). A Query
+	// is answered with its own RowDescriptions; an Execute takes its
+	// statement's columns from cols, its portal's result formats, and param,
+	// the value its portal kept for Statement.KeyParam. keys is Outcome.Read:
+	// a Query's from its arrival, an Execute's once its answer found cols
+	// known, nil otherwise. Set and filled under s.mu; cols is read on the
+	// server side alone.
+	track   bool
+	cols    *resultCols
+	formats []int16
+	param   *Param
+	keys    *ReadKeys
 }
 
 // unrecordedWrite is what the gate's Begin handed back for a write that is
@@ -499,22 +535,34 @@ func (s *session) clientTap() *tap {
 }
 
 // serverTap follows the server's completions, errors and ReadyForQuery, and
-// its one BackendKeyData (see backendKey), in both modes.
+// its one BackendKeyData (see backendKey), in both modes. The bodies of
+// RowDescription and DataRow are read only for a tracked read (keys.go): a
+// RowDescription when what its header answers wants it (rowDesc), a DataRow
+// while the answer it belongs to takes keys (rowWanted). The bytes forwarded
+// stay the ones the server sent.
 func (s *session) serverTap() *tap {
 	want := func(t byte) bool {
 		switch t {
 		case 'C', 'I', 's', 'E', 'Z', 'K':
 			return true
+		case 'T':
+			return s.desc.wanted()
+		case 'D':
+			return s.rowWanted()
 		}
 		return false
 	}
 	if s.enforce {
 		// Also ParameterStatus (see parameter), CopyInResponse and
-		// CopyBothResponse (see copyIn). Rows are still not shown.
+		// CopyBothResponse (see copyIn).
 		want = func(t byte) bool {
 			switch t {
 			case 'C', 'I', 's', 'E', 'Z', 'K', 'S', 'G', 'W':
 				return true
+			case 'T':
+				return s.desc.wanted()
+			case 'D':
+				return s.rowWanted()
 			}
 			return false
 		}
@@ -522,6 +570,14 @@ func (s *session) serverTap() *tap {
 	return &tap{
 		want: want,
 		see: func(t byte, body []byte, _ func() error) ([]byte, error) {
+			switch t {
+			case 'T':
+				s.rowDescription(body)
+				return nil, nil
+			case 'D':
+				s.dataRow(body)
+				return nil, nil
+			}
 			return s.fromServer(t, body)
 		},
 		each: func(t byte) {
@@ -529,18 +585,26 @@ func (s *session) serverTap() *tap {
 			case 'D', 'd': // DataRow, CopyData
 				s.sent++
 			case '1', '2', '3', 'T', 'n': // ParseComplete, BindComplete, CloseComplete, RowDescription, NoData
-				s.ack()
+				s.ack(t)
 			}
 		},
 	}
 }
 
-// ack counts a message of the unit being answered as completed. It runs on
-// the server side, once per completion, never per row.
-func (s *session) ack() {
+// ack counts message t, a completion of a message of the unit being
+// answered, as completed; for a RowDescription it first notes what the body
+// is for (describing). It runs on the server side, once per completion, never
+// per row.
+func (s *session) ack(t byte) {
 	s.mu.Lock()
 	done := s.answeredUnsynced(nil)
+	if t == 'T' {
+		s.desc = rowDesc{}
+	}
 	if len(s.units) > 0 {
+		if t == 'T' {
+			s.describing(s.units[0])
+		}
 		s.acked(s.units[0])
 	}
 	s.mu.Unlock()
@@ -594,6 +658,9 @@ func (s *session) leave(a answer, after byte) {
 	}
 	if s.lastQuery == u {
 		s.lastQuery = nil
+	}
+	if u.tracked {
+		s.tracking.Add(-1)
 	}
 	s.stmts.answered(u, u.acks)
 	s.portals.answered(u, u.acks)
@@ -702,7 +769,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 				return s.block(u, 0, 'Q', "", reason), nil
 			}
 		}
-		return s.statement(u, 0, 0, 'Q', st, nil, nil, nil, flush), nil
+		return s.statement(u, 0, 0, 'Q', st, nil, nil, flush), nil
 
 	case 'P':
 		var m pgproto3.Parse
@@ -710,6 +777,9 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		var p prepared
 		if read {
 			p = prepared{st: s.gate.Inspect(m.Query), oids: slices.Clone(m.ParameterOIDs)}
+			if tracks(p.st) && ascii(m.Name) {
+				p.cols = new(resultCols) // filled by the answer to a Describe of it (see describe)
+			}
 		}
 		var closedPoint string // on a session that does not enforce: the closed point it is, if any
 		if !s.enforce {
@@ -778,6 +848,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		var p prepared
 		var ok bool
 		var others []prepared
+		var single bool // the statement's name has one meaning, whatever the server holds
 		var atParse, atBind readUnder
 		s.mu.Lock()
 		u, pos := s.count()
@@ -789,6 +860,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		}
 		if read {
 			p, ok, others = s.stmts.get(u, m.PreparedStatement)
+			single = ok && len(others) == 0
 			if s.enforce && ok {
 				// The portal runs whichever meaning of the name holds, one
 				// dropped below as the same statement included, and each may
@@ -823,6 +895,11 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		if read {
 			b = binding(&m, p, ok, others)
 			b.atParse, b.atBind = atParse, atBind
+			if single && ascii(m.PreparedStatement) && ascii(m.DestinationPortal) {
+				// Another meaning, even the same SQL parsed again, may have
+				// other columns: only a portal sure of its statement is tracked.
+				b.track(&m, p)
+			}
 		}
 		s.mu.Lock()
 		if read {
@@ -894,7 +971,10 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 			at := b.read(others)
 			under = &at
 		}
-		r := s.statement(u, idx, pos, 'E', b.st, b.params, b.rows, under, flush)
+		if len(others) > 0 {
+			b.cols = nil // it may run another meaning of the name, whose columns are not these
+		}
+		r := s.statement(u, idx, pos, 'E', b.st, &b, under, flush)
 		if mayRunUnclean(b, others) {
 			s.markDirty(u) // the server may run another meaning of the name
 		}
@@ -922,8 +1002,13 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		s.mu.Unlock()
 
 	case 'D':
+		var m pgproto3.Describe
+		read := body != nil && m.Decode(body) == nil
 		s.mu.Lock()
-		s.count()
+		u, pos := s.count()
+		if read {
+			s.describe(u, pos, m.ObjectType, m.Name)
+		}
 		s.mu.Unlock()
 
 	case 'H':
@@ -936,7 +1021,7 @@ func (s *session) fromClient(t byte, body []byte, flush func() error) ([]byte, e
 		s.mu.Unlock()
 
 	case 'F':
-		u := s.push(&unit{closed: true, dirty: true}) // the function may change anything
+		u := s.push(&unit{closed: true, dirty: true, notReadOnly: true}) // the function may change anything
 		if s.enforce {
 			return s.block(u, 0, 'F', "", BlockFunctionCall), nil
 		}
@@ -1024,18 +1109,23 @@ func (s *session) firstTime(reason string) bool {
 	return true
 }
 
-// statement follows st, arriving as a Query (idx and pos 0) or as Execute idx
-// at pos of u, with the bind values ps and the running row count rows of its
-// portal, and, for a watched write an Execute runs on an enforced session,
-// what its statement and portal were read under (nil otherwise: a Query is
-// read where it runs). It returns the message to send in its place when the
-// gate refused it, and nil to forward it.
+// statement follows st, arriving as a Query (idx and pos 0, b nil) or as
+// Execute idx at pos of u of the portal b (its bind values, running row count
+// and what a tracked read takes keys with), and, for a watched write an
+// Execute runs on an enforced session, what its statement and portal were
+// read under (nil otherwise: a Query is read where it runs). It returns the
+// message to send in its place when the gate refused it, and nil to forward
+// it.
 //
 // A refused statement never runs, so it leaves on_behalf_of and the cursor
 // table as they were. It still marks u: its replacement was sent and fails,
 // and the server's answer settles the rest.
-func (s *session) statement(u *unit, idx, pos int, t byte, st Statement, ps []Param, rows *int64, under *readUnder, flush func() error) []byte {
+func (s *session) statement(u *unit, idx, pos int, t byte, st Statement, b *bound, under *readUnder, flush func() error) []byte {
 	if st.Watch {
+		var ps []Param
+		if b != nil {
+			ps = b.params
+		}
 		if r := s.begin(u, idx, pos, t, st, ps, under, flush); r != nil {
 			s.dirties(u, st)
 			return r
@@ -1046,9 +1136,9 @@ func (s *session) statement(u *unit, idx, pos int, t byte, st Statement, ps []Pa
 	case len(st.Cursors) > 0: // for a watched write too: a write among cursor statements
 		s.applyCursors(u, idx, st)
 	case st.Observe && !st.Watch:
-		s.observe(u, idx, st, rows)
+		s.observe(u, idx, st, b)
 	}
-	s.dirties(u, st)
+	s.dirties(u, st) // after observe: a read's own message does not count against it
 	return nil
 }
 
@@ -1059,14 +1149,18 @@ func (s *session) apply(st Statement) {
 }
 
 // dirties marks u when the message st stands for, sent as part of u, is not
-// clean: the transaction it runs in is dirty from then on. A watched write
-// is never clean; it marks u only here, after Begin was told whether the
+// clean: the transaction it runs in is dirty from then on; and, apart from
+// that, when it is not read-only (see readOnlySoFar). A watched write is
+// neither; it marks u only here, after Begin was told whether the
 // transaction was clean when it arrived. On an enforced session it also
 // marks u when st holds a SET or RESET (see setPending), likewise after
 // Begin was told of one in the write's own message.
 func (s *session) dirties(u *unit, st Statement) {
-	if unclean(st) {
-		s.markDirty(u)
+	if dirty, written := unclean(st), !readOnly(st); dirty || written {
+		s.mu.Lock()
+		u.dirty = u.dirty || dirty
+		u.notReadOnly = u.notReadOnly || written
+		s.mu.Unlock()
 	}
 	if s.enforce && st.Sets {
 		s.markSets(u)
@@ -1076,10 +1170,16 @@ func (s *session) dirties(u *unit, st Statement) {
 // unclean reports whether st leaves the transaction it runs in dirty.
 func unclean(st Statement) bool { return st.Watch || !st.Clean }
 
-// markDirty notes that u holds a statement that is not clean.
+// readOnly reports whether sending st leaves later reads of its transaction
+// comparable (Statement.ReadOnly). A watched write never does.
+func readOnly(st Statement) bool { return !st.Watch && st.ReadOnly }
+
+// markDirty notes that u holds a message that is not clean, nor read-only,
+// with no statement to tell otherwise: one the proxy could not read, one
+// that may run anything or another meaning of a name.
 func (s *session) markDirty(u *unit) {
 	s.mu.Lock()
-	u.dirty = true
+	u.dirty, u.notReadOnly = true, true
 	s.mu.Unlock()
 }
 
@@ -1092,13 +1192,15 @@ func (s *session) markSets(u *unit) {
 
 // carry moves the marks of a's unit, which is no longer waiting, to the
 // session, given the transaction status after it (see leave). Whether it
-// left the transaction dirty counts only while a transaction stays open.
-// What it owes the gate, and the Unseen calls made for it, always pass on:
-// the next idle ReadyForQuery hands them over in one TxEnded, the one
-// answering the unit when after is idle. It runs with s.mu held.
+// left the transaction dirty, or not read-only, counts only while a
+// transaction stays open. What it owes the gate, and the Unseen calls made
+// for it, always pass on: the next idle ReadyForQuery hands them over in one
+// TxEnded, the one answering the unit when after is idle. It runs with s.mu
+// held.
 func (s *session) carry(a answer, after byte) {
 	if after != 'I' {
 		s.dirty = s.dirty || a.u.dirty
+		s.notReadOnly = s.notReadOnly || a.u.notReadOnly
 	}
 	s.owed = s.owed || a.u.owes(a.inTx)
 	s.unseenCalls += a.u.unseen
@@ -1126,6 +1228,17 @@ func (s *session) txDirty() bool {
 		}
 	}
 	return false
+}
+
+// readOnlySoFar reports whether every message sent since the server last
+// reported the session idle was read-only (Statement.ReadOnly), in a unit
+// answered since then or in one still waiting, as txDirty does for clean
+// ones. A read sent after them alone sees no row version Stet's own
+// connection cannot (spec 4); after any other, even one the server has not
+// answered or one earlier under the same Sync, its keys are not taken. It
+// runs with s.mu held.
+func (s *session) readOnlySoFar() bool {
+	return !s.notReadOnly && !slices.ContainsFunc(s.units, func(u *unit) bool { return u.notReadOnly })
 }
 
 // setPending reports whether a SET or RESET was sent that no ReadyForQuery
@@ -1219,10 +1332,33 @@ func (s *session) stuck() bool {
 
 // observe notes a read in its unit. Nothing waits for the gate and nothing
 // queued is flushed first: the gate hears of the read once it was answered.
-// rows is the running count of the portal it reads, or nil for a Query.
-func (s *session) observe(u *unit, idx int, st Statement, rows *int64) {
+// b is the portal it reads, or nil for a Query.
+//
+// A tracked read (see tracks) sent after read-only messages alone may take
+// the keys of the rows it sends (spec 4): a Query, from its own
+// RowDescriptions; an Execute, from what a Describe the server answered said
+// of its statement (b.cols, nil when its portal may run another meaning).
+// Its unit then counts in s.tracking until it is answered.
+func (s *session) observe(u *unit, idx int, st Statement, b *bound) {
+	var rows *int64
+	if b != nil {
+		rows = b.rows
+	}
 	s.mu.Lock()
-	u.reads = append(u.reads, s.arriving(st, idx, rows))
+	r := s.arriving(st, idx, rows)
+	if tracks(st) && s.readOnlySoFar() {
+		switch {
+		case b == nil:
+			r.track, r.keys = true, &ReadKeys{}
+		case b.cols != nil:
+			r.track, r.cols, r.formats, r.param = true, b.cols, b.formats, b.key
+		}
+		if r.track && !u.tracked {
+			u.tracked = true
+			s.tracking.Add(1)
+		}
+	}
+	u.reads = append(u.reads, r)
 	s.mu.Unlock()
 }
 
@@ -1304,10 +1440,11 @@ func (s *session) count() (*unit, int) {
 
 // binding is what the portal of Bind m means, given what its statement's
 // name meant (see names.get). A portal is given a statement when its Execute
-// does something beyond leaving the transaction dirty, runs a name (see
-// runsWatched), or hides its writes (Block, which only a session that does
-// not enforce lets into its table: see unseen); one left empty dirties it.
-// Only a watched statement keeps the bind values, for Begin.
+// does something beyond leaving the transaction dirty and not read-only,
+// runs a name (see runsWatched), or hides its writes (Block, which only a
+// session that does not enforce lets into its table: see unseen); one left
+// empty dirties it and is not read-only. Only a watched statement keeps the
+// bind values, for Begin.
 func binding(m *pgproto3.Bind, p prepared, ok bool, others []prepared) bound {
 	b := bound{others: others}
 	switch {
@@ -1318,7 +1455,7 @@ func binding(m *pgproto3.Bind, p prepared, ok bool, others []prepared) bound {
 		b.st, b.params = p.st, params(m, p.oids)
 	case p.st.Observe:
 		b.st, b.rows = p.st, new(int64)
-	case p.st.Clean || p.st.Sets || p.st.OnBehalfOf != nil || len(p.st.Cursors) > 0 || runsNames(p.st) || p.st.Block != "":
+	case p.st.Clean || p.st.ReadOnly || p.st.Sets || p.st.OnBehalfOf != nil || len(p.st.Cursors) > 0 || runsNames(p.st) || p.st.Block != "":
 		b.st = p.st
 	}
 	return b
@@ -1344,6 +1481,9 @@ func (s *session) fromServer(t byte, body []byte) ([]byte, error) {
 	var info SessionInfo // the session as the gate is told of it then
 	switch t {
 	case 'C', 'I', 's':
+		if s.take.state == takeUndecided {
+			s.decideRows(head) // an answer that sent no row: its read's Read, if any
+		}
 		s.settle(head)
 		if head != nil {
 			head.completions++
@@ -1427,8 +1567,8 @@ func (s *session) readyForQuery(head *unit, body []byte, done []answer) (_ []ans
 	s.setsCarried = false // the server reported what the unsynced units changed
 	if status == 'I' {
 		// No transaction is open: what was answered before cannot make the
-		// next one dirty. The units still waiting keep theirs.
-		s.dirty = false
+		// next one dirty, or not read-only. The units still waiting keep theirs.
+		s.dirty, s.notReadOnly = false, false
 	}
 	if !s.ready {
 		s.ready = true
@@ -1458,8 +1598,10 @@ func (s *session) readyForQuery(head *unit, body []byte, done []answer) (_ []ans
 // settle moves the row messages sent since the last completion or error to
 // head, under the statement that was answering: the Execute after its last
 // completion, or the Query as a whole. A unit without observed reads drops
-// them. It runs on the server side with s.mu held, or from abandon.
+// them. The keys taken from them go to their read (settleKeys). It runs on
+// the server side with s.mu held, or from abandon.
 func (s *session) settle(head *unit) {
+	s.settleKeys(head)
 	n := s.sent
 	if n == 0 {
 		return
@@ -1503,7 +1645,7 @@ func (s *session) finish(u *unit, inTx bool) {
 	}
 	for _, r := range u.reads {
 		o := u.answered(r.idx, inTx)
-		o.Sent, o.Before, o.Arrived = u.sent[r.idx], r.before, r.at
+		o.Sent, o.Before, o.Arrived, o.Read = u.sent[r.idx], r.before, r.at, r.keys
 		if r.ifRows && o.Sent == 0 {
 			continue
 		}
@@ -1643,9 +1785,10 @@ func (s *session) abandon() {
 		// The rows of the statement that was still answering belong to the
 		// first unit not answered in full: an unsynced unit that completed
 		// settled its own. When the lock was left held, the server side may
-		// be the one waiting for it, having counted rows after it last let go
-		// of the lock (s.sent is counted without it): those are left out
-		// rather than read with nothing ordering them.
+		// be the one waiting for it, having counted rows, and taken their
+		// keys, after it last let go of the lock (s.sent and s.take are
+		// written without it): those are left out rather than read with
+		// nothing ordering them.
 		if !locked {
 			break
 		}
@@ -1671,7 +1814,7 @@ func (s *session) abandon() {
 		}
 		for _, r := range u.reads {
 			o := u.unanswered(r.idx, inTx)
-			o.Sent, o.Before, o.Arrived = u.sent[r.idx], r.before, r.at
+			o.Sent, o.Before, o.Arrived, o.Read = u.sent[r.idx], r.before, r.at, r.keys
 			if r.ifRows && o.Sent == 0 {
 				continue
 			}
@@ -1725,20 +1868,26 @@ func (u *unit) unansweredWrite(w watchedWrite, inTx bool) Outcome {
 
 func params(m *pgproto3.Bind, oids []uint32) []Param {
 	ps := make([]Param, len(m.Parameters))
-	for i, v := range m.Parameters {
-		p := Param{Value: cloneBytes(v)}
-		switch n := len(m.ParameterFormatCodes); {
-		case n == 1:
-			p.Format = m.ParameterFormatCodes[0]
-		case i < n:
-			p.Format = m.ParameterFormatCodes[i]
-		}
-		if i < len(oids) {
-			p.OID = oids[i]
-		}
-		ps[i] = p
+	for i := range m.Parameters {
+		ps[i] = param(m, oids, i)
 	}
 	return ps
+}
+
+// param is the value at index i of Bind m, copied, with its format and the
+// type oids (from its Parse) gives it.
+func param(m *pgproto3.Bind, oids []uint32, i int) Param {
+	p := Param{Value: cloneBytes(m.Parameters[i])}
+	switch n := len(m.ParameterFormatCodes); {
+	case n == 1:
+		p.Format = m.ParameterFormatCodes[0]
+	case i < n:
+		p.Format = m.ParameterFormatCodes[i]
+	}
+	if i < len(oids) {
+		p.OID = oids[i]
+	}
+	return p
 }
 
 // cloneBytes copies b out of the reused read buffer, keeping nil (NULL)

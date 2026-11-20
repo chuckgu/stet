@@ -43,6 +43,15 @@ type recordingGate struct {
 	// STDIN (Statement.CopyIn); when nil, none is: the classifier did not see
 	// it.
 	copyIn func(sql string) bool
+	// readOnly, when set, says which statements Inspect marks ReadOnly, and
+	// Inspect marks Track each observed read it marks ReadOnly (cursor
+	// statements too, which the proxy must not take keys for); when nil, none
+	// is. keyParam, when set, gives such a read's KeyParam. tracked answers
+	// Tracked: the key column of each table by OID. All three are set before
+	// the gate is used and not changed after.
+	readOnly func(sql string) bool
+	keyParam func(sql string) int
+	tracked  map[uint32]trackedKey
 
 	mu       sync.Mutex
 	inspects int // Inspect calls
@@ -109,6 +118,13 @@ func (g *recordingGate) Inspect(sql string) proxy.Statement {
 	}
 	if g.copyIn != nil {
 		st.CopyIn = g.copyIn(sql)
+	}
+	if g.readOnly != nil {
+		st.ReadOnly = g.readOnly(sql)
+		st.Track = st.Observe && st.ReadOnly
+	}
+	if g.keyParam != nil && st.Track {
+		st.KeyParam = g.keyParam(sql)
 	}
 	for _, m := range executeRE.FindAllStringSubmatch(sql, -1) {
 		st.Executes = append(st.Executes, strings.ToLower(m[1]))
@@ -213,8 +229,17 @@ func (g *recordingGate) TxEnded(info proxy.SessionInfo, unseen int) {
 	g.calls = append(g.calls, fmt.Sprintf("TxEnded(%d)", unseen))
 }
 
-// Tracked tracks no table.
-func (g *recordingGate) Tracked(uint32) (uint16, proxy.KeyType, bool) { return 0, 0, false }
+// trackedKey is the key column of a table the gate tracks.
+type trackedKey struct {
+	attr uint16
+	typ  proxy.KeyType
+}
+
+// Tracked answers from g.tracked: no table unless the test set one.
+func (g *recordingGate) Tracked(table uint32) (uint16, proxy.KeyType, bool) {
+	k, ok := g.tracked[table]
+	return k.attr, k.typ, ok
+}
 
 // callLog returns the End, Unseen and TxEnded(n) calls made so far, in order.
 func (g *recordingGate) callLog() []string {

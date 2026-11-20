@@ -245,9 +245,12 @@ func (p prepared) same(q prepared) bool {
 	return p.unread == q.unread && p.st.SQL == q.st.SQL && slices.Equal(p.oids, q.oids)
 }
 
-// merged is p with the Parse record of q too.
+// merged is p with the Parse record of q too, and q's cell: q is the later
+// Parse, a new statement whose columns no Describe of p says (see
+// resultCols). The portals and Describes that took p's cell keep it.
 func (p prepared) merged(q prepared) prepared {
 	p.atParse = p.atParse.with(q.atParse)
+	p.cols = q.cols
 	return p
 }
 

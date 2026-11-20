@@ -125,6 +125,43 @@ func TestEnforcedSessionLatencyBudget(t *testing.T) {
 	}
 }
 
+// Spec 14 of the stale-write spec: a tracked read of 100 rows, whose key the
+// proxy copies out of each row, stays inside the same 2ms budget at p95. pgx
+// prepares the statement once (Parse, Describe) and then binds it with binary
+// result formats on every round trip.
+func TestTrackedReadLatencyBudget(t *testing.T) {
+	tb := idTable(t, 100)
+	g := newKeyGate(tb)
+	sql := "select id, title from " + tb.name
+	added := addedLatencyOf(t, g, proxy.Policy{}, "stet_scram", "tracked read of 100 rows",
+		func(ctx context.Context, conn *pgx.Conn, _ int) error {
+			rows, err := conn.Query(ctx, sql)
+			if err != nil {
+				return err
+			}
+			n := 0
+			for rows.Next() {
+				n++
+			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
+			if n != 100 {
+				return fmt.Errorf("%d rows, want 100", n)
+			}
+			return nil
+		})
+	obs := g.observed(t, latencyWarmUp+latencyTrips)
+	for _, ob := range obs[len(obs)-10:] {
+		if ob.o.Read == nil || len(ob.o.Read.Keys) != 100 {
+			t.Fatalf("tracked read: Read %+v, want 100 keys", ob.o.Read)
+		}
+	}
+	if added > 2*time.Millisecond {
+		t.Errorf("a tracked read of 100 rows adds %v at p95, budget is 2ms", added)
+	}
+}
+
 // Ruling 22: an enforced session follows the ParameterStatus messages the
 // server sends, here one per round trip (application_name is reported on
 // every change). That stays inside the same 2ms budget at p95.
