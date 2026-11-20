@@ -57,6 +57,19 @@ func newStaleEnv(t *testing.T) *staleEnv {
 	return e
 }
 
+// superuser is a connection to the test database as its superuser, closed
+// when the test ends.
+func (e *staleEnv) superuser(t *testing.T) *pgx.Conn {
+	t.Helper()
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, "postgres://postgres:postgres-pw@"+os.Getenv("STET_TEST_PG")+"/stet_test?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close(ctx) })
+	return conn
+}
+
 // name is base made unique to the test.
 func (e *staleEnv) name(base string) string { return fmt.Sprintf("%s_%d", base, e.stamp) }
 
@@ -272,8 +285,12 @@ func TestLookupKeyTypes(t *testing.T) {
 	domain := e.name("code")
 	mustExec(t, e.admin, "create domain "+domain+"_inner as text check (value <> 'x')")
 	mustExec(t, e.admin, "create domain "+domain+" as "+domain+"_inner")
+	// Domains over types with a length: a cast to the domain would cut.
+	short, fixed := e.name("short"), e.name("fixed")
+	mustExec(t, e.admin, "create domain "+short+" as varchar(3)")
+	mustExec(t, e.admin, "create domain "+fixed+" as char(5)")
 	t.Cleanup(func() {
-		e.admin.Exec(context.Background(), "drop domain if exists "+domain+", "+domain+"_inner cascade")
+		e.admin.Exec(context.Background(), "drop domain if exists "+domain+", "+domain+"_inner, "+short+", "+fixed+" cascade")
 	})
 
 	type tc struct {
@@ -294,7 +311,10 @@ func TestLookupKeyTypes(t *testing.T) {
 		{"varchar(10)", proxy.KeyText, `pg_catalog."varchar"`, []string{"ab", "cd"}, []string{"cd"}, map[string]string{"cd": "cd"}},
 		{"char(5)", proxy.KeyText, "pg_catalog.bpchar", []string{"ab", "cd"}, []string{"ab"}, map[string]string{"ab   ": "ab"}},
 		{"name", proxy.KeyText, "pg_catalog.name", []string{"ab", "cd"}, []string{"ab"}, map[string]string{"ab": "ab"}},
-		{domain, proxy.KeyText, "public." + domain, []string{"ab", "cd"}, []string{"cd"}, map[string]string{"cd": "cd"}},
+		// A domain's key is cast to its base type, with no modifier.
+		{domain, proxy.KeyText, "pg_catalog.text", []string{"ab", "cd"}, []string{"cd"}, map[string]string{"cd": "cd"}},
+		{short, proxy.KeyText, `pg_catalog."varchar"`, []string{"ab", "cd"}, []string{"cd"}, map[string]string{"cd": "cd"}},
+		{fixed, proxy.KeyText, "pg_catalog.bpchar", []string{"ab", "cd"}, []string{"ab"}, map[string]string{"ab   ": "ab"}},
 	}
 	var blocks []string
 	names := make([]string, len(cases))
@@ -403,7 +423,7 @@ func TestLookupQuotesNames(t *testing.T) {
 
 	for _, c := range []struct{ table, col, key, typeName string }{
 		{contacts, "id", "2", "pg_catalog.int4"},
-		{notes, "Order", "10", "public." + quoted(domain)},
+		{notes, "Order", "10", "pg_catalog.int4"}, // the domain's base type
 	} {
 		if _, _, ok := e.gate.Tracked(e.oid(t, c.table)); !ok {
 			t.Errorf("%s is not tracked", c.table)
@@ -462,7 +482,9 @@ func TestWhereKeyFallback(t *testing.T) {
 	e.insert(t, bigs, "id", "9000000000")
 	u := "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
 	e.insert(t, uuids, "id", u)
-	e.insert(t, texts, "id", "ab", "ab  ", "abc", "abcdef", `a\b`)
+	e.insert(t, texts, "id", "ab", "ab  ", "abc", "abcdef", `a\b`, "42",
+		// What a cast of a constant sends (100), and its text as written (1e2).
+		"100", "1e2", "0.5", ".5", "101", "b101", "00011111", "x1F", "true")
 	e.start(t, tableBlock(deals, "id", "stale: {}"), tableBlock(bigs, "id", "stale: {}"),
 		tableBlock(uuids, "id", "stale: {}"), tableBlock(texts, "id", "stale: {}"))
 	byParam := func(table string) proxy.Statement {
@@ -506,6 +528,8 @@ func TestWhereKeyFallback(t *testing.T) {
 		{"cast to uuid", uuids, u, e.gate.Inspect("select title from " + uuids + " where id = $1::uuid"), &proxy.Param{Value: []byte(u)}},
 		{"cast to bigint, binary", deals, "42", e.gate.Inspect("select title from " + deals + " where id = $1::bigint"), &proxy.Param{Value: be64(42), Format: 1}},
 		{"cast to text on a text key", texts, "ab", e.gate.Inspect("select title from " + texts + " where id = $1::text"), &proxy.Param{Value: []byte("ab")}},
+		// An integer constant's text is the one the cast gives.
+		{"integer cast to text on a text key", texts, "42", e.gate.Inspect("select title from " + texts + " where id = 42::text"), nil},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			role := strings.ReplaceAll(c.name, " ", "_")
@@ -550,6 +574,19 @@ func TestWhereKeyFallback(t *testing.T) {
 			// standard_conforming_strings off would read it as ab.
 			{"literal with a backslash", whereKeyed(nil, 1, e.oid(t, texts)), texts, `a\b`,
 				inspect("select title from " + texts + ` where id = 'a\b'`)},
+			// A constant that is not an integer or a string, cast to text: the
+			// server sends the row 100, 0.5, 101, 00011111 or true; its text as
+			// written names another row, or (true) the same by chance.
+			{"float cast to text", whereKeyed(nil, 1, e.oid(t, texts)), texts, "1e2",
+				inspect("select title from " + texts + " where id = 1e2::text")},
+			{"float cast to varchar", whereKeyed(nil, 1, e.oid(t, texts)), texts, ".5",
+				inspect("select title from " + texts + " where id = .5::varchar")},
+			{"bit string cast to text", whereKeyed(nil, 1, e.oid(t, texts)), texts, "b101",
+				inspect("select title from " + texts + " where id = B'101'::text")},
+			{"hex bit string cast to text", whereKeyed(nil, 1, e.oid(t, texts)), texts, "x1F",
+				inspect("select title from " + texts + " where id = X'1F'::text")},
+			{"boolean cast to text", whereKeyed(nil, 1, e.oid(t, texts)), texts, "true",
+				inspect("select title from " + texts + " where id = true::text")},
 		} {
 			role := "none_" + strings.ReplaceAll(c.name, " ", "_")
 			st := c.st
@@ -654,8 +691,16 @@ func TestUntrackedTables(t *testing.T) {
 	mustExec(t, e.admin, "create view "+view+" as select * from "+good)
 	t.Cleanup(func() { e.admin.Exec(context.Background(), "drop view if exists "+view) })
 	// A table Stet's account may not read: every lookup would fail.
-	hidden := e.create(t, "hidden", "(id int primary key)")
-	mustExec(t, e.admin, "revoke select on "+hidden+" from stet_scram")
+	// No other account's table grants Stet's account anything, so one the
+	// superuser makes is that table; no privilege of a shared role changes.
+	hidden := e.name("hidden")
+	su := e.superuser(t)
+	mustExec(t, su, "create table public."+hidden+" (id int primary key)")
+	t.Cleanup(func() { su.Exec(context.Background(), "drop table if exists public."+hidden) })
+	var readable bool
+	if err := e.admin.QueryRow(context.Background(), "select has_table_privilege($1, 'SELECT')", "public."+hidden).Scan(&readable); err != nil || readable {
+		t.Fatalf("stet_scram may read %s: %v %v", hidden, readable, err)
+	}
 	e.insert(t, dated, "day", "2026-11-20")
 	untracked := []string{missing, nocol, dated, pair, pairs, same, "public." + same, view, hidden}
 	e.start(t, tableBlock(missing, "id", "stale: {}"), tableBlock(nocol, "nope", "stale: {}"),
@@ -970,11 +1015,14 @@ func TestFailedLookupIsLogged(t *testing.T) {
 }
 
 // Close ends every read whose lookup is queued or running, at once rather
-// than after the lookups' time, and counts none of them as failed.
+// than after the lookups' time, and counts none of them as failed. The
+// lookups are given a minute, so that however slowly the test gets to Close,
+// none has ended by itself.
 func TestCloseEndsLookups(t *testing.T) {
 	e := newStaleEnv(t)
 	deals := e.create(t, "deals", "(id int primary key)")
 	e.start(t, tableBlock(deals, "id", "stale: {}"))
+	gate.SetLookupTimeout(e.gate, time.Minute)
 	running := make(chan struct{}, 2) // one per worker
 	gate.OnLookup(e.gate, func(ctx context.Context, table string, keys []string) error {
 		select {
@@ -997,8 +1045,8 @@ func TestCloseEndsLookups(t *testing.T) {
 
 	start := time.Now()
 	e.gate.Close()
-	if took := time.Since(start); took > 300*time.Millisecond {
-		t.Errorf("Close took %v with lookups running, want it at once, not after their time", took)
+	if took := time.Since(start); took > 10*time.Second {
+		t.Errorf("Close took %v with lookups running, want it at once, not after their minute", took)
 	}
 	for i := range reads {
 		e.wantResult(t, "agent", "", deals, strconv.Itoa(i), "1", decide.ReadNone)

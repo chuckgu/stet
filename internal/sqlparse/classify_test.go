@@ -1086,6 +1086,16 @@ func TestKeyValueCast(t *testing.T) {
 		{"'7'::int8", &Value{Kind: Literal, Text: "7", Cast: "int8"}},
 		{"'ab'::char(4)", &Value{Kind: Literal, Text: "ab", Cast: "bpchar", CastMod: true}},
 		{"uuid '" + u + "'", &Value{Kind: Literal, Text: u, Cast: "uuid"}},
+		// A constant that is neither an integer nor a string keeps its text as
+		// written (1e2), not as the cast writes it (100): CastMod.
+		{"42::text", &Value{Kind: Literal, Text: "42", Cast: "text"}},
+		{"(-42)::text", &Value{Kind: Literal, Text: "-42", Cast: "text"}},
+		{"1e2::text", &Value{Kind: Literal, Text: "1e2", Cast: "text", CastMod: true}},
+		{".5::varchar", &Value{Kind: Literal, Text: ".5", Cast: "varchar", CastMod: true}},
+		{"9000000000::int8", &Value{Kind: Literal, Text: "9000000000", Cast: "int8", CastMod: true}},
+		{"B'101'::text", &Value{Kind: Literal, Text: "b101", Cast: "text", CastMod: true}},
+		{"X'1F'::text", &Value{Kind: Literal, Text: "x1F", Cast: "text", CastMod: true}},
+		{"true::text", &Value{Kind: Literal, Text: "true", Cast: "text", CastMod: true}},
 	}
 	for _, c := range cases {
 		for _, sql := range []string{"delete from contacts where id = " + c.value, "select title from contacts where id = " + c.value} {
@@ -1101,6 +1111,12 @@ func TestKeyValueCast(t *testing.T) {
 				t.Errorf("%q: key value %+v, want %+v", sql, got, c.want)
 			}
 		}
+	}
+	// Such a constant written to a column is recorded as before: its text as
+	// written.
+	r, err := Classify("update contacts set title = 1e2::text where id = 1", gated)
+	if err != nil || r.Write == nil || len(r.Write.Values) != 1 || r.Write.Values[0].Kind != Literal || r.Write.Values[0].Text != "1e2" {
+		t.Errorf("update setting 1e2::text: %+v (%v), want the literal 1e2", r.Write, err)
 	}
 	for _, sql := range []string{"delete from contacts where id = $1::text::uuid", "select title from contacts where id = $1::text::uuid"} {
 		if r, err := Classify(sql, gated); err != nil || r.Write != nil || r.ReadKey != nil {

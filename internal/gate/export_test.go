@@ -57,6 +57,12 @@ func LookupVersions(g *Gate, table string, keys []string) (map[string]string, er
 	return g.stale.lookupVersions(ctx, table, keys)
 }
 
+// SetLookupTimeout gives g's lookups of row versions d instead of
+// staleLookupTimeout. Call it before the reads it is for reach g.
+func SetLookupTimeout(g *Gate, d time.Duration) {
+	g.stale.lookupTimeout = d
+}
+
 // StaleTable is what g's catalog says of the config key table.
 func StaleTable(g *Gate, table string) (oid uint32, attr uint16, typ proxy.KeyType, typeName string, ok bool) {
 	t, ok := g.stale.table(table)

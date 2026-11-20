@@ -51,8 +51,10 @@ type stale struct {
 	// it without a lock.
 	cat atomic.Pointer[staleCatalog]
 	// lookup reads the versions of rows (lookupVersions): a field so tests
-	// can hold it back or make it fail.
-	lookup func(ctx context.Context, table string, keys []string) (map[string]string, error)
+	// can hold it back or make it fail. lookupTimeout bounds each call:
+	// staleLookupTimeout, a field so tests can lengthen it.
+	lookup        func(ctx context.Context, table string, keys []string) (map[string]string, error)
+	lookupTimeout time.Duration
 
 	jobs chan lookupJob
 	// mu orders queueing against Close: a lookup is queued under its read
@@ -112,7 +114,7 @@ func newStale(g *Gate, remember map[string]time.Duration) *stale {
 	for key := range remember {
 		s.pks[key] = g.tables[key]
 	}
-	s.lookup = s.lookupVersions
+	s.lookup, s.lookupTimeout = s.lookupVersions, staleLookupTimeout
 	s.readCatalog()
 	s.wg.Add(staleWorkers + 1)
 	for range staleWorkers {
@@ -267,7 +269,7 @@ func (s *stale) remember(sess proxy.SessionInfo, reads []staleRead) {
 func (s *stale) refresh(table, key string, then func(serverKey, version string, ok bool)) {
 	queued := false
 	s.mu.RLock()
-	if _, tracked := s.table(table); tracked && !s.closed {
+	if _, ok := s.table(table); ok && !s.closed {
 		s.idle.add(1)
 		select {
 		case s.jobs <- lookupJob{table: table, keys: []string{key}, then: then}:
@@ -358,12 +360,12 @@ func (s *stale) work() {
 	}
 }
 
-// run runs one lookup, under staleLookupTimeout, and ends it. A failure is
+// run runs one lookup, under lookupTimeout, and ends it. A failure is
 // counted with its cause, unless the gate is closing or the catalog stopped
 // tracking the table, which it logged.
 func (s *stale) run(j lookupJob) {
 	defer s.idle.done()
-	ctx, cancel := context.WithTimeout(s.ctx, staleLookupTimeout)
+	ctx, cancel := context.WithTimeout(s.ctx, s.lookupTimeout)
 	versions, err := s.lookup(ctx, j.table, j.keys)
 	cancel()
 	if err != nil && s.ctx.Err() == nil && !errors.Is(err, errUntracked) {

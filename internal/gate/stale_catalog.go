@@ -34,11 +34,14 @@ type tracked struct {
 	oid  uint32
 	attr uint16        // the key column's attribute number
 	typ  proxy.KeyType // of the key column's base type
-	// typeName is the key column's own type (for a domain, the domain), for
-	// a cast to it: qualified by its schema, each part quoted where it must
-	// be, and with no type modifier. With one, a cast cuts a longer value
-	// ('abcdefg'::character(5) is abcde, another row); and format_type of
-	// bpchar with none is character, which as a cast means character(1).
+	// typeName is the key column's base type (the type its domains, if any,
+	// end in), for a cast to it: qualified by its schema, each part quoted
+	// where it must be, and with no type modifier. A lookup compares as that
+	// type already. A modifier, the column's own or a domain's, would make
+	// the cast cut a longer value ('abcdefg'::character(5) is abcde, another
+	// row); format_type of bpchar with none is character, which as a cast
+	// means character(1); and a cast to a domain would also run its CHECK on
+	// a value an agent wrote.
 	typeName string
 	base     uint32 // the OID of the key column's base type
 }
@@ -228,23 +231,24 @@ func sameTables(entries map[string]catalogEntry) {
 // catalogQuery reads, for the config key whose quoted name is $1 and its key
 // column $2, the table's OID and kind as Stet's search_path resolves it (as
 // the gate's own SQL does), whether Stet's account may read it, the column's
-// number and type (tracked.typeName), the column's base type (through
-// domains, however nested), and whether a unique index is on the column
-// alone, not partial and not on an expression.
+// number, its base type (through domains, however nested) by OID and as
+// tracked.typeName, and whether a unique index is on the column alone, not
+// partial and not on an expression.
 const catalogQuery = `
 with recursive
   rel as (select c.oid, c.relkind from pg_class c where c.oid = to_regclass($1)),
-  col as (select a.attnum, a.atttypid, format('%I.%I', tn.nspname, ty.typname) as type_name
+  col as (select a.attnum, a.atttypid
             from pg_attribute a join rel on a.attrelid = rel.oid
-            join pg_type ty on ty.oid = a.atttypid
-            join pg_namespace tn on tn.oid = ty.typnamespace
            where a.attname = $2 and a.attnum > 0 and not a.attisdropped),
   base as (select t.oid, t.typtype, t.typbasetype from pg_type t join col on t.oid = col.atttypid
            union all
            select t.oid, t.typtype, t.typbasetype from pg_type t join base b on t.oid = b.typbasetype
             where b.typtype = 'd')
 select rel.oid, rel.relkind::text, coalesce(has_table_privilege(rel.oid, 'SELECT'), false),
-       col.attnum, col.type_name, b.oid, format_type(b.oid, null),
+       col.attnum,
+       (select format('%I.%I', n.nspname, t.typname)
+          from pg_type t join pg_namespace n on n.oid = t.typnamespace where t.oid = b.oid),
+       b.oid, format_type(b.oid, null),
        exists (select from pg_index x
                 where x.indrelid = rel.oid and x.indisunique and x.indisvalid
                   and x.indnkeyatts = 1 and x.indkey[0] = col.attnum

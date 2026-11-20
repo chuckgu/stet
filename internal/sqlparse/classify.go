@@ -81,8 +81,10 @@ type Value struct {
 	// "" when it stands alone.
 	Cast string
 	// CastMod: the cast carried a type modifier or array bounds (varchar(3),
-	// int4[]), or named a schema other than pg_catalog: the value does not
-	// simply read as a value of the type Cast names.
+	// int4[]), or named a schema other than pg_catalog, or cast a constant
+	// that is neither an integer nor a string (1e2::text, whose Text is 1e2
+	// and whose value is 100): the value does not simply read as a value of
+	// the type Cast names.
 	CastMod bool
 	// Shared: a parameter ($n) that appears elsewhere in the statement too,
 	// where the server may fix its type. Set only for a key value: Write.PK
@@ -764,6 +766,15 @@ func value(n *pg.Node) Value {
 		if arg := tc.Arg; arg.GetAConst() != nil || arg.GetParamRef() != nil {
 			v := value(arg)
 			v.Cast, v.CastMod = cast(tc.TypeName)
+			// The text of a constant that is neither an integer nor a string
+			// is as it was written (1e2, .5, b101), not as the cast writes it
+			// (100, 0.5, 101), so it does not read as a value of the type
+			// Cast names. It stays a Literal: what a write records of it is
+			// unchanged.
+			switch arg.GetAConst().GetVal().(type) {
+			case *pg.A_Const_Fval, *pg.A_Const_Bsval, *pg.A_Const_Boolval:
+				v.CastMod = true
+			}
 			return v
 		}
 	}
