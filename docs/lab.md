@@ -799,7 +799,7 @@ bin/stet-lab bench stale-check
 - 보이지 않는 것: 실제 업무에서 낡은 쓰기가 얼마나 잦은지. 그것은 섀도의 기록과 위의 재는 질의로만 안다.
 - 시간에 달린 길: 이 서버에서는 "곧바로" 줄(N2, N5, N8)이 두 모드 모두 `fresh`였다. 그 쓰기를 준비하는 왕복 없이 한 번에 보내도 그렇다. Stet의 조회(로컬 서버에 키 하나)가 게이트가 그 쓰기를 비교하기 전에 끝났다는 뜻이고(게이트는 비교하기 전에 그 행의 지금 상태를 먼저 읽는다), 이 확인에서는 `read_pending`과 `own_write`의 길을 지나가지 않았다. 그 길은 `internal/gate`의 테스트가 조회를 막아 두고 확인한다(`TestWriteWhileLookupPending`, `TestOwnWrite`).
 - M1의 `fresh`는 알려진 놓침이다(스펙 12장). 업무를 적지 않은 같은 계정의 두 연결은 한 쪽으로 묶여, 다른 연결이 다시 읽은 것이 첫 연결의 낡은 쓰기를 가린다.
-- 다루지 않는 것: 답을 받기 전에 끊긴 연결(스펙 보정 S15), Stet의 확인과 서버의 실행 사이의 틈(스펙 2장), 여러 키 타입과 형식, 이름 있는 준비된 문장의 다시 실행, 쓰지 못하는 키 값(S13). 이것들은 `internal/proxy`와 `internal/gate`의 테스트가 본다(`TestLostWriteLeavesNoMark`, `TestKeyValueNotUsable` 등).
+- 다루지 않는 것: 답을 받기 전에 끊긴 연결(스펙 7장, 1분 동안 두는 표시), Stet의 확인과 서버의 실행 사이의 틈(스펙 2장), 여러 키 타입과 형식, 이름 있는 준비된 문장의 다시 실행, 쓰지 못하는 키 값(스펙 4장의 "키 값으로 쓰는 것"). 이것들은 `internal/proxy`와 `internal/gate`의 테스트가 본다(`TestLostWriteLeavesNoMark`, `TestKeyValueNotUsable` 등).
 
 **결과** (2026-11-20, PostgreSQL 14.18, 이 컴퓨터의 테스트 서버. `bin/stet-lab`은 커밋 `1547dc6`에서 `go build -o bin/stet-lab ./cmd/stet-lab`으로 빌드했다)
 
