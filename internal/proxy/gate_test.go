@@ -52,6 +52,9 @@ type recordingGate struct {
 	reads    []observation
 	blocked  []blockedCall
 	would    []blockedCall // WouldBlock calls
+	unseen   []proxy.SessionInfo
+	txEnded  []proxy.SessionInfo
+	calls    []string // End, Unseen and TxEnded, in the order they were made
 }
 
 type blockedCall struct {
@@ -167,6 +170,7 @@ func (g *recordingGate) End(h any, o proxy.Outcome) {
 	defer g.mu.Unlock()
 	g.ends[h.(int)] = o
 	g.endCalls++
+	g.calls = append(g.calls, "End")
 }
 
 func (g *recordingGate) Observe(info proxy.SessionInfo, st proxy.Statement, o proxy.Outcome) {
@@ -189,6 +193,62 @@ func (g *recordingGate) WouldBlock(info proxy.SessionInfo, reason string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.would = append(g.would, blockedCall{info: info, reason: reason})
+}
+
+// Unseen records the call.
+func (g *recordingGate) Unseen(info proxy.SessionInfo) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.unseen = append(g.unseen, info)
+	g.calls = append(g.calls, "Unseen")
+}
+
+// TxEnded records the call.
+func (g *recordingGate) TxEnded(info proxy.SessionInfo) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.txEnded = append(g.txEnded, info)
+	g.calls = append(g.calls, "TxEnded")
+}
+
+// Tracked tracks no table.
+func (g *recordingGate) Tracked(uint32) (uint16, proxy.KeyType, bool) { return 0, 0, false }
+
+// callLog returns the End, Unseen and TxEnded calls made so far, in order.
+func (g *recordingGate) callLog() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return slices.Clone(g.calls)
+}
+
+// wantCalls fails the test unless the gate's End, Unseen and TxEnded calls so
+// far are want, in order. The gate hears of a statement before its
+// ReadyForQuery is forwarded, so once the client has its answer the calls it
+// caused have been made.
+func (g *recordingGate) wantCalls(t *testing.T, when string, want ...string) {
+	t.Helper()
+	if got := g.callLog(); !slices.Equal(got, want) {
+		t.Errorf("%s: gate called %q, want %q", when, got, want)
+	}
+}
+
+// wantTold fails the test unless every session Unseen or TxEnded was told of
+// is an authenticated session of user, and TxEnded's with no transaction
+// open.
+func (g *recordingGate) wantTold(t *testing.T, user string) {
+	t.Helper()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, info := range slices.Concat(g.unseen, g.txEnded) {
+		if info.ID == "" || info.User != user {
+			t.Errorf("told of session %+v, want a session of %s", info, user)
+		}
+	}
+	for _, info := range g.txEnded {
+		if info.TxOpen {
+			t.Errorf("TxEnded told of session %+v, want no transaction open", info)
+		}
+	}
 }
 
 // wantBlocked fails the test unless Blocked was called once for each of
@@ -3546,4 +3606,234 @@ func TestPanicHoldingTheSessionLockEndsTheSession(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A watched write inside an explicit transaction is reported through End as
+// inside a transaction when its own ReadyForQuery comes, and the gate is told
+// once, after that End, that the transaction ended: when the server reports
+// the session idle again, at COMMIT or ROLLBACK (spec 7). Nothing after it
+// tells the gate again.
+func TestTxEndedAfterWriteInTransaction(t *testing.T) {
+	for _, end := range []string{"commit", "rollback"} {
+		t.Run(end, func(t *testing.T) {
+			table := watchedTable(t)
+			mustExec(t, connect(t, upstream(t), "stet_scram", nil), "insert into "+table+" values (1, 'a')")
+			g := newRecordingGate(watches(table))
+			addr, _ := startProxy(t, upstream(t), g)
+			conn := connect(t, addr, "stet_scram", nil)
+
+			mustExec(t, conn, "begin")
+			mustExec(t, conn, "update "+table+" set v = 'b' where id = 1")
+			mustExec(t, conn, "select 1")
+			g.wantCalls(t, "before "+end, "End")
+			mustExec(t, conn, end)
+			g.wantCalls(t, "after "+end, "End", "TxEnded")
+			mustExec(t, conn, "select 1")
+			g.wantCalls(t, "after a later select", "End", "TxEnded")
+
+			if _, os := g.outcomes(t, 1); !os[0].Executed || !os[0].InTransaction {
+				t.Errorf("update: %+v, want executed inside a transaction", os[0])
+			}
+			g.wantTold(t, "stet_scram")
+		})
+	}
+}
+
+// A watched write outside a transaction ends with its own ReadyForQuery: its
+// End says it was not inside a transaction, and nothing more is owed.
+func TestNoTxEndedForAutocommitWrite(t *testing.T) {
+	table := watchedTable(t)
+	g := newRecordingGate(watches(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	mustExec(t, conn, "insert into "+table+" values (1, 'a')")
+	if _, err := conn.Exec(testCtx(t), "insert into "+table+" values ($1, $2)", 2, "b"); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, "select 1")
+	g.wantCalls(t, "after two writes outside a transaction", "End", "End")
+	_, os := g.outcomes(t, 2)
+	for i, o := range os {
+		if !o.Executed || o.InTransaction {
+			t.Errorf("write %d: %+v, want executed outside a transaction", i+1, o)
+		}
+	}
+}
+
+// Two writes under one Sync run in one implicit transaction: both End calls
+// say so, and the gate is told once, after both, that it ended.
+func TestTxEndedAfterImplicitTransaction(t *testing.T) {
+	table := watchedTable(t)
+	g := newRecordingGate(watches(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	b := &pgx.Batch{}
+	b.Queue("insert into "+table+" values ($1, 'batch')", 1)
+	b.Queue("insert into "+table+" values ($1, 'batch')", 2)
+	if err := conn.SendBatch(testCtx(t), b).Close(); err != nil {
+		t.Fatal(err)
+	}
+	g.wantCalls(t, "after the batch", "End", "End", "TxEnded")
+	mustExec(t, conn, "select 1")
+	g.wantCalls(t, "after a later select", "End", "End", "TxEnded")
+	_, os := g.outcomes(t, 2)
+	for i, o := range os {
+		if !o.Executed || !o.InTransaction {
+			t.Errorf("write %d: %+v, want executed inside a transaction", i+1, o)
+		}
+	}
+	g.wantTold(t, "stet_scram")
+}
+
+// However many watched writes a transaction holds, the gate is told once that
+// it ended; the next transaction with a write is told of again.
+func TestTxEndedOncePerTransaction(t *testing.T) {
+	table := watchedTable(t)
+	g := newRecordingGate(watches(table))
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	mustExec(t, conn, "begin")
+	for i := 1; i <= 3; i++ {
+		mustExec(t, conn, fmt.Sprintf("insert into %s values (%d, 'a')", table, i))
+	}
+	mustExec(t, conn, "commit")
+	g.wantCalls(t, "after the first transaction", "End", "End", "End", "TxEnded")
+	mustExec(t, conn, "begin")
+	mustExec(t, conn, "insert into "+table+" values (4, 'b')")
+	g.wantCalls(t, "inside the second transaction", "End", "End", "End", "TxEnded", "End")
+	mustExec(t, conn, "commit")
+	g.wantCalls(t, "after the second transaction", "End", "End", "End", "TxEnded", "End", "TxEnded")
+	g.wantTold(t, "stet_scram")
+}
+
+// A write the gate refused was never sent, so a transaction whose only watched
+// writes were refused owes the gate nothing when it ends.
+func TestNoTxEndedForRefusedWrite(t *testing.T) {
+	table := watchedTable(t)
+	g := newRecordingGate(watches(table))
+	g.refuse = refuseAll
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	mustExec(t, conn, "begin")
+	_, err := conn.Exec(testCtx(t), "insert into "+table+" values (1, 'x')")
+	wantHeld(t, err)
+	mustExec(t, conn, "rollback")
+	b := &pgx.Batch{}
+	b.Queue("insert into "+table+" values ($1, 'batch')", 2)
+	b.Queue("insert into "+table+" values ($1, 'batch')", 3)
+	conn.SendBatch(testCtx(t), b).Close()
+	mustExec(t, conn, "select 1")
+	g.wantCalls(t, "after refused writes", "End", "End", "End")
+}
+
+// unseenGate is closedPointGate for the table it watches that also marks
+// CREATE FUNCTION as SQL that defines code.
+func unseenGate(table string) *recordingGate {
+	g := closedPointGate(watches(table))
+	g.block = func(sql string) string {
+		if strings.HasPrefix(sql, "create function") {
+			return proxy.BlockDefinesCode
+		}
+		return blockClosedPoints(sql)
+	}
+	return g
+}
+
+// A session that does not enforce tells the gate through Unseen of every
+// message whose writes the proxy cannot see, each time it is sent, while
+// WouldBlock still logs each reason once (spec correction S7): a DO block, a
+// FunctionCall, SQL the classifier cannot read, SQL that defines code, the
+// Parse of a DO block and each Execute of it, and SQL EXECUTE of a prepared
+// statement. A plain read and a watched write are not unseen.
+func TestUnseenEveryTime(t *testing.T) {
+	oid := backendPID(t)
+	table := watchedTable(t)
+	g := unseenGate(table)
+	addr, _ := startProxyWith(t, upstream(t), g, proxy.Policy{})
+	fe := rawAgent(t, addr, table)
+	do := "do $$ begin perform 1; end $$"
+	step := func(what string, want int, msgs ...pgproto3.FrontendMessage) {
+		t.Helper()
+		sendAll(t, fe, msgs...)
+		untilReady(t, fe)
+		g.mu.Lock()
+		got := len(g.unseen)
+		g.mu.Unlock()
+		if got != want {
+			t.Errorf("after %s: Unseen %d times, want %d", what, got, want)
+		}
+	}
+
+	step("a DO block", 1, &pgproto3.Query{String: do})
+	step("the DO block again", 2, &pgproto3.Query{String: do})
+	step("a FunctionCall", 3, &pgproto3.FunctionCall{Function: oid})
+	step("SQL the classifier cannot read", 4, &pgproto3.Query{String: unreadableSQL})
+	step("SQL that defines code", 5, &pgproto3.Query{String: "create function pg_temp.f() returns int language sql as 'select 1'"})
+	step("the Parse of a DO block", 6, &pgproto3.Parse{Name: "d", Query: do}, &pgproto3.Sync{})
+	step("an Execute of it", 7, &pgproto3.Bind{PreparedStatement: "d"}, &pgproto3.Execute{}, &pgproto3.Sync{})
+	step("another Execute of it", 8, &pgproto3.Bind{PreparedStatement: "d"}, &pgproto3.Execute{}, &pgproto3.Sync{})
+	step("a PREPARE", 8, &pgproto3.Query{String: "prepare w(int) as select $1"})
+	step("SQL EXECUTE of it", 9, &pgproto3.Query{String: "execute w(1)"})
+	step("a select", 9, &pgproto3.Query{String: "select 1"})
+	step("a select's Execute", 9, slices.Concat(unnamed("select 1"), []pgproto3.FrontendMessage{&pgproto3.Sync{}})...)
+	step("a watched write", 9, &pgproto3.Query{String: "insert into " + table + " values (1, 'a')"})
+	step("a watched write's Execute", 9, slices.Concat(unnamed("insert into "+table+" values ($1, 'b')", "2"), []pgproto3.FrontendMessage{&pgproto3.Sync{}})...)
+
+	g.mu.Lock()
+	var would []string
+	for _, w := range g.would {
+		would = append(would, w.reason)
+	}
+	g.mu.Unlock()
+	if want := []string{proxy.BlockDo, proxy.BlockFunctionCall, proxy.BlockUnparsed, proxy.BlockDefinesCode}; !slices.Equal(would, want) {
+		t.Errorf("WouldBlock for %q, want %q, once each", would, want)
+	}
+	g.wantBlocked(t, "stet_trust")
+	g.wantTold(t, "stet_trust")
+}
+
+// A message Unseen was told of owes the gate a TxEnded once the server
+// reports the session idle after it: at its own ReadyForQuery outside a
+// transaction, at COMMIT inside one.
+func TestTxEndedAfterUnseen(t *testing.T) {
+	g := unseenGate("no_such_table")
+	addr, _ := startProxyWith(t, upstream(t), g, proxy.Policy{})
+	conn := connect(t, addr, "stet_scram", nil)
+	do := "do $$ begin perform 1; end $$"
+
+	mustExec(t, conn, do)
+	g.wantCalls(t, "after a DO block", "Unseen", "TxEnded")
+	mustExec(t, conn, "begin")
+	mustExec(t, conn, do)
+	mustExec(t, conn, "select 1")
+	g.wantCalls(t, "after a DO block in a transaction", "Unseen", "TxEnded", "Unseen")
+	mustExec(t, conn, "commit")
+	g.wantCalls(t, "after commit", "Unseen", "TxEnded", "Unseen", "TxEnded")
+	mustExec(t, conn, "select 1")
+	g.wantCalls(t, "after a later select", "Unseen", "TxEnded", "Unseen", "TxEnded")
+	g.wantTold(t, "stet_scram")
+}
+
+// An enforced session refuses a DO block as before (Blocked), and the gate
+// hears neither Unseen nor TxEnded of it: nothing went upstream. SQL EXECUTE
+// of a prepared read runs and is not unseen either.
+func TestEnforcedSessionHasNoUnseen(t *testing.T) {
+	g := unseenGate("no_such_table")
+	addr, _ := startProxyWith(t, upstream(t), g, proxy.Policy{Enforce: true})
+	conn := connect(t, addr, "stet_scram", nil)
+
+	_, err := conn.Exec(testCtx(t), "do $$ begin perform 1; end $$")
+	wantST002(t, err, proxy.BlockDo)
+	mustExec(t, conn, "begin")
+	_, err = conn.Exec(testCtx(t), "do $$ begin perform 1; end $$")
+	wantST002(t, err, proxy.BlockDo)
+	mustExec(t, conn, "rollback")
+	mustExec(t, conn, "prepare r(int) as select $1")
+	mustExec(t, conn, "execute r(1)")
+	g.wantBlocked(t, "stet_scram", proxy.BlockDo, proxy.BlockDo)
+	g.wantCalls(t, "after the refused DO blocks")
 }

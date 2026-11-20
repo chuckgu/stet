@@ -232,6 +232,22 @@ func (g *Gate) WouldBlock(s proxy.SessionInfo, reason string) {
 		"session", s.ID, "login_role", s.User, "database", s.Database, "agent", s.ApplicationName)
 }
 
+// Unseen is told of each message a shadow session sends whose writes the
+// proxy cannot see. Stale-write detection is to forget what the session's
+// login role read then (spec-v0.2-stale 7); until it does, nothing is kept
+// to forget, and Unseen does nothing.
+func (g *Gate) Unseen(proxy.SessionInfo) {}
+
+// TxEnded is told when a session's transaction that held a watched write, or
+// a message Unseen was told of, has ended. Stale-write detection is to settle
+// the rows those writes marked then (spec-v0.2-stale 7); until it does,
+// nothing is marked, and TxEnded does nothing.
+func (g *Gate) TxEnded(proxy.SessionInfo) {}
+
+// Tracked reports no table: until stale-write detection reads its tables'
+// key columns, the gate remembers no read by key.
+func (g *Gate) Tracked(uint32) (attr uint16, typ proxy.KeyType, ok bool) { return 0, 0, false }
+
 var cursorOps = map[sqlparse.CursorOp]proxy.CursorOp{
 	sqlparse.CursorDeclare:  proxy.CursorDeclare,
 	sqlparse.CursorFetch:    proxy.CursorFetch,

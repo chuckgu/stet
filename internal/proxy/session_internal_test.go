@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -13,7 +14,9 @@ import (
 // fakeGate watches every statement and records each End. While refusal is
 // set, Begin refuses every write with it. Blocked records each reason, and
 // whether the proxy called it the first time for that reason, and answers
-// with an ST002 that names it. WouldBlock records each reason.
+// with an ST002 that names it. WouldBlock records each reason. calls lists
+// the End, Unseen and TxEnded calls in the order they were made. Tracked
+// tracks no table.
 type fakeGate struct {
 	n       int
 	ends    map[int]Outcome
@@ -21,6 +24,7 @@ type fakeGate struct {
 	blocked []string
 	firsts  []bool
 	would   []string
+	calls   []string
 }
 
 func newFakeGate() *fakeGate { return &fakeGate{ends: map[int]Outcome{}} }
@@ -30,7 +34,10 @@ func (g *fakeGate) Begin(SessionInfo, Statement, []Param) (any, *Refusal) {
 	g.n++
 	return g.n - 1, g.refusal
 }
-func (g *fakeGate) End(h any, o Outcome)                    { g.ends[h.(int)] = o }
+func (g *fakeGate) End(h any, o Outcome) {
+	g.ends[h.(int)] = o
+	g.calls = append(g.calls, "End")
+}
 func (g *fakeGate) Observe(SessionInfo, Statement, Outcome) {}
 func (g *fakeGate) Blocked(_ SessionInfo, reason string, first bool) Refusal {
 	g.blocked = append(g.blocked, reason)
@@ -38,6 +45,21 @@ func (g *fakeGate) Blocked(_ SessionInfo, reason string, first bool) Refusal {
 	return Refusal{Code: "ST002", Message: "blocked " + reason}
 }
 func (g *fakeGate) WouldBlock(_ SessionInfo, reason string) { g.would = append(g.would, reason) }
+func (g *fakeGate) Unseen(SessionInfo)                      { g.calls = append(g.calls, "Unseen") }
+func (g *fakeGate) TxEnded(SessionInfo)                     { g.calls = append(g.calls, "TxEnded") }
+func (g *fakeGate) Tracked(uint32) (uint16, KeyType, bool)  { return 0, 0, false }
+
+// count is how many times the gate was called as call ("End", "Unseen" or
+// "TxEnded").
+func (g *fakeGate) count(call string) int {
+	n := 0
+	for _, c := range g.calls {
+		if c == call {
+			n++
+		}
+	}
+	return n
+}
 
 // body is a message's payload, as the taps hand it to the session.
 func body(m pgproto3.Message) []byte {
@@ -916,5 +938,201 @@ func TestFailedRedeclareAmongSeveralKeepsTheOldCursor(t *testing.T) {
 
 			g.wantReads(t, held, 1)
 		})
+	}
+}
+
+// doGate is txGate that also marks the SQL "do" as a DO block.
+type doGate struct{ *txGate }
+
+func (g doGate) Inspect(sql string) Statement {
+	st := g.txGate.Inspect(sql)
+	if sql == "do" {
+		st.Block = BlockDo
+	}
+	return st
+}
+
+// wantCalls fails the test unless g's End, Unseen and TxEnded calls so far
+// are want, in order.
+func (g *fakeGate) wantCalls(t *testing.T, when string, want ...string) {
+	t.Helper()
+	if !slices.Equal(g.calls, want) {
+		t.Errorf("%s: gate called %q, want %q", when, g.calls, want)
+	}
+}
+
+// When the connection ends while a transaction that held a watched write, or
+// a message Unseen was told of, may still be open, the gate is told once,
+// after every End, that nothing of the session is uncommitted any more. A
+// write lost before its answer counts: it may have run. A write lost outside
+// a transaction owes nothing beyond its End, nor does a transaction the gate
+// was already told ended.
+func TestTxEndedWhenConnectionDrops(t *testing.T) {
+	for _, c := range []struct {
+		name, sent string
+		want       []string
+	}{
+		{"a write answered inside a transaction", "begin Z(T) insert Z(T)", []string{"End", "TxEnded"}},
+		{"a write lost inside a transaction", "begin Z(T) insert", []string{"End", "TxEnded"}},
+		{"writes lost under one Sync", "E:insert E:insert S", []string{"End", "End", "TxEnded"}},
+		{"a DO block answered inside a transaction", "begin Z(T) do Z(T)", []string{"Unseen", "TxEnded"}},
+		{"a DO block lost", "do", []string{"Unseen", "TxEnded"}},
+		{"a write lost outside a transaction", "insert", []string{"End"}},
+		{"a write answered outside a transaction", "insert Z(I)", []string{"End"}},
+		{"a transaction already ended", "begin Z(T) insert Z(T) commit Z(I)", []string{"End", "TxEnded"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			g := doGate{&txGate{fakeGate: newFakeGate()}}
+			s := readySession(g)
+			drive(s, c.sent)
+			s.abandon()
+			g.wantCalls(t, "after the connection ended", c.want...)
+		})
+	}
+
+	g := doGate{&txGate{fakeGate: newFakeGate()}}
+	s := readySession(g)
+	drive(s, "begin Z(T) insert")
+	s.abandon()
+	if o := g.ends[0]; !o.Lost || !o.InTransaction {
+		t.Errorf("write lost inside a transaction: %+v, want lost inside a transaction", o)
+	}
+}
+
+// The gate is told a transaction ended in the order the server answers, not
+// the order things were sent: an idle ReadyForQuery answering an earlier unit
+// says nothing of writes sent behind it, which owe their TxEnded once their
+// own unit is answered and their transaction has ended.
+func TestTxEndedWaitsForItsOwnAnswer(t *testing.T) {
+	g := &txGate{fakeGate: newFakeGate()}
+	s := readySession(g)
+	send(s, queryMsg("select 1"), parseMsg("", ins), bindMsg("", ""), execMsg(""), parseMsg("", ins), bindMsg("", ""), execMsg(""), syncMsg,
+		queryMsg("begin"), queryMsg(ins), queryMsg("commit"))
+
+	serve(s, &pgproto3.RowDescription{}, row, tag("SELECT 1"), ready)
+	g.wantCalls(t, "after the select")
+	serve(s, parseOK, bindOK, tag("INSERT 0 1"), parseOK, bindOK, tag("INSERT 0 1"), ready)
+	g.wantCalls(t, "after the writes under one Sync", "End", "End", "TxEnded")
+	serve(s, tag("BEGIN"), readyWith('T'), tag("INSERT 0 1"), readyWith('T'))
+	g.wantCalls(t, "after the write inside a transaction", "End", "End", "TxEnded", "End")
+	serve(s, tag("COMMIT"), ready)
+	g.wantCalls(t, "after commit", "End", "End", "TxEnded", "End", "TxEnded")
+}
+
+// A watched write in a unit the server answers with no ReadyForQuery of its
+// own, a Query having followed it before any Sync, runs in the implicit
+// transaction of that Query: its End comes once its messages completed, and
+// the gate is told the transaction ended at the Query's ReadyForQuery.
+func TestTxEndedAfterAnUnsyncedWrite(t *testing.T) {
+	g := &txGate{fakeGate: newFakeGate()}
+	s := readySession(g)
+	send(s, parseMsg("", ins), bindMsg("", ""), execMsg(""), queryMsg("select 1"))
+	serve(s, parseOK, bindOK, tag("INSERT 0 1"), &pgproto3.RowDescription{}, row, tag("SELECT 1"))
+	g.wantCalls(t, "before the Query's ReadyForQuery", "End")
+	if o := g.ends[0]; !o.Executed || !o.InTransaction {
+		t.Errorf("write: %+v, want executed inside a transaction", o)
+	}
+	serve(s, ready)
+	g.wantCalls(t, "after the Query's ReadyForQuery", "End", "TxEnded")
+}
+
+// hiddenGate is byNameGate that also marks the SQL "do" as a DO block.
+type hiddenGate struct{ byNameGate }
+
+func (g hiddenGate) Inspect(sql string) Statement {
+	st := g.byNameGate.Inspect(sql)
+	if sql == "do" {
+		st.Block = BlockDo
+	}
+	return st
+}
+
+// On a session that does not enforce, an Execute is unseen when its portal
+// may run a statement the proxy could not read, one the gate marked with
+// Block, or SQL EXECUTE of a prepared statement: the newest meaning of its
+// names, or another one the server may hold. So is a Query of SQL EXECUTE. A
+// FETCH of a portal is not, nor is a read. An enforced session tells the gate
+// of none of them.
+func TestUnseenExecutes(t *testing.T) {
+	flush := func() error { return nil }
+	for _, c := range []struct {
+		name string
+		run  func(s *session)
+		want int // Unseen calls on a session that does not enforce
+	}{
+		{"an Execute of a statement not read", func(s *session) {
+			s.fromClient('P', nil, flush) // past maxInspect
+			send(s, bindMsg("", ""), execMsg(""), syncMsg)
+		}, 2},
+		{"an Execute of a DO block", func(s *session) {
+			send(s, parseMsg("d", "do"), bindMsg("", "d"), execMsg(""), syncMsg)
+		}, 2},
+		{"an Execute of SQL EXECUTE", func(s *session) {
+			send(s, parseMsg("e", "execute w"), bindMsg("", "e"), execMsg(""), syncMsg)
+		}, 1},
+		{"an Execute of a name that may still mean a DO block", func(s *session) {
+			send(s, parseMsg("s1", "do"), syncMsg)
+			serve(s, parseOK, ready)
+			send(s, parseMsg("s1", "select 1"), syncMsg, bindMsg("", "s1"), execMsg(""), syncMsg)
+		}, 2},
+		{"an Execute of a portal that may still mean a DO block", func(s *session) {
+			send(s, parseMsg("d", "do"), parseMsg("r", "select 1"), bindMsg("p", "d"), syncMsg)
+			serve(s, parseOK, parseOK, bindOK, readyWith('T'))
+			send(s, bindMsg("p", "r"), syncMsg, execMsg("p"), syncMsg)
+		}, 2},
+		{"a Query of SQL EXECUTE", func(s *session) { send(s, queryMsg("execute w")) }, 1},
+		{"a Query of FETCH", func(s *session) { send(s, queryMsg("fetch c")) }, 0},
+		{"an Execute of FETCH", func(s *session) {
+			send(s, parseMsg("f", "fetch c"), bindMsg("", "f"), execMsg(""), syncMsg)
+		}, 0},
+		{"an Execute of a read", func(s *session) {
+			send(s, parseMsg("r", "select 1"), bindMsg("", "r"), execMsg(""), syncMsg)
+		}, 0},
+	} {
+		for _, enforce := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s, enforce %v", c.name, enforce), func(t *testing.T) {
+				g := hiddenGate{byNameGate{newStmtGate()}}
+				s := sessionOf(g, enforce)
+				c.run(s)
+				want := c.want
+				if enforce {
+					want = 0
+				}
+				if got := g.count("Unseen"); got != want {
+					t.Errorf("Unseen %d times, want %d", got, want)
+				}
+			})
+		}
+	}
+}
+
+// panicTxEndedGate is txGate whose TxEnded panics.
+type panicTxEndedGate struct{ *txGate }
+
+func (panicTxEndedGate) TxEnded(SessionInfo) { panic("test gate: TxEnded") }
+
+// A gate's TxEnded that panics takes nothing else with it: the session logs
+// the panic as an error and goes on reporting the statements after it, and
+// the connection's end is reported as well.
+func TestAPanickingTxEndedDoesNotLoseTheOthers(t *testing.T) {
+	g := panicTxEndedGate{&txGate{fakeGate: newFakeGate()}}
+	s := readySession(g)
+	var logs strings.Builder
+	s.log = slog.New(slog.NewTextHandler(&logs, nil))
+	defer func() {
+		if v := recover(); v != nil {
+			t.Errorf("the panic escaped: %v", v)
+		}
+	}()
+	send(s, queryMsg("begin"), queryMsg(ins), queryMsg("commit"), queryMsg(ins))
+	serve(s, tag("BEGIN"), readyWith('T'), tag("INSERT 0 1"), readyWith('T'), tag("COMMIT"), ready, tag("INSERT 0 1"), ready)
+	if o, ok := g.ends[1]; !ok || !o.Executed || o.Lost {
+		t.Errorf("write after the panic: %+v (reported %v), want executed", o, ok)
+	}
+	send(s, queryMsg("begin"), queryMsg(ins))
+	serve(s, tag("BEGIN"), readyWith('T'), tag("INSERT 0 1"), readyWith('T'))
+	s.abandon()
+	if n := strings.Count(logs.String(), "test gate: TxEnded"); n != 2 || !strings.Contains(logs.String(), "level=ERROR") {
+		t.Errorf("log %q, want both panics as errors", logs.String())
 	}
 }
