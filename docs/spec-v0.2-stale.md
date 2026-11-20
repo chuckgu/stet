@@ -509,22 +509,38 @@ stale:                     # 선택. 전체 설정
 
 ## 15. 수용 기준
 
-- [ ] `stale`을 켠 테이블에서 11장의 P1~P7이 `stale`로 판정된다. 섀도에서는 쓰기가 실행되고 `reasons`에 `stale_read`가 남는다. enforce에서는 쓰기가 실행되지 않고 클라이언트가 `ST003`과 `HINT`를 받는다.
-- [ ] 11장의 N1~N11이 `stale`로 판정되지 않고, 표에 적은 결과가 나온다. N5에서 다시 읽은 뒤의 쓰기가 실행된다.
-- [ ] 읽기의 조회가 끝나기 전에 온 쓰기는 `read_pending`이다. 지운 뒤에 끝난 조회가 지운 기억을 되살리지 않는다. 트랜잭션 안의 자기 쓰기는 그 트랜잭션이 끝날 때까지 `own_write`로 남는다.
-- [ ] M1이 `fresh`로 남고, 문서가 그것을 한계로 적는다.
-- [ ] `stale_read`로 정해진 쓰기는 모델을 부르지 않는다. 누적 한도를 넘은 쓰기라도 낡았으면 `hold`가 아니라 `reject`다.
-- [ ] 판단하는 동안 행이 바뀐 쓰기는, 읽은 기억이 있으면 `stale_read`로 거절된다.
-- [ ] 단순 프로토콜과 확장 프로토콜(이름 있는 준비된 문장을 다시 실행하는 경우 포함), 글자 형식과 바이너리 형식의 결과에서 키를 얻는다. 키 컬럼의 타입이 여덟 가지 밖인 테이블은 시작할 때 경고하고 추적하지 않으며, 그 쓰기는 `not_checked`다.
-- [ ] 키를 `'042'`처럼 다르게 적은 쓰기도 읽은 행과 맞는다.
-- [ ] 트랜잭션에서 쓰기 뒤에 온 읽기, 커서로 읽은 행, 뷰를 거친 읽기는 기억되지 않는다. 앞의 둘은 행을 보내면 그 접속 계정의 그 테이블 기억을 지운다.
-- [ ] 1,000행을 넘는 읽기는 앞의 1,000키만 기억하고, 그 테이블에 대해 그 전에 기억한 것을 지운다. `remember`를 넘긴 기억과 `max_keys`를 넘긴 기억이 버려지고, 한 접속 계정이 다른 계정의 기억을 밀어내지 못한다.
-- [ ] 한 접속 계정의 읽기가 다른 접속 계정의 쓰기의 판정을 `stale`로 바꾸지 못한다. 대기열을 채워 다른 계정의 읽기가 버려지게 해도 그렇다. `on_behalf_of`를 무엇으로, 얼마나 길게, 몇 가지로 적어도 다른 쪽의 멀쩡한 쓰기를 `stale`로 만들지 못하고 다른 세션을 기다리게 하지 못한다.
-- [ ] 조회가 실패하거나 대기열이 차도 읽기와 쓰기는 기다리지 않고 지나가고, 그 수가 로그에 남는다. 그 읽기의 행에 대해 그 접속 계정이 가진 기억은 지워져서, 그 뒤의 쓰기는 `stale`이 아니라 `no_read`다. 행을 읽고, 다른 쪽이 바꾸고, Stet이 보았지만 키를 얻지 못하는 길로 다시 읽은 뒤의 쓰기도 `no_read`다.
-- [ ] `stale`을 켠 테이블이 없으면 프록시가 결과 행을 열어 보지 않는다. 섀도에서 프록시가 넘기는 바이트가 `stale`을 켜기 전과 같다.
-- [ ] `stet.decisions.read_check`가 여섯 결과를 구분해 남고, `stet.reads`의 `keyed`와 `keys`가 맞는다. 재생이 `stale_read`의 판정을 `commit`으로 바꾸지 않는다.
-- [ ] 추적 대상 읽기에서 프록시가 더하는 시간이 p95로 2ms를 넘지 않는다. 기존 지연 테스트가 통과한다. `go test -race ./...`가 통과한다.
-- [ ] `stet-lab bench stale-check`의 결과를 `docs/lab.md`에 적는다.
+- [x] `stale`을 켠 테이블에서 11장의 P1~P7이 `stale`로 판정된다. 섀도에서는 쓰기가 실행되고 `reasons`에 `stale_read`가 남는다. enforce에서는 쓰기가 실행되지 않고 클라이언트가 `ST003`과 `HINT`를 받는다.
+  - 근거: `stet-lab bench stale-check`의 P1~P7 열네 줄(`docs/lab.md` "낡은 쓰기"). `internal/gate`의 `TestStaleWrite`, `TestStaleAcrossConnections`, `TestDeletedRowIsStale`, `TestOnBehalfOf`, `TestWhereKeyFallback`. `stet` 실행 파일을 거친 `cmd/stet`의 `TestStaleEndToEnd`.
+- [x] 11장의 N1~N11이 `stale`로 판정되지 않고, 표에 적은 결과가 나온다. N5에서 다시 읽은 뒤의 쓰기가 실행된다.
+  - 근거: 같은 확인의 N1~N11 열아홉 줄. N5는 enforce에서 실행됐다. `TestFreshWrite`, `TestOwnWrite`, `TestWriteWithoutRead`, `TestUnlockAfterRejection`, `TestMultiRowWriteForgetsTable`, `TestOwnWriteInTransaction`, `TestUnseenForgets`, `cmd/stet`의 `TestApprovedWriteIsNotStale`. 이 서버의 실행에서 N2·N5·N8은 모두 `fresh`였다. `read_pending`과 `own_write`는 다음 항목의 테스트가 본다.
+- [x] 읽기의 조회가 끝나기 전에 온 쓰기는 `read_pending`이다. 지운 뒤에 끝난 조회가 지운 기억을 되살리지 않는다. 트랜잭션 안의 자기 쓰기는 그 트랜잭션이 끝날 때까지 `own_write`로 남는다.
+  - 근거: `TestWriteWhileLookupPending`, `TestLateLookupDoesNotRevive`, `TestOwnWriteInTransaction`.
+- [x] M1이 `fresh`로 남고, 문서가 그것을 한계로 적는다.
+  - 근거: 실험실 확인의 M1 두 줄이 `fresh`. 12장 "놓치는 것"의 첫 항목.
+- [x] `stale_read`로 정해진 쓰기는 모델을 부르지 않는다. 누적 한도를 넘은 쓰기라도 낡았으면 `hold`가 아니라 `reject`다.
+  - 근거: `TestStaleNeverAsksTheModel`(두 모드), `TestStaleBeforeCumulative`.
+- [x] 판단하는 동안 행이 바뀐 쓰기는, 읽은 기억이 있으면 `stale_read`로 거절된다.
+  - 근거: `TestRowChangedWhileJudged`.
+- [x] 단순 프로토콜과 확장 프로토콜(이름 있는 준비된 문장을 다시 실행하는 경우 포함), 글자 형식과 바이너리 형식의 결과에서 키를 얻는다. 키 컬럼의 타입이 여덟 가지 밖인 테이블은 시작할 때 경고하고 추적하지 않으며, 그 쓰기는 `not_checked`다.
+  - 근거: `internal/proxy`의 `TestKeysFromSimpleQuery`, `TestKeysFromExtendedQuery`(여덟 타입, 글자·바이너리), `TestKeysFromNamedStatementRunAgain`. `internal/gate`의 `TestUntrackedTables`, `TestNotChecked`, `cmd/stet`의 `TestStaleTableNotTrackedStillStarts`.
+- [x] 키를 `'042'`처럼 다르게 적은 쓰기도 읽은 행과 맞는다.
+  - 근거: `TestKeyWrittenOtherwise`.
+- [x] 트랜잭션에서 쓰기 뒤에 온 읽기, 커서로 읽은 행, 뷰를 거친 읽기는 기억되지 않는다. 앞의 둘은 행을 보내면 그 접속 계정의 그 테이블 기억을 지운다.
+  - 근거: `internal/proxy`의 `TestNoKeysAfterAWrite`, `TestNoKeysFromCursor`, `TestNoKeysThroughView`. 지우는 것은 `internal/gate`의 `TestRereadNotTakenInIsNotStale`.
+- [x] 1,000행을 넘는 읽기는 앞의 1,000키만 기억하고, 그 테이블에 대해 그 전에 기억한 것을 지운다. `remember`를 넘긴 기억과 `max_keys`를 넘긴 기억이 버려지고, 한 접속 계정이 다른 계정의 기억을 밀어내지 못한다.
+  - 근거: `internal/proxy`의 `TestLargeReadKeepsThousandKeys`, `TestReadPastTheKeyLimitIsPartial`. `internal/gate`의 `TestRereadNotTakenInIsNotStale`, `TestRememberExpires`, `TestLimits`.
+- [x] 한 접속 계정의 읽기가 다른 접속 계정의 쓰기의 판정을 `stale`로 바꾸지 못한다. 대기열을 채워 다른 계정의 읽기가 버려지게 해도 그렇다. `on_behalf_of`를 무엇으로, 얼마나 길게, 몇 가지로 적어도 다른 쪽의 멀쩡한 쓰기를 `stale`로 만들지 못하고 다른 세션을 기다리게 하지 못한다.
+  - 근거: `TestOtherRoleCannotMakeStale`, `TestOtherRoleIsUntouched`, `TestFullQueueDoesNotMakeAnotherRolesWriteStale`, `TestRowHoldsAFewTasks`, `TestLongTasksAreOnePartyByTheirStart`. 한 행에 업무 50,000가지를 건 뒤 그 행을 지우는 데 잠금을 쥐는 시간은 0.9µs였다(마지막 검토의 측정).
+- [x] 조회가 실패하거나 대기열이 차도 읽기와 쓰기는 기다리지 않고 지나가고, 그 수가 로그에 남는다. 그 읽기의 행에 대해 그 접속 계정이 가진 기억은 지워져서, 그 뒤의 쓰기는 `stale`이 아니라 `no_read`다. 행을 읽고, 다른 쪽이 바꾸고, Stet이 보았지만 키를 얻지 못하는 길로 다시 읽은 뒤의 쓰기도 `no_read`다.
+  - 근거: `TestSlowLookupDelaysNothing`, `TestFailedLookupIsLogged`, `TestRereadNotTakenInIsNotStale`(일곱 순서), `TestCloseForgetsWhatPendingReadsShowed`. 마지막 검토가 따로 돌린 부하 확인(다른 쪽이 바꾸고, 그 계정이 무작위 길로 다시 읽고 쓰는 것을 프록시를 거쳐 약 50,000번)에서 `stale`은 0번이었다. 닫지 못한 한 가지는 12장에 적었다: 읽기의 응답이 아직 흘러가는 동안 다른 연결로 보낸 쓰기.
+- [x] `stale`을 켠 테이블이 없으면 프록시가 결과 행을 열어 보지 않는다. 섀도에서 프록시가 넘기는 바이트가 `stale`을 켜기 전과 같다.
+  - 근거: `internal/proxy`의 `TestRowsNotShownWithoutTrackedRead`, `TestTrackedReadBytesUnchanged`.
+- [x] `stet.decisions.read_check`가 여섯 결과를 구분해 남고, `stet.reads`의 `keyed`와 `keys`가 맞는다. 재생이 `stale_read`의 판정을 `commit`으로 바꾸지 않는다.
+  - 근거: 여섯 결과는 위 항목들의 테스트가 판단 기록에서 읽어 단언한다. `internal/store`의 `TestInsertRecordsReadCheck`, `TestReadCheckIsAppendOnly`, `TestAddReadsSumsKeys`, `internal/gate`의 `TestReadsCountKeys`, `internal/lab/replay`의 `TestModelVerdictsKeepRecordedStaleRead`.
+- [x] 추적 대상 읽기에서 프록시가 더하는 시간이 p95로 2ms를 넘지 않는다. 기존 지연 테스트가 통과한다. `go test -race ./...`가 통과한다.
+  - 근거: `TestTrackedReadLatencyBudget`: 100행을 돌려주는 추적 대상 읽기에서 p95로 28.7µs를 더했다. 다른 다섯 지연 테스트는 20.5~24.5µs였다(2026-11-20, 커밋 `d3d13d1`). 같은 커밋에서 `STET_TEST_PG=127.0.0.1:55432 go test -race -count=1 ./...`가 18개 패키지 모두 `ok`였다.
+- [x] `stet-lab bench stale-check`의 결과를 `docs/lab.md`에 적는다.
+  - 근거: `docs/lab.md` "낡은 쓰기" 절의 결과 표(35줄, 커밋 `d98fbab`의 실행 파일). 그 뒤 테스트와 문서만 바뀐 `d3d13d1`에서 다시 돌려 35줄이 같았다.
 
 ## 16. 정한 것과 남긴 것
 
