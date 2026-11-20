@@ -801,9 +801,9 @@ bin/stet-lab bench stale-check
 - M1의 `fresh`는 알려진 놓침이다(스펙 12장). 업무를 적지 않은 같은 계정의 두 연결은 한 쪽으로 묶여, 다른 연결이 다시 읽은 것이 첫 연결의 낡은 쓰기를 가린다.
 - 다루지 않는 것: 답을 받기 전에 끊긴 연결(스펙 7장, 1분 동안 두는 표시), Stet의 확인과 서버의 실행 사이의 틈(스펙 2장), 여러 키 타입과 형식, 이름 있는 준비된 문장의 다시 실행, 쓰지 못하는 키 값(스펙 4장의 "키 값으로 쓰는 것"). 이것들은 `internal/proxy`와 `internal/gate`의 테스트가 본다(`TestLostWriteLeavesNoMark`, `TestKeyValueNotUsable` 등).
 
-**결과** (2026-11-20, PostgreSQL 14.18, 이 컴퓨터의 테스트 서버. `bin/stet-lab`은 커밋 `1547dc6`에서 `go build -o bin/stet-lab ./cmd/stet-lab`으로 빌드했다)
+**결과** (2026-11-20, PostgreSQL 14.18, 이 컴퓨터의 테스트 서버. `bin/stet-lab`은 커밋 `7402bc4`에서 `go build -o bin/stet-lab ./cmd/stet-lab`으로 빌드했다)
 
-`bin/stet-lab bench stale-check`, 10:28:28 ~ 10:28:31 UTC(약 3초), 종료 코드 0. 35줄(섀도 17, enforce 18)이 모두 기대대로다. 기대와 다른 줄은 없다. Stet이 낸 경고는 섀도의 N11에서 `DO` 블록에 대한 `would be refused under enforce` 한 줄뿐이다. P6의 섀도 쓰기는 지워진 행에 보내져 0행으로 실행됐다. N7과 N10의 앞선 쓰기(트랜잭션 안의 쓰기, 보류된 쓰기)는 `fresh`로 기록됐다. N10의 마지막 쓰기는 낡지 않아(`no_read`) 누적 한도로 다시 보류됐다(`ST001`).
+`bin/stet-lab bench stale-check`, 12:29:09 ~ 12:29:11 UTC(약 2초), 종료 코드 0. 35줄(섀도 17, enforce 18)이 모두 기대대로다. 기대와 다른 줄은 없다. Stet이 낸 경고는 섀도의 N11에서 `DO` 블록에 대한 `would be refused under enforce` 한 줄뿐이다. P6의 섀도 쓰기는 지워진 행에 보내져 0행으로 실행됐다. N7과 N10의 앞선 쓰기(트랜잭션 안의 쓰기, 보류된 쓰기)는 `fresh`로 기록됐다. N10의 마지막 쓰기는 낡지 않아(`no_read`) 누적 한도로 다시 보류됐다(`ST001`).
 
 | scenario | mode | want | read_check | verdict | reasons | executed | sqlstate | ok |
 |---|---|---|---|---|---|---|---|---|
