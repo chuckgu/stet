@@ -70,6 +70,12 @@ commands:
            are dropped at the end unless -keep; -fast sends without the none arm's rate and pauses
            ([-practice] [-name crm_undo_check] [-config lab/bench/stet.yaml] [-max-rows 10000]
             [-paths s5.call,s5.view] [-keep] [-fast])
+  stale-check  check stale-write detection end to end (spec-v0.2-stale 11): clone the template once per mode
+           (<name>_shadow, <name>_enforce), start Stet inside this command in front of each clone, with stale on
+           contacts and deals and no model, run the spec's nineteen scenarios through it as the benchmark's agents,
+           with the owner changing rows straight on the server, and print a Markdown table of what Stet recorded of
+           each scenario's last write; fails when a row is not as the spec expects. The clones are dropped at the
+           end unless -keep ([-practice] [-name crm_stale_check] [-keep])
 `
 
 // benchEpoch is the date the benchmark's data is generated relative to.
@@ -109,6 +115,8 @@ func runBench(args []string) error {
 		return benchStetConfig(args[1:])
 	case "undo-check":
 		return benchUndoCheck(args[1:])
+	case "stale-check":
+		return benchStaleCheck(args[1:])
 	}
 	fmt.Fprint(os.Stderr, benchUsage)
 	os.Exit(2)
@@ -988,6 +996,36 @@ func benchUndoCheck(args []string) error {
 	}
 	if n := res.Unexplained(); n > 0 {
 		return fmt.Errorf("bench undo-check: %d rows differ with no reason the system reported", n)
+	}
+	return nil
+}
+
+// benchStaleCheck runs bench.CheckStale (docs/spec-v0.2-stale.md 11) on clones of the template named -name_shadow and
+// -name_enforce, with the benchmark's roles as they are, and prints the table of its rows; progress and Stet's
+// warnings go to standard error. It calls no model and reads no key. It fails when the check could not finish, and
+// when a row is not as the spec expects.
+func benchStaleCheck(args []string) error {
+	fs := flag.NewFlagSet("bench stale-check", flag.ExitOnError)
+	f := newBenchFlags(fs)
+	name := fs.String("name", "crm_stale_check", "the clones are <name>_shadow and <name>_enforce, which must not exist")
+	keep := fs.Bool("keep", false, "keep the clones (drop them with bench drop -name)")
+	fs.Parse(args)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	res, err := bench.CheckStale(ctx, bench.StaleCheck{Admin: f.admin(), Names: bench.Names{},
+		Template: bench.Template(*f.practice), Database: *name, Keep: *keep,
+		Progress: func(line string) { fmt.Fprintln(os.Stderr, line) }})
+	if len(res.Rows) > 0 {
+		if werr := res.Write(os.Stdout); werr != nil {
+			return errors.Join(err, werr)
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("bench stale-check: %w", err)
+	}
+	if n := res.Failed(); n > 0 {
+		return fmt.Errorf("bench stale-check: %d of %d rows are not as the spec expects", n, len(res.Rows))
 	}
 	return nil
 }

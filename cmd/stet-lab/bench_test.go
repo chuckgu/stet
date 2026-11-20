@@ -140,6 +140,14 @@ func TestScoreNamesTheArmWhoseDatabaseIsMissing(t *testing.T) {
 	}
 }
 
+func TestBenchUsageNamesStaleCheck(t *testing.T) {
+	for _, want := range []string{"\n  stale-check  ", "[-name crm_stale_check]", "[-keep]"} {
+		if !strings.Contains(benchUsage, want) {
+			t.Errorf("bench's help does not say %q:\n%s", want, benchUsage)
+		}
+	}
+}
+
 func TestLLMRecorderOutMustBeAJSONLFile(t *testing.T) {
 	// Only *.jsonl files in the directory count against the cap: any other
 	// name would let a restart forget what it spent.
