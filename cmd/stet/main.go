@@ -84,6 +84,10 @@ func runProxy(args []string) error {
 	return run(ctx, cfg, ln, log)
 }
 
+// onGate, when set, is called by run with the gate it opened (nil when there
+// are no gated tables). Only tests set it, to wait for the gate's lookups.
+var onGate func(*gate.Gate)
+
 // run serves cfg on ln until ctx is done, then stops in order: the proxy
 // first, waiting for its sessions to report their last statements; then the
 // gate, which records what it still holds; then, in enforce mode, the
@@ -95,6 +99,9 @@ func run(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog.Log
 	if err != nil {
 		ln.Close()
 		return err
+	}
+	if onGate != nil {
+		onGate(g)
 	}
 	// Deferred so it runs last, once the proxy's Close below has returned.
 	defer closeGate()
@@ -186,6 +193,7 @@ func openGate(ctx context.Context, cfg *config.Config, log *slog.Logger) (g *gat
 	var applier *apply.Applier
 	if len(cfg.Tables) > 0 && cfg.Mode == config.ModeEnforce {
 		applier = apply.New(cfg, pool, st, log)
+		applier.Applying = g.Applying // g is set: there are tables
 		applier.Start()
 	}
 	return g, func() {

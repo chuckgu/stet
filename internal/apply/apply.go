@@ -73,6 +73,12 @@ type Applier struct {
 	startOnce sync.Once
 	stopped   chan struct{} // closed once the loop has returned, or at Close when it never started
 
+	// Applying, when set, is called once a held write's checks have passed,
+	// just before its statement runs, with the agent's role and the table;
+	// the func it returns is called once the transaction has committed or
+	// been given up. Set it before Start.
+	Applying func(role, table string) (done func())
+
 	// Test seams.
 	markApplied     func(ctx context.Context, q store.Querier, id string, rows int64) error
 	beforeStatement func()                                    // called once the checks pass, before the row's role and settings
@@ -159,6 +165,12 @@ func (a *Applier) apply(ctx context.Context, conn *pgx.Conn, w store.Approved) e
 		return a.fail(ctx, tx, c, reason, true) // the reason may be a server error that aborted the transaction
 	}
 
+	if a.Applying != nil {
+		// Runs on every way out from here: committed, recorded as failed,
+		// an error of Stet's own step, a panic. A transaction given up on
+		// an error ends with the connection, and changed nothing.
+		defer a.Applying(c.LoginRole, c.TargetTable)()
+	}
 	if a.beforeStatement != nil {
 		a.beforeStatement()
 	}

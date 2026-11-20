@@ -1117,3 +1117,64 @@ func TestSchemaNames(t *testing.T) {
 		}
 	}
 }
+
+// Applying is called once, before the statement, and its done once the
+// transaction has committed, whether the write was applied or recorded as
+// failed. A write a check stopped does not call it.
+func TestApplyingAroundTheStatement(t *testing.T) {
+	e := setup(t)
+	var mu sync.Mutex
+	var events []string
+	var statusAtDone []string
+	note := func(s string) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, s)
+	}
+	var current string // the held write being applied
+	e.a.Applying = func(role, tbl string) func() {
+		note("applying " + role + " " + tbl)
+		return func() {
+			mu.Lock()
+			statusAtDone = append(statusAtDone, e.row(current).Status)
+			mu.Unlock()
+			note("done")
+		}
+	}
+	apply.BeforeStatement(e.a, func() { note("statement") })
+	take := func(h *store.HeldWrite) {
+		current = h.ID
+		events, statusAtDone = nil, nil
+		e.apply(e.approved(h, nil))
+	}
+	want := func(name string, wantEvents []string, wantStatus ...string) {
+		t.Helper()
+		if !slices.Equal(events, wantEvents) {
+			t.Errorf("%s: events = %v, want %v", name, events, wantEvents)
+		}
+		if !slices.Equal(statusAtDone, wantStatus) {
+			t.Errorf("%s: status when done was called = %v, want %v", name, statusAtDone, wantStatus)
+		}
+	}
+
+	take(e.update("update contacts set name = 'one' where id = 1", 1))
+	want("applied", []string{"applying stet_md5 contacts", "statement", "done"}, "applied")
+
+	take(e.held("insert into contacts (id, name) values (1, 'dup')"))
+	want("failed statement", []string{"applying stet_md5 contacts", "statement", "done"}, "failed")
+
+	// A check stops this one: its row changed since the hold.
+	h := e.update("update contacts set name = 'two' where id = 2", 2)
+	e.exec("update contacts set name = 'other' where id = 2")
+	take(h)
+	want("stopped by a check", nil)
+	if e.row(h.ID).Status != "failed" {
+		t.Errorf("the write a check stopped is %s, want failed", e.row(h.ID).Status)
+	}
+
+	// Without Applying nothing changes.
+	e.a.Applying = nil
+	h = e.update("update contacts set name = 'three' where id = 3", 3)
+	e.apply(e.approved(h, nil))
+	e.wantApplied(h.ID, 1)
+}
