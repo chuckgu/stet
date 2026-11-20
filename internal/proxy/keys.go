@@ -51,7 +51,8 @@ type ReadKeys struct {
 	//
 	// A NULL key (an outer join's missing side) is not partial: there is no
 	// row of the table there. Nor is a read that took its last key from its
-	// last row: it is set only once a row came that gave less than it held.
+	// last row. Once a read may take no more keys, any row that follows makes
+	// it partial: the row is not looked into, so it is taken to hold a key.
 	Partial bool
 }
 
@@ -295,7 +296,7 @@ func (s *session) rowWanted() bool {
 		return true
 	}
 	if s.take.blind {
-		s.take.partial = true // a row whose key is not taken
+		s.take.partial = true // a row not looked into, which may hold a key
 	}
 	return false
 }
