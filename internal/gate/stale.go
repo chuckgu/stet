@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/stetdb/stet/internal/proxy"
@@ -65,6 +66,9 @@ type stale struct {
 	// What was not remembered since it was last logged (report).
 	dropped atomic.Int64 // lookups the full queue turned away
 	failed  atomic.Int64 // lookups that failed or ran out of time
+	// lastFailure is why the last failed lookup failed (failure); nil when
+	// none failed.
+	lastFailure atomic.Pointer[string]
 
 	ctx    context.Context // done once the gate closes: running lookups and catalog reads end
 	cancel context.CancelFunc
@@ -186,16 +190,17 @@ func (s *stale) reads(sess proxy.SessionInfo, r sqlparse.Result, o proxy.Outcome
 
 // whereKey is the key that the value v of a read's WHERE clause `key = v`
 // gives, as text a lookup reads as table's key column: a literal's text, or
-// the bind value the proxy kept, read as the type the client gave it, or the
-// key column's when it gave none. ok is false when the table is not tracked;
-// when the result had no column of it (the classifier matches tables by name,
-// and a table of the same name in another schema would name another row:
-// correction S5); when the client gave the value a type the key column may
-// compare otherwise (paramType); and for a value that is NULL or KeyOutput
-// does not read.
+// the bind value the proxy kept, read as the type it was sent as: the one
+// the client gave it, else the one its cast names, else the key column's.
+// ok is false when the table is not tracked; when the result had no column
+// of it (the classifier matches tables by name, and a table of the same name
+// in another schema would name another row: correction S5); when v does not
+// read as a value of the key column (keyUsable), or the client gave the
+// value a type the key column may compare otherwise (paramType); and for a
+// value that is NULL or KeyOutput does not read.
 func whereKey(c *staleCatalog, table string, v sqlparse.Value, rk *proxy.ReadKeys) (string, bool) {
 	t, ok := c.byKey[table]
-	if !ok || !slices.Contains(rk.Tables, t.oid) {
+	if !ok || !slices.Contains(rk.Tables, t.oid) || !keyUsable(t, v) {
 		return "", false
 	}
 	switch v.Kind {
@@ -206,7 +211,11 @@ func whereKey(c *staleCatalog, table string, v sqlparse.Value, rk *proxy.ReadKey
 		if p == nil {
 			return "", false
 		}
-		typ, ok := paramType(p.OID, t)
+		oid := p.OID
+		if oid == 0 {
+			oid = castOIDs[v.Cast] // 0 for none
+		}
+		typ, ok := paramType(oid, t)
 		if !ok {
 			return "", false
 		}
@@ -229,6 +238,9 @@ func (s *stale) remember(sess proxy.SessionInfo, reads []staleRead) {
 	}
 	p := party{role: sess.User, task: sess.OnBehalfOf}
 	at := s.mem.now()
+	// Counted at once for all the read's tables, so that StaleIdle cannot
+	// return between two of them.
+	s.idle.add(len(reads))
 	for _, r := range reads {
 		keys, ask := r.keys, r.keys
 		if r.where != nil {
@@ -236,7 +248,6 @@ func (s *stale) remember(sess proxy.SessionInfo, reads []staleRead) {
 		}
 		// The ticket exists before its lookup is queued (see reading).
 		t := s.mem.reading(p, r.table, keys, at)
-		s.idle.add()
 		select {
 		case s.jobs <- lookupJob{table: r.table, keys: ask, t: t}:
 		default:
@@ -249,14 +260,15 @@ func (s *stale) remember(sess proxy.SessionInfo, reads []staleRead) {
 
 // refresh queues a lookup of one row's version for a write that ran; then is
 // called with the row's key as the server writes it and its xmin, with ok
-// false when the row is not there, the lookup failed or the queue was full.
-// then runs on a worker, or, when the queue is full or the gate closed,
-// before refresh returns.
+// false when the row is not there, the lookup failed or the queue was full,
+// or the catalog does not track table. then runs on a worker, or, when the
+// queue is full, the gate closed or table is not tracked, before refresh
+// returns.
 func (s *stale) refresh(table, key string, then func(serverKey, version string, ok bool)) {
 	queued := false
 	s.mu.RLock()
-	if !s.closed {
-		s.idle.add()
+	if _, tracked := s.table(table); tracked && !s.closed {
+		s.idle.add(1)
 		select {
 		case s.jobs <- lookupJob{table: table, keys: []string{key}, then: then}:
 			queued = true
@@ -283,10 +295,12 @@ func (s *stale) refresh(table, key string, then func(serverKey, version string, 
 // wrongly calls a key can give, is left out: which row a write of it means
 // is not known.
 func (s *stale) lookupVersions(ctx context.Context, table string, keys []string) (map[string]string, error) {
-	pk, ok := s.pks[table]
-	if !ok {
-		return nil, fmt.Errorf("table %s has no stale", table)
+	// A table the catalog does not track now may be another table than the
+	// one its reads were remembered of, or have another key type.
+	if _, ok := s.table(table); !ok {
+		return nil, errUntracked
 	}
+	pk := s.pks[table]
 	col := pgx.Identifier{pk}.Sanitize()
 	q := fmt.Sprintf("select t.%s, t.xmin::text from %s as t where t.%s = any($1)", col, ident(table), col)
 	rows, err := s.query(ctx, q, []*string{ptr(arrayLiteral(keys))})
@@ -345,20 +359,40 @@ func (s *stale) work() {
 }
 
 // run runs one lookup, under staleLookupTimeout, and ends it. A failure is
-// counted, unless the gate is closing.
+// counted with its cause, unless the gate is closing or the catalog stopped
+// tracking the table, which it logged.
 func (s *stale) run(j lookupJob) {
 	defer s.idle.done()
 	ctx, cancel := context.WithTimeout(s.ctx, staleLookupTimeout)
 	versions, err := s.lookup(ctx, j.table, j.keys)
 	cancel()
-	if err != nil && s.ctx.Err() == nil {
+	if err != nil && s.ctx.Err() == nil && !errors.Is(err, errUntracked) {
 		s.failed.Add(1)
+		s.lastFailure.Store(ptr(failure(err)))
 	}
 	s.end(j, versions, err)
 }
 
-// errClosed ends the lookups still queued when the gate closes.
-var errClosed = errors.New("the gate closed")
+// failure is what err, a lookup's, says of why it failed, quoting nothing an
+// agent wrote: the SQLSTATE the server gave (22P02 for a key the key
+// column's type does not read), timeout, or error.
+func failure(err error) string {
+	var pe *pgconn.PgError
+	switch {
+	case errors.As(err, &pe):
+		return pe.Code
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	}
+	return "error"
+}
+
+var (
+	// errClosed ends the lookups still queued when the gate closes.
+	errClosed = errors.New("the gate closed")
+	// errUntracked refuses a lookup in a table the catalog does not track.
+	errUntracked = errors.New("the table is not tracked")
+)
 
 // end ends j with what its lookup found; err is not nil when it found nothing.
 func (s *stale) end(j lookupJob, versions map[string]string, err error) {
@@ -400,15 +434,20 @@ func (s *stale) watch(catalogEvery, reportEvery time.Duration) {
 }
 
 // report logs, in one line, the reads the full queue dropped, the lookups
-// that failed and the remembered versions the limits threw away since the
-// last report; nothing when all are 0. No row data is logged.
+// that failed and why the last of them did, and the remembered versions the
+// limits threw away since the last report; nothing when all are 0. No row
+// data is logged.
 func (s *stale) report() {
 	dropped, failed, evicted := s.dropped.Swap(0), s.failed.Swap(0), s.mem.evicted()
+	last := ""
+	if p := s.lastFailure.Swap(nil); p != nil {
+		last = *p
+	}
 	if dropped == 0 && failed == 0 && evicted == 0 {
 		return
 	}
 	s.log.Warn("row versions not remembered: some reads will not be checked",
-		"queue_full", dropped, "lookups_failed", failed, "evicted", evicted)
+		"queue_full", dropped, "lookups_failed", failed, "last_failure", last, "evicted", evicted)
 }
 
 // close stops the workers, ends what is left on the queue with nothing
@@ -446,13 +485,14 @@ type idleCount struct {
 	none chan struct{} // while n is not 0: closed when it gets back to 0
 }
 
-func (c *idleCount) add() {
+// add counts n more lookups.
+func (c *idleCount) add(n int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.n == 0 {
 		c.none = make(chan struct{})
 	}
-	c.n++
+	c.n += n
 }
 
 func (c *idleCount) done() {

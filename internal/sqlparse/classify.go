@@ -7,6 +7,7 @@
 package sqlparse
 
 import (
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -75,6 +76,18 @@ type Value struct {
 	Kind  ValueKind
 	Text  string // Literal: the constant as text. Expr: the deparsed expression.
 	Param int    // Param: n in $n, filled from Bind
+	// Cast is the name of the type the value was written under ('x'::uuid,
+	// $1::int8), as the parser names it (int8 for bigint, bpchar for char);
+	// "" when it stands alone.
+	Cast string
+	// CastMod: the cast carried a type modifier or array bounds (varchar(3),
+	// int4[]), or named a schema other than pg_catalog: the value does not
+	// simply read as a value of the type Cast names.
+	CastMod bool
+	// Shared: a parameter ($n) that appears elsewhere in the statement too,
+	// where the server may fix its type. Set only for a key value: Write.PK
+	// and Result.ReadKey.
+	Shared bool
 }
 
 type Write struct {
@@ -83,6 +96,14 @@ type Write struct {
 	Columns []string // insert target or update SET columns; nil for insert without a column list
 	Values  []Value  // aligned with Columns, or positional when Columns is nil
 	PK      *Value   // update/delete: the WHERE pk = value; insert: the pk column's value if given
+}
+
+// pk is w's PK; nil when w is nil.
+func (w *Write) pk() *Value {
+	if w == nil {
+		return nil
+	}
+	return w.PK
 }
 
 type Method string
@@ -281,6 +302,13 @@ func Classify(sql string, tables Tables) (Result, error) {
 	r.ReadOnly = readOnly
 	if r.Kind == Read && readOnly {
 		r.ReadKey = readKey(tree.Stmts, m, r.Reads)
+	}
+	// A key parameter the statement names elsewhere too may be given its
+	// type there.
+	for _, k := range []*Value{r.ReadKey, r.Write.pk()} {
+		if k != nil && k.Kind == Param {
+			k.Shared = shared(sql, tree.Stmts, k.Param)
+		}
 	}
 	return r, nil
 }
@@ -729,13 +757,77 @@ func value(n *pg.Node) Value {
 	case n.GetSetToDefault() != nil:
 		return Value{Kind: Default}
 	case n.GetTypeCast() != nil:
-		// 'x'::text and $1::int carry the same value as their argument.
-		arg := n.GetTypeCast().Arg
-		if arg.GetAConst() != nil || arg.GetParamRef() != nil {
-			return value(arg)
+		// 'x'::text and $1::int carry the same value as their argument, under
+		// the type they name. A cast of anything else, a cast included, is an
+		// expression.
+		tc := n.GetTypeCast()
+		if arg := tc.Arg; arg.GetAConst() != nil || arg.GetParamRef() != nil {
+			v := value(arg)
+			v.Cast, v.CastMod = cast(tc.TypeName)
+			return v
 		}
 	}
 	return Value{Kind: Expr, Text: deparse(n)}
+}
+
+// cast is the name of the type t names, as the parser writes it (int8 for
+// bigint, bpchar for char), and whether t does more than name a type of
+// pg_catalog: a type modifier, array bounds, SETOF or %TYPE, or a schema, as
+// the type then is not simply the one its name says.
+func cast(t *pg.TypeName) (name string, mod bool) {
+	parts := t.GetNames()
+	if len(parts) == 0 {
+		return "", true
+	}
+	name = parts[len(parts)-1].GetString_().GetSval()
+	qualified := len(parts) > 2 || len(parts) == 2 && parts[0].GetString_().GetSval() != "pg_catalog"
+	return name, qualified || len(t.Typmods) > 0 || len(t.ArrayBounds) > 0 || t.Setof || t.PctType
+}
+
+// shared reports whether the parameter $n appears more than once in stmts,
+// the statements of sql. The walk is skipped when sql cannot hold $n twice.
+func shared(sql string, stmts []*pg.RawStmt, n int) bool {
+	if mentions(sql, n) < 2 {
+		return false
+	}
+	uses := 0
+	for _, s := range stmts {
+		walk(s.Stmt, func(msg proto.Message) bool {
+			if p, ok := msg.(*pg.ParamRef); ok && int(p.Number) == n {
+				uses++
+			}
+			return uses < 2
+		})
+		if uses > 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// mentions counts what in sql may be the parameter $n: each $ followed by
+// digits that read as n, or as a number too large to compare, wherever it
+// stands (a string or a comment included). The lexer makes a parameter only
+// of such text, so sql never names $n more often than this.
+func mentions(sql string, n int) int {
+	count := 0
+	for i := strings.IndexByte(sql, '$'); i >= 0; {
+		j := i + 1
+		for j < len(sql) && sql[j] >= '0' && sql[j] <= '9' {
+			j++
+		}
+		if j > i+1 {
+			if v, err := strconv.Atoi(sql[i+1 : j]); err != nil || v == n || v > math.MaxInt32 {
+				count++
+			}
+		}
+		k := strings.IndexByte(sql[j:], '$')
+		if k < 0 {
+			break
+		}
+		i = j + k
+	}
+	return count
 }
 
 func constant(c *pg.A_Const) Value {

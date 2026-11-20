@@ -470,7 +470,7 @@ func TestClassifyExtractsWrite(t *testing.T) {
 			"insert into contacts (a, b, c, d, e, f, g) values ('x'::text, 7, -3, 1.5, true, null, default)",
 			Write{Op: "insert", Table: "contacts", Columns: []string{"a", "b", "c", "d", "e", "f", "g"},
 				Values: []Value{
-					{Kind: Literal, Text: "x"},
+					{Kind: Literal, Text: "x", Cast: "text"},
 					{Kind: Literal, Text: "7"},
 					{Kind: Literal, Text: "-3"},
 					{Kind: Literal, Text: "1.5"},
@@ -729,7 +729,7 @@ func TestClassifySingleValueIn(t *testing.T) {
 		{"update contacts set title = 'x' where id in (5)", Gated, "", &Value{Kind: Literal, Text: "5"}},
 		{"delete from contacts where id in ($1)", Gated, "", &Value{Kind: Param, Param: 1}},
 		{"update contacts set title = 'x' where contacts.id in (5) and status = 'a'", Gated, "", &Value{Kind: Literal, Text: "5"}},
-		{"update contacts set title = 'x' where id in ('5'::int)", Gated, "", &Value{Kind: Literal, Text: "5"}},
+		{"update contacts set title = 'x' where id in ('5'::int)", Gated, "", &Value{Kind: Literal, Text: "5", Cast: "int4"}},
 
 		{"update contacts set title = 'x' where id in (5, 6)", Measured, "not_single_row", nil},
 		{"update contacts set title = 'x' where id not in (5)", Measured, "not_single_row", nil},
@@ -1054,5 +1054,109 @@ func TestResolves(t *testing.T) {
 		if r.Resolves != c.want {
 			t.Errorf("%q: Resolves = %v, want %v", c.sql, r.Resolves, c.want)
 		}
+	}
+}
+
+// A key value carries the type it was cast to, as the parser names it, and
+// whether the cast does more than name a type of pg_catalog's: a type
+// modifier, array bounds, or another schema. A cast of a cast is an
+// expression, which is no key value at all.
+func TestKeyValueCast(t *testing.T) {
+	p1 := func(cast string, mod bool) *Value { return &Value{Kind: Param, Param: 1, Cast: cast, CastMod: mod} }
+	u := "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+	cases := []struct {
+		value string
+		want  *Value
+	}{
+		{"$1", p1("", false)},
+		{"$1::bigint", p1("int8", false)},
+		{"$1::int", p1("int4", false)},
+		{"$1::int8", p1("int8", false)},
+		{"$1::pg_catalog.int8", p1("int8", false)},
+		{"$1::uuid", p1("uuid", false)},
+		{"$1::text", p1("text", false)},
+		{"$1::varchar", p1("varchar", false)},
+		{"$1::character varying", p1("varchar", false)},
+		{"$1::varchar(3)", p1("varchar", true)},
+		{"$1::char(4)", p1("bpchar", true)},
+		{"$1::myschema.t", p1("t", true)},
+		{"$1::int[]", p1("int4", true)},
+		{"cast($1 as uuid)", p1("uuid", false)},
+		{"'7'", &Value{Kind: Literal, Text: "7"}},
+		{"'7'::int8", &Value{Kind: Literal, Text: "7", Cast: "int8"}},
+		{"'ab'::char(4)", &Value{Kind: Literal, Text: "ab", Cast: "bpchar", CastMod: true}},
+		{"uuid '" + u + "'", &Value{Kind: Literal, Text: u, Cast: "uuid"}},
+	}
+	for _, c := range cases {
+		for _, sql := range []string{"delete from contacts where id = " + c.value, "select title from contacts where id = " + c.value} {
+			r, err := Classify(sql, gated)
+			if err != nil {
+				t.Fatalf("%q: %v", sql, err)
+			}
+			got := r.ReadKey
+			if r.Write != nil {
+				got = r.Write.PK
+			}
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("%q: key value %+v, want %+v", sql, got, c.want)
+			}
+		}
+	}
+	for _, sql := range []string{"delete from contacts where id = $1::text::uuid", "select title from contacts where id = $1::text::uuid"} {
+		if r, err := Classify(sql, gated); err != nil || r.Write != nil || r.ReadKey != nil {
+			t.Errorf("%q: Write %+v ReadKey %+v (%v), want no key value", sql, r.Write, r.ReadKey, err)
+		}
+	}
+}
+
+// A parameter that is a write's or a read's key value is Shared when the
+// statement names it elsewhere too, where the server may fix its type. The
+// values a write records are not marked.
+func TestKeyValueShared(t *testing.T) {
+	cases := []struct {
+		sql    string
+		shared bool
+	}{
+		{"update contacts set title = $2 where id = $1", false},
+		{"update contacts set title = $1 where id = $1", true},
+		{"update contacts set title = $01 where id = $1", true}, // $01 is $1
+		{"update contacts set title = 'costs $1' where id = $1", false},
+		{"update contacts set title = $10 where id = $1", false},
+		{"update contacts set title = 'x' where id = $1 and company_id = $1", true},
+		{"update contacts set title = 'x' where id = $1 and company_id = $2", false},
+		{"delete from contacts where id = $1 and $1::text <> ''", true},
+		{"delete from contacts where id = $1 returning $1", true},
+		{"insert into contacts (id, name) values ($1, $1)", true},
+		{"insert into contacts (id, name) values ($1, $2)", false},
+		{"select title from contacts where id = $1", false},
+		{"select title, $1::char(4) from contacts where id = $1", true},
+		{"select title from contacts where company_id = $1 and id = $1", true},
+		{"select title from contacts where id = $1 and company_id = $2", false},
+		{"select title from contacts where id = $1 order by $2", false},
+	}
+	for _, c := range cases {
+		r, err := Classify(c.sql, gated)
+		if err != nil {
+			t.Fatalf("%q: %v", c.sql, err)
+		}
+		v := r.ReadKey
+		if r.Write != nil {
+			v = r.Write.PK
+			for _, x := range r.Write.Values {
+				if x.Shared {
+					t.Errorf("%q: the written value %+v is marked Shared", c.sql, x)
+				}
+			}
+		}
+		if v == nil || v.Kind != Param {
+			t.Fatalf("%q: key value %+v, want a parameter", c.sql, v)
+		}
+		if v.Shared != c.shared {
+			t.Errorf("%q: Shared = %v, want %v", c.sql, v.Shared, c.shared)
+		}
+	}
+	// A literal is never Shared.
+	if r, _ := Classify("delete from contacts where id = 7 and company_id = 7", gated); r.Write.PK.Shared {
+		t.Error("a literal key value is marked Shared")
 	}
 }

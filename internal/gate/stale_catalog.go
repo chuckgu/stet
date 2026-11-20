@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/stetdb/stet/internal/proxy"
+	"github.com/stetdb/stet/internal/sqlparse"
 )
 
 // keyTypes are the base types a tracked table's key column may have (spec
@@ -30,11 +31,52 @@ var keyTypes = map[uint32]proxy.KeyType{
 
 // tracked is what the catalog says of a table that remembers reads.
 type tracked struct {
-	oid      uint32
-	attr     uint16        // the key column's attribute number
-	typ      proxy.KeyType // of the key column's base type
-	typeName string        // format_type of the key column, for a cast to it
-	base     uint32        // the OID of the key column's base type
+	oid  uint32
+	attr uint16        // the key column's attribute number
+	typ  proxy.KeyType // of the key column's base type
+	// typeName is the key column's own type (for a domain, the domain), for
+	// a cast to it: qualified by its schema, each part quoted where it must
+	// be, and with no type modifier. With one, a cast cuts a longer value
+	// ('abcdefg'::character(5) is abcde, another row); and format_type of
+	// bpchar with none is character, which as a cast means character(1).
+	typeName string
+	base     uint32 // the OID of the key column's base type
+}
+
+// castOIDs are the casts a key value may carry and still name its row, by
+// the name the parser gives the type (keyUsable), and the type's OID.
+var castOIDs = map[string]uint32{"int2": 21, "int4": 23, "int8": 20, "uuid": 2950, "text": 25, "varchar": 1043}
+
+// keyUsable reports whether v, a key value as the classifier read it, reads
+// as a value of t's key column, so that its text names the row the
+// statement's comparison matches. It is a literal or a parameter; no other
+// part of the statement may give a parameter its type (Shared), since the
+// server would read it as that type; a cast must name a type of pg_catalog
+// with no modifier, and one the key column compares as it compares its own
+// values: integers of any size with an integer key, uuid with uuid, text or
+// varchar with a text or varchar key, and no cast at all with a bpchar key
+// (the cast sets its length, or drops trailing spaces in the comparison) or
+// a name key (a cast to text compares more than 63 bytes). A literal of a
+// string key must hold no backslash: a session with
+// standard_conforming_strings off reads it otherwise than the classifier.
+func keyUsable(t tracked, v sqlparse.Value) bool {
+	switch {
+	case v.Kind != sqlparse.Literal && v.Kind != sqlparse.Param, v.Shared, v.CastMod:
+		return false
+	case v.Kind == sqlparse.Literal && t.typ == proxy.KeyText && strings.ContainsRune(v.Text, '\\'):
+		return false
+	case v.Cast == "":
+		return true
+	}
+	switch c := v.Cast; t.base {
+	case 21, 23, 20:
+		return c == "int2" || c == "int4" || c == "int8"
+	case 2950:
+		return c == "uuid"
+	case 25, 1043:
+		return c == "text" || c == "varchar"
+	}
+	return false
 }
 
 // staleCatalog is a reading of the catalog: the tables it tracks, by config
@@ -185,20 +227,24 @@ func sameTables(entries map[string]catalogEntry) {
 
 // catalogQuery reads, for the config key whose quoted name is $1 and its key
 // column $2, the table's OID and kind as Stet's search_path resolves it (as
-// the gate's own SQL does), the column's number and type name, the column's
-// base type (through domains, however nested), and whether a unique index is
-// on the column alone, not partial and not on an expression.
+// the gate's own SQL does), whether Stet's account may read it, the column's
+// number and type (tracked.typeName), the column's base type (through
+// domains, however nested), and whether a unique index is on the column
+// alone, not partial and not on an expression.
 const catalogQuery = `
 with recursive
   rel as (select c.oid, c.relkind from pg_class c where c.oid = to_regclass($1)),
-  col as (select a.attnum, a.atttypid, format_type(a.atttypid, a.atttypmod) as type_name
+  col as (select a.attnum, a.atttypid, format('%I.%I', tn.nspname, ty.typname) as type_name
             from pg_attribute a join rel on a.attrelid = rel.oid
+            join pg_type ty on ty.oid = a.atttypid
+            join pg_namespace tn on tn.oid = ty.typnamespace
            where a.attname = $2 and a.attnum > 0 and not a.attisdropped),
   base as (select t.oid, t.typtype, t.typbasetype from pg_type t join col on t.oid = col.atttypid
            union all
            select t.oid, t.typtype, t.typbasetype from pg_type t join base b on t.oid = b.typbasetype
             where b.typtype = 'd')
-select rel.oid, rel.relkind::text, col.attnum, col.type_name, b.oid, format_type(b.oid, null),
+select rel.oid, rel.relkind::text, coalesce(has_table_privilege(rel.oid, 'SELECT'), false),
+       col.attnum, col.type_name, b.oid, format_type(b.oid, null),
        exists (select from pg_index x
                 where x.indrelid = rel.oid and x.indisunique and x.indisvalid
                   and x.indnkeyatts = 1 and x.indkey[0] = col.attnum
@@ -217,9 +263,10 @@ func readTable(ctx context.Context, conn *pgxpool.Conn, table, pk string) (catal
 		relkind, typeName *string
 		baseName          *string
 		attnum            *int16
-		unique            bool
+		readable, unique  bool
 	)
-	err := conn.QueryRow(ctx, catalogQuery, ident(table), pk).Scan(&oid, &relkind, &attnum, &typeName, &base, &baseName, &unique)
+	err := conn.QueryRow(ctx, catalogQuery, ident(table), pk).Scan(&oid, &relkind, &readable, &attnum, &typeName,
+		&base, &baseName, &unique)
 	if err != nil {
 		return catalogEntry{}, err
 	}
@@ -233,6 +280,9 @@ func readTable(ctx context.Context, conn *pgxpool.Conn, table, pk string) (catal
 		return catalogEntry{reason: "Stet's account finds no table " + name}, nil
 	case *relkind != "r" && *relkind != "p":
 		return catalogEntry{reason: name + " is not a table"}, nil
+	case !readable:
+		return catalogEntry{reason: "Stet's account may not read " + name + ": it has no SELECT privilege on it, " +
+			"so every lookup of its rows' versions would fail"}, nil
 	case attnum == nil:
 		return catalogEntry{reason: fmt.Sprintf("table %s has no column %s", name, col)}, nil
 	case typ == 0:

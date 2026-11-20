@@ -277,23 +277,24 @@ func TestLookupKeyTypes(t *testing.T) {
 	})
 
 	type tc struct {
-		sqlType string
-		typ     proxy.KeyType
-		rows    []string          // inserted, each in its own transaction
-		ask     []string          // what the lookup is given
-		want    map[string]string // the server's text of each key asked → the row it names
+		sqlType  string
+		typ      proxy.KeyType
+		typeName string            // the key column's own type, qualified, with no modifier
+		rows     []string          // inserted, each in its own transaction
+		ask      []string          // what the lookup is given
+		want     map[string]string // the server's text of each key asked → the row it names
 	}
 	u1, u2 := "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "b1eebc99-9c0b-4ef8-bb6d-6bb9bd380a12"
 	cases := []tc{
-		{"int2", proxy.KeyInt2, []string{"42", "7"}, []string{"042"}, map[string]string{"42": "42"}},
-		{"int4", proxy.KeyInt4, []string{"42", "7"}, []string{"042", "7"}, map[string]string{"42": "42", "7": "7"}},
-		{"int8", proxy.KeyInt8, []string{"9000000000", "7"}, []string{"9000000000"}, map[string]string{"9000000000": "9000000000"}},
-		{"uuid", proxy.KeyUUID, []string{u1, u2}, []string{u2}, map[string]string{u2: u2}},
-		{"text", proxy.KeyText, []string{"ab", "cd"}, []string{"ab"}, map[string]string{"ab": "ab"}},
-		{"varchar(10)", proxy.KeyText, []string{"ab", "cd"}, []string{"cd"}, map[string]string{"cd": "cd"}},
-		{"char(5)", proxy.KeyText, []string{"ab", "cd"}, []string{"ab"}, map[string]string{"ab   ": "ab"}},
-		{"name", proxy.KeyText, []string{"ab", "cd"}, []string{"ab"}, map[string]string{"ab": "ab"}},
-		{domain, proxy.KeyText, []string{"ab", "cd"}, []string{"cd"}, map[string]string{"cd": "cd"}},
+		{"int2", proxy.KeyInt2, "pg_catalog.int2", []string{"42", "7"}, []string{"042"}, map[string]string{"42": "42"}},
+		{"int4", proxy.KeyInt4, "pg_catalog.int4", []string{"42", "7"}, []string{"042", "7"}, map[string]string{"42": "42", "7": "7"}},
+		{"int8", proxy.KeyInt8, "pg_catalog.int8", []string{"9000000000", "7"}, []string{"9000000000"}, map[string]string{"9000000000": "9000000000"}},
+		{"uuid", proxy.KeyUUID, "pg_catalog.uuid", []string{u1, u2}, []string{u2}, map[string]string{u2: u2}},
+		{"text", proxy.KeyText, "pg_catalog.text", []string{"ab", "cd"}, []string{"ab"}, map[string]string{"ab": "ab"}},
+		{"varchar(10)", proxy.KeyText, `pg_catalog."varchar"`, []string{"ab", "cd"}, []string{"cd"}, map[string]string{"cd": "cd"}},
+		{"char(5)", proxy.KeyText, "pg_catalog.bpchar", []string{"ab", "cd"}, []string{"ab"}, map[string]string{"ab   ": "ab"}},
+		{"name", proxy.KeyText, "pg_catalog.name", []string{"ab", "cd"}, []string{"ab"}, map[string]string{"ab": "ab"}},
+		{domain, proxy.KeyText, "public." + domain, []string{"ab", "cd"}, []string{"cd"}, map[string]string{"cd": "cd"}},
 	}
 	var blocks []string
 	names := make([]string, len(cases))
@@ -306,9 +307,20 @@ func TestLookupKeyTypes(t *testing.T) {
 
 	for i, c := range cases {
 		table := names[i]
-		oid, attr, typ, _, ok := gate.StaleTable(e.gate, table)
-		if !ok || oid != e.oid(t, table) || attr != 1 || typ != c.typ {
-			t.Errorf("%s: catalog oid %d attr %d type %d ok %v, want %d, 1, %d, true", c.sqlType, oid, attr, typ, ok, e.oid(t, table), c.typ)
+		oid, attr, typ, typeName, ok := gate.StaleTable(e.gate, table)
+		if !ok || oid != e.oid(t, table) || attr != 1 || typ != c.typ || typeName != c.typeName {
+			t.Errorf("%s: catalog oid %d attr %d type %d %q ok %v, want %d, 1, %d, %q, true",
+				c.sqlType, oid, attr, typ, typeName, ok, e.oid(t, table), c.typ, c.typeName)
+		}
+		// A cast to the type name keeps a value longer than the column's
+		// length whole: a cast to character(5) would cut it, and name
+		// another row.
+		if long := "abcdefghijkl"; ok && typ == proxy.KeyText {
+			var got string
+			err := e.admin.QueryRow(context.Background(), "select $1::"+typeName, pgx.QueryExecModeSimpleProtocol, long).Scan(&got)
+			if err != nil || got != long {
+				t.Errorf("%s: select $1::%s of %q = %q (%v), want it whole", c.sqlType, typeName, long, got, err)
+			}
 		}
 		if a, ty, ok := e.gate.Tracked(e.oid(t, table)); !ok || a != 1 || ty != c.typ {
 			t.Errorf("%s: Tracked = %d, %d, %v; want 1, %d, true", c.sqlType, a, ty, ok, c.typ)
@@ -325,9 +337,6 @@ func TestLookupKeyTypes(t *testing.T) {
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("%s: lookup of %q = %v, want %v", c.sqlType, c.ask, got, want)
 		}
-	}
-	if _, _, _, typeName, _ := gate.StaleTable(e.gate, names[len(names)-1]); typeName != domain {
-		t.Errorf("type name of the domain key = %q, want %q", typeName, domain)
 	}
 }
 
@@ -384,14 +393,28 @@ func TestLookupQuotesNames(t *testing.T) {
 	schema := e.schema(t, "crm")
 	contacts := schema + ".contacts"
 	mustExec(t, e.admin, "create table "+quoted(contacts)+" (id int primary key, name text)")
-	notes := e.create(t, "Deal Notes", `("Order" int primary key, body text)`)
+	domain := e.name("Order No")
+	mustExec(t, e.admin, "create domain "+quoted(domain)+" as int")
+	t.Cleanup(func() { e.admin.Exec(context.Background(), "drop domain if exists "+quoted(domain)+" cascade") })
+	notes := e.create(t, "Deal Notes", `("Order" `+quoted(domain)+` primary key, body text)`)
 	e.insert(t, contacts, "id", "1", "2")
 	e.insert(t, notes, "Order", "10", "20")
 	e.start(t, tableBlock(contacts, "id", "stale: {}"), tableBlock(notes, "Order", "stale: {}"))
 
-	for _, c := range []struct{ table, col, key string }{{contacts, "id", "2"}, {notes, "Order", "10"}} {
+	for _, c := range []struct{ table, col, key, typeName string }{
+		{contacts, "id", "2", "pg_catalog.int4"},
+		{notes, "Order", "10", "public." + quoted(domain)},
+	} {
 		if _, _, ok := e.gate.Tracked(e.oid(t, c.table)); !ok {
 			t.Errorf("%s is not tracked", c.table)
+		}
+		if _, _, _, typeName, _ := gate.StaleTable(e.gate, c.table); typeName != c.typeName {
+			t.Errorf("%s: key type name %q, want %q", c.table, typeName, c.typeName)
+		}
+		var cast string
+		err := e.admin.QueryRow(context.Background(), "select $1::"+c.typeName+"::text", pgx.QueryExecModeSimpleProtocol, c.key).Scan(&cast)
+		if err != nil || cast != c.key {
+			t.Errorf("%s: a cast to %s gives %q (%v), want %q", c.table, c.typeName, cast, err, c.key)
 		}
 		got, err := gate.LookupVersions(e.gate, c.table, []string{c.key})
 		if err != nil {
@@ -434,12 +457,12 @@ func TestWhereKeyFallback(t *testing.T) {
 	deals := e.create(t, "deals", "(id int primary key, title text)")
 	bigs := e.create(t, "bigs", "(id int8 primary key, title text)")
 	uuids := e.create(t, "uuids", "(id uuid primary key, title text)")
-	texts := e.create(t, "texts", "(id text primary key, title text)")
+	texts := e.create(t, "texts", "(id text primary key, c5 char(5), title text)")
 	e.insert(t, deals, "id", "1", "7", "42")
 	e.insert(t, bigs, "id", "9000000000")
 	u := "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
 	e.insert(t, uuids, "id", u)
-	e.insert(t, texts, "id", "ab", "ab  ")
+	e.insert(t, texts, "id", "ab", "ab  ", "abc", "abcdef", `a\b`)
 	e.start(t, tableBlock(deals, "id", "stale: {}"), tableBlock(bigs, "id", "stale: {}"),
 		tableBlock(uuids, "id", "stale: {}"), tableBlock(texts, "id", "stale: {}"))
 	byParam := func(table string) proxy.Statement {
@@ -479,6 +502,10 @@ func TestWhereKeyFallback(t *testing.T) {
 		{"binary text", texts, "ab", byParam(texts), &proxy.Param{Value: []byte("ab"), Format: 1, OID: 25}},
 		{"binary varchar on a text key", texts, "ab  ", byParam(texts), &proxy.Param{Value: []byte("ab  "), Format: 1, OID: 1043}},
 		{"text int8 typed", deals, "42", byParam(deals), &proxy.Param{Value: []byte("042"), OID: 20}},
+		// A cast gives the parameter its type when the client gave none.
+		{"cast to uuid", uuids, u, e.gate.Inspect("select title from " + uuids + " where id = $1::uuid"), &proxy.Param{Value: []byte(u)}},
+		{"cast to bigint, binary", deals, "42", e.gate.Inspect("select title from " + deals + " where id = $1::bigint"), &proxy.Param{Value: be64(42), Format: 1}},
+		{"cast to text on a text key", texts, "ab", e.gate.Inspect("select title from " + texts + " where id = $1::text"), &proxy.Param{Value: []byte("ab")}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			role := strings.ReplaceAll(c.name, " ", "_")
@@ -489,25 +516,50 @@ func TestWhereKeyFallback(t *testing.T) {
 	}
 
 	t.Run("not remembered", func(t *testing.T) {
+		inspect := func(sql string) *proxy.Statement { st := e.gate.Inspect(sql); return &st }
 		for _, c := range []struct {
 			name  string
 			o     proxy.Outcome
 			table string
 			key   string
+			st    *proxy.Statement // nil: select title from table where id = $1
 		}{
-			{"no row sent", whereKeyed(&proxy.Param{Value: []byte("42")}, 0, e.oid(t, deals)), deals, "42"},
-			{"binary of a type not read", whereKeyed(&proxy.Param{Value: be32(42), Format: 1, OID: 1700}, 1, e.oid(t, deals)), deals, "42"},
-			{"null", whereKeyed(&proxy.Param{Format: 0}, 1, e.oid(t, deals)), deals, "42"},
-			{"not ASCII", whereKeyed(&proxy.Param{Value: []byte("ab\xc3\xa9")}, 1, e.oid(t, texts)), texts, "ab"},
-			{"no param", whereKeyed(nil, 1, e.oid(t, deals)), deals, "42"},
+			{"no row sent", whereKeyed(&proxy.Param{Value: []byte("42")}, 0, e.oid(t, deals)), deals, "42", nil},
+			{"binary of a type not read", whereKeyed(&proxy.Param{Value: be32(42), Format: 1, OID: 1700}, 1, e.oid(t, deals)), deals, "42", nil},
+			{"null", whereKeyed(&proxy.Param{Format: 0}, 1, e.oid(t, deals)), deals, "42", nil},
+			{"not ASCII", whereKeyed(&proxy.Param{Value: []byte("ab\xc3\xa9")}, 1, e.oid(t, texts)), texts, "ab", nil},
+			{"no param", whereKeyed(nil, 1, e.oid(t, deals)), deals, "42", nil},
 			// Compared as text, 'ab  '::bpchar is 'ab': the read named the row
 			// ab, and a lookup of its text would find the row 'ab  '.
-			{"binary bpchar on a text key", whereKeyed(&proxy.Param{Value: []byte("ab  "), Format: 1, OID: 1042}, 1, e.oid(t, texts)), texts, "ab  "},
-			{"text bpchar on a text key", whereKeyed(&proxy.Param{Value: []byte("ab  "), OID: 1042}, 1, e.oid(t, texts)), texts, "ab  "},
-			{"name on a text key", whereKeyed(&proxy.Param{Value: []byte("ab"), Format: 1, OID: 19}, 1, e.oid(t, texts)), texts, "ab"},
+			{"binary bpchar on a text key", whereKeyed(&proxy.Param{Value: []byte("ab  "), Format: 1, OID: 1042}, 1, e.oid(t, texts)), texts, "ab  ", nil},
+			{"text bpchar on a text key", whereKeyed(&proxy.Param{Value: []byte("ab  "), OID: 1042}, 1, e.oid(t, texts)), texts, "ab  ", nil},
+			{"name on a text key", whereKeyed(&proxy.Param{Value: []byte("ab"), Format: 1, OID: 19}, 1, e.oid(t, texts)), texts, "ab", nil},
+			// The statement gives $1 a type elsewhere: the server reads
+			// 'ab  ' as character, and sends the row ab.
+			{"shared with a char column", whereKeyed(&proxy.Param{Value: []byte("ab  ")}, 1, e.oid(t, texts)), texts, "ab  ",
+				inspect("select title from " + texts + " where c5 = $1 and id = $1")},
+			{"shared with a cast in the select list", whereKeyed(&proxy.Param{Value: []byte("ab  ")}, 1, e.oid(t, texts)), texts, "ab  ",
+				inspect("select title, $1::char(4) from " + texts + " where id = $1")},
+			{"cast to char(4)", whereKeyed(&proxy.Param{Value: []byte("ab  ")}, 1, e.oid(t, texts)), texts, "ab  ",
+				inspect("select title from " + texts + " where id = $1::char(4)")},
+			// varchar(3) cuts abcdef to abc, the row sent.
+			{"cast to varchar(3)", whereKeyed(&proxy.Param{Value: []byte("abcdef"), OID: 25}, 1, e.oid(t, texts)), texts, "abcdef",
+				inspect("select title from " + texts + " where id = $1::varchar(3)")},
+			{"literal cast to bpchar", whereKeyed(nil, 1, e.oid(t, texts)), texts, "ab  ",
+				inspect("select title from " + texts + " where id = 'ab  '::bpchar")},
+			// standard_conforming_strings off would read it as ab.
+			{"literal with a backslash", whereKeyed(nil, 1, e.oid(t, texts)), texts, `a\b`,
+				inspect("select title from " + texts + ` where id = 'a\b'`)},
 		} {
 			role := "none_" + strings.ReplaceAll(c.name, " ", "_")
-			e.gate.Observe(session(role), byParam(c.table), c.o)
+			st := c.st
+			if st == nil {
+				st = ptr(byParam(c.table))
+			}
+			if !st.Track {
+				t.Fatalf("%s: the read is not tracked", c.name)
+			}
+			e.gate.Observe(session(role), *st, c.o)
 			e.wantResult(t, role, "", c.table, c.key, "1", decide.ReadNone) // not even pending
 			e.idle(t)
 			e.wantResult(t, role, "", c.table, c.key, e.xmin(t, c.table, "id", c.key), decide.ReadNone)
@@ -595,11 +647,22 @@ func TestUntrackedTables(t *testing.T) {
 	pair := e.create(t, "pair", "(region int, id int, primary key (region, id))")
 	pairs := e.create(t, "pairs", "(region int, id int, primary key (region, id))")
 	good := e.create(t, "good", "(id int primary key)")
+	// Two config keys that name one table, under the search_path and by schema.
+	same := e.create(t, "same", "(id int primary key)")
+	// A view, which has no row versions of its own.
+	view := e.name("view")
+	mustExec(t, e.admin, "create view "+view+" as select * from "+good)
+	t.Cleanup(func() { e.admin.Exec(context.Background(), "drop view if exists "+view) })
+	// A table Stet's account may not read: every lookup would fail.
+	hidden := e.create(t, "hidden", "(id int primary key)")
+	mustExec(t, e.admin, "revoke select on "+hidden+" from stet_scram")
 	e.insert(t, dated, "day", "2026-11-20")
-	untracked := []string{missing, nocol, dated, pair, pairs}
+	untracked := []string{missing, nocol, dated, pair, pairs, same, "public." + same, view, hidden}
 	e.start(t, tableBlock(missing, "id", "stale: {}"), tableBlock(nocol, "nope", "stale: {}"),
 		tableBlock(dated, "day", "stale: {}"), tableBlock(pair, "id", "stale: {}"),
-		tableBlock(pairs, "region, id", "stale: {}"), tableBlock(good, "id", "stale: {}"))
+		tableBlock(pairs, "region, id", "stale: {}"), tableBlock(good, "id", "stale: {}"),
+		tableBlock(same, "id", "stale: {}"), tableBlock("public."+same, "id", "stale: {}"),
+		tableBlock(view, "id", "stale: {}"), tableBlock(hidden, "id", "stale: {}"))
 	t.Cleanup(func() {
 		e.admin.Exec(context.Background(), "delete from stet.reads where target_table = any($1)", untracked)
 	})
@@ -712,6 +775,10 @@ func TestSlowLookupDelaysNothing(t *testing.T) {
 		if p95 := took[len(took)*95/100]; p95 > time.Millisecond {
 			t.Errorf("Observe took %v at p95 while lookups were held, want at most 1ms", p95)
 		}
+		// Loose, for a slow machine, but far below a lookup's time.
+		if longest := took[len(took)-1]; longest > 50*time.Millisecond {
+			t.Errorf("an Observe took %v while lookups were held, want none over 50ms", longest)
+		}
 		if dropped == 0 || dropped > reads-1024 {
 			t.Errorf("%d of %d reads dropped, want some and at most %d", dropped, reads, reads-1024)
 		}
@@ -753,8 +820,9 @@ func TestSlowLookupDelaysNothing(t *testing.T) {
 				lines = append(lines, rec)
 			}
 		}
-		if len(lines) != 1 || lines[0]["lookups_failed"] != float64(1) || lines[0]["queue_full"] != float64(0) {
-			t.Errorf("log lines counting failed lookups %v, want one with lookups_failed=1", lines)
+		if len(lines) != 1 || lines[0]["lookups_failed"] != float64(1) || lines[0]["queue_full"] != float64(0) ||
+			lines[0]["last_failure"] != "timeout" {
+			t.Errorf("log lines counting failed lookups %v, want one with lookups_failed=1 and last_failure=timeout", lines)
 		}
 	})
 }
@@ -849,9 +917,19 @@ func TestObserveAfterClose(t *testing.T) {
 func TestRefreshLooksUpOneRow(t *testing.T) {
 	e := newStaleEnv(t)
 	deals := e.create(t, "deals", "(id int primary key)")
+	dated := e.create(t, "dated", "(day date primary key)")
 	e.insert(t, deals, "id", "42")
-	e.start(t, tableBlock(deals, "id", "stale: {}"))
+	e.insert(t, dated, "day", "2026-11-20")
+	e.start(t, tableBlock(deals, "id", "stale: {}"), tableBlock(dated, "day", "stale: {}"))
 
+	// A table with stale that the catalog does not track is neither
+	// refreshed nor looked up.
+	if key, v, ok := gate.Refresh(e.gate, dated, "2026-11-20"); ok {
+		t.Errorf("refresh of a row of a table not tracked = %q, %q, true", key, v)
+	}
+	if got, err := gate.LookupVersions(e.gate, dated, []string{"2026-11-20"}); err == nil {
+		t.Errorf("lookup in a table not tracked = %v, want an error", got)
+	}
 	if key, v, ok := gate.Refresh(e.gate, deals, "042"); !ok || key != "42" || v != e.xmin(t, deals, "id", "42") {
 		t.Errorf("refresh of 042 = %q, %q, %v; want 42, its xmin, true", key, v, ok)
 	}
@@ -862,4 +940,96 @@ func TestRefreshLooksUpOneRow(t *testing.T) {
 	if _, _, ok := gate.Refresh(e.gate, deals, "42"); ok {
 		t.Error("refresh after Close answered ok")
 	}
+}
+
+// A lookup the server refuses is counted with the SQLSTATE of the last one,
+// never its message, which may quote a key: an agent's WHERE clause can
+// give a key the key column's type does not read (7.0 for an int).
+func TestFailedLookupIsLogged(t *testing.T) {
+	e := newStaleEnv(t)
+	deals := e.create(t, "deals", "(id int primary key)")
+	e.insert(t, deals, "id", "7")
+	e.start(t, tableBlock(deals, "id", "stale: {}"))
+	e.gate.Observe(proxy.SessionInfo{User: "agent"}, e.gate.Inspect("select 1 from "+deals+" where id = 7.25"),
+		whereKeyed(nil, 1, e.oid(t, deals)))
+	e.idle(t)
+	e.wantResult(t, "agent", "", deals, "7", e.xmin(t, deals, "id", "7"), decide.ReadNone)
+	e.gate.Close()
+	var lines []map[string]any
+	for _, rec := range logRecords(t, &e.logs) {
+		if rec["lookups_failed"] != nil {
+			lines = append(lines, rec)
+		}
+	}
+	if len(lines) != 1 || lines[0]["lookups_failed"] != float64(1) || lines[0]["last_failure"] != "22P02" {
+		t.Errorf("log lines counting failed lookups %v, want one with lookups_failed=1 and last_failure=22P02", lines)
+	}
+	if strings.Contains(e.logs.String(), "7.25") {
+		t.Errorf("the log quotes the key:\n%s", e.logs.String())
+	}
+}
+
+// Close ends every read whose lookup is queued or running, at once rather
+// than after the lookups' time, and counts none of them as failed.
+func TestCloseEndsLookups(t *testing.T) {
+	e := newStaleEnv(t)
+	deals := e.create(t, "deals", "(id int primary key)")
+	e.start(t, tableBlock(deals, "id", "stale: {}"))
+	running := make(chan struct{}, 2) // one per worker
+	gate.OnLookup(e.gate, func(ctx context.Context, table string, keys []string) error {
+		select {
+		case running <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	st := e.gate.Inspect("select id from " + deals)
+	const reads = 20
+	for i := range reads {
+		e.gate.Observe(proxy.SessionInfo{User: "agent"}, st, keyed(e.oid(t, deals), strconv.Itoa(i)))
+	}
+	<-running // both workers hold a lookup; the rest are queued
+	<-running
+	for i := range reads {
+		e.wantResult(t, "agent", "", deals, strconv.Itoa(i), "1", decide.ReadPending)
+	}
+
+	start := time.Now()
+	e.gate.Close()
+	if took := time.Since(start); took > 300*time.Millisecond {
+		t.Errorf("Close took %v with lookups running, want it at once, not after their time", took)
+	}
+	for i := range reads {
+		e.wantResult(t, "agent", "", deals, strconv.Itoa(i), "1", decide.ReadNone)
+	}
+	e.idle(t)
+	if strings.Contains(e.logs.String(), "lookups_failed") {
+		t.Errorf("lookups ended by Close were counted:\n%s", e.logs.String())
+	}
+}
+
+// A read of two tracked tables remembers each table's rows under that
+// table, and no key under the other.
+func TestReadOfTwoTablesIsRememberedPerTable(t *testing.T) {
+	e := newStaleEnv(t)
+	deals := e.create(t, "deals", "(id int primary key)")
+	notes := e.create(t, "notes", "(id int primary key)")
+	e.insert(t, deals, "id", "1", "2")
+	e.insert(t, notes, "id", "1", "2")
+	e.start(t, tableBlock(deals, "id", "stale: {}"), tableBlock(notes, "id", "stale: {}"))
+	deal, note := e.oid(t, deals), e.oid(t, notes)
+
+	o := keyed(deal, "1", "2")
+	o.Read.Keys = append(o.Read.Keys, proxy.RowKey{Table: note, Text: "1"})
+	o.Read.Tables = append(o.Read.Tables, note)
+	e.gate.Observe(proxy.SessionInfo{User: "agent"},
+		e.gate.Inspect("select d.id, n.id from "+deals+" d left join "+notes+" n on n.id = d.id and n.id = 1"), o)
+	e.idle(t)
+
+	for _, k := range []string{"1", "2"} {
+		e.wantResult(t, "agent", "", deals, k, e.xmin(t, deals, "id", k), decide.ReadFresh)
+	}
+	e.wantResult(t, "agent", "", notes, "1", e.xmin(t, notes, "id", "1"), decide.ReadFresh)
+	e.wantResult(t, "agent", "", notes, "2", e.xmin(t, notes, "id", "2"), decide.ReadNone)
 }
