@@ -3,8 +3,11 @@ package gate
 import (
 	"fmt"
 	"math/rand/v2"
+	"os"
+	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -580,20 +583,12 @@ func TestOtherRoleIsUntouched(t *testing.T) {
 // version was seen at some moment between the making of the write's mark and
 // the refresh, not when the refresh arrived, and two lookups can be delivered
 // in either order. When the role knows the row by another version inside that
-// span, nothing orders the two, and the row must not be called stale.
+// span, nothing orders the two, and the row is forgotten. Each order is paired
+// with the same calls without the disagreement, where the refresh must stay.
 
-// wantNotStale checks a write by p to the row key of deals, whose version now
-// is version, and fails only on stale: forgetting the row is a miss, and any
-// answer but stale is allowed.
-func wantNotStale(t *testing.T, m *readMemory, c *testClock, p party, key, version string) {
-	t.Helper()
-	if rc := m.check(p, "deals", key, version, c.tick()); rc.Result == decide.ReadStale {
-		t.Errorf("check(%v, deals, %q, %q) = %s, want anything but stale", p, key, version, summary(rc))
-	}
-}
-
-// Order A: two writes of the role to one row from two connections; their
-// refreshes are delivered in either order. Only the role changed the row.
+// Order A: two writes of the role to one row from two connections, both out
+// before either refresh arrives; the refreshes are delivered in either order.
+// Only the role changed the row.
 func TestOwnWritesRefreshedInEitherOrderAreNotStale(t *testing.T) {
 	for _, laterFirst := range []bool{true, false} {
 		m, c := testMemory(1000)
@@ -613,69 +608,258 @@ func TestOwnWritesRefreshedInEitherOrderAreNotStale(t *testing.T) {
 			c.tick()
 			m.refreshed(second, "v4")
 		}
-		wantNotStale(t, m, c, a, "1", "v4")
+		wantCheck(t, m, c, a, "deals", "1", "v4", decide.ReadNone)
 	}
+}
+
+// Without the overlap: a write refreshed before the next is sent stays.
+func TestOwnWritesOneAfterAnotherStayFresh(t *testing.T) {
+	m, c := testMemory(1000)
+	a := party{"agent", "a"}
+	remembered(m, c, a, "deals", "1", "v1")
+	c.tick()
+	mk := m.writing("agent", "deals", "1")
+	c.tick()
+	m.refreshed(mk, "v2")
+	wantCheck(t, m, c, a, "deals", "1", "v2", "fresh read=v2 task=a")
+	c.tick()
+	mk = m.writing("agent", "deals", "1")
+	c.tick()
+	m.refreshed(mk, "v3")
+	wantCheck(t, m, c, a, "deals", "1", "v3", "fresh read=v3 task=a")
 }
 
 // Order B: a read by the role ends while its write is out, after someone else
 // changed the row past the refresh's version, and is learned before the
-// refresh. Nobody changed the row after that read.
+// refresh. Nobody changed the row after that read. With the write's own
+// version instead, the refresh stays.
 func TestReadDuringOwnWriteLearnedBeforeItsRefreshIsNotStale(t *testing.T) {
-	m, c := testMemory(1000)
-	b := party{"agent", "b"}
-	remembered(m, c, b, "deals", "1", "v2")
-	c.tick()
-	mk := m.writing("agent", "deals", "1") // commits v3; the refresh lookup sees v3; then someone writes v4
-	remembered(m, c, b, "deals", "1", "v4")
-	c.tick()
-	m.refreshed(mk, "v3")
-	wantNotStale(t, m, c, b, "1", "v4")
+	for _, tc := range []struct{ seen, want string }{
+		{"v4", decide.ReadNone},
+		{"v3", "fresh read=v3 task=b"},
+	} {
+		m, c := testMemory(1000)
+		b := party{"agent", "b"}
+		remembered(m, c, b, "deals", "1", "v2")
+		c.tick()
+		mk := m.writing("agent", "deals", "1") // commits v3; the refresh lookup sees v3; then someone may write v4
+		remembered(m, c, b, "deals", "1", tc.seen)
+		c.tick()
+		m.refreshed(mk, "v3")
+		wantCheck(t, m, c, b, "deals", "1", tc.seen, tc.want)
+	}
 }
 
-// Order C: order B with the read's lookup answering after the refresh, when
-// the refresh's time already keeps it out.
+// Order C: order B with the read's lookup answering after the refresh, which
+// already keeps it out. With the write's own version, the refresh stays.
 func TestReadDuringOwnWriteLearnedAfterItsRefreshIsNotStale(t *testing.T) {
-	m, c := testMemory(1000)
-	b := party{"agent", "b"}
-	remembered(m, c, b, "deals", "1", "v2")
-	c.tick()
-	mk := m.writing("agent", "deals", "1")
-	tk := m.reading(b, "deals", []string{"1"}, c.tick())
-	c.tick()
-	m.refreshed(mk, "v3")
-	m.learned(tk, map[string]string{"1": "v4"})
-	wantNotStale(t, m, c, b, "1", "v4")
+	for _, tc := range []struct{ seen, want string }{
+		{"v4", decide.ReadNone},
+		{"v3", "fresh read=v3 task=b"},
+	} {
+		m, c := testMemory(1000)
+		b := party{"agent", "b"}
+		remembered(m, c, b, "deals", "1", "v2")
+		c.tick()
+		mk := m.writing("agent", "deals", "1")
+		tk := m.reading(b, "deals", []string{"1"}, c.tick())
+		c.tick()
+		m.refreshed(mk, "v3")
+		m.learned(tk, map[string]string{"1": tc.seen})
+		wantCheck(t, m, c, b, "deals", "1", tc.seen, tc.want)
+	}
 }
 
 // Order D: order B for an INSERT with a key, refreshed by refreshedRow while
-// the INSERT's table mark is out.
+// the INSERT's table mark is out. With the INSERT's own version, the refresh
+// stays.
 func TestReadDuringOwnInsertIsNotStale(t *testing.T) {
-	m, c := testMemory(1000)
-	b := party{"agent", "b"}
-	remembered(m, c, b, "deals", "1", "v2")
-	c.tick()
-	tm := m.writing("agent", "deals", "")
-	remembered(m, c, b, "deals", "1", "v4")
-	c.tick()
-	m.refreshedRow("agent", "deals", "1", "v3")
-	m.released(tm)
-	wantNotStale(t, m, c, b, "1", "v4")
+	for _, tc := range []struct{ seen, want string }{
+		{"v4", decide.ReadNone},
+		{"v3", "fresh read=v3 task=b"},
+	} {
+		m, c := testMemory(1000)
+		b := party{"agent", "b"}
+		remembered(m, c, b, "deals", "1", "v2")
+		c.tick()
+		tm := m.writing("agent", "deals", "")
+		remembered(m, c, b, "deals", "1", tc.seen)
+		c.tick()
+		m.refreshedRow("agent", "deals", "1", "v3")
+		m.released(tm)
+		wantCheck(t, m, c, b, "deals", "1", tc.seen, tc.want)
+	}
 }
 
-// A read inside the span that found the write's own version agrees with the
-// refresh, which is kept, whether the read is learned before or after it.
-func TestReadDuringOwnWriteThatAgreesKeepsTheRefresh(t *testing.T) {
+// The span is closed at both ends: a read that ended at the very making of
+// the mark, or at the very time of the refresh, cannot be ordered against it;
+// one a moment before or after can.
+func TestRefreshSpanIncludesItsEnds(t *testing.T) {
+	b := party{"agent", "b"}
+	setup := func() (*readMemory, *testClock) {
+		m, c := testMemory(1000)
+		remembered(m, c, b, "deals", "1", "v2")
+		c.tick()
+		return m, c
+	}
+
+	// Ended as the mark was made, learned before the refresh.
+	m, c := setup()
+	mk := m.writing("agent", "deals", "1")
+	m.learned(m.reading(b, "deals", []string{"1"}, mk.since), map[string]string{"1": "v4"})
+	c.tick()
+	m.refreshed(mk, "v3")
+	wantCheck(t, m, c, b, "deals", "1", "v4", decide.ReadNone)
+
+	// Ended a moment before the mark: before the write, and stamped over.
+	m, c = setup()
+	m.learned(m.reading(b, "deals", []string{"1"}, c.now().Add(-time.Nanosecond)), map[string]string{"1": "v4"})
+	mk = m.writing("agent", "deals", "1")
+	c.tick()
+	m.refreshed(mk, "v3")
+	wantCheck(t, m, c, b, "deals", "1", "v3", "fresh read=v3 task=b")
+
+	// Ended at the very time of the refresh, learned after it.
+	m, c = setup()
+	mk = m.writing("agent", "deals", "1")
+	refreshAt := c.tick()
+	tk := m.reading(b, "deals", []string{"1"}, refreshAt)
+	m.refreshed(mk, "v3")
+	m.learned(tk, map[string]string{"1": "v4"})
+	wantCheck(t, m, c, b, "deals", "1", "v4", decide.ReadNone)
+
+	// Ended a moment after the refresh: after it, and kept.
+	m, c = setup()
+	mk = m.writing("agent", "deals", "1")
+	refreshAt = c.tick()
+	m.refreshed(mk, "v3")
+	m.learned(m.reading(b, "deals", []string{"1"}, refreshAt.Add(time.Nanosecond)), map[string]string{"1": "v4"})
+	wantCheck(t, m, c, b, "deals", "1", "v4", "fresh read=v4 task=b")
+}
+
+// What cannot be ordered is forgotten up to the end of the span, not up to
+// when the late lookup answered: a read that ended after the span was read
+// after the write and its refresh, and stays, learned before or after.
+func TestReadAfterTheSpanSurvivesAReadInsideIt(t *testing.T) {
 	m, c := testMemory(1000)
 	a, b := party{"agent", "a"}, party{"agent", "b"}
 	remembered(m, c, b, "deals", "1", "v2")
 	c.tick()
 	mk := m.writing("agent", "deals", "1")
-	remembered(m, c, b, "deals", "1", "v3")
-	tk := m.reading(a, "deals", []string{"1"}, c.tick())
+	inside := m.reading(b, "deals", []string{"1"}, c.tick())
 	c.tick()
 	m.refreshed(mk, "v3")
-	m.learned(tk, map[string]string{"1": "v3"})
-	wantCheck(t, m, c, b, "deals", "1", "v3", "fresh read=v3 task=b")
+	learnedFirst := m.reading(a, "deals", []string{"1"}, c.tick())
+	learnedAfter := m.reading(party{"agent", "c"}, "deals", []string{"1"}, c.tick())
+	m.learned(learnedFirst, map[string]string{"1": "v4"})
+	m.learned(inside, map[string]string{"1": "v5"})
+	m.learned(learnedAfter, map[string]string{"1": "v4"})
+	wantCheck(t, m, c, a, "deals", "1", "v4", "fresh read=v4 task=a")
+	wantCheck(t, m, c, party{"agent", "c"}, "deals", "1", "v4", "fresh read=v4 task=c")
+	wantCheck(t, m, c, b, "deals", "1", "v4", decide.ReadNone)
+}
+
+// A clock that stands still across a lookup's round trip gives two reads of
+// one slot the same time; if they found different versions, only one could be
+// kept and neither is known to be the newer. The row is forgotten up to that
+// time, in every task, so no older read is left to decide; a read the clock
+// stood still for while its lookup was out is kept out too.
+func TestSameSlotSameTimeOtherVersionIsForgotten(t *testing.T) {
+	m, c := testMemory(1000)
+	a, none := party{"agent", "a"}, party{"agent", ""}
+	remembered(m, c, none, "deals", "1", "v0")
+	at := c.tick()
+	older := m.reading(a, "deals", []string{"1"}, at.Add(-time.Nanosecond))
+	m.learned(m.reading(a, "deals", []string{"1"}, at), map[string]string{"1": "v1"})
+	m.learned(m.reading(a, "deals", []string{"1"}, at), map[string]string{"1": "v2"})
+	m.learned(older, map[string]string{"1": "v0"})
+	wantCheck(t, m, c, a, "deals", "1", "v2", decide.ReadNone)
+
+	// The same version at the same time is no disagreement.
+	at = c.tick()
+	m.learned(m.reading(a, "deals", []string{"2"}, at), map[string]string{"2": "v1"})
+	m.learned(m.reading(a, "deals", []string{"2"}, at), map[string]string{"2": "v1"})
+	wantCheck(t, m, c, a, "deals", "2", "v1", "fresh read=v1 task=a")
+
+	// Two tasks at the same time keep both; check prefers the one that
+	// agrees with the row now.
+	at = c.tick()
+	m.learned(m.reading(a, "deals", []string{"3"}, at), map[string]string{"3": "v1"})
+	m.learned(m.reading(none, "deals", []string{"3"}, at), map[string]string{"3": "v2"})
+	wantCheck(t, m, c, a, "deals", "3", "v2", "fresh read=v2")
+	wantCheck(t, m, c, a, "deals", "3", "v1", "fresh read=v1 task=a")
+}
+
+// Reads tied in time are chosen in a fixed order, so the same calls record the
+// same read_check every time: the one that agrees with the row now, then the
+// writer's own task, then no task, then by task name.
+func TestTiedReadsAnswerTheSameEveryTime(t *testing.T) {
+	cases := []struct {
+		p       party
+		version string
+		want    string
+	}{
+		{party{"agent", ""}, "v2", "fresh read=v2 task=b"},
+		{party{"agent", ""}, "v9", "stale read=v1"},
+		{party{"agent", "c"}, "v9", "stale read=v2 task=c"},
+		{party{"agent", "d"}, "v9", "stale read=v1"},
+		{party{"agent", "a"}, "v1", "fresh read=v1 task=a"},
+	}
+	seen := make([]map[string]bool, len(cases))
+	for i := range seen {
+		seen[i] = map[string]bool{}
+	}
+	for range 200 {
+		m, c := testMemory(1000)
+		at := c.tick()
+		for task, version := range map[string]string{"": "v1", "a": "v1", "b": "v2", "c": "v2", "e": "v3"} {
+			m.learned(m.reading(party{"agent", task}, "deals", []string{"1"}, at), map[string]string{"1": version})
+		}
+		for i, tc := range cases {
+			seen[i][summary(m.check(tc.p, "deals", "1", tc.version, at.Add(time.Second)))] = true
+		}
+	}
+	for i, tc := range cases {
+		if len(seen[i]) != 1 || !seen[i][tc.want] {
+			t.Errorf("check(%v, %q) gave %v over 200 runs, want only %q", tc.p, tc.version, seen[i], tc.want)
+		}
+	}
+}
+
+// The note that a write was judged stale goes when an own write refreshes the
+// row: a task that never read the row is not compared with what the refresh
+// stamped.
+func TestOwnWriteRefreshDropsTheStaleNote(t *testing.T) {
+	m, c := testMemory(1000)
+	a, b := party{"agent", "a"}, party{"agent", "b"}
+	remembered(m, c, a, "deals", "1", "v1")
+	wantCheck(t, m, c, a, "deals", "1", "v2", "stale read=v1 task=a")
+	c.tick()
+	mk := m.writing("agent", "deals", "1") // the stale write runs (shadow)
+	c.tick()
+	m.refreshed(mk, "v3")
+	// someone else writes v4
+	wantCheck(t, m, c, b, "deals", "1", "v4", decide.ReadNone)
+	wantCheck(t, m, c, a, "deals", "1", "v4", "stale read=v3 task=a")
+}
+
+// A refresh makes its entries the newest, so the limits throw away another.
+func TestRefreshedEntryIsNotTheOldest(t *testing.T) {
+	m, c := testMemory(8) // a role keeps 2
+	p := party{"agent", ""}
+	remembered(m, c, p, "deals", "1", "v1")
+	remembered(m, c, p, "deals", "2", "v1")
+	c.tick()
+	mk := m.writing("agent", "deals", "1")
+	c.tick()
+	m.refreshed(mk, "v2")
+	remembered(m, c, p, "deals", "3", "v1")
+	if e := m.evicted(); e != 1 {
+		t.Errorf("evicted = %d, want 1", e)
+	}
+	wantCheck(t, m, c, p, "deals", "1", "v2", "fresh read=v2")
+	wantCheck(t, m, c, p, "deals", "2", "v1", decide.ReadNone)
+	wantCheck(t, m, c, p, "deals", "3", "v1", "fresh read=v1")
 }
 
 // refreshedRow with no mark covering the row cannot bound when its version
@@ -689,12 +873,64 @@ func TestRefreshedRowWithoutAMarkForgetsADisagreeingRow(t *testing.T) {
 	wantCheck(t, m, c, b, "deals", "1", "v3", decide.ReadNone)
 }
 
-// records counts what the memory holds besides entries: login roles, tables
-// and rows with a record, tickets not ended, marks not ended, and times of
-// clears kept.
-func (m *readMemory) records() (roles, tables, rows, tickets, marks, clears int) {
+// A forget of a table or a role takes its entries out of the counts at once,
+// and the entries held stay within the limits after it: the cleared ones go
+// as new ones come.
+func TestClearedEntriesLeaveTheCountsAtOnce(t *testing.T) {
+	m, c := testMemory(400) // a role keeps 100
+	r0, r1 := party{"r0", ""}, party{"r1", ""}
+	keys := func(from, n int) ([]string, map[string]string) {
+		ks, vs := make([]string, n), map[string]string{}
+		for i := range ks {
+			ks[i] = strconv.Itoa(from + i)
+			vs[ks[i]] = "v1"
+		}
+		return ks, vs
+	}
+	ks, vs := keys(0, 100)
+	m.learned(m.reading(r0, "deals", ks, c.tick()), vs)
+	m.learned(m.reading(r1, "deals", ks, c.tick()), vs)
+	m.forget("r0", "", "")
+	if n := m.len(); n != 100 {
+		t.Errorf("len = %d after forgetting r0's 100, want 100", n)
+	}
+	if held := m.held(); held != 200-clearSweep {
+		t.Errorf("held = %d, want %d: a clear takes out %d at once", held, 200-clearSweep, clearSweep)
+	}
+	wantCheck(t, m, c, r0, "deals", "5", "v1", decide.ReadNone)
+	wantCheck(t, m, c, r1, "deals", "5", "v1", "fresh read=v1")
+
+	// r0 reads 100 again, one row at a time: each new entry takes a cleared
+	// one out, so no eviction is needed and nothing of r1 goes.
+	for i := 100; i < 200; i++ {
+		remembered(m, c, r0, "deals", strconv.Itoa(i), "v1")
+	}
+	if n, held, e := m.len(), m.held(), m.evicted(); n != 200 || held != 200 || e != 0 {
+		t.Errorf("len, held, evicted = %d, %d, %d; want 200, 200, 0", n, held, e)
+	}
+	// One more for r0 is past its quarter: its oldest live entry goes.
+	m.learned(m.reading(r0, "deals", []string{"x"}, c.tick()), map[string]string{"x": "v1"})
+	if n, e := m.len(), m.evicted(); n != 200 || e != 1 {
+		t.Errorf("len, evicted = %d, %d; want 200, 1", n, e)
+	}
+	wantCheck(t, m, c, r0, "deals", "100", "v1", decide.ReadNone)
+	wantCheck(t, m, c, r0, "deals", "x", "v1", "fresh read=v1")
+}
+
+// held counts the entries held, live or cleared and not yet taken out.
+func (m *readMemory) held() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.all.len()
+}
+
+// records counts what the memory holds besides live entries: login roles,
+// tables, row records, rows with entries, tickets not ended, marks not ended,
+// times of clears kept, and cleared entries not yet taken out.
+func (m *readMemory) records() (roles, tables, rows, tickets, marks, clears, cleared int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cleared = m.all.len() - m.live + len(m.graving)
 	for _, rr := range m.roles {
 		roles++
 		tickets += len(rr.pending)
@@ -707,6 +943,9 @@ func (m *readMemory) records() (roles, tables, rows, tickets, marks, clears int)
 				rows++
 				marks += len(row.marks)
 			}
+			if tr.known != nil {
+				rows += len(tr.known.rows)
+			}
 		}
 	}
 	return
@@ -714,8 +953,8 @@ func (m *readMemory) records() (roles, tables, rows, tickets, marks, clears int)
 
 func wantNoRecords(t *testing.T, m *readMemory) {
 	t.Helper()
-	if roles, tables, rows, tickets, marks, clears := m.records(); roles+tables+rows+tickets+marks+clears != 0 {
-		t.Errorf("records: roles %d, tables %d, rows %d, tickets %d, marks %d, clears %d; want none", roles, tables, rows, tickets, marks, clears)
+	if roles, tables, rows, tickets, marks, clears, cleared := m.records(); roles+tables+rows+tickets+marks+clears+cleared != 0 {
+		t.Errorf("records: roles %d, tables %d, rows %d, tickets %d, marks %d, clears %d, cleared %d; want none", roles, tables, rows, tickets, marks, clears, cleared)
 	}
 	if n := m.len(); n != 0 {
 		t.Errorf("len = %d, want 0", n)
@@ -729,7 +968,7 @@ func TestBookkeepingEndsWithWhatItServes(t *testing.T) {
 	// Times of clears are kept only while a ticket that could be cut by them
 	// is pending.
 	m.forget("agent", "deals", "1")
-	if _, _, _, _, _, clears := m.records(); clears != 0 {
+	if _, _, _, _, _, clears, _ := m.records(); clears != 0 {
 		t.Errorf("a forget with no read pending kept %d times", clears)
 	}
 	tk := m.reading(a, "deals", []string{"1"}, c.tick())
@@ -737,7 +976,7 @@ func TestBookkeepingEndsWithWhatItServes(t *testing.T) {
 	c.tick()
 	m.forget("agent", "deals", "1")
 	m.forget("agent", "notes", "7")
-	if _, _, _, _, _, clears := m.records(); clears != 2 {
+	if _, _, _, _, _, clears, _ := m.records(); clears != 2 {
 		t.Errorf("clears = %d while reads are pending, want 2", clears)
 	}
 	m.dropped(tk)
@@ -768,14 +1007,20 @@ func TestBookkeepingEndsWithWhatItServes(t *testing.T) {
 	wantNoRecords(t, m)
 }
 
+// TestConcurrentUse has many goroutines mix every call, with limits small
+// enough that evictions happen and forgets of tables and roles leave cleared
+// entries to be taken out later, and checks the memory's invariants as it
+// goes (consistent).
 func TestConcurrentUse(t *testing.T) {
-	m := newReadMemory(memoryTables, 64, time.Now)
-	roles := []string{"r0", "r1", "r2"}
+	m := newReadMemory(memoryTables, 200, time.Now) // a role keeps 50
+	roles := []string{"r0", "r1", "r2", "r3", "r4", "r5"}
 	tasks := []string{"", "a", "b"}
 	tables := []string{"deals", "notes"}
+	var evicted atomic.Int64
+	var sawCleared atomic.Bool
 
 	var wg sync.WaitGroup
-	for g := range 8 {
+	for g := range 12 {
 		wg.Go(func() {
 			r := rand.New(rand.NewPCG(uint64(g), 7))
 			role := roles[g%len(roles)]
@@ -785,11 +1030,15 @@ func TestConcurrentUse(t *testing.T) {
 			for range 3000 {
 				p := party{role, tasks[r.IntN(len(tasks))]}
 				table := tables[r.IntN(len(tables))]
-				key := strconv.Itoa(r.IntN(30))
+				key := strconv.Itoa(r.IntN(40))
 				version := "v" + strconv.Itoa(r.IntN(3))
-				switch r.IntN(12) {
+				switch r.IntN(13) {
 				case 0:
-					tickets = append(tickets, m.reading(p, table, []string{key, strconv.Itoa(r.IntN(30))}, time.Now()))
+					keys := []string{key}
+					for range r.IntN(40) {
+						keys = append(keys, strconv.Itoa(r.IntN(40)))
+					}
+					tickets = append(tickets, m.reading(p, table, keys, time.Now()))
 				case 1:
 					tickets = append(tickets, m.reading(p, table, nil, time.Now()))
 				case 2, 3:
@@ -798,7 +1047,16 @@ func TestConcurrentUse(t *testing.T) {
 						if r.IntN(4) == 0 {
 							m.dropped(tickets[i])
 						} else {
-							m.learned(tickets[i], map[string]string{key: version})
+							versions := map[string]string{}
+							for _, k := range tickets[i].keys {
+								if r.IntN(8) != 0 {
+									versions[k] = version
+								}
+							}
+							if tickets[i].keyless {
+								versions[key] = version
+							}
+							m.learned(tickets[i], versions)
 						}
 						tickets = append(tickets[:i], tickets[i+1:]...)
 					}
@@ -829,10 +1087,24 @@ func TestConcurrentUse(t *testing.T) {
 				case 9:
 					m.refreshedRow(role, table, key, version)
 				case 10:
-					m.forget(role, table, key)
+					switch r.IntN(3) {
+					case 0:
+						m.forget(role, table, key)
+					case 1:
+						m.forget(role, table, "")
+					default:
+						m.forget(role, "", "")
+					}
+				case 11:
+					evicted.Add(m.evicted())
+					if held, live := m.counts(); held > live {
+						sawCleared.Store(true)
+					}
 				default:
-					m.evicted()
-					m.len()
+					if err := m.consistent(); err != nil {
+						t.Error(err)
+						return
+					}
 				}
 			}
 			for _, tk := range tickets {
@@ -844,9 +1116,213 @@ func TestConcurrentUse(t *testing.T) {
 		})
 	}
 	wg.Wait()
+	if err := m.consistent(); err != nil {
+		t.Error(err)
+	}
+	if evicted.Load()+m.evicted() == 0 || !sawCleared.Load() {
+		t.Errorf("evicted %d, saw cleared entries held %v: the run did not reach the limits or the deferred removal", evicted.Load(), sawCleared.Load())
+	}
 
 	for _, role := range roles {
 		m.forget(role, "", "")
 	}
+	m.drain()
 	wantNoRecords(t, m)
+}
+
+// counts reports the entries held, live or cleared, and the live ones, at
+// one moment.
+func (m *readMemory) counts() (held, live int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.all.len(), m.live
+}
+
+// drain takes out every cleared entry still held, as enough later additions
+// would.
+func (m *readMemory) drain() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sweep(&roleMemory{}, m.all.len()+1)
+}
+
+// consistent checks what the memory's design rests on: both orders by read
+// time are heaps and every entry knows its place in them; len and the
+// per-role counts are exact about live entries, each of which is where its
+// role, table and row say; and the entries held, live or cleared, stay within
+// maxKeys and each role's quarter, so an eviction never meets a cleared one.
+func (m *readMemory) consistent() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ordered := func(h *byRead) error {
+		for i, e := range h.es {
+			if e.pos[h.slot] != i {
+				return fmt.Errorf("heap %d: the entry at %d says it is at %d", h.slot, i, e.pos[h.slot])
+			}
+			if i > 0 && h.less(i, (i-1)/2) {
+				return fmt.Errorf("heap %d: the entry at %d was read before its parent", h.slot, i)
+			}
+		}
+		return nil
+	}
+	if err := ordered(&m.all); err != nil {
+		return err
+	}
+	if m.all.len() > m.maxKeys {
+		return fmt.Errorf("%d entries held, over maxKeys %d", m.all.len(), m.maxKeys)
+	}
+	live := 0
+	for _, e := range m.all.es {
+		if m.roles[e.role.name] != e.role {
+			return fmt.Errorf("an entry of %s is held after its role's record went", e.role.name)
+		}
+		if !e.set.cleared {
+			live++
+		}
+	}
+	if live != m.live {
+		return fmt.Errorf("len says %d, %d entries are live", m.live, live)
+	}
+	for name, rr := range m.roles {
+		if err := ordered(&rr.all); err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		if rr.all.len() > m.perRole {
+			return fmt.Errorf("%s holds %d entries, over its quarter %d", name, rr.all.len(), m.perRole)
+		}
+		n := 0
+		for _, e := range rr.all.es {
+			if e.set.cleared {
+				continue
+			}
+			n++
+			tr := rr.tables[e.table]
+			if tr == nil || tr.known != e.set || e.set.rows[e.key] != e.row || !slices.Contains(e.row.entries, e) || e.set.entries[e.inSet] != e {
+				return fmt.Errorf("%s: a live entry of %s %q is not where its records say", name, e.table, e.key)
+			}
+		}
+		if n != rr.live {
+			return fmt.Errorf("%s: its count says %d, %d entries are live", name, rr.live, n)
+		}
+	}
+	return nil
+}
+
+// The memory has one lock, and the read path takes it before the client's
+// next statement. These tests hold calls whose work could grow with what is
+// remembered to a time far above what they need, so that they do not flake
+// under -race, and log what they measured.
+
+// fillRoles fills m with n entries of deals for each of roles, from reads a
+// microsecond apart, oldest first, and returns when the last read ended.
+func fillRoles(m *readMemory, roles []string, n int, start time.Time) time.Time {
+	at := start
+	keys := make([]string, 1000)
+	for _, role := range roles {
+		for i := 0; i < n; i += len(keys) {
+			versions := make(map[string]string, len(keys))
+			for j := range keys {
+				keys[j] = strconv.Itoa(i + j)
+				versions[keys[j]] = "v1"
+			}
+			at = at.Add(time.Microsecond)
+			m.learned(m.reading(party{role, ""}, "deals", keys, at), versions)
+		}
+	}
+	return at
+}
+
+// longestWait runs f while another goroutine takes the memory's lock again
+// and again, and returns how long f took and the longest the other waited.
+func longestWait(m *readMemory, f func()) (took, waited time.Duration) {
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			start := time.Now()
+			m.len()
+			waited = max(waited, time.Since(start))
+		}
+	})
+	time.Sleep(time.Millisecond)
+	start := time.Now()
+	f()
+	took = time.Since(start)
+	close(done)
+	wg.Wait()
+	return took, waited
+}
+
+// limitBound is far above what the calls below need (well under a
+// millisecond without -race), and below what forgetting a role's 50,000
+// entries one by one took.
+const limitBound = 20 * time.Millisecond
+
+// A role-wide forget at the default limit, with one role at its quarter.
+func TestForgetOfALargeScopeHoldsTheLockBriefly(t *testing.T) {
+	m := newReadMemory(memoryTables, 200_000, (&testClock{t: memoryStart}).now)
+	fillRoles(m, []string{"r0", "r1", "r2", "r3"}, 50_000, memoryStart)
+	if n := m.len(); n != 200_000 {
+		t.Fatalf("len = %d, want 200000", n)
+	}
+	took, waited := longestWait(m, func() { m.forget("r0", "", "") })
+	t.Logf("forget of 50000 entries: %v, longest wait of another call %v", took, waited)
+	if took > limitBound || waited > limitBound {
+		t.Errorf("forget of 50000 entries took %v, held another call %v; want both under %v", took, waited, limitBound)
+	}
+	if n := m.len(); n != 150_000 {
+		t.Errorf("len = %d after the forget, want 150000", n)
+	}
+}
+
+// At the allowed maximum (stale.max_keys 10,000,000, one role at its quarter)
+// the same calls hold the lock for bounded work. It needs a few GiB, so it runs
+// only when STET_MEMORY_AT_MAX is set.
+func TestLockHoldAtTheAllowedMaximum(t *testing.T) {
+	if os.Getenv("STET_MEMORY_AT_MAX") == "" {
+		t.Skip("STET_MEMORY_AT_MAX not set")
+	}
+	m := newReadMemory(memoryTables, 10_000_000, (&testClock{t: memoryStart}).now)
+	last := fillRoles(m, []string{"r0"}, 2_500_000, memoryStart)
+	keys := make([]string, 1000)
+	versions := map[string]string{}
+	for j := range keys {
+		keys[j] = "new" + strconv.Itoa(j)
+		versions[keys[j]] = "v1"
+	}
+	tk := m.reading(party{"r0", ""}, "deals", keys, last.Add(time.Second))
+	took, waited := longestWait(m, func() { m.learned(tk, versions) })
+	t.Logf("at the maximum, learned of 1000 keys with 1000 evictions: %v, longest wait of another call %v (evicted %d)", took, waited, m.evicted())
+	took, waited = longestWait(m, func() { m.forget("r0", "", "") })
+	t.Logf("at the maximum, forget of 2500000 entries: %v, longest wait of another call %v", took, waited)
+	tk = m.reading(party{"r0", ""}, "deals", keys, last.Add(2*time.Second))
+	took, waited = longestWait(m, func() { m.learned(tk, versions) })
+	t.Logf("at the maximum, learned of 1000 keys after it, taking cleared entries out: %v, longest wait of another call %v", took, waited)
+}
+
+// A read of 1,000 rows learned at the default limit, each new entry throwing
+// away another.
+func TestLearnedWithEvictionsHoldsTheLockBriefly(t *testing.T) {
+	m := newReadMemory(memoryTables, 200_000, (&testClock{t: memoryStart}).now)
+	last := fillRoles(m, []string{"r0", "r1", "r2", "r3"}, 50_000, memoryStart)
+	keys := make([]string, 1000)
+	versions := map[string]string{}
+	for j := range keys {
+		keys[j] = "new" + strconv.Itoa(j)
+		versions[keys[j]] = "v1"
+	}
+	tk := m.reading(party{"r1", ""}, "deals", keys, last.Add(time.Second))
+	took, waited := longestWait(m, func() { m.learned(tk, versions) })
+	t.Logf("learned of 1000 keys with 1000 evictions: %v, longest wait of another call %v", took, waited)
+	if waited > limitBound {
+		t.Errorf("learned held another call %v, want under %v", waited, limitBound)
+	}
+	if n, e := m.len(), m.evicted(); n != 200_000 || e != 1000 {
+		t.Errorf("len, evicted = %d, %d; want 200000, 1000", n, e)
+	}
 }
