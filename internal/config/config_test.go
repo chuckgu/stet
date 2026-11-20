@@ -149,6 +149,14 @@ func TestInvalidConfigs(t *testing.T) {
 		"undo keep not a duration":                    {minimal + "undo: {tables: {a: {pk: id}}, keep: forever}\n", "undo.keep"},
 		"undo unknown key":                            {minimal + "undo: {table: {}}\n", "table"},
 		"undo table unknown key":                      {minimal + "undo: {tables: {contacts: {key: id}}}\n", "key"},
+		"stale remember too short":                    {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], stale: {remember: 59s}}}\n", "stale.remember"},
+		"stale remember too long":                     {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], stale: {remember: 25h}}}\n", "stale.remember"},
+		"stale remember not a duration":               {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], stale: {remember: soon}}}\n", "stale.remember"},
+		"stale table unknown key":                     {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], stale: {keep: 1h}}}\n", "keep"},
+		"stale without a table":                       {minimal + "stale: {max_keys: 5000}\n", "stale"},
+		"stale max_keys too small":                    {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], stale: {}}}\nstale: {max_keys: 999}\n", "stale.max_keys"},
+		"stale max_keys too big":                      {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], stale: {}}}\nstale: {max_keys: 10000001}\n", "stale.max_keys"},
+		"stale unknown key":                           {minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id, send_fields: [a], stale: {}}}\nstale: {max_key: 5}\n", "max_key"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -621,5 +629,55 @@ func TestUndoSettings(t *testing.T) {
 	}
 	if c.Undo.Tables["contacts"] != "id" {
 		t.Errorf("Tables = %v", c.Undo.Tables)
+	}
+}
+
+const staleGate = minimal + `model: {adapter: jev, version: jev-1.13.0}
+tables:
+  contacts:
+    pk: id
+    send_fields: [a]
+`
+
+func TestStaleAbsent(t *testing.T) {
+	c, err := Parse([]byte(staleGate))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Tables["contacts"].Stale != nil || c.StaleMaxKeys != 0 {
+		t.Errorf("stale = %+v, max keys = %d, want nil and 0", c.Tables["contacts"].Stale, c.StaleMaxKeys)
+	}
+}
+
+func TestStaleSettings(t *testing.T) {
+	for name, tc := range map[string]struct {
+		table, global string
+		remember      time.Duration
+		maxKeys       int
+	}{
+		"spec example":   {"    stale:\n      remember: 1h\n", "", time.Hour, 200000},
+		"no value":       {"    stale:\n", "", time.Hour, 200000},
+		"tilde":          {"    stale: ~\n", "", time.Hour, 200000},
+		"empty map":      {"    stale: {}\n", "", time.Hour, 200000},
+		"remember min":   {"    stale: {remember: 1m}\n", "", time.Minute, 200000},
+		"remember max":   {"    stale: {remember: 24h}\n", "", 24 * time.Hour, 200000},
+		"max_keys min":   {"    stale:\n", "stale: {max_keys: 1000}\n", time.Hour, 1000},
+		"max_keys max":   {"    stale:\n", "stale: {max_keys: 10000000}\n", time.Hour, 10000000},
+		"global no keys": {"    stale:\n", "stale: {}\n", time.Hour, 200000},
+		"with reads":     {"    stale:\n    reads:\n", "", time.Hour, 200000},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, err := Parse([]byte(staleGate + tc.table + tc.global))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := c.Tables["contacts"]
+			if got.Stale == nil || got.Stale.Remember != tc.remember || c.StaleMaxKeys != tc.maxKeys {
+				t.Errorf("stale = %+v, max keys = %d, want remember %s, max keys %d", got.Stale, c.StaleMaxKeys, tc.remember, tc.maxKeys)
+			}
+			if name == "with reads" && got.Reads == nil {
+				t.Error("reads lost")
+			}
+		})
 	}
 }

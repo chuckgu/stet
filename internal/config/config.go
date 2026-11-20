@@ -42,6 +42,9 @@ type Config struct {
 	// Undo turns on capture for tables. nil: no undo clause; nothing of the
 	// undo stage runs.
 	Undo *Undo
+	// StaleMaxKeys is stale.max_keys: how many row versions are remembered in
+	// all. 200000 unless set; 0 when no table has stale.
+	StaleMaxKeys int
 
 	// Hash identifies the config file's bytes. Decisions record it as
 	// policy_version.
@@ -102,6 +105,7 @@ type Table struct {
 	Unsupported  string  // pass | reject
 	Impact       *Impact // nil: multi-row writes stay unsupported, as before
 	Reads        *Reads  // nil: reads of the table are not recorded
+	Stale        *Stale  // nil: reads of the table are not remembered and its writes are not checked
 }
 
 // Impact limits how much one multi-row write may touch.
@@ -123,6 +127,20 @@ type Cumulative struct {
 type Reads struct {
 	LogAbove int // 0: aggregate only; otherwise a read sending more rows is logged by itself
 }
+
+// Stale turns on stale-write detection for a table (spec-v0.2-stale 9).
+type Stale struct {
+	Remember time.Duration // stale.remember: how long a read version is remembered; default 1h
+}
+
+const (
+	defaultStaleRemember = time.Hour
+	minStaleRemember     = time.Minute
+	maxStaleRemember     = 24 * time.Hour
+	defaultStaleMaxKeys  = 200000
+	minStaleMaxKeys      = 1000
+	maxStaleMaxKeys      = 10_000_000
+)
 
 // maxCumulativeWindow is the longest cumulative window.
 const maxCumulativeWindow = 24 * time.Hour
@@ -161,7 +179,10 @@ type rawConfig struct {
 		ExpireAfter  string `yaml:"expire_after"`
 		ApplyTimeout string `yaml:"apply_timeout"`
 	} `yaml:"held"`
-	Undo *rawUndo `yaml:"undo"`
+	Undo  *rawUndo `yaml:"undo"`
+	Stale *struct {
+		MaxKeys *int `yaml:"max_keys"`
+	} `yaml:"stale"`
 }
 
 // rawUndo is the undo clause. A table's value may be null (`contacts:`).
@@ -214,24 +235,28 @@ type rawTable struct {
 	Reads *struct {
 		LogAbove *int `yaml:"log_above"`
 	} `yaml:"reads"`
+	Stale *struct {
+		Remember string `yaml:"remember"`
+	} `yaml:"stale"`
 }
 
 // presentKeys is the file read once more for the optional blocks whose key
-// is present with no value. yaml decodes `reads:` with nothing after it (or
+// is present with no value. yaml decodes `reads:` (or `stale:`) with nothing after it (or
 // only a commented-out line, or ~) to a nil pointer, the same as no key at
 // all; a map keeps the key.
 type presentKeys struct {
 	Tables map[string]map[string]any `yaml:"tables"`
 }
 
-// present reports whether table name writes the reads key and the impact
-// block's cumulative key, with or without a value.
-func (k presentKeys) present(name string) (reads, cumulative bool) {
+// present reports whether table name writes the reads key, the stale key and
+// the impact block's cumulative key, with or without a value.
+func (k presentKeys) present(name string) (reads, stale, cumulative bool) {
 	t := k.Tables[name]
 	_, reads = t["reads"]
+	_, stale = t["stale"]
 	impact, _ := t["impact"].(map[string]any)
 	_, cumulative = impact["cumulative"]
-	return reads, cumulative
+	return reads, stale, cumulative
 }
 
 var (
@@ -345,14 +370,32 @@ func Parse(b []byte) (*Config, error) {
 
 	c.Tables = make(map[string]Table, len(raw.Tables))
 	for name, rt := range raw.Tables {
-		reads, cumulative := keys.present(name)
-		t, tErrs := resolveTable(name, rt, reads, cumulative)
+		reads, stale, cumulative := keys.present(name)
+		t, tErrs := resolveTable(name, rt, reads, stale, cumulative)
 		errs = append(errs, tErrs...)
 		c.Tables[name] = t
 	}
 
 	if raw.Undo != nil {
 		c.Undo = resolveUndo(raw.Undo, c.Tables, fail)
+	}
+
+	staleTables := false
+	for _, t := range c.Tables {
+		staleTables = staleTables || t.Stale != nil
+	}
+	switch {
+	case staleTables:
+		c.StaleMaxKeys = defaultStaleMaxKeys
+		if raw.Stale != nil && raw.Stale.MaxKeys != nil {
+			if m := *raw.Stale.MaxKeys; m < minStaleMaxKeys || m > maxStaleMaxKeys {
+				fail("stale.max_keys: %d must be between %d and %d", m, minStaleMaxKeys, maxStaleMaxKeys)
+			} else {
+				c.StaleMaxKeys = m
+			}
+		}
+	case raw.Stale != nil:
+		fail("stale: no table turns stale on; add stale to a table or remove this clause")
 	}
 
 	if len(errs) > 0 {
@@ -461,8 +504,9 @@ func resolveRoles(agents *struct {
 }
 
 // resolveTable checks one table. hasReads and hasCumulative say whether its
-// reads key and its impact.cumulative key are present, with a value or not.
-func resolveTable(name string, rt rawTable, hasReads, hasCumulative bool) (Table, []error) {
+// reads key, its stale key and its impact.cumulative key are present, with a
+// value or not.
+func resolveTable(name string, rt rawTable, hasReads, hasStale, hasCumulative bool) (Table, []error) {
 	var errs []error
 	fail := func(field, format string, args ...any) {
 		errs = append(errs, fmt.Errorf("tables.%s.%s: %s", name, field, fmt.Sprintf(format, args...)))
@@ -578,6 +622,23 @@ func resolveTable(name string, rt rawTable, hasReads, hasCumulative bool) (Table
 			reads.LogAbove = *rr.LogAbove
 		}
 		t.Reads = &reads
+	}
+
+	// A present stale block turns detection on, also when it is empty.
+	if rs := rt.Stale; rs != nil || hasStale {
+		stale := Stale{Remember: defaultStaleRemember}
+		if rs != nil && rs.Remember != "" {
+			d, err := parseDuration(rs.Remember)
+			switch {
+			case err != nil:
+				fail("stale.remember", "%v", err)
+			case d < minStaleRemember || d > maxStaleRemember:
+				fail("stale.remember", "%s must be between %s and %s", rs.Remember, minStaleRemember, maxStaleRemember)
+			default:
+				stale.Remember = d
+			}
+		}
+		t.Stale = &stale
 	}
 
 	th := rt.Thresholds
