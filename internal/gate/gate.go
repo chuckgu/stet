@@ -491,6 +491,17 @@ func rowsAffected(r sqlparse.Result, o proxy.Outcome) *int64 {
 func (g *Gate) End(h any, o proxy.Outcome) {
 	p := h.(*pending)
 	p.done = time.Now()
+	// The write's mark ends on every way out of End, also a panic, which the
+	// proxy recovers from: a mark left on would make every later write of
+	// its role to what it covers an own write, for as long as Stet runs.
+	settled := false
+	settleMark := func() {
+		if !settled {
+			settled = true
+			g.stale.ended(p, o)
+		}
+	}
+	defer settleMark()
 	switch {
 	case p.refused == nil:
 	case o.Executed || o.Lost:
@@ -511,7 +522,7 @@ func (g *Gate) End(h any, o proxy.Outcome) {
 	}
 	// The write's mark is settled here too, not in the background: the
 	// TxEnded that follows a write inside a transaction must find it.
-	g.stale.ended(p, o)
+	settleMark()
 	g.wg.Add(1)
 	go func() {
 		defer g.wg.Done()

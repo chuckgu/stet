@@ -641,7 +641,7 @@ func TestLostMarksEnd(t *testing.T) {
 	deals := e.create(t, "deals", "(id int primary key, title text)")
 	e.insert(t, deals, "id", "1", "2")
 	e.start(t, tableBlock(deals, "id", "stale: {}"))
-	agent := proxy.SessionInfo{ID: "s", User: "agent"}
+	agent := proxy.SessionInfo{Database: "stet_test", ID: "s", User: "agent"}
 	lose := func(id string, grace time.Duration) {
 		t.Helper()
 		defer gate.SetStaleLostGrace(grace)()
@@ -939,7 +939,7 @@ func TestUnseenForgets(t *testing.T) {
 	}
 
 	// Two Unseen calls, one settled: the mark stays until the other is.
-	info := proxy.SessionInfo{ID: "pipelined", User: "stet_md5"}
+	info := proxy.SessionInfo{Database: "stet_test", ID: "pipelined", User: "stet_md5"}
 	check := func() string { return gate.CheckRead(e.gate, "stet_md5", "", e.table, "2", e.xminOf(t, 2)).Result }
 	e.gate.Unseen(info)
 	e.gate.Unseen(info)
@@ -953,8 +953,8 @@ func TestUnseenForgets(t *testing.T) {
 	}
 	// An Unseen call made before the session's login role was known is
 	// counted too: settling it does not end the mark of a later one.
-	early := proxy.SessionInfo{ID: "early"}
-	known := proxy.SessionInfo{ID: "early", User: "stet_md5"}
+	early := proxy.SessionInfo{Database: "stet_test", ID: "early"}
+	known := proxy.SessionInfo{Database: "stet_test", ID: "early", User: "stet_md5"}
 	e.gate.Unseen(early)
 	e.gate.Unseen(known)
 	e.gate.TxEnded(known, 1, false)
@@ -1001,7 +1001,7 @@ func TestNotChecked(t *testing.T) {
 
 	mustExec(t, agent, "insert into "+e.table+" (id, name) values (3, 'New')")
 	mustExec(t, agent, "update "+e.table+" set status = 'm' where id > 0")
-	h, _ := e.gate.Begin(proxy.SessionInfo{ID: "early"}, e.gate.Inspect("update "+e.table+" set title = 'x' where id = 1"), nil)
+	h, _ := e.gate.Begin(proxy.SessionInfo{Database: "stet_test", ID: "early"}, e.gate.Inspect("update "+e.table+" set title = 'x' where id = 1"), nil)
 	e.gate.End(h, proxy.Outcome{Executed: true, Rows: ptr(int64(1))})
 	for i, r := range e.checks(t, e.table, 3) {
 		wantRead(t, i, r, "not_checked")
@@ -1019,7 +1019,7 @@ func TestNotChecked(t *testing.T) {
 func TestRowAbsentStateUnchanged(t *testing.T) {
 	e := newStaleEnv(t)
 	deals := e.create(t, "deals", "(id int primary key, title text)")
-	agent := proxy.SessionInfo{ID: "s", User: "agent"}
+	agent := proxy.SessionInfo{Database: "stet_test", ID: "s", User: "agent"}
 	// Two rows, so that the second write has no recent change of the first.
 	for i, clauses := range [][]string{nil, {"stale: {}"}} {
 		e.start(t, tableBlock(deals, "id", clauses...))
@@ -1083,7 +1083,7 @@ func TestOwnWriteEndedWhileStateRead(t *testing.T) {
 	deals := e.create(t, "deals", "(id int primary key, title text)")
 	e.insert(t, deals, "id", "1")
 	e.start(t, tableBlock(deals, "id", "stale: {}"))
-	agent := proxy.SessionInfo{ID: "s", User: "agent"}
+	agent := proxy.SessionInfo{Database: "stet_test", ID: "s", User: "agent"}
 	e.gate.Observe(agent, e.gate.Inspect("select id from "+deals), keyed(e.oid(t, deals), "1"))
 	e.idle(t)
 	read := e.xmin(t, deals, "id", "1")
@@ -1101,7 +1101,7 @@ func TestOwnWriteEndedWhileStateRead(t *testing.T) {
 		t.Errorf("an own write ended before the state read: %+v, want stale", got)
 	}
 	// Another role's writes do not change this role's comparison.
-	other := proxy.SessionInfo{ID: "o", User: "other"}
+	other := proxy.SessionInfo{Database: "stet_test", ID: "o", User: "other"}
 	e.gate.Observe(other, e.gate.Inspect("select id from "+deals), keyed(e.oid(t, deals), "1"))
 	e.idle(t)
 	sent = time.Now()
@@ -1280,7 +1280,7 @@ func TestInTransactionMarksStayFew(t *testing.T) {
 	deals := e.create(t, "deals", "(id int primary key, title text)")
 	e.start(t, tableBlock(deals, "id", "stale: {}"))
 	inTx := proxy.Outcome{Executed: true, InTransaction: true, Rows: ptr(int64(1))}
-	one := proxy.SessionInfo{ID: "one", User: "agent"}
+	one := proxy.SessionInfo{Database: "stet_test", ID: "one", User: "agent"}
 	for i := range 10000 {
 		gate.MarkAndEnd(e.gate, one, fmt.Sprintf("insert into %s (id) values (%d)", deals, i), inTx)
 	}
@@ -1288,7 +1288,7 @@ func TestInTransactionMarksStayFew(t *testing.T) {
 		t.Errorf("%d marks held after ten thousand INSERTs in one transaction, want 1", n)
 	}
 	// A mark on every table covers the table's.
-	two := proxy.SessionInfo{ID: "two", User: "agent"}
+	two := proxy.SessionInfo{Database: "stet_test", ID: "two", User: "agent"}
 	gate.MarkAndEnd(e.gate, two, "update "+deals+" set title = 'a' where id = 1; update "+deals+" set title = 'b' where id = 2", inTx)
 	for i := range 100 {
 		gate.MarkAndEnd(e.gate, two, fmt.Sprintf("insert into %s (id) values (%d)", deals, 20000+i), inTx)
@@ -1413,7 +1413,7 @@ func TestStateOfAnExistingRowUnchanged(t *testing.T) {
 	e := newStaleEnv(t)
 	deals := e.create(t, "deals", "(id int primary key, title text, n numeric, tags text[], meta jsonb, at timestamptz, gone text)")
 	mustExec(t, e.admin, "insert into "+deals+` values (1, 'it''s "x"', 1.50, '{a,"b c"}', '{"k": [1, null]}', '2026-11-20 10:00:00+00', null)`)
-	agent := proxy.SessionInfo{ID: "s", User: "agent"}
+	agent := proxy.SessionInfo{Database: "stet_test", ID: "s", User: "agent"}
 	for _, clauses := range [][]string{nil, {"stale: {}"}} {
 		block := fmt.Sprintf("  %q:\n    pk: id\n    send_fields: [id, title, n, tags, meta, at, gone]\n", deals)
 		for _, c := range clauses {

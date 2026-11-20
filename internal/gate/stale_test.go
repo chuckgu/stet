@@ -234,7 +234,7 @@ func TestReadsAreRemembered(t *testing.T) {
 	oid := e.oid(t, deals)
 
 	st := e.gate.Inspect("select id, title from " + deals)
-	e.gate.Observe(proxy.SessionInfo{ID: "s1", User: "agent", OnBehalfOf: "alice"}, st, keyed(oid, "1", "2", "3"))
+	e.gate.Observe(proxy.SessionInfo{Database: "stet_test", ID: "s1", User: "agent", OnBehalfOf: "alice"}, st, keyed(oid, "1", "2", "3"))
 	e.idle(t)
 
 	for _, k := range []string{"1", "2", "3"} {
@@ -494,7 +494,9 @@ func TestWhereKeyFallback(t *testing.T) {
 		}
 		return st
 	}
-	session := func(role string) proxy.SessionInfo { return proxy.SessionInfo{ID: role, User: role} }
+	session := func(role string) proxy.SessionInfo {
+		return proxy.SessionInfo{Database: "stet_test", ID: role, User: role}
+	}
 
 	t.Run("pending until looked up", func(t *testing.T) {
 		release := blockLookups(t, e.gate)
@@ -631,7 +633,7 @@ func TestSameNameInAnotherSchemaIsNotRemembered(t *testing.T) {
 		t.Fatalf("Inspect: Track %v KeyParam %d, want the read tracked by $1", st.Track, st.KeyParam)
 	}
 	// The proxy found no column of a tracked table: Tables is empty.
-	e.gate.Observe(proxy.SessionInfo{ID: "s", User: "agent"}, st, whereKeyed(&proxy.Param{Value: []byte("1")}, 1))
+	e.gate.Observe(proxy.SessionInfo{Database: "stet_test", ID: "s", User: "agent"}, st, whereKeyed(&proxy.Param{Value: []byte("1")}, 1))
 	e.wantResult(t, "agent", "", notes, "1", "1", decide.ReadNone)
 	e.idle(t)
 	e.wantResult(t, "agent", "", notes, "1", e.xmin(t, notes, "id", "1"), decide.ReadNone)
@@ -658,10 +660,10 @@ func TestReadsNotRemembered(t *testing.T) {
 		s    proxy.SessionInfo
 		o    proxy.Outcome
 	}{
-		{"no keys taken", proxy.SessionInfo{User: "agent"}, noRead},
-		{"failed", proxy.SessionInfo{User: "agent"}, failed},
-		{"errored", proxy.SessionInfo{User: "agent"}, errored},
-		{"lost", proxy.SessionInfo{User: "agent"}, lost},
+		{"no keys taken", proxy.SessionInfo{Database: "stet_test", User: "agent"}, noRead},
+		{"failed", proxy.SessionInfo{Database: "stet_test", User: "agent"}, failed},
+		{"errored", proxy.SessionInfo{Database: "stet_test", User: "agent"}, errored},
+		{"lost", proxy.SessionInfo{Database: "stet_test", User: "agent"}, lost},
 		{"no login role", proxy.SessionInfo{}, keyed(oid, "1")},
 	} {
 		e.gate.Observe(c.s, st, c.o)
@@ -735,7 +737,7 @@ func TestUntrackedTables(t *testing.T) {
 	if !st.Observe || !st.Track {
 		t.Errorf("a read of %s: Observe %v Track %v, want both: the proxy asks Tracked", dated, st.Observe, st.Track)
 	}
-	e.gate.Observe(proxy.SessionInfo{User: "agent"}, st, keyed(e.oid(t, dated), "2026-11-20"))
+	e.gate.Observe(proxy.SessionInfo{Database: "stet_test", User: "agent"}, st, keyed(e.oid(t, dated), "2026-11-20"))
 	e.wantResult(t, "agent", "", dated, "2026-11-20", "1", decide.ReadNone)
 	e.gate.FlushReads()
 	if got := e.keyedReads(t, dated); !reflect.DeepEqual(got, map[string]keyCount{"agent": {Statements: 1}}) {
@@ -799,7 +801,7 @@ func TestNondeterministicKeyIsNotTracked(t *testing.T) {
 	}
 
 	// A read is counted, and nothing of it is remembered.
-	agent := proxy.SessionInfo{ID: "s", User: "agent"}
+	agent := proxy.SessionInfo{Database: "stet_test", ID: "s", User: "agent"}
 	st := e.gate.Inspect("select k, title from " + folded)
 	e.gate.Observe(agent, st, keyed(e.oid(t, folded), "Abc"))
 	e.wantResult(t, "agent", "", folded, "Abc", "1", decide.ReadNone)
@@ -854,7 +856,7 @@ func TestCatalogIsReadAgain(t *testing.T) {
 	second := e.oid(t, deals)
 
 	// Meanwhile a read of the old table and a write to the new one.
-	agent := proxy.SessionInfo{ID: "s", User: "agent"}
+	agent := proxy.SessionInfo{Database: "stet_test", ID: "s", User: "agent"}
 	e.gate.Observe(agent, e.gate.Inspect("select id from "+deals), keyed(first, "1"))
 	h, refuse := e.gate.Begin(agent, e.gate.Inspect("update "+deals+" set title = 'x' where id = 1"), nil)
 	if refuse != nil {
@@ -885,7 +887,7 @@ func TestSlowLookupDelaysNothing(t *testing.T) {
 		release := blockLookups(t, e.gate)
 		oid := e.oid(t, deals)
 		st := e.gate.Inspect("select id from " + deals)
-		agent := proxy.SessionInfo{User: "agent"}
+		agent := proxy.SessionInfo{Database: "stet_test", User: "agent"}
 
 		const reads = 1100
 		var took []time.Duration
@@ -937,7 +939,7 @@ func TestSlowLookupDelaysNothing(t *testing.T) {
 			<-ctx.Done()
 			return ctx.Err()
 		})
-		e.gate.Observe(proxy.SessionInfo{User: "agent"}, e.gate.Inspect("select id from "+deals), keyed(e.oid(t, deals), "1"))
+		e.gate.Observe(proxy.SessionInfo{Database: "stet_test", User: "agent"}, e.gate.Inspect("select id from "+deals), keyed(e.oid(t, deals), "1"))
 		e.wantResult(t, "agent", "", deals, "1", "1", decide.ReadPending)
 		start := time.Now()
 		e.idle(t)
@@ -997,7 +999,7 @@ func TestReadsCountKeys(t *testing.T) {
 	t.Cleanup(func() {
 		e.admin.Exec(context.Background(), "delete from stet.reads where target_table = any($1)", []string{deals, notes})
 	})
-	agent := proxy.SessionInfo{User: "agent"}
+	agent := proxy.SessionInfo{Database: "stet_test", User: "agent"}
 	deal, note := e.oid(t, deals), e.oid(t, notes)
 
 	all := e.gate.Inspect("select id, title from " + deals)
@@ -1034,7 +1036,7 @@ func TestObserveAfterClose(t *testing.T) {
 	e.gate.Close()
 
 	start := time.Now()
-	e.gate.Observe(proxy.SessionInfo{User: "agent"}, st, keyed(e.oid(t, deals), "1"))
+	e.gate.Observe(proxy.SessionInfo{Database: "stet_test", User: "agent"}, st, keyed(e.oid(t, deals), "1"))
 	e.wantResult(t, "agent", "", deals, "1", "1", decide.ReadNone)
 	e.idle(t)
 	if took := time.Since(start); took > 100*time.Millisecond {
@@ -1082,7 +1084,7 @@ func TestFailedLookupIsLogged(t *testing.T) {
 	deals := e.create(t, "deals", "(id int primary key)")
 	e.insert(t, deals, "id", "7")
 	e.start(t, tableBlock(deals, "id", "stale: {}"))
-	e.gate.Observe(proxy.SessionInfo{User: "agent"}, e.gate.Inspect("select 1 from "+deals+" where id = 7.25"),
+	e.gate.Observe(proxy.SessionInfo{Database: "stet_test", User: "agent"}, e.gate.Inspect("select 1 from "+deals+" where id = 7.25"),
 		whereKeyed(nil, 1, e.oid(t, deals)))
 	e.idle(t)
 	e.wantResult(t, "agent", "", deals, "7", e.xmin(t, deals, "id", "7"), decide.ReadNone)
@@ -1122,7 +1124,7 @@ func TestCloseEndsLookups(t *testing.T) {
 	st := e.gate.Inspect("select id from " + deals)
 	const reads = 20
 	for i := range reads {
-		e.gate.Observe(proxy.SessionInfo{User: "agent"}, st, keyed(e.oid(t, deals), strconv.Itoa(i)))
+		e.gate.Observe(proxy.SessionInfo{Database: "stet_test", User: "agent"}, st, keyed(e.oid(t, deals), strconv.Itoa(i)))
 	}
 	<-running // both workers hold a lookup; the rest are queued
 	<-running
@@ -1158,7 +1160,7 @@ func TestReadOfTwoTablesIsRememberedPerTable(t *testing.T) {
 	o := keyed(deal, "1", "2")
 	o.Read.Keys = append(o.Read.Keys, proxy.RowKey{Table: note, Text: "1"})
 	o.Read.Tables = append(o.Read.Tables, note)
-	e.gate.Observe(proxy.SessionInfo{User: "agent"},
+	e.gate.Observe(proxy.SessionInfo{Database: "stet_test", User: "agent"},
 		e.gate.Inspect("select d.id, n.id from "+deals+" d left join "+notes+" n on n.id = d.id and n.id = 1"), o)
 	e.idle(t)
 

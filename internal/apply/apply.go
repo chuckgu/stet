@@ -166,10 +166,13 @@ func (a *Applier) apply(ctx context.Context, conn *pgx.Conn, w store.Approved) e
 	}
 
 	if a.Applying != nil {
-		// Runs on every way out from here: committed, recorded as failed,
-		// an error of Stet's own step, a panic. A transaction given up on
-		// an error ends with the connection, and changed nothing.
-		defer a.Applying(c.LoginRole, c.TargetTable)()
+		// done runs on every way out from here: committed, recorded as
+		// failed, an error of Stet's own step, a panic. A transaction given
+		// up on an error ends with the connection, and changed nothing. An
+		// Applying that gives none has nothing to end.
+		if done := a.Applying(c.LoginRole, c.TargetTable); done != nil {
+			defer done()
+		}
 	}
 	if a.beforeStatement != nil {
 		a.beforeStatement()

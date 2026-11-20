@@ -77,7 +77,7 @@ ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS backend_pid integer;      --
 ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS sent_after  timestamptz;  -- DB 시계. 문장은 이보다 뒤에 서버로 갔다
 ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS done_before timestamptz;  -- DB 시계. 문장의 결과는 이보다 앞에 나왔다
 -- 낡은 읽기 판단 (docs/spec-v0.2-stale.md 8장). 쓰기의 행을 그 업무가 읽은 버전과 견준 결과다. 줄을 넣을 때만 적는다(규칙 3).
--- 견주지 않은 쓰기와 stale을 켜지 않은 테이블의 쓰기는 NULL이다.
+-- stale을 켠 테이블에 쓴 줄에는 언제나 있고, 견주지 않은 쓰기는 result가 not_checked다. stale을 켜지 않은 테이블의 쓰기만 NULL이다.
 ALTER TABLE stet.decisions ADD COLUMN IF NOT EXISTS read_check jsonb;
 -- stet.history가 묶음마다 후보를 찾는 인덱스. 창의 두 끝이 모두 인덱스 안에 있어 힙을 읽지 않고 거른다. done_before가
 -- 앞이므로 묶음의 stmt_at 이후로 끝난 것만 훑는다. 검토와 되돌리기는 대개 최근의 변경을 읽는다. 이 단계의 앞선 판을

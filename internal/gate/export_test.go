@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/stetdb/stet/internal/decide"
 	"github.com/stetdb/stet/internal/proxy"
 	"github.com/stetdb/stet/internal/sqlparse"
@@ -34,14 +36,24 @@ func SetLogger(g *Gate, l *slog.Logger) {
 // whose version now is version ("" when it is not there).
 func CheckRead(g *Gate, role, task, table, key, version string) decide.ReadCheck {
 	m := g.stale.mem
-	return m.check(party{role, task}, table, key, version, m.now())
+	return m.check(partyOf(role, task), table, key, version, m.now())
 }
 
 // CompareWrite is what a write by role on behalf of task to the row key of
 // table is found to be, when the state read sent at sent found its version
 // to be version ("" when the row is not there).
 func CompareWrite(g *Gate, role, task, table, key, version string, sent time.Time) decide.ReadCheck {
-	return g.stale.compareRead(party{role, task}, table, key, version, sent)
+	return g.stale.compareRead(partyOf(role, task), table, key, version, sent)
+}
+
+// StaleQueueKeys is how many key values g's lookups waiting may hold.
+const StaleQueueKeys = staleQueueKeys
+
+// StaleQueue is how many lookups wait on g's queue, how many key values
+// they hold, and how many reads and refreshes the queue turned away since
+// that was last logged.
+func StaleQueue(g *Gate) (lookups int, keys, dropped int64) {
+	return len(g.stale.jobs), g.stale.waiting.Load(), g.stale.dropped.Load()
 }
 
 // OnLookup makes g call hook before each lookup of row versions, with the
@@ -327,4 +339,45 @@ func HoldInflight(g *Gate) (release func()) {
 			<-g.inflight
 		}
 	}
+}
+
+// SessionRowMarks is how many rows of one table one session's transaction
+// holds a mark each for.
+const SessionRowMarks = staleSessionRowMarks
+
+// LostTimers is how many timers g holds for marks waiting out their grace.
+func LostTimers(g *Gate) int {
+	w := &g.stale.writes
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.lost)
+}
+
+// BreakEnd makes g's End panic when it is told of a single-row write that
+// ran, before it settles the write's mark, until restore is called. Call it
+// between that write's Begin and its End, with no other write on its way.
+func BreakEnd(g *Gate) (restore func()) {
+	recent := g.recent
+	g.recent = nil
+	return func() { g.recent = recent }
+}
+
+// ReadCatalog reads g's catalog again, as its watch does every
+// staleCatalogEvery; with fail, as when no reading of it succeeds. Tests that
+// use it leave staleCatalogEvery long, so the watch does not read meanwhile.
+func ReadCatalog(g *Gate, fail bool) {
+	s := g.stale
+	if !fail {
+		s.readCatalog()
+		return
+	}
+	pool := s.pool
+	closed, err := pgxpool.NewWithConfig(context.Background(), pool.Config())
+	if err != nil {
+		panic(err)
+	}
+	closed.Close() // every Acquire fails
+	s.pool = closed
+	s.readCatalog()
+	s.pool = pool
 }

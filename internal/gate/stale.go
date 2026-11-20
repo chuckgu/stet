@@ -20,7 +20,13 @@ import (
 )
 
 const (
-	staleQueue          = 1024                   // lookups waiting; past it a read is dropped and counted
+	staleQueue = 1024 // lookups waiting; past it a read is dropped and counted
+	// staleQueueKeys is how many key values the lookups waiting may hold in
+	// all; a lookup that would take them past it is dropped like one that
+	// finds the queue full. A lookup holds up to a thousand keys of up to
+	// 1,024 bytes, so the number of lookups alone would let about a gigabyte
+	// wait when lookups are slow.
+	staleQueueKeys      = 100_000
 	staleWorkers        = 2                      // lookups running at once
 	staleLookupTimeout  = 500 * time.Millisecond // one lookup (spec-v0.2-stale 5); past it the read is not remembered
 	staleCatalogTimeout = 5 * time.Second        // one reading of the catalog, every table with stale
@@ -41,8 +47,13 @@ var (
 // those reads sent, on Stet's own connections, outside any transaction, and
 // feed them to the memory. Nothing on a client's path waits for a lookup.
 type stale struct {
-	mem   *readMemory
-	pks   map[string]string // config key → key column, of every table with stale
+	mem *readMemory
+	pks map[string]string // config key → key column, of every table with stale
+	// db is the database Stet's pool is connected to: the one the catalog was
+	// read in and every lookup runs in. A session connected to another
+	// database of the server reads and writes other tables, whatever their
+	// names, and is outside stale-write detection (remembers).
+	db    string
 	pool  *pgxpool.Pool
 	query func(ctx context.Context, sql string, args []*string) ([][]*string, error) // Gate.queryText
 	log   *slog.Logger
@@ -57,6 +68,8 @@ type stale struct {
 	lookupTimeout time.Duration
 
 	jobs chan lookupJob
+	// waiting counts the key values of the lookups on jobs (staleQueueKeys).
+	waiting atomic.Int64
 	// mu orders queueing against Close: a lookup is queued under its read
 	// lock, and Close sets closed under its write lock, so every lookup
 	// queued before Close is on the queue when Close drains it, and none is
@@ -105,6 +118,7 @@ func newStale(g *Gate, remember map[string]time.Duration) *stale {
 	s := &stale{
 		mem:     newReadMemory(remember, g.cfg.StaleMaxKeys, time.Now),
 		pks:     map[string]string{},
+		db:      poolDatabase(g.pool),
 		pool:    g.pool,
 		query:   g.queryText,
 		log:     g.log,
@@ -126,6 +140,26 @@ func newStale(g *Gate, remember map[string]time.Duration) *stale {
 	}
 	go s.watch(staleCatalogEvery, staleReportEvery)
 	return s
+}
+
+// poolDatabase is the database pool's connections are made to: the one its
+// settings name, or, as the server takes it when they name none, the one
+// named like their user.
+func poolDatabase(pool *pgxpool.Pool) string {
+	c := pool.Config().ConnConfig
+	if c.Database != "" {
+		return c.Database
+	}
+	return c.User
+}
+
+// remembers reports whether sess is a session stale-write detection keeps a
+// memory for: its login role is known, the memory being a login role's, and
+// it is connected to the database Stet's own connections are, where the
+// tracked tables are. Any other session's reads are counted only, its writes
+// are not compared, and it neither marks nor forgets anything.
+func (s *stale) remembers(sess proxy.SessionInfo) bool {
+	return s != nil && sess.User != "" && sess.Database == s.db
 }
 
 // remembersAny reports whether any of the config keys tables has stale,
@@ -157,12 +191,12 @@ func (r staleRead) count() int64 {
 }
 
 // reads is what the read r, which ended with o, gives the memory, table by
-// table in the order of r.Reads. It gives nothing when the session's login
-// role is not known, since the memory is a login role's, nor for a read that
-// failed or whose connection ended before its answer (spec 4): what it showed
-// the client is not known. It does no I/O and does not change the memory.
+// table in the order of r.Reads. It gives nothing for a session the memory
+// is not kept for (remembers), nor for a read that failed or whose connection
+// ended before its answer (spec 4): what it showed the client is not known.
+// It does no I/O and does not change the memory.
 func (s *stale) reads(sess proxy.SessionInfo, r sqlparse.Result, o proxy.Outcome) []staleRead {
-	if s == nil || sess.User == "" || !o.Executed || o.Error != "" || o.Lost || o.Read == nil {
+	if !s.remembers(sess) || !o.Executed || o.Error != "" || o.Lost || o.Read == nil {
 		return nil
 	}
 	c := s.cat.Load()
@@ -230,11 +264,33 @@ func whereKey(c *staleCatalog, table string, v sqlparse.Value, rk *proxy.ReadKey
 	return "", false
 }
 
-// remember notes each of reads as a read of sess that ended now, and queues
-// its lookup. A lookup the full queue turns away is dropped at once and
-// counted. After Close it does nothing. It does no I/O and never waits.
-func (s *stale) remember(sess proxy.SessionInfo, reads []staleRead) {
-	if s == nil || len(reads) == 0 {
+// remember hands the memory the read r of sess, which ended now with o and
+// gives it reads (reads): each of them is noted as pending and its lookup
+// queued. A lookup the queue turns away, full of lookups or of keys, is
+// dropped at once and counted. After Close it does nothing, and nothing for a
+// session the memory is not kept for. It does no I/O and never waits.
+//
+// A read that sent rows showed its client some version of them, and an entry
+// stands only while it is the newest thing its role is known to have seen of
+// its row. So what the read showed and Stet could not take in makes the role
+// forget, table by table:
+//   - of a table with stale the read gave no key of (untaken), everything
+//     the role held: which of its rows the client saw is not known. So it is
+//     for a cursor's FETCH, a read after a write in its transaction, a
+//     statement whose columns were never described, a key the WHERE clause
+//     gives that cannot be used, a read that failed or was lost after rows
+//     were sent, and a table the catalog does not track now.
+//   - of a table it gave keys of, when the proxy did not take every key the
+//     rows held (ReadKeys.Partial), everything the role held from before
+//     this read; what this read's own lookup learns is kept (readingPartial).
+//
+// A read that sent no rows showed nothing, and forgets nothing.
+func (s *stale) remember(sess proxy.SessionInfo, r sqlparse.Result, o proxy.Outcome, reads []staleRead) {
+	if !s.remembers(sess) {
+		return
+	}
+	untaken := s.untaken(r, o, reads)
+	if len(reads) == 0 && len(untaken) == 0 {
 		return
 	}
 	s.mu.RLock()
@@ -242,7 +298,11 @@ func (s *stale) remember(sess proxy.SessionInfo, reads []staleRead) {
 	if s.closed {
 		return
 	}
-	p := party{role: sess.User, task: sess.OnBehalfOf}
+	for _, table := range untaken {
+		s.mem.forget(sess.User, table, "")
+	}
+	partial := o.Sent >= 1 && o.Read != nil && o.Read.Partial
+	p := partyOf(sess.User, sess.OnBehalfOf)
 	at := s.mem.now()
 	// Counted at once for all the read's tables, so that StaleIdle cannot
 	// return between two of them.
@@ -253,10 +313,13 @@ func (s *stale) remember(sess proxy.SessionInfo, reads []staleRead) {
 			keys, ask = nil, []string{*r.where}
 		}
 		// The ticket exists before its lookup is queued (see reading).
-		t := s.mem.reading(p, r.table, keys, at)
-		select {
-		case s.jobs <- lookupJob{table: r.table, keys: ask, t: t}:
-		default:
+		var t *ticket
+		if partial {
+			t = s.mem.readingPartial(p, r.table, keys, at)
+		} else {
+			t = s.mem.reading(p, r.table, keys, at)
+		}
+		if !s.queue(lookupJob{table: r.table, keys: ask, t: t}) {
 			s.dropped.Add(1)
 			s.mem.dropped(t)
 			s.idle.done()
@@ -264,10 +327,45 @@ func (s *stale) remember(sess proxy.SessionInfo, reads []staleRead) {
 	}
 }
 
+// untaken lists the tables with stale that the read r, which ended with o,
+// showed rows of to its client while giving the memory no key of them:
+// those r names that are not among reads, when it sent a row.
+func (s *stale) untaken(r sqlparse.Result, o proxy.Outcome, reads []staleRead) []string {
+	if o.Sent < 1 {
+		return nil
+	}
+	var out []string
+	for _, table := range r.Reads {
+		if _, ok := s.pks[table]; ok && !slices.ContainsFunc(reads, func(x staleRead) bool { return x.table == table }) {
+			out = append(out, table)
+		}
+	}
+	return out
+}
+
+// queue puts j on the queue without waiting, and reports whether it did: not
+// when the queue holds staleQueue lookups, nor when j's keys would take the
+// keys waiting past staleQueueKeys. It runs with s.mu held for reading, and
+// two calls at once may both be turned away where one would have fit.
+func (s *stale) queue(j lookupJob) bool {
+	n := int64(len(j.keys))
+	if s.waiting.Add(n) > staleQueueKeys {
+		s.waiting.Add(-n)
+		return false
+	}
+	select {
+	case s.jobs <- j:
+		return true
+	default:
+		s.waiting.Add(-n)
+		return false
+	}
+}
+
 // refresh queues a lookup of one row's version for a write that ran; then is
 // called with the row's key as the server writes it and its xmin, with ok
-// false when the row is not there, the lookup failed or the queue was full,
-// or the catalog does not track table. then runs on a worker, or, when the
+// false when the row is not there, the lookup failed or the queue turned it
+// away, or the catalog does not track table. then runs on a worker, or, when the
 // queue is full, the gate closed or table is not tracked, before refresh
 // returns.
 func (s *stale) refresh(table, key string, then func(serverKey, version string, ok bool)) {
@@ -275,10 +373,7 @@ func (s *stale) refresh(table, key string, then func(serverKey, version string, 
 	s.mu.RLock()
 	if _, ok := s.table(table); ok && !s.closed {
 		s.idle.add(1)
-		select {
-		case s.jobs <- lookupJob{table: table, keys: []string{key}, then: then}:
-			queued = true
-		default:
+		if queued = s.queue(lookupJob{table: table, keys: []string{key}, then: then}); !queued {
 			s.dropped.Add(1)
 			defer s.idle.done() // after then, below
 		}
@@ -359,6 +454,7 @@ func (s *stale) work() {
 		case <-s.stop:
 			return
 		case j := <-s.jobs:
+			s.waiting.Add(-int64(len(j.keys)))
 			s.run(j)
 		}
 	}
@@ -401,6 +497,8 @@ var (
 )
 
 // end ends j with what its lookup found; err is not nil when it found nothing.
+// A read whose lookup found nothing is dropped: what its role held of its
+// rows is forgotten (readMemory.dropped).
 func (s *stale) end(j lookupJob, versions map[string]string, err error) {
 	if j.t != nil {
 		if err != nil {
@@ -439,7 +537,7 @@ func (s *stale) watch(catalogEvery, reportEvery time.Duration) {
 	}
 }
 
-// report logs, in one line, the reads the full queue dropped, the lookups
+// report logs, in one line, the reads the queue turned away, the lookups
 // that failed and why the last of them did, and the remembered versions the
 // limits threw away since the last report; nothing when all are 0. No row
 // data is logged.
@@ -475,6 +573,7 @@ func (s *stale) close() {
 		for drained := false; !drained; {
 			select {
 			case j := <-s.jobs:
+				s.waiting.Add(-int64(len(j.keys)))
 				s.end(j, nil, errClosed)
 				s.idle.done()
 			default:

@@ -1178,3 +1178,32 @@ func TestApplyingAroundTheStatement(t *testing.T) {
 	e.apply(e.approved(h, nil))
 	e.wantApplied(h.ID, 1)
 }
+
+// done is called also when one of Stet's own steps fails after the statement
+// ran, so the gate's mark of the write does not stay: the transaction is
+// given up, and the write is still approved. An Applying that gives no done
+// is not called through.
+func TestApplyingDoneRunsWhenAStepFails(t *testing.T) {
+	e := setup(t)
+	var applying, done int
+	e.a.Applying = func(role, tbl string) func() {
+		applying++
+		return func() { done++ }
+	}
+	h := e.update("update contacts set name = 'one' where id = 1", 1)
+	w := e.approved(h, nil)
+	apply.FailMarks(e.a, 1)
+	if err := e.a.Apply(w); err == nil {
+		t.Fatal("Apply = nil while MarkApplied failed, want an error")
+	}
+	if applying != 1 || done != 1 {
+		t.Errorf("after a failed MarkApplied: Applying called %d times, done %d; want 1 and 1", applying, done)
+	}
+	if r := e.row(h.ID); r.Status != "approved" {
+		t.Errorf("after a failed MarkApplied the write is %s, want approved", r.Status)
+	}
+
+	e.a.Applying = func(role, tbl string) func() { return nil }
+	e.apply(w)
+	e.wantApplied(h.ID, 1)
+}

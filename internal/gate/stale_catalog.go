@@ -44,6 +44,14 @@ type tracked struct {
 	// a value an agent wrote.
 	typeName string
 	base     uint32 // the OID of the key column's base type
+	// schema is the schema the table is in: a write that names its table
+	// with another schema writes another table (stale.otherSchema).
+	schema string
+	// filenode is the table's pg_class.relfilenode: it changes when the
+	// table is rewritten (ALTER TABLE of a column's type, say), which gives
+	// every row a new version under the same OID; 0 for a partitioned table,
+	// which has no storage of its own.
+	filenode uint32
 }
 
 // castOIDs are the casts a key value may carry and still name its row, by
@@ -149,6 +157,15 @@ func paramType(oid uint32, t tracked) (proxy.KeyType, bool) {
 // before (nothing, the first time): the reading is retried at the next tick.
 // Only what changed since the last reading is logged; a table not tracked
 // with a warning that names it and says why, never with row data.
+//
+// A table whose entry is not the one published before is another table
+// under the same config key, or the same one with every row rewritten: its
+// OID, key column, key type or relfilenode changed, or it came to be or
+// stopped being tracked. What any role remembered of it is of rows that are
+// no longer those, and is forgotten, after the new entry is published, so a
+// read observed under the old one is cut with the rest. A reading that
+// failed publishes the old entry and forgets nothing; nor does the first
+// reading, which has nothing before it.
 func (s *stale) readCatalog() {
 	ctx, cancel := context.WithTimeout(s.ctx, staleCatalogTimeout)
 	defer cancel()
@@ -195,6 +212,12 @@ func (s *stale) readCatalog() {
 			s.log.Info("stale-write detection tracks a table", "table", key, "oid", e.t.oid, "key_type", e.t.typeName)
 		}
 	}
+	var changed []string
+	for _, key := range keys {
+		if prev, known := s.known[key]; known && next[key] != prev {
+			changed = append(changed, key)
+		}
+	}
 	s.known = next
 	c := &staleCatalog{byKey: map[string]tracked{}, byOID: map[uint32]string{}}
 	for key, e := range next {
@@ -204,6 +227,9 @@ func (s *stale) readCatalog() {
 		}
 	}
 	s.cat.Store(c)
+	for _, key := range changed {
+		s.mem.forgetAll(key)
+	}
 }
 
 // sameTables leaves untracked every table another config key resolves to as
@@ -230,15 +256,18 @@ func sameTables(entries map[string]catalogEntry) {
 
 // catalogQuery reads, for the config key whose quoted name is $1 and its key
 // column $2, the table's OID and kind as Stet's search_path resolves it (as
-// the gate's own SQL does), whether Stet's account may read it, the column's
-// number, its base type (through domains, however nested) by OID and as
+// the gate's own SQL does), its schema, its relfilenode, whether other tables
+// inherit from it or are its partitions, whether Stet's account may read it,
+// the column's number, its base type (through domains, however nested) by OID and as
 // tracked.typeName, whether the column's own collation is not deterministic
 // (a type with no collation, such as an integer, has collation 0, and a
 // column of a domain that sets one carries the domain's), and whether a
 // unique index is on the column alone, not partial and not on an expression.
 const catalogQuery = `
 with recursive
-  rel as (select c.oid, c.relkind from pg_class c where c.oid = to_regclass($1)),
+  rel as (select c.oid, c.relkind, c.relfilenode, c.relhassubclass,
+                 (select n.nspname from pg_namespace n where n.oid = c.relnamespace) as nspname
+            from pg_class c where c.oid = to_regclass($1)),
   col as (select a.attnum, a.atttypid, a.attcollation
             from pg_attribute a join rel on a.attrelid = rel.oid
            where a.attname = $2 and a.attnum > 0 and not a.attisdropped),
@@ -257,7 +286,8 @@ select rel.oid, rel.relkind::text, coalesce(has_table_privilege(rel.oid, 'SELECT
        exists (select from pg_index x
                 where x.indrelid = rel.oid and x.indisunique and x.indisvalid
                   and x.indnkeyatts = 1 and x.indkey[0] = col.attnum
-                  and x.indpred is null and x.indexprs is null)
+                  and x.indpred is null and x.indexprs is null),
+       rel.nspname, rel.relfilenode, coalesce(rel.relhassubclass, false)
   from (select) as one
   left join rel on true
   left join col on true
@@ -268,16 +298,17 @@ select rel.oid, rel.relkind::text, coalesce(has_table_privilege(rel.oid, 'SELECT
 // entry with its reason.
 func readTable(ctx context.Context, conn *pgxpool.Conn, table, pk string) (catalogEntry, error) {
 	var (
-		oid, base         *uint32
-		relkind, typeName *string
-		baseName          *string
-		collation         *string
-		attnum            *int16
-		readable, unique  bool
-		nondeterministic  bool
+		oid, base, filenode *uint32
+		relkind, typeName   *string
+		baseName, schema    *string
+		collation           *string
+		attnum              *int16
+		readable, unique    bool
+		nondeterministic    bool
+		children            bool
 	)
 	err := conn.QueryRow(ctx, catalogQuery, ident(table), pk).Scan(&oid, &relkind, &readable, &attnum, &typeName,
-		&base, &baseName, &nondeterministic, &collation, &unique)
+		&base, &baseName, &nondeterministic, &collation, &unique, &schema, &filenode, &children)
 	if err != nil {
 		return catalogEntry{}, err
 	}
@@ -291,6 +322,13 @@ func readTable(ctx context.Context, conn *pgxpool.Conn, table, pk string) (catal
 		return catalogEntry{reason: "Stet's account finds no table " + name}, nil
 	case *relkind != "r" && *relkind != "p":
 		return catalogEntry{reason: name + " is not a table"}, nil
+	case *relkind == "r" && children:
+		// Its children's rows answer to a statement that names it, and its
+		// own unique index does not reach them: one key may be several rows.
+		// The flag stays set after the last child is dropped, until the
+		// table is next analyzed.
+		return catalogEntry{reason: "other tables inherit from " + name + ", or did: a lookup of a row by its key " +
+			"would find their rows too, and the key may then be more than one row"}, nil
 	case !readable:
 		return catalogEntry{reason: "Stet's account may not read " + name + ": it has no SELECT privilege on it, " +
 			"so every lookup of its rows' versions would fail"}, nil
@@ -309,5 +347,12 @@ func readTable(ctx context.Context, conn *pgxpool.Conn, table, pk string) (catal
 	case !unique:
 		return catalogEntry{reason: fmt.Sprintf("column %s of %s is not a key: no unique index is on it alone", col, name)}, nil
 	}
-	return catalogEntry{ok: true, t: tracked{oid: *oid, attr: uint16(*attnum), typ: typ, typeName: *typeName, base: *base}}, nil
+	t := tracked{oid: *oid, attr: uint16(*attnum), typ: typ, typeName: *typeName, base: *base}
+	if schema != nil { // of a table that is there, never NULL
+		t.schema = *schema
+	}
+	if filenode != nil {
+		t.filenode = *filenode
+	}
+	return catalogEntry{ok: true, t: t}, nil
 }

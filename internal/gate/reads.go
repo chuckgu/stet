@@ -117,9 +117,10 @@ func (g *Gate) recordsAny(keys []string) bool {
 // read that sent more than the smallest of those tables' log_above is also
 // logged, once, naming every gated table it read. Then the keys go to the
 // memory, which notes the read as pending and queues the lookup of the rows'
-// versions (spec-v0.2-stale 5). The proxy calls it before forwarding the
-// read's ReadyForQuery, so it does no I/O and never waits for the store or a
-// lookup.
+// versions (spec-v0.2-stale 5); what the read showed of a table with stale
+// and gave no key of makes its login role forget what it held (see
+// stale.remember). The proxy calls it before forwarding the read's
+// ReadyForQuery, so it does no I/O and never waits for the store or a lookup.
 //
 // A read taken in parts (the FETCHes of one cursor, the Executes of one
 // row-limited portal) is one read for max_rows and log_above: o.Before is
@@ -133,7 +134,7 @@ func (g *Gate) Observe(s proxy.SessionInfo, st proxy.Statement, o proxy.Outcome)
 	}
 	keys := g.stale.reads(s, r, o)
 	g.countRead(s, st, r, o, keys)
-	g.stale.remember(s, keys)
+	g.stale.remember(s, r, o, keys)
 }
 
 // countRead is Observe's counting and logging of the read r, which gives the
