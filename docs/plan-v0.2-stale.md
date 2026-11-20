@@ -52,6 +52,9 @@
 | S9 | 7장 "그 접속 계정의 그 테이블 기억을 모두 지운다" | 분류기는 첫 게이트 대상 쓰기의 테이블만 준다. `multi_statement`, `nested_write`, `with`, `truncate`는 다른 테이블도 쓸 수 있다 | 그 네 이유의 쓰기는 그 계정의 모든 테이블에 표시하고 지운다 (9) |
 | S10 | 7장 "승인되어 실행된 쓰기 … 단일 행이면 그 행" | 실행부가 아는 키는 에이전트가 적은 글자다. 기억의 키(서버의 글자)와 다를 수 있다 | 실행부는 문장을 실행하기 전에 게이트에 알리고(테이블 단위 표시), 끝나면 그 계정의 그 테이블 기억을 지운다 (10) |
 | S12 | 4장 "준비된 문장마다 … 자리를 적어 두고" | 서버는 `search_path`나 역할이 바뀌면 준비된 문장을 조용히 다시 계획한다. 같은 이름의 테이블이 두 스키마에 있으면 같은 문장이 다른 테이블을 읽는데, 새 RowDescription은 오지 않는다(14.18에서 확인) | 적어 둔 자리는 이름이 가리키는 테이블이 바뀌었을 수 없는 동안만 쓴다. `search_path`·`role`·`session_authorization`의 `SET`/`RESET`, `RESET ALL`, `DISCARD ALL`(분류기의 `Resolves`)이나 들여다보지 못하는 메시지가 가거나, 그런 것이 든 트랜잭션이 끝나면 다시 Describe될 때까지 그 문장의 결과에서 키를 얻지 않는다. `SET stet.on_behalf_of` 같은 다른 `SET`은 해당하지 않는다. 한 단위가 드는 키는 16,000개까지다 (2, 6) |
+| S13 | 4장·6장이 키 값을 에이전트가 적은 글자 그대로 쓴다 | 서버는 키 값을 키 컬럼과 다른 타입으로 읽을 수 있다. 같은 `$n`이 문장의 다른 곳에도 쓰이거나 변환(`::char(4)`, `::varchar(3)`)이 붙으면 공백을 무시하거나 값을 자른다. Stet이 그 글자로 찾는 행과 서버가 고른 행이 달라진다(14.18에서 확인) | 키 값은 키 컬럼의 타입 그대로 읽힐 때만 쓴다(`keyUsable`). 같은 `$n`이 문장에 한 번만 나오고, 변환이 없거나 키와 같은 계열로의 변환(정수 키: `int2`·`int4`·`int8`, `uuid` 키: `uuid`, `text`·`varchar` 키: `text`나 길이 없는 `varchar`)이어야 한다. `bpchar`·`name` 키는 변환이 붙으면 쓰지 않는다. 글자 키의 리터럴에 역슬래시가 있으면 쓰지 않는다. 쓰지 않는 키의 읽기는 기억하지 않고, 쓰기는 `not_checked`다 (2, 8, 9) |
+| S14 | 7장 | 자기 쓰기 둘이 겹치고 고치기 조회의 결과가 뒤바뀐 순서로 오면 자기 변경을 낡았다고 본다. Stet의 시계로는 두 조회가 본 것의 순서를 가릴 수 없다 | 고치기는 그 쓰기의 표시가 생긴 때부터 고칠 때까지의 구간에 그 계정이 그 행의 다른 버전을 알게 된 것이 있으면, 고치지 않고 그 행의 기억을 지운다 (7) |
+| S15 | S6 | 답이 오기 전에 연결이 끊긴 쓰기는 서버에서 조금 뒤에 커밋될 수 있다. 곧바로 지우면 그 사이에 읽은 옛 버전이 기억에 남는다 | 끊긴 쓰기의 표시는 1분 동안 둔 뒤에 `forgotten`으로 끝낸다 (9) |
 | S11 | 6장 "행이 지금 없으면 `stale`" | 지금의 상태 읽기는 행이 없으면 아무것도 돌려주지 않아, 기억의 키(서버의 글자)를 알 수 없다 | 추적하는 테이블의 상태 읽기는 행이 없어도 키의 글자를 돌려주는 모양으로 바꾼다. 질의 수는 그대로 하나다 (9) |
 
 **스펙이 구현에 맡겨 이 계획이 정한 것.** 프록시는 게이트에게 테이블 OID마다 키 컬럼의 번호와 타입을 묻는다(`Tracked`). 확장 프로토콜의 키 컬럼 자리는 Parse한 문장마다 하나인 칸에 두고 그 문장의 포털이 함께 쓴다. 조회 작업자는 둘이고 대기열은 1,024다. "읽기가 아닌 문장"은 분류기의 `ReadOnly`가 거짓인 메시지다. 승인 실행을 게이트에 알리는 길은 `Applier.Applying` 필드다. 실험실 확인은 Stet을 자기 프로세스 안에서 띄우고 `Gate.StaleIdle`로 조회가 끝나기를 기다린다.
@@ -601,12 +604,12 @@ func (g *Gate) Applying(role, table string) (done func())
 
 **동작.**
 
-1. **상태 읽기(S11).** 카탈로그가 추적하는 테이블의 `currentRow`는 행이 없어도 한 줄을 돌려주는 모양으로 읽는다. `select to_jsonb(t)::text, t.xmin::text, k.key from (select $1::<키 타입> as key) as k left join <테이블> as t on t.<키> = k.key`. 키 타입은 카탈로그의 `typeName`이고, 셋째 컬럼이 서버가 쓴 키의 글자다. 추적하지 않는 테이블은 지금의 질의 그대로다. 행이 없을 때 `assemble`이 만드는 상태와 `stateVersion`은 지금과 같아야 한다.
-2. **비교.** `assemble`이 현재 행을 읽은 뒤 `check`를 부른다(그래서 enforce의 다시 판단도 다시 비교한다). 대상은 `stale`을 켠 테이블의 `Gated` `UPDATE`·`DELETE`다. `not_checked`인 경우: 접속 계정을 모른다, 카탈로그가 그 테이블을 추적하지 않는다, 상태를 읽지 못했다, 키 값이 없다, `INSERT`와 `Measured`·`Unsupported` 쓰기, enforce가 상태를 읽기 전에 정한 쓰기(`unjudged`). `stale`을 켜지 않은 테이블은 `readCheck`가 nil이다.
+1. **상태 읽기(S11).** 카탈로그가 추적하는 테이블의 `currentRow`는 행이 없어도 한 줄을 돌려주는 모양으로 읽는다. `select to_jsonb(t)::text, t.xmin::text, k.key from (select $1::<키 타입> as key) as k left join <테이블> as t on t.<키> = k.key`. 키 타입은 카탈로그의 `typeName`(길이 제한이 없는, 스키마까지 적은 타입 이름)이고, 셋째 컬럼이 서버가 쓴 키의 글자다. 추적하지 않는 테이블은 지금의 질의 그대로다. 행이 없을 때 `assemble`이 만드는 상태와 `stateVersion`은 지금과 같아야 한다.
+2. **비교.** `assemble`이 현재 행을 읽은 뒤 `check`를 부른다(그래서 enforce의 다시 판단도 다시 비교한다). 대상은 `stale`을 켠 테이블의 `Gated` `UPDATE`·`DELETE`다. `not_checked`인 경우: 접속 계정을 모른다, 카탈로그가 그 테이블을 추적하지 않는다, 상태를 읽지 못했다, 키 값이 없다, 키 값이 `keyUsable`이 아니다(S13), `INSERT`와 `Measured`·`Unsupported` 쓰기, enforce가 상태를 읽기 전에 정한 쓰기(`unjudged`). `stale`을 켜지 않은 테이블은 `readCheck`가 nil이다.
 3. **판정.** `input`이 `ReadCheck`를 넘긴다. 섀도의 `judge`와 enforce의 `verdict`가 같은 규칙을 쓴다. `stale`이면 모델을 부르지 않는다. `judge`는 어느 규칙이 정했든 `d.ReadCheck`를 적는다(S4).
 4. **거절.** enforce의 `act`가 `ST003`을 돌려주고 `d.Refused == "ST003"`이다. `facts`의 `RowGone`은 `stale`이고 `Version == nil`일 때 참이다. `recheck`에서 다시 판단한 것이 `stale`이면 이유는 `["stale_read", "rejudged"]`이고 다시 버전을 읽지 않는다.
 5. **표시.** `stale`을 켠 테이블에 쓰는, 접속 계정을 아는 쓰기가 서버로 갈 때(섀도는 언제나, enforce는 보내기로 정했을 때) 표시한다. 자기 비교가 끝난 뒤에 한다. 행 표시: `Gated` `UPDATE`·`DELETE`이고 행이 지금 있다. 표시 없음: `Gated` `UPDATE`·`DELETE`인데 행이 지금 없다, 키 값을 주지 않은 `Gated` `INSERT`. 모든 테이블 표시(S9): 이유가 `multi_statement`, `nested_write`, `with`, `truncate`. 테이블 표시: 그 밖의 모든 쓰기(키 값을 준 `INSERT` 포함).
-6. **`End`.** 거절된 쓰기는 표시가 없다. 실행되지 않았으면(`Executed`도 `Lost`도 아님) `released`. 트랜잭션 밖에서 실행됐으면: 행 표시의 `UPDATE`는 `refresh`로 그 행의 버전을 조회하고 결과로 `refreshed`를 부른다(`ok`가 거짓이면 `forgotten`). `DELETE`는 `forgotten`. 키 값을 준 `INSERT`는 에이전트가 적은 키 글자로 `refresh`해 `refreshedRow`를 부르고 표시를 `released`로 끝낸다(`ok`가 거짓이면 `forgotten`). 그 밖의 표시는 `forgotten`. 트랜잭션 안에서 실행됐으면 표시를 그 세션의 것으로 적어 둔다. `Lost`이면 `forgotten`(S6).
+6. **`End`.** 거절된 쓰기는 표시가 없다. 실행되지 않았으면(`Executed`도 `Lost`도 아님) `released`. 트랜잭션 밖에서 실행됐으면: 행 표시의 `UPDATE`는 `refresh`로 그 행의 버전을 조회하고 결과로 `refreshed`를 부른다(`ok`가 거짓이면 `forgotten`). `DELETE`는 `forgotten`. 키 값을 준 `INSERT`는 에이전트가 적은 키 글자로 `refresh`해 `refreshedRow`를 부르고 표시를 `released`로 끝낸다(`ok`가 거짓이면 `forgotten`). 그 밖의 표시는 `forgotten`. 트랜잭션 안에서 실행됐으면 표시를 그 세션의 것으로 적어 둔다. `Lost`이면 표시를 1분(`staleLostGrace`) 동안 둔 뒤 `forgotten`으로 끝낸다(S6, S15). 게이트가 닫히면 기다리지 않고 끝낸다.
 7. **`TxEnded`.** 그 세션이 적어 둔 표시(트랜잭션 안에서 실행된 쓰기의 것)를 모두 `forgotten`으로 끝낸다. `unseen`이 0보다 크면 그 접속 계정의 기억을 모두 지우고, 그 세션의 남은 `Unseen` 수에서 뺀다. 남은 수가 0이 되면 그 세션의 `Unseen` 표시를 `forgotten`으로 끝낸다.
 8. **`Unseen`.** 접속 계정을 알면 그 계정의 모든 테이블에 표시하고(세션마다 하나이고, 그 세션의 남은 `Unseen` 수를 센다) 그 계정의 기억을 모두 지운다. `TxEnded`가 수를 맞춰 끝낸다. 접속 계정을 모르는 세션의 `Unseen`과 그것을 정리하는 `TxEnded`는 아무것도 하지 않는다.
 9. **`Applying`.** 테이블 표시를 하고, `done`에서 `forgotten`으로 끝낸다. 그 테이블이 `stale`을 켜지 않았으면 아무것도 하지 않는다.
@@ -625,7 +628,8 @@ func (g *Gate) Applying(role, table string) (done func())
   - `TestOwnWriteInTransaction`: 읽기 → `BEGIN`, 쓰기 → (커밋 전) 다른 연결의 그 행 쓰기는 `own_write`(서버에서 행 잠금을 기다리므로 다른 고루틴에서 보내고, `COMMIT` 뒤에 기록을 본다) → `COMMIT` → 쓰기는 `no_read`. 트랜잭션 안의 쓰기보다 먼저 끝났고 조회가 늦은 읽기가 기억을 되살리지 않는다.
   - `TestMultiRowWriteForgetsTable`: 읽기 → 자기의 여러 행 `UPDATE` → 그 행에 쓰기 → `no_read`. 여러 행 쓰기가 서버에 가 있는 동안의 쓰기는 `own_write`. `with` 모양의 쓰기는 다른 테이블의 기억도 지운다.
   - `TestInsertWithKey`: 읽기 → 다른 쪽이 그 행을 지움 → 자기가 같은 키로 `INSERT` → 그 행에 쓰기 → `stale`이 아니다. 키 없는 `INSERT`는 다른 행의 기억을 지우지 않는다.
-  - `TestLostWriteLeavesNoMark`: 쓰기를 보낸 뒤 답이 오기 전에 연결을 끊는다 → 그 계정의 다음 쓰기가 `own_write`가 아니고, 끊긴 쓰기가 바꾼 행에 쓰는 것이 `stale`이 아니다(`no_read`).
+  - `TestLostWriteLeavesNoMark`: 쓰기를 보낸 뒤 답이 오기 전에 연결을 끊는다 → `staleLostGrace`(테스트에서 줄인다) 동안은 그 행의 쓰기가 `own_write`이고, 지난 뒤에는 `own_write`가 아니며 끊긴 쓰기가 바꾼 행에 쓰는 것이 `stale`이 아니다(`no_read`).
+  - `TestKeyValueNotUsable`: 글자 키에 `where id = $1::char(4)`, 같은 `$1`을 두 번 쓴 쓰기, 역슬래시가 든 리터럴 → `not_checked`. `where id = $1::uuid`와 `where id = $1::bigint`는 확인된다.
   - `TestOnBehalfOf`: P7(업무 `a` 읽기 → 변경 → 업무 `b` 읽기 → `a` 쓰기)은 `stale`, `read_on_behalf_of == "a"`. M1(둘 다 업무 없음)은 `fresh`.
   - `TestUnlockAfterRejection` (enforce): `stale`로 거절 → 다시 보내면 또 거절 → 같은 계정의 다른 업무 연결로 다시 읽기 → 쓰기가 실행된다.
   - `TestStaleBeforeCumulative` (enforce): 누적 한도를 넘은 쓰기가 낡았으면 `reject`, `stale_read`이고 보류되지 않는다(`stet.held_writes`에 줄이 없다).
