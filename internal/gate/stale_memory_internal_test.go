@@ -222,6 +222,32 @@ func TestUnlockAfterStale(t *testing.T) {
 	wantCheck(t, m, c, a, "deals", "3", "v2", "stale read=v1 task=a")
 }
 
+// compare answers as check does but leaves no note that the row was judged
+// stale, so another task's later read is not compared; noteStale leaves the
+// note check would have.
+func TestCompareLeavesNoNote(t *testing.T) {
+	m, c := testMemory(1000)
+	a, b := party{"agent", "a"}, party{"agent", "b"}
+	compared := func(want string) {
+		t.Helper()
+		if got := summary(m.compare(a, "deals", "1", "v2", c.tick())); got != want {
+			t.Errorf("compare = %q, want %q", got, want)
+		}
+	}
+	remembered(m, c, a, "deals", "1", "v1")
+	remembered(m, c, b, "deals", "1", "v2")
+	compared("stale read=v1 task=a")
+	remembered(m, c, b, "deals", "1", "v2") // after the comparison
+	compared("stale read=v1 task=a")
+
+	judged := c.tick()
+	m.noteStale("agent", "deals", "1", judged)
+	m.noteStale("agent", "deals", "1", judged.Add(time.Hour)) // a later judgment does not move it
+	remembered(m, c, b, "deals", "1", "v2")
+	compared("fresh read=v2 task=b")
+	m.noteStale("nobody", "deals", "1", c.tick()) // a role with nothing remembered: nothing to note
+}
+
 func TestOwnWriteMark(t *testing.T) {
 	m, c := testMemory(1000)
 	a, b, other, none := party{"agent", "a"}, party{"agent", "b"}, party{"agent", "c"}, party{"agent", ""}

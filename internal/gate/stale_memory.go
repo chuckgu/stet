@@ -434,12 +434,50 @@ func (rr *roleMemory) clearedSince(table string, readAt time.Time) (whole bool, 
 // version ("" when the row is not there), at time at. A stale result is
 // remembered for the unlock rule of spec 6.
 func (m *readMemory) check(p party, table, key, version string, at time.Time) decide.ReadCheck {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rc := m.compareLocked(p, table, key, version, at)
+	if rc.Result == decide.ReadStale {
+		m.noteLocked(p.role, table, key, at)
+	}
+	return rc
+}
+
+// compare is check without remembering a stale result: for a caller that may
+// still decide, from what the memory does not know, that the write is not to
+// be judged stale, and calls noteStale only when it is.
+func (m *readMemory) compare(p party, table, key, version string, at time.Time) decide.ReadCheck {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.compareLocked(p, table, key, version, at)
+}
+
+// noteStale remembers, as check does for a stale result, that a write by role
+// to the row key of table was judged stale at at.
+func (m *readMemory) noteStale(role, table, key string, at time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.noteLocked(role, table, key, at)
+}
+
+// noteLocked is noteStale with m.mu held. The note stays at the earliest
+// judgment, and goes with the row's entries.
+func (m *readMemory) noteLocked(role, table, key string, at time.Time) {
+	rr := m.roles[role]
+	if rr == nil {
+		return
+	}
+	if re := rr.entriesOf(table, key); re != nil && (re.staleAt.IsZero() || at.Before(re.staleAt)) {
+		re.staleAt = at
+	}
+}
+
+// compareLocked is compare with m.mu held.
+func (m *readMemory) compareLocked(p party, table, key, version string, at time.Time) decide.ReadCheck {
 	rc := decide.ReadCheck{Result: decide.ReadNone}
 	if version != "" {
 		rc.Version = &version
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	rr := m.roles[p.role]
 	if rr == nil {
 		return rc
@@ -511,9 +549,6 @@ func (m *readMemory) check(p party, table, key, version string, at time.Time) de
 		return rc
 	}
 	rc.Result = decide.ReadStale
-	if staleAt.IsZero() || at.Before(staleAt) {
-		re.staleAt = at
-	}
 	return rc
 }
 
