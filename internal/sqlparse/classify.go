@@ -147,6 +147,11 @@ type Result struct {
 	// or Measured). Op is insert, update, delete, merge, copy, or truncate.
 	Table string
 	Op    string
+	// TableSchema is the schema that write names its table with, "" when it
+	// names none. Table is the config key, which Stet resolves on its own
+	// connection: a write that names another schema than that table's writes
+	// another table of the same name.
+	TableSchema string
 
 	// Reads holds the config keys of the gated tables the statements read,
 	// sorted, and is set exactly when Kind is Read. A statement that writes
@@ -296,7 +301,7 @@ func Classify(sql string, tables Tables) (Result, error) {
 		n := tree.Stmts[0].Stmt
 		r = measured(n, m, classifyStmt(n, m))
 	}
-	r.Table, r.Op = target.table, target.op // empty when nothing gated is written
+	r.Table, r.Op, r.TableSchema = target.table, target.op, target.schema // empty when nothing gated is written
 	r.OnBehalfOf, r.Cursors, r.Statements = obo, cursors, len(tree.Stmts)
 	r.Clean, r.Sets, r.Do, r.Executes, r.Portals = clean, sets, do, executes, portals
 	r.Resolves = resolves
@@ -533,7 +538,9 @@ func matcher(gated map[string]string) matchFunc {
 	}
 }
 
-type gatedWrite struct{ table, op string }
+// gatedWrite is a write of a gated table: its config key, what it does, and
+// the schema the statement names the table with ("" for none).
+type gatedWrite struct{ table, op, schema string }
 
 // firstGatedWrite finds the first statement nested anywhere in n that writes
 // a gated table: CTEs, EXPLAIN ANALYZE, PREPARE, and rule actions included.
@@ -541,7 +548,7 @@ func firstGatedWrite(n *pg.Node, m matchFunc) (gatedWrite, bool) {
 	var found gatedWrite
 	hit := func(rv *pg.RangeVar, op string) bool {
 		if t, ok := m(rv); ok {
-			found = gatedWrite{t.key, op}
+			found = gatedWrite{t.key, op, rv.Schemaname}
 			return true
 		}
 		return false

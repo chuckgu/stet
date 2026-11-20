@@ -1374,3 +1374,160 @@ func TestKeysForgottenAfterAPortalThatMayRunASet(t *testing.T) {
 		t.Errorf("after a portal that may run a SET: Read %+v, want none", *obs[1].o.Read)
 	}
 }
+
+// wantPartial fails the test unless the read o took keys and says, as want,
+// whether its rows held key values it did not take.
+func wantPartial(t *testing.T, what string, o proxy.Outcome, want bool) {
+	t.Helper()
+	if o.Read == nil {
+		t.Errorf("%s: no Read", what)
+		return
+	}
+	if o.Read.Partial != want {
+		t.Errorf("%s: Partial = %v with %d keys of %d rows, want %v", what, o.Read.Partial, len(o.Read.Keys), o.Sent, want)
+	}
+}
+
+// A read that sends more key values than one read takes is partial: the gate
+// cannot tell which rows the client saw beyond the keys. One that ends with
+// the last key it may take, or before, is not.
+func TestReadPastTheKeyLimitIsPartial(t *testing.T) {
+	tb := idTable(t, proxy.MaxReadKeys+1)
+	g := newKeyGate(tb)
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	for _, limit := range []int{proxy.MaxReadKeys + 1, proxy.MaxReadKeys, 5} {
+		mustExec(t, conn, fmt.Sprintf("select id from %s order by id limit %d", tb.name, limit))
+	}
+	obs := g.observed(t, 3)
+	for i, tc := range []struct {
+		rows, keys int
+		partial    bool
+	}{
+		{proxy.MaxReadKeys + 1, proxy.MaxReadKeys, true},
+		{proxy.MaxReadKeys, proxy.MaxReadKeys, false},
+		{5, 5, false},
+	} {
+		o := obs[i].o
+		what := fmt.Sprintf("%d rows", tc.rows)
+		if o.Sent != int64(tc.rows) || o.Read == nil || len(o.Read.Keys) != tc.keys {
+			t.Errorf("%s: %d rows sent, Read %+v; want %d keys", what, o.Sent, o.Read != nil, tc.keys)
+		}
+		wantPartial(t, what, o, tc.partial)
+	}
+}
+
+// A read cut short by its unit's bound is partial, with the keys it took
+// before or none; the reads before it, which took every key, are not.
+func TestReadPastTheUnitBoundIsPartial(t *testing.T) {
+	const per = 700 // rows each Execute sends
+	tb := idTable(t, per)
+	g := newKeyGate(tb)
+	addr, _ := startProxy(t, upstream(t), g)
+	fe := rawConn(t, addr)
+
+	exchange(t, fe, &pgproto3.Parse{Name: "s", Query: "select id from " + tb.name + " order by id"},
+		&pgproto3.Describe{ObjectType: 'S', Name: "s"}, &pgproto3.Sync{})
+	reads := proxy.MaxUnitKeys/per + 2
+	var msgs []pgproto3.FrontendMessage
+	for range reads {
+		msgs = append(msgs, &pgproto3.Bind{PreparedStatement: "s"}, &pgproto3.Execute{})
+	}
+	sendAll(t, fe, append(msgs, &pgproto3.Sync{})...)
+	untilReady(t, fe)
+	left := proxy.MaxUnitKeys
+	for i, ob := range g.observed(t, reads) {
+		took := min(per, left)
+		left -= took
+		wantPartial(t, fmt.Sprintf("Execute %d, %d keys taken", i+1, took), ob.o, took < per)
+	}
+}
+
+// A key value the proxy does not take as a key makes its read partial: a text
+// key that is not ASCII or longer than a key may be, in text and in binary.
+// The same read without those rows is not.
+func TestUnreadableKeyMakesTheReadPartial(t *testing.T) {
+	tb := newKeyTable(t, "k text primary key, n int", "k", proxy.KeyText,
+		`insert into %[1]s values ('é', 1), ('a', 2), (repeat('x', 1025), 3), (repeat('y', 1024), 4)`)
+	g := newKeyGate(tb)
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	for _, where := range []string{"n = 1 or n = 2", "n = 3 or n = 2", "n = 2 or n = 4"} {
+		sql := "select k from " + tb.name + " where " + where + " order by n"
+		mustExec(t, conn, sql)
+		if _, err := conn.PgConn().ExecParams(testCtx(t), sql, nil, nil, nil, []int16{1}).Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	obs := g.observed(t, 6)
+	for i, tc := range []struct {
+		what    string
+		partial bool
+	}{{"not ASCII", true}, {"too long", true}, {"keys as they may be", false}} {
+		for j, format := range []string{"text", "binary"} {
+			wantPartial(t, tc.what+", "+format, obs[2*i+j].o, tc.partial)
+		}
+	}
+}
+
+// A row too large to inspect makes its read partial.
+func TestOversizedRowMakesTheReadPartial(t *testing.T) {
+	t.Cleanup(proxy.SetMaxInspect(256)) // before the proxy, so it is restored once the proxy closed
+	tb := newKeyTable(t, "id int primary key, title text", "id", proxy.KeyInt4,
+		"insert into %[1]s values (1, 'a'), (2, repeat('x', 1000)), (3, 'c')")
+	g := newKeyGate(tb)
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	mustExec(t, conn, "select id, title from "+tb.name+" order by id")
+	mustExec(t, conn, "select id, title from "+tb.name+" where id <> 2 order by id")
+	obs := g.observed(t, 2)
+	wantPartial(t, "with the large row", obs[0].o, true)
+	wantPartial(t, "without it", obs[1].o, false)
+}
+
+// A NULL key is no key of a row: an outer join's missing side leaves its
+// read whole.
+func TestNullKeyIsNotPartial(t *testing.T) {
+	tb := newKeyTable(t, "id int primary key, title text", "id", proxy.KeyInt4, "insert into %[1]s values (1, 'a'), (3, 'c')")
+	g := newKeyGate(tb)
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	mustExec(t, conn, "select t.id from generate_series(1, 3) g left join "+tb.name+" t on t.id = g order by g")
+	o := g.observed(t, 1)[0].o
+	wantKeys(t, "outer join", o, tb, "1", "3")
+	wantPartial(t, "outer join", o, false)
+}
+
+// A binary key whose length does not fit its type, and a row that does not
+// hold the columns its RowDescription said, make the read partial.
+func TestMalformedKeyMakesTheReadPartial(t *testing.T) {
+	const oid = 4242
+	desc := &pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{{Name: []byte("id"), TableOID: oid,
+		TableAttributeNumber: 1, DataTypeOID: 23, DataTypeSize: 4, TypeModifier: -1, Format: 1}}}
+	for _, tc := range []struct {
+		what    string
+		row     *pgproto3.DataRow
+		partial bool
+	}{
+		{"a key of 3 bytes for int4", &pgproto3.DataRow{Values: [][]byte{{0, 0, 9}}}, true},
+		{"a row of two columns", &pgproto3.DataRow{Values: [][]byte{{0, 0, 0, 9}, {1}}}, true},
+		{"a NULL key", &pgproto3.DataRow{Values: [][]byte{nil}}, false},
+		{"a key as it should be", &pgproto3.DataRow{Values: [][]byte{{0, 0, 0, 9}}}, false},
+	} {
+		g := newObservingGate(func(string) bool { return true })
+		g.readOnly = func(string) bool { return true }
+		g.tracked = map[uint32]trackedKey{oid: {attr: 1, typ: proxy.KeyInt4}}
+		proxy.ServerShows(g, []pgproto3.FrontendMessage{&pgproto3.Query{String: "select id from t"}},
+			[]pgproto3.BackendMessage{desc, &pgproto3.DataRow{Values: [][]byte{{0, 0, 0, 7}}}, tc.row,
+				&pgproto3.CommandComplete{CommandTag: []byte("SELECT 2")}, &pgproto3.ReadyForQuery{TxStatus: 'I'}})
+		o := g.observed(t, 1)[0].o
+		if o.Read == nil || len(o.Read.Keys) == 0 || o.Read.Keys[0].Text != "7" {
+			t.Errorf("%s: Read %+v, want the first row's key 7", tc.what, o.Read)
+		}
+		wantPartial(t, tc.what, o, tc.partial)
+	}
+}

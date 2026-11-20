@@ -1176,3 +1176,48 @@ func TestKeyValueShared(t *testing.T) {
 		t.Error("a literal key value is marked Shared")
 	}
 }
+
+// Result.TableSchema is the schema the first gated write names its table
+// with, "" when it names none: the config key may resolve to a table of
+// another schema than the one the statement writes.
+func TestClassifyReportsTargetSchema(t *testing.T) {
+	for _, tc := range []struct {
+		sql, table, schema string
+	}{
+		{"update contacts set title = 'x' where id = 1", "contacts", ""},
+		{"update public.contacts set title = 'x' where id = 1", "contacts", "public"},
+		{"delete from archive.contacts where id = 1", "contacts", "archive"},
+		{`update "Archive".contacts set title = 'x' where id = 1`, "contacts", "Archive"},
+		{"insert into archive.contacts (name) values ('a')", "contacts", "archive"},
+		{"update archive.contacts set status = 'x'", "contacts", "archive"},
+		{"with d as (delete from archive.contacts where id = 1 returning *) select * from d", "contacts", "archive"},
+		{"truncate deals, archive.contacts", "contacts", "archive"},
+		{"copy archive.contacts from stdin", "contacts", "archive"},
+		{"select 1; delete from archive.contacts where id = 1", "contacts", "archive"},
+		// The first gated write's, like Table.
+		{"delete from contacts where id = 1; delete from archive.contacts where id = 2", "contacts", ""},
+		{"select * from archive.contacts", "", ""},
+	} {
+		r, err := Classify(tc.sql, gated)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Table != tc.table || r.TableSchema != tc.schema {
+			t.Errorf("%s: target = %q in schema %q, want %q in %q", tc.sql, r.Table, r.TableSchema, tc.table, tc.schema)
+		}
+	}
+	// A config key that names its schema.
+	qualified := Tables{PK: map[string]string{"crm.contacts": "id"}}
+	for sql, schema := range map[string]string{
+		"delete from crm.contacts where id = 1": "crm",
+		"delete from contacts where id = 1":     "",
+	} {
+		r, err := Classify(sql, qualified)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Table != "crm.contacts" || r.TableSchema != schema {
+			t.Errorf("%s: target = %q in schema %q, want crm.contacts in %q", sql, r.Table, r.TableSchema, schema)
+		}
+	}
+}

@@ -43,6 +43,16 @@ type ReadKeys struct {
 	Keys   []RowKey // from the rows sent, in order, at most MaxReadKeys
 	Tables []uint32 // the tracked tables the result had a column of, in column order, each once
 	Param  *Param   // the value bound to Statement.KeyParam; nil when there is none
+	// Partial: rows of this read held key values the proxy did not take: the
+	// read reached MaxReadKeys or its unit's bound, a value could not be read as
+	// a key (too long, not ASCII for a text key, a length that does not fit its
+	// type), or a row was too large to inspect. The gate cannot tell which rows
+	// the client saw beyond Keys.
+	//
+	// A NULL key (an outer join's missing side) is not partial: there is no
+	// row of the table there. Nor is a read that took its last key from its
+	// last row: it is set only once a row came that gave less than it held.
+	Partial bool
 }
 
 // KeyOutput is the key value v, sent in format (0 text, 1 binary), as the
@@ -193,6 +203,12 @@ type keyTake struct {
 	room   int         // how many keys the read may still take
 	keys   []RowKey    // taken from this answer's rows
 	tables []uint32    // of a Query's result set: the tracked tables it has a column of
+	// blind: the result has a key column whose values are not taken from the
+	// rows still to come: the read may take no more keys, or the Bind gave
+	// the column no format. partial: a row came that held a key value which
+	// was not taken (ReadKeys.Partial).
+	blind   bool
+	partial bool
 }
 
 // keyFormat is a key column and the format its values are sent in.
@@ -275,7 +291,13 @@ func (s *session) rowWanted() bool {
 		}
 		s.decide()
 	}
-	return s.take.state == takeTaking
+	if s.take.state == takeTaking {
+		return true
+	}
+	if s.take.blind {
+		s.take.partial = true // a row whose key is not taken
+	}
+	return false
 }
 
 // decide looks, at the first row of an answer, which read the rows answer.
@@ -340,9 +362,11 @@ func bindFormat(codes []int16, fields int) func(k keyCol) (format int16, ok bool
 
 // start makes tk read the rows for the key columns of c, taking at most room
 // keys; format gives the format of a key column's values, and a column whose
-// format it does not give leaves no key.
+// format it does not give leaves no key. With no room, or for such a column,
+// the rows that come hold key values that are not taken (blind).
 func (tk *keyTake) start(c resultCols, room int, format func(k keyCol) (int16, bool)) {
 	if room <= 0 {
+		tk.blind = len(c.keys) > 0
 		return
 	}
 	var cols []keyFormat
@@ -351,6 +375,7 @@ func (tk *keyTake) start(c resultCols, room int, format func(k keyCol) (int16, b
 			cols = append(cols, keyFormat{keyCol: k, format: f})
 		}
 	}
+	tk.blind = len(cols) < len(c.keys)
 	if len(cols) > 0 {
 		tk.state, tk.fields, tk.cols, tk.room = takeTaking, c.fields, cols, room
 	}
@@ -468,21 +493,26 @@ func (s *session) columns(body []byte) resultCols {
 // (rowWanted). A body past maxInspect (nil) is skipped, and so is one that
 // does not hold the columns its RowDescription said: no key of it is taken.
 // A NULL key, or one KeyOutput does not read, gives none. Once the read has
-// all the keys it may take, later rows are not read. It runs on the server
-// side without s.mu.
+// all the keys it may take, later rows are not read. Whenever a row held a
+// key value that was not taken, for any of these reasons but NULL, the take
+// is partial. It runs on the server side without s.mu.
 func (s *session) dataRow(body []byte) {
 	tk := &s.take
-	if tk.state != takeTaking || body == nil {
+	if tk.state != takeTaking {
 		return
 	}
-	if len(body) < 2 || int(int16(binary.BigEndian.Uint16(body))) != tk.fields {
+	if tk.blind {
+		tk.partial = true // a key column the Bind gave no format
+	}
+	if body == nil || len(body) < 2 || int(int16(binary.BigEndian.Uint16(body))) != tk.fields {
+		tk.partial = true
 		return
 	}
 	start, off, col := len(tk.keys), 2, 0
 	for _, kc := range tk.cols {
 		for ; col <= kc.at; col++ {
 			if len(body)-off < 4 {
-				tk.keys = tk.keys[:start]
+				tk.keys, tk.partial = tk.keys[:start], true
 				return
 			}
 			n := int32(binary.BigEndian.Uint32(body[off:]))
@@ -491,21 +521,28 @@ func (s *session) dataRow(body []byte) {
 			switch {
 			case n == -1:
 			case n < 0 || int64(n) > int64(len(body)-off):
-				tk.keys = tk.keys[:start]
+				tk.keys, tk.partial = tk.keys[:start], true
 				return
 			default:
 				v = body[off : off+int(n)]
 				off += int(n)
 			}
-			if col == kc.at && len(tk.keys) < tk.room {
-				if text, ok := KeyOutput(kc.typ, kc.format, v); ok {
-					tk.keys = append(tk.keys, RowKey{Table: kc.table, Text: text})
-				}
+			if col != kc.at || v == nil {
+				continue
 			}
+			text, ok := "", false
+			if len(tk.keys) < tk.room {
+				text, ok = KeyOutput(kc.typ, kc.format, v)
+			}
+			if !ok {
+				tk.partial = true // no room left for it, or not a value a key may be
+				continue
+			}
+			tk.keys = append(tk.keys, RowKey{Table: kc.table, Text: text})
 		}
 	}
 	if len(tk.keys) >= tk.room {
-		tk.state = takeNone
+		tk.state, tk.blind = takeNone, true
 	}
 }
 
@@ -521,6 +558,7 @@ func (s *session) settleKeys(head *unit) {
 	head.keys += len(tk.keys)
 	r := head.reads[tk.read].keys
 	r.Keys = append(r.Keys, tk.keys...)
+	r.Partial = r.Partial || tk.partial
 	for _, t := range tk.tables {
 		if !slices.Contains(r.Tables, t) {
 			r.Tables = append(r.Tables, t)
