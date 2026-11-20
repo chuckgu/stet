@@ -358,11 +358,11 @@ type ReadKeys struct {
 **Interfaces — Consumes:** Task 5의 `Tracked`, `Statement.Track`·`KeyParam`·`ReadOnly`, `ReadKeys`. **Produces:** `Outcome.Read`의 동작과, 게이트가 바인딩 값을 같은 규칙으로 읽는 데 쓰는 함수 하나.
 
 ```go
-// KeyText is the key value v, sent in format (0 text, 1 binary), as the
+// KeyOutput is the key value v, sent in format (0 text, 1 binary), as the
 // output function of a type read as typ writes it. ok is false for NULL, for
 // a binary value whose length does not fit typ, for a KeyText value holding
 // a byte that is not ASCII, and for a value longer than 1024 bytes.
-func KeyText(typ KeyType, format int16, v []byte) (text string, ok bool)
+func KeyOutput(typ KeyType, format int16, v []byte) (text string, ok bool)
 ```
 
 **동작.** 추적하는 읽기는 `Observe`와 `Track`이 서 있고 `Cursors`가 없는 문장이 Query나 Execute로 온 것이다.
@@ -389,7 +389,7 @@ func KeyText(typ KeyType, format int16, v []byte) (text string, ok bool)
   - `TestNullKeyIsSkipped`: 외부 조인으로 NULL인 키 → 그 행은 건너뛰고 나머지는 얻는다.
   - `TestLargeReadKeepsThousandKeys`: 1,500행 → `len(Keys) == 1000`(앞의 1,000개), `Sent == 1500`.
   - `TestOddKeyValues`: 0x80 이상의 바이트가 든 글자 키와 1,025바이트 키는 건너뛴다. 빈 글자 키와 쉼표·따옴표가 든 키는 그대로 얻는다.
-  - `TestKeyText`: 타입마다 글자·바이너리 값의 표(음수 정수, 길이가 맞지 않는 바이너리, 대문자가 없는 `uuid` 글자, NULL)가 동작 5의 규칙대로 나온다.
+  - `TestKeyOutput`: 타입마다 글자·바이너리 값의 표(음수 정수, 길이가 맞지 않는 바이너리, 대문자가 없는 `uuid` 글자, NULL)가 동작 5의 규칙대로 나온다.
   - `TestNoKeysAfterAWrite`: `BEGIN` / `UPDATE other …` / 추적하는 읽기 → `Read == nil`. `BEGIN` / 읽기 / 읽기 → 둘 다 키. `COMMIT`의 답을 받은 뒤의 읽기 → 키. 답을 받지 않은 `ReadOnly`가 아닌 메시지 뒤에 파이프라인으로 온 읽기 → nil. 한 Sync 아래 쓰기 Execute 다음의 읽기 Execute → nil.
   - `TestKeysFromSeveralStatements`: `select id from t where id = 1; select id from t where id = 2` → 두 키.
   - `TestNoKeysFromCursor`: `DECLARE`/`FETCH`로 읽은 행 → `Read == nil`.
@@ -550,7 +550,7 @@ func (s *stale) refresh(table, key string, then func(serverKey, version string, 
 3. `Inspect`: `stale`을 켠 테이블이 있으면 분류기가 읽기를 찾는다. 읽는 테이블 가운데 `stale`을 켠 것이 있으면 `Observe`가 선다. `Track`은 거기에 더해 `r.ReadOnly`이고 `r.Cursors`가 없을 때 선다. `ReadOnly`는 `r.ReadOnly`다. `KeyParam`은 `r.ReadKey`가 `$n`이고 그 테이블이 `stale`을 켰을 때 n이다.
 4. `Observe`: `stale`을 켠 테이블은 `reads`를 켜지 않아도 `stet.reads`에 센다(`log_above` 없음). 버킷에 `keyed`(그 테이블의 키를 하나 이상 얻은 읽기)와 `keys`를 더한다.
 5. `Observe`가 기억으로 넘기는 읽기: 접속 계정을 알고, `Executed`이고 에러가 없고 `Lost`가 아니며, `o.Read != nil`이다. `Read.Keys`를 OID로 테이블에 나누고 겹친 키를 줄인 뒤, 테이블마다 `reading`으로 적고 조회를 대기열에 넣는다. 읽은 시각은 `Observe`가 불린 때의 Stet 시계다.
-6. 조건절의 키(S5): `r.ReadKey`가 있고, 그 테이블의 키를 결과에서 얻지 못했고, 그 테이블의 OID가 `Read.Tables`에 있고, `o.Sent >= 1`이면 그 값 하나를 키로 쓴다. 값이 리터럴이면 그 글자, `$n`이면 `Read.Param`이다. 바이너리 값은 `Param.OID`가 0이면 키 컬럼의 타입으로, 아니면 그 OID가 여덟 타입 가운데 하나일 때만 `proxy.KeyText`로 읽는다. NULL이거나 읽지 못하면 쓰지 않는다. 이 읽기는 키 없이(`keys == nil`) 적는다.
+6. 조건절의 키(S5): `r.ReadKey`가 있고, 그 테이블의 키를 결과에서 얻지 못했고, 그 테이블의 OID가 `Read.Tables`에 있고, `o.Sent >= 1`이면 그 값 하나를 키로 쓴다. 값이 리터럴이면 그 글자, `$n`이면 `Read.Param`이다. 바이너리 값은 `Param.OID`가 0이면 키 컬럼의 타입으로, 아니면 그 OID가 여덟 타입 가운데 하나일 때만 `proxy.KeyOutput`으로 읽는다. NULL이거나 읽지 못하면 쓰지 않는다. 이 읽기는 키 없이(`keys == nil`) 적는다.
 7. 대기열이 차 있으면 `dropped`로 끝내고 센다. `Observe`는 기다리지 않고 DB를 쓰지 않는다.
 8. 작업자는 조회 하나에 `staleLookupTimeout`을 건다. 조회문은 Global Constraints의 것이고, 키들은 글자 매개변수 하나에 배열 값으로 묶어 보낸다(요소마다 큰따옴표로 감싸고 `\`와 `"`를 막는다). 성공하면 `learned`, 실패하면 `dropped`로 끝내고 센다.
 9. 1분에 한 번, 버린 읽기(대기열), 실패한 조회, 상한으로 버린 기억의 수가 하나라도 0이 아니면 `Warn` 한 줄을 낸다.
