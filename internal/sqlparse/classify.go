@@ -159,7 +159,14 @@ type Result struct {
 
 	Clean bool // every statement is BEGIN, START TRANSACTION, SET or SHOW; true for SQL with no statement
 	Sets  bool // some statement is SET or RESET (any VariableSetStmt)
-	Do    bool // some statement is a DO block
+	// Resolves: some statement may change which table an unqualified name
+	// means: SET or RESET of search_path, role or session_authorization (SET
+	// ROLE, SET SESSION AUTHORIZATION and their RESET forms included, SET LOCAL
+	// too), or RESET ALL. A prepared statement the server planned before it may
+	// read another table after it. DISCARD ALL counts: it runs RESET ALL and
+	// SET SESSION AUTHORIZATION DEFAULT.
+	Resolves bool
+	Do       bool // some statement is a DO block
 	// DefinesCode: some statement defines a function, procedure, rule or
 	// trigger, or a view whose query reads a gated table (see definesCode):
 	// writes through it would reach a gated table unseen.
@@ -208,6 +215,7 @@ func Classify(sql string, tables Tables) (Result, error) {
 		clean    = true
 		readOnly = true
 		sets     bool
+		resolves bool
 		do       bool
 		defines  bool
 		prepares bool // a SQL PREPARE of a gated write
@@ -234,6 +242,7 @@ func Classify(sql string, tables Tables) (Result, error) {
 		clean = clean && leavesClean(raw.Stmt)
 		readOnly = readOnly && (leavesClean(raw.Stmt) || readOnlySelect(raw.Stmt.GetSelectStmt()))
 		sets = sets || raw.Stmt.GetVariableSetStmt() != nil
+		resolves = resolves || changesResolution(raw.Stmt)
 		do = do || raw.Stmt.GetDoStmt() != nil
 		defines = defines || definesCode(raw.Stmt, m)
 		if c := raw.Stmt.GetCopyStmt(); c != nil && c.IsFrom && !c.IsProgram && c.Filename == "" {
@@ -267,6 +276,7 @@ func Classify(sql string, tables Tables) (Result, error) {
 	r.Table, r.Op = target.table, target.op // empty when nothing gated is written
 	r.OnBehalfOf, r.Cursors, r.Statements = obo, cursors, len(tree.Stmts)
 	r.Clean, r.Sets, r.Do, r.Executes, r.Portals = clean, sets, do, executes, portals
+	r.Resolves = resolves
 	r.DefinesCode, r.CopyIn = defines, copyIn
 	r.ReadOnly = readOnly
 	if r.Kind == Read && readOnly {
@@ -362,6 +372,28 @@ func leavesClean(n *pg.Node) bool {
 		}
 	case n.GetVariableShowStmt() != nil:
 		return true
+	}
+	return false
+}
+
+// changesResolution reports whether n, a top-level statement, may change
+// which table an unqualified name means (see Result.Resolves). Setting names
+// are compared as the server compares them, ignoring case.
+func changesResolution(n *pg.Node) bool {
+	if d := n.GetDiscardStmt(); d != nil {
+		return d.Target == pg.DiscardMode_DISCARD_ALL
+	}
+	s := n.GetVariableSetStmt()
+	switch {
+	case s == nil:
+		return false
+	case s.Kind == pg.VariableSetKind_VAR_RESET_ALL:
+		return true
+	}
+	for _, name := range []string{"search_path", "role", "session_authorization"} {
+		if strings.EqualFold(s.Name, name) {
+			return true
+		}
 	}
 	return false
 }

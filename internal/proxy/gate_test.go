@@ -52,6 +52,8 @@ type recordingGate struct {
 	readOnly func(sql string) bool
 	keyParam func(sql string) int
 	tracked  map[uint32]trackedKey
+	// resolves, when set, says which statements Inspect marks Resolves.
+	resolves func(sql string) bool
 
 	mu       sync.Mutex
 	inspects int // Inspect calls
@@ -125,6 +127,9 @@ func (g *recordingGate) Inspect(sql string) proxy.Statement {
 	}
 	if g.keyParam != nil && st.Track {
 		st.KeyParam = g.keyParam(sql)
+	}
+	if g.resolves != nil {
+		st.Resolves = g.resolves(sql)
 	}
 	for _, m := range executeRE.FindAllStringSubmatch(sql, -1) {
 		st.Executes = append(st.Executes, strings.ToLower(m[1]))

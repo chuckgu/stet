@@ -64,15 +64,22 @@ func idTable(t *testing.T, n int) keyTable {
 // classifier would here: SELECT, and the clean BEGIN, SET and SHOW.
 var readOnlyRE = regexp.MustCompile(`(?i)^\s*(select|begin|set|show)\b`)
 
+// resolvesRE matches the statements the test gate marks Resolves, as the
+// classifier would here: what sets or resets search_path, the role or the
+// session authorization, RESET ALL and DISCARD ALL.
+var resolvesRE = regexp.MustCompile(`(?i)^\s*(set\s+(local\s+|session\s+)?(search_path|role|session\s+authorization|schema)\b|reset\s+(search_path|role|session\s+authorization|all)\b|discard\s+all\b)`)
+
 // newKeyGate observes the reads that name one of tables, marks ReadOnly what
-// readOnlyRE matches, and so tracks each observed read among those; Tracked
-// answers each table's key column. It watches no write.
+// readOnlyRE matches, and so tracks each observed read among those, and
+// Resolves what resolvesRE matches; Tracked answers each table's key column.
+// It watches no write.
 func newKeyGate(tables ...keyTable) *recordingGate {
 	g := newRecordingGate(func(string) bool { return false })
 	g.observeMatch = func(sql string) bool {
 		return !isWrite(sql) && slices.ContainsFunc(tables, func(tb keyTable) bool { return strings.Contains(sql, tb.name) })
 	}
 	g.readOnly = readOnlyRE.MatchString
+	g.resolves = resolvesRE.MatchString
 	g.tracked = map[uint32]trackedKey{}
 	for _, tb := range tables {
 		g.tracked[tb.oid] = trackedKey{attr: tb.attr, typ: tb.typ}
@@ -827,5 +834,442 @@ func TestTrackedReadBytesUnchanged(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Key columns learnt at a Describe hold only while nothing the proxy can see
+// may have changed which table the statement's names mean. After a SET of
+// search_path or role (also inside a transaction still open), RESET ALL, a
+// SET LOCAL whose transaction has ended, or a DO block or FunctionCall whose
+// content the proxy cannot see, the statement's Executes take no keys until
+// it is described again. A SET of stet.on_behalf_of or of the time zone
+// leaves them. A Describe answered after the SET ran, and an Execute in the
+// transaction of a SET LOCAL, keep their keys; an Execute pipelined behind
+// the end of that transaction does not.
+func TestKeysForgottenWhenNamesMayResolveOtherwise(t *testing.T) {
+	fn := backendPID(t)
+	tb := idTable(t, 3)
+	g := newKeyGate(tb)
+	g.block = blockClosedPoints
+	addr, _ := startProxy(t, upstream(t), g)
+	fe := rawConn(t, addr)
+	read := "select id from " + tb.name + " where id = 1"
+	run := func() {
+		t.Helper()
+		exchange(t, fe, &pgproto3.Bind{PreparedStatement: "s"}, &pgproto3.Execute{}, &pgproto3.Sync{})
+	}
+
+	exchange(t, fe, &pgproto3.Parse{Name: "s", Query: read}, &pgproto3.Describe{ObjectType: 'S', Name: "s"}, &pgproto3.Sync{})
+	run()
+	wantKeys(t, "described", g.observed(t, 1)[0].o, tb, "1")
+	query := func(sql string) pgproto3.FrontendMessage { return &pgproto3.Query{String: sql} }
+	n := 1
+	for _, c := range []struct {
+		name           string
+		between, after []pgproto3.FrontendMessage
+		keys           bool
+	}{
+		{"set search_path", []pgproto3.FrontendMessage{query("set search_path = public")}, nil, false},
+		{"set role", []pgproto3.FrontendMessage{query("set role stet_scram")}, nil, false},
+		{"reset all", []pgproto3.FrontendMessage{query("reset all")}, nil, false},
+		{"set local search_path, then commit",
+			[]pgproto3.FrontendMessage{query("begin"), query("set local search_path = public"), query("commit")}, nil, false},
+		{"set search_path in a transaction still open",
+			[]pgproto3.FrontendMessage{query("begin"), query("set search_path = public")}, []pgproto3.FrontendMessage{query("commit")}, false},
+		{"a DO block", []pgproto3.FrontendMessage{query("do $$ begin perform 1; end $$")}, nil, false},
+		{"a FunctionCall", []pgproto3.FrontendMessage{&pgproto3.FunctionCall{Function: fn}}, nil, false},
+		{"set stet.on_behalf_of", []pgproto3.FrontendMessage{query("set stet.on_behalf_of = 'task-1'")}, nil, true},
+		{"set timezone", []pgproto3.FrontendMessage{query("set timezone = 'UTC'")}, nil, true},
+	} {
+		for _, m := range c.between {
+			exchange(t, fe, m)
+		}
+		run()
+		exchange(t, fe, &pgproto3.Describe{ObjectType: 'S', Name: "s"}, &pgproto3.Sync{})
+		run()
+		for _, m := range c.after {
+			exchange(t, fe, m)
+		}
+		obs := g.observed(t, n+2)
+		if c.keys {
+			wantKeys(t, "after "+c.name, obs[n].o, tb, "1")
+		} else {
+			wantNoRead(t, "after "+c.name, obs[n].o)
+		}
+		wantKeys(t, "after "+c.name+", described again", obs[n+1].o, tb, "1")
+		n += 2
+	}
+
+	sendAll(t, fe, &pgproto3.Query{String: "set search_path = public"}, &pgproto3.Parse{Query: read}, &pgproto3.Bind{},
+		&pgproto3.Describe{ObjectType: 'P'}, &pgproto3.Execute{}, &pgproto3.Sync{})
+	untilReady(t, fe)
+	untilReady(t, fe)
+	// The SET LOCAL holds in the implicit transaction of its own Sync.
+	sendAll(t, fe, &pgproto3.Parse{Name: "l", Query: "set local search_path = public"}, &pgproto3.Bind{PreparedStatement: "l"},
+		&pgproto3.Execute{}, &pgproto3.Describe{ObjectType: 'S', Name: "s"}, &pgproto3.Bind{PreparedStatement: "s"},
+		&pgproto3.Execute{}, &pgproto3.Sync{}, &pgproto3.Bind{PreparedStatement: "s"}, &pgproto3.Execute{}, &pgproto3.Sync{})
+	untilReady(t, fe)
+	untilReady(t, fe)
+	obs := g.observed(t, n+3)
+	wantKeys(t, "pipelined behind a SET", obs[n].o, tb, "1")
+	wantKeys(t, "in the transaction of a SET LOCAL", obs[n+1].o, tb, "1")
+	wantNoRead(t, "pipelined behind the end of a SET LOCAL's transaction", obs[n+2].o)
+}
+
+// rowsOf sends msgs in one write and returns the values of the rows the
+// answers up to ReadyForQuery hold, failing on an error.
+func rowsOf(t *testing.T, fe *pgproto3.Frontend, msgs ...pgproto3.FrontendMessage) [][]string {
+	t.Helper()
+	sendAll(t, fe, msgs...)
+	var rows [][]string
+	for {
+		msg, err := fe.Receive()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch m := msg.(type) {
+		case *pgproto3.DataRow:
+			var row []string
+			for _, v := range m.Values {
+				row = append(row, string(v))
+			}
+			rows = append(rows, row)
+		case *pgproto3.ErrorResponse:
+			t.Fatalf("SQLSTATE %s: %s", m.Code, m.Message)
+		case *pgproto3.ReadyForQuery:
+			return rows
+		}
+	}
+}
+
+// Tables of the same name in two schemas: a statement prepared and described
+// under one search_path, then run under the other, which the server plans
+// again against the other table with no new Parse or RowDescription. Its rows
+// are not keyed as the first table's; once described again they are keyed as
+// the second's.
+func TestKeysOfAStatementRunUnderAnotherSearchPath(t *testing.T) {
+	stamp := time.Now().UnixNano()
+	admin := connect(t, upstream(t), "stet_scram", nil)
+	schemas := []string{fmt.Sprintf("keys_a_%d", stamp), fmt.Sprintf("keys_b_%d", stamp)}
+	oids := make([]uint32, 2)
+	for i, schema := range schemas {
+		mustExec(t, admin, "create schema "+schema)
+		t.Cleanup(func() { admin.Exec(context.Background(), "drop schema "+schema+" cascade") })
+		mustExec(t, admin, "create table "+schema+".accounts (id int primary key, title text)")
+		mustExec(t, admin, fmt.Sprintf("insert into %s.accounts values (%d, '%s')", schema, i+1, schema))
+		var oid int64
+		if err := admin.QueryRow(testCtx(t), "select ($1 || '.accounts')::regclass::oid::int8", schema).Scan(&oid); err != nil {
+			t.Fatal(err)
+		}
+		oids[i] = uint32(oid)
+	}
+	g := newRecordingGate(func(string) bool { return false })
+	g.observeMatch = func(sql string) bool { return strings.Contains(sql, "accounts") }
+	g.readOnly, g.resolves = readOnlyRE.MatchString, resolvesRE.MatchString
+	g.tracked = map[uint32]trackedKey{oids[0]: {attr: 1, typ: proxy.KeyInt4}, oids[1]: {attr: 1, typ: proxy.KeyInt4}}
+	addr, _ := startProxy(t, upstream(t), g)
+	fe := rawConn(t, addr)
+	run := func() [][]string {
+		t.Helper()
+		return rowsOf(t, fe, &pgproto3.Bind{PreparedStatement: "s"}, &pgproto3.Execute{}, &pgproto3.Sync{})
+	}
+
+	exchange(t, fe, &pgproto3.Query{String: "set search_path = " + schemas[0]})
+	exchange(t, fe, &pgproto3.Parse{Name: "s", Query: "select id, title from accounts"}, &pgproto3.Describe{ObjectType: 'S', Name: "s"}, &pgproto3.Sync{})
+	first := run()
+	exchange(t, fe, &pgproto3.Query{String: "set search_path = " + schemas[1]})
+	second := run()
+	exchange(t, fe, &pgproto3.Describe{ObjectType: 'S', Name: "s"}, &pgproto3.Sync{})
+	third := run()
+	// Again inside one transaction, where no idle ReadyForQuery comes between.
+	exchange(t, fe, &pgproto3.Query{String: "begin"})
+	exchange(t, fe, &pgproto3.Query{String: "set search_path = " + schemas[0]})
+	exchange(t, fe, &pgproto3.Describe{ObjectType: 'S', Name: "s"}, &pgproto3.Sync{})
+	fourth := run()
+	exchange(t, fe, &pgproto3.Query{String: "set search_path = " + schemas[1]})
+	fifth := run()
+	exchange(t, fe, &pgproto3.Query{String: "commit"})
+	for i, c := range []struct {
+		rows [][]string
+		want string
+	}{{first, schemas[0]}, {second, schemas[1]}, {third, schemas[1]}, {fourth, schemas[0]}, {fifth, schemas[1]}} {
+		if len(c.rows) != 1 || c.rows[0][1] != c.want {
+			t.Fatalf("run %d: rows %q, want the row of %s", i+1, c.rows, c.want)
+		}
+	}
+	obs := g.observed(t, 5)
+	wantRead(t, "under the first search_path", obs[0].o, oids[:1], []string{fmt.Sprintf("%d:1", oids[0])})
+	wantNoRead(t, "under the second search_path, not described again", obs[1].o)
+	wantRead(t, "under the second search_path, described again", obs[2].o, oids[1:], []string{fmt.Sprintf("%d:2", oids[1])})
+	wantRead(t, "in a transaction, under the first search_path", obs[3].o, oids[:1], []string{fmt.Sprintf("%d:1", oids[0])})
+	wantNoRead(t, "in a transaction, under the second search_path, not described again", obs[4].o)
+}
+
+// trackAnyway marks every observed read Track while leaving it not
+// ReadOnly, as a gate in error might.
+type trackAnyway struct{ *recordingGate }
+
+func (g trackAnyway) Inspect(sql string) proxy.Statement {
+	st := g.recordingGate.Inspect(sql)
+	st.Track, st.ReadOnly = st.Observe, false
+	return st
+}
+
+// Spec 4: a message that is not read-only gives no keys, even when the gate
+// marks it Track.
+func TestNoKeysFromAMessageThatIsNotReadOnly(t *testing.T) {
+	tb := idTable(t, 3)
+	g := newKeyGate(tb)
+	addr, _ := startProxy(t, upstream(t), trackAnyway{g})
+	conn := connect(t, addr, "stet_scram", nil)
+
+	mustExec(t, conn, "select id from "+tb.name+" where id = 1")
+	o := g.observed(t, 1)[0].o
+	wantNoRead(t, "a read not marked ReadOnly", o)
+}
+
+// A bind value longer than any key the proxy takes could never become one:
+// it is not kept, and the read's Param is nil.
+func TestLongKeyParamIsNotKept(t *testing.T) {
+	tb := newKeyTable(t, "k text primary key, n int", "k", proxy.KeyText, "insert into %[1]s values ('a', 1)")
+	g := newKeyGate(tb)
+	g.keyParam = func(sql string) int {
+		if strings.Contains(sql, "k = $1") {
+			return 1
+		}
+		return 0
+	}
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+	sql := "select n from " + tb.name + " where k = $1"
+	for _, n := range []int{1024, 1025} {
+		if _, err := conn.PgConn().ExecParams(testCtx(t), sql, [][]byte{bytes.Repeat([]byte("x"), n)}, []uint32{25}, nil, nil).Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	obs := g.observed(t, 2)
+	if r := obs[0].o.Read; r == nil || r.Param == nil || len(r.Param.Value) != 1024 {
+		t.Errorf("1024-byte value: Read %+v, want its Param kept", r)
+	}
+	if r := obs[1].o.Read; r == nil || r.Param != nil {
+		t.Errorf("1025-byte value: Read %+v, want a Read with no Param", r)
+	}
+}
+
+// The reads of one unit take MaxUnitKeys keys in all: a read that starts once
+// the unit has them keeps the keys it took before, possibly none. Every row is
+// still counted.
+func TestKeysAUnitHoldsAreBounded(t *testing.T) {
+	const per = 700 // rows each Execute sends
+	tb := idTable(t, per)
+	g := newKeyGate(tb)
+	addr, _ := startProxy(t, upstream(t), g)
+	fe := rawConn(t, addr)
+
+	exchange(t, fe, &pgproto3.Parse{Name: "s", Query: "select id from " + tb.name + " order by id"},
+		&pgproto3.Describe{ObjectType: 'S', Name: "s"}, &pgproto3.Sync{})
+	reads := proxy.MaxUnitKeys/per + 2
+	var msgs []pgproto3.FrontendMessage
+	for range reads {
+		msgs = append(msgs, &pgproto3.Bind{PreparedStatement: "s"}, &pgproto3.Execute{})
+	}
+	sendAll(t, fe, append(msgs, &pgproto3.Sync{})...)
+	if rows, _ := untilReady(t, fe); rows != reads*per {
+		t.Fatalf("client got %d rows, want %d", rows, reads*per)
+	}
+	left := proxy.MaxUnitKeys
+	for i, ob := range g.observed(t, reads) {
+		want := min(per, left)
+		left -= want
+		if o := ob.o; o.Sent != per || o.Read == nil || len(o.Read.Keys) != want || !slices.Equal(o.Read.Tables, []uint32{tb.oid}) {
+			t.Errorf("Execute %d: %d rows sent, Read %v; want %d rows sent and %d keys", i+1, o.Sent, o.Read != nil, per, want)
+		}
+	}
+}
+
+// A Query's rows come in the format its RowDescription gives each column:
+// text, but for a binary cursor's. A key column it marks binary is read as
+// binary.
+func TestQueryKeysInTheFormatsOfItsRowDescription(t *testing.T) {
+	const oid = 4242
+	g := newObservingGate(func(string) bool { return true })
+	g.readOnly = func(string) bool { return true }
+	g.tracked = map[uint32]trackedKey{oid: {attr: 1, typ: proxy.KeyInt4}}
+	desc := &pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{{Name: []byte("id"), TableOID: oid,
+		TableAttributeNumber: 1, DataTypeOID: 23, DataTypeSize: 4, TypeModifier: -1, Format: 1}}}
+	proxy.ServerShows(g, []pgproto3.FrontendMessage{&pgproto3.Query{String: "select id from t"}},
+		[]pgproto3.BackendMessage{desc, &pgproto3.DataRow{Values: [][]byte{{0, 0, 0, 7}}},
+			&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}, &pgproto3.ReadyForQuery{TxStatus: 'I'}})
+	wantRead(t, "binary column", g.observed(t, 1)[0].o, []uint32{oid}, []string{fmt.Sprintf("%d:7", oid)})
+}
+
+// What the proxy cannot see leaves the transaction not read-only: a tracked
+// read after a FunctionCall, or after an Execute of a portal the proxy does
+// not know (here a SQL cursor's), takes no keys; before it, it does.
+func TestNoKeysAfterAMessageThatCannotBeSeen(t *testing.T) {
+	fn := backendPID(t)
+	tb := idTable(t, 3)
+	g := newKeyGate(tb)
+	g.readOnly = func(sql string) bool { // the DECLARE too: only the protocol messages below mark the transaction
+		return readOnlyRE.MatchString(sql) || strings.HasPrefix(sql, "declare")
+	}
+	addr, _ := startProxy(t, upstream(t), g)
+	fe := rawConn(t, addr)
+	read := &pgproto3.Query{String: "select id from " + tb.name + " where id = 1"}
+	query := func(sql string) {
+		t.Helper()
+		exchange(t, fe, &pgproto3.Query{String: sql})
+	}
+
+	query("begin")
+	exchange(t, fe, read)
+	exchange(t, fe, &pgproto3.FunctionCall{Function: fn})
+	exchange(t, fe, read)
+	query("commit")
+	query("begin")
+	query("declare c cursor for select 1")
+	exchange(t, fe, read)
+	exchange(t, fe, &pgproto3.Execute{Portal: "c"}, &pgproto3.Sync{})
+	exchange(t, fe, read)
+	query("commit")
+	obs := g.observed(t, 4)
+	wantKeys(t, "before a FunctionCall", obs[0].o, tb, "1")
+	wantNoRead(t, "after a FunctionCall", obs[1].o)
+	wantKeys(t, "before an Execute of an unknown portal", obs[2].o, tb, "1")
+	wantNoRead(t, "after an Execute of an unknown portal", obs[3].o)
+}
+
+// So does a Query the proxy could not read (past maxInspect).
+func TestNoKeysAfterAnUnreadableQuery(t *testing.T) {
+	t.Cleanup(proxy.SetMaxInspect(512)) // before the proxy, so it is restored once the proxy closed
+	tb := idTable(t, 3)
+	g := newKeyGate(tb)
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+	read := "select id from " + tb.name + " where id = 1"
+
+	mustExec(t, conn, "begin")
+	mustExec(t, conn, read)
+	mustExec(t, conn, "select 1 /* "+strings.Repeat("x", 600)+" */")
+	mustExec(t, conn, read)
+	mustExec(t, conn, "commit")
+	obs := g.observed(t, 2)
+	wantKeys(t, "before an unreadable Query", obs[0].o, tb, "1")
+	wantNoRead(t, "after an unreadable Query", obs[1].o)
+}
+
+// Extended-protocol messages closed by a Query before any Sync run in one
+// implicit transaction with it: the Execute and the Query both give keys.
+func TestKeysFromAnUnsyncedUnit(t *testing.T) {
+	tb := idTable(t, 3)
+	g := newKeyGate(tb)
+	addr, _ := startProxy(t, upstream(t), g)
+	fe := rawConn(t, addr)
+
+	sendAll(t, fe, &pgproto3.Parse{Query: "select id from " + tb.name + " where id <= 2 order by id"}, &pgproto3.Bind{},
+		&pgproto3.Describe{ObjectType: 'P'}, &pgproto3.Execute{}, &pgproto3.Query{String: "select id from " + tb.name + " where id = 3"})
+	if rows, _ := untilReady(t, fe); rows != 3 {
+		t.Fatalf("client got %d rows, want 3", rows)
+	}
+	obs := g.observed(t, 2)
+	wantKeys(t, "the Execute", obs[0].o, tb, "1", "2")
+	wantKeys(t, "the Query", obs[1].o, tb, "3")
+}
+
+// A read cut off by the connection's end is reported with the keys of the
+// rows the proxy saw before it, in order, no more than it counted.
+func TestKeysOfALostRead(t *testing.T) {
+	tb := idTable(t, 1000)
+	g := newKeyGate(tb)
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+
+	// Rows of some 200 bytes, one a millisecond: still sending when the
+	// client hangs up.
+	rows, err := conn.Query(testCtx(t), "select id, repeat('x', 200), pg_sleep(0.001) from "+tb.name+" order by id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatalf("no row arrived: %v", rows.Err())
+	}
+	conn.PgConn().Conn().Close()
+
+	o := g.observed(t, 1)[0].o
+	if !o.Lost || o.Read == nil || len(o.Read.Keys) == 0 || int64(len(o.Read.Keys)) > o.Sent {
+		t.Fatalf("lost read: %+v, want it lost with keys, no more than its %d rows", o, o.Sent)
+	}
+	var want []string
+	for i := range o.Read.Keys {
+		want = append(want, strconv.Itoa(i+1))
+	}
+	wantKeys(t, "lost read", o, tb, want...)
+}
+
+// A read that failed after it sent rows is reported with the keys of those
+// rows, simple and extended; the gate remembers no read that failed.
+func TestKeysOfAFailedRead(t *testing.T) {
+	tb := idTable(t, 5)
+	g := newKeyGate(tb)
+	addr, _ := startProxy(t, upstream(t), g)
+	conn := connect(t, addr, "stet_scram", nil)
+	sql := "select id, 1 / (3 - id) from " + tb.name + " order by id"
+
+	if _, err := conn.PgConn().Exec(testCtx(t), sql).ReadAll(); pgCode(err) != "22012" {
+		t.Fatalf("simple read: %v, want 22012", err)
+	}
+	if _, err := conn.PgConn().ExecParams(testCtx(t), sql, nil, nil, nil, nil).Close(); pgCode(err) != "22012" {
+		t.Fatalf("extended read: %v, want 22012", err)
+	}
+	for i, ob := range g.observed(t, 2) {
+		if o := ob.o; o.Executed || !strings.Contains(o.Error, "22012") || o.Sent != 2 {
+			t.Errorf("read %d: %+v, want 2 rows sent and the 22012 error", i, o)
+		}
+		wantKeys(t, fmt.Sprintf("read %d", i), ob.o, tb, "1", "2")
+	}
+}
+
+// An Execute of a portal whose name may still mean a SET of search_path,
+// though its newest meaning is a plain select, may run the SET: key columns
+// learnt before it do not hold after it. The server's answers are made up
+// here, inside a transaction, so no idle ReadyForQuery comes between.
+func TestKeysForgottenAfterAPortalThatMayRunASet(t *testing.T) {
+	const oid = 4242
+	desc := &pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{{Name: []byte("id"), TableOID: oid,
+		TableAttributeNumber: 1, DataTypeOID: 23, DataTypeSize: 4, TypeModifier: -1}}}
+	g := newObservingGate(func(sql string) bool { return strings.HasPrefix(sql, "select id") })
+	g.readOnly, g.resolves = func(string) bool { return true }, resolvesRE.MatchString
+	g.tracked = map[uint32]trackedKey{oid: {attr: 1, typ: proxy.KeyInt4}}
+	inTx := &pgproto3.ReadyForQuery{TxStatus: 'T'}
+	bind := func(stmt string) []pgproto3.FrontendMessage {
+		return []pgproto3.FrontendMessage{&pgproto3.Bind{PreparedStatement: stmt}, &pgproto3.Sync{}}
+	}
+	run := func(binds ...string) {
+		t.Helper()
+		sent := []pgproto3.FrontendMessage{&pgproto3.Query{String: "begin"},
+			&pgproto3.Parse{Name: "r", Query: "select id from t"}, &pgproto3.Describe{ObjectType: 'S', Name: "r"}, &pgproto3.Sync{},
+			&pgproto3.Parse{Name: "x", Query: "set search_path = public"}, &pgproto3.Parse{Name: "one", Query: "select 1"}, &pgproto3.Sync{}}
+		answers := []pgproto3.BackendMessage{&pgproto3.CommandComplete{CommandTag: []byte("BEGIN")}, inTx,
+			&pgproto3.ParseComplete{}, &pgproto3.ParameterDescription{}, desc, inTx,
+			&pgproto3.ParseComplete{}, &pgproto3.ParseComplete{}, inTx}
+		for _, stmt := range binds {
+			sent = append(sent, bind(stmt)...)
+			answers = append(answers, &pgproto3.BindComplete{}, inTx)
+		}
+		sent = append(sent, &pgproto3.Execute{}, &pgproto3.Sync{},
+			&pgproto3.Bind{PreparedStatement: "r"}, &pgproto3.Execute{}, &pgproto3.Sync{})
+		answers = append(answers, &pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}, inTx,
+			&pgproto3.BindComplete{}, &pgproto3.DataRow{Values: [][]byte{[]byte("1")}},
+			&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}, inTx)
+		proxy.ServerShows(g, sent, answers)
+	}
+
+	run("one")      // the unnamed portal means the select alone
+	run("x", "one") // it may still mean the SET, bound in a unit not answered yet
+	obs := g.observed(t, 2)
+	wantRead(t, "after a portal that means a select", obs[0].o, []uint32{oid}, []string{fmt.Sprintf("%d:1", oid)})
+	if obs[1].o.Read != nil {
+		t.Errorf("after a portal that may run a SET: Read %+v, want none", *obs[1].o.Read)
 	}
 }

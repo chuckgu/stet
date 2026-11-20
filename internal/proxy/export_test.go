@@ -6,6 +6,9 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
+// MaxUnitKeys is how many keys the reads of one unit take in all.
+const MaxUnitKeys = maxUnitKeys
+
 // ServerShows drives a session watched through g as the pumps do, with no
 // connection: after the server's first ReadyForQuery the client sends sent,
 // then the server answers with answers. It reports, for each answer, whether

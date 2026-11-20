@@ -177,6 +177,7 @@ func (g *Gate) Inspect(sql string) proxy.Statement {
 	st.Several = r.Statements > 1
 	st.CopyIn = r.CopyIn
 	st.Sets = r.Sets
+	st.Resolves = r.Resolves
 	st.Executes, st.Portals = r.Executes, r.Portals
 	st.Data = r
 	return st

@@ -28,6 +28,10 @@ const MaxReadKeys = 1000
 // maxKeyLen is the longest key value taken, in bytes (spec correction S2).
 const maxKeyLen = 1024
 
+// maxUnitKeys is how many keys the reads of one unit take in all, so a batch
+// of reads under one Sync holds no more than this many until it is answered.
+const maxUnitKeys = 16 * MaxReadKeys
+
 // RowKey names one row of a tracked table.
 type RowKey struct {
 	Table uint32 // the table's OID
@@ -109,10 +113,11 @@ func asciiBytes(v []byte) bool {
 
 // tracks reports whether st, arriving as a Query or an Execute, is a read
 // whose rows the gate wants the keys of: observed, not watched, marked Track,
-// and with no cursor statement (a FETCH is reported with its DECLARE's
-// statement, and gives no keys).
+// read-only (otherwise its rows may show its own changes, which Stet's
+// connection cannot see), and with no cursor statement (a FETCH is reported
+// with its DECLARE's statement, and gives no keys).
 func tracks(st Statement) bool {
-	return st.Observe && st.Track && !st.Watch && len(st.Cursors) == 0
+	return st.Observe && st.Track && st.ReadOnly && !st.Watch && len(st.Cursors) == 0
 }
 
 // resultCols is what the server said of the result columns of one parsed
@@ -122,24 +127,37 @@ func tracks(st Statement) bool {
 // Execute of the statement finds it with no Describe of its own; a Parse of
 // the name again allocates a new one. Only the server side fills and reads
 // it; the client side passes the pointer along.
+//
+// The server plans a statement again, with no new RowDescription, when what
+// its names mean changes (a SET of search_path, say), and may then read
+// another table with the same columns. So the cell serves an Execute only
+// when nothing that may change what the names mean came between the Describe
+// and the Execute: gen is session.resolution when the Describe arrived, which
+// must be the Execute's, and reverts is session.reverts when the answer was
+// read, which must be the same when the Execute's rows are.
 type resultCols struct {
-	known  bool     // a RowDescription for the statement was read
-	fields int      // columns in each row
-	keys   []keyCol // the columns that hold a tracked table's key, in column order
-	tables []uint32 // the tracked tables with a column in the result, in column order, each once
+	known   bool     // a RowDescription for the statement was read
+	fields  int      // columns in each row
+	keys    []keyCol // the columns that hold a tracked table's key, in column order
+	tables  []uint32 // the tracked tables with a column in the result, in column order, each once
+	gen     uint64
+	reverts uint64
 }
 
 // keyCol is a result column that holds the key of a tracked table.
 type keyCol struct {
-	at    int // the column's index in a row
-	table uint32
-	typ   KeyType
+	at     int // the column's index in a row
+	table  uint32
+	typ    KeyType
+	format int16 // the format the RowDescription gives it: a Query's rows come in it
 }
 
-// cellAt is a Describe at pos of its unit whose answer fills cols.
+// cellAt is a Describe at pos of its unit whose answer fills cols; gen is
+// session.resolution when it arrived.
 type cellAt struct {
 	pos  int
 	cols *resultCols
+	gen  uint64
 }
 
 // takeState is what the server side does with the rows of the answer in
@@ -180,11 +198,12 @@ type keyFormat struct {
 }
 
 // rowDesc is what the body of the RowDescription being read is for, from
-// its header (see describing): a Describe's answer fills cell; or a Query's
-// result set starts, whose rows answer read of unit, which may take room
-// more keys. Server side only.
+// its header (see describing): a Describe's answer fills cell, with gen; or
+// a Query's result set starts, whose rows answer read of unit, which may
+// take room more keys. Server side only.
 type rowDesc struct {
 	cell *resultCols
+	gen  uint64
 	unit *unit
 	read int
 	room int
@@ -196,14 +215,15 @@ func (d rowDesc) wanted() bool { return d.cell != nil || d.unit != nil }
 // track gives b, the portal Bind m makes of p, what its Executes need to
 // take keys from their rows: p's cell, the result format codes m sets, and
 // the one value m binds to Statement.KeyParam, the only bind value an
-// observed read keeps (spec 4). The caller makes sure the statement's name
-// had no other meaning at the Bind and that both names are ASCII.
+// observed read keeps (spec 4), unless it is longer than any key taken. The
+// caller makes sure the statement's name had no other meaning at the Bind
+// and that both names are ASCII.
 func (b *bound) track(m *pgproto3.Bind, p prepared) {
 	if p.cols == nil {
 		return
 	}
 	b.cols, b.formats = p.cols, slices.Clone(m.ResultFormatCodes)
-	if n := p.st.KeyParam; n > 0 && n <= len(m.Parameters) {
+	if n := p.st.KeyParam; n > 0 && n <= len(m.Parameters) && len(m.Parameters[n-1]) <= maxKeyLen {
 		v := param(m, p.oids, n-1)
 		b.key = &v
 	}
@@ -214,7 +234,8 @@ func (b *bound) track(m *pgproto3.Bind, p prepared) {
 // of a tracked read's statement, when it does: the name means one statement,
 // whatever the server holds (names.get gives no other meaning), and that
 // statement has a cell. A name that is not ASCII is left out: the server may
-// know it by other bytes (see foreign). It runs with s.mu held.
+// know it by other bytes (see foreign). The answer is noted with the
+// resolution now (see resultCols). It runs with s.mu held.
 func (s *session) describe(u *unit, pos int, kind byte, name string) {
 	if !ascii(name) {
 		return
@@ -231,7 +252,7 @@ func (s *session) describe(u *unit, pos int, kind byte, name string) {
 		}
 	}
 	if cols != nil {
-		u.describes = append(u.describes, cellAt{pos: pos, cols: cols})
+		u.describes = append(u.describes, cellAt{pos: pos, cols: cols, gen: s.resolution})
 	}
 }
 
@@ -265,12 +286,15 @@ func (s *session) decide() {
 
 // decideRows decides the take for the answer to head now in progress: the
 // Execute after its last completion. When that Execute is a tracked read
-// whose statement's columns a Describe the server answered made known, the
-// read gets its Read (its Tables, and the KeyParam value its portal kept),
-// and its rows are read for keys when it has a key column. Otherwise the rows
-// give nothing, and an Execute's read keeps no Read. A Query's rows were
-// decided at its RowDescription. It runs on the server side with s.mu held,
-// at an answer's first row or, for one that sent none, at its completion.
+// whose statement's columns a Describe the server answered made known, and
+// nothing that may have changed what its names mean came between that
+// Describe and the Execute (see resultCols), the read gets its Read (its
+// Tables, and the KeyParam value its portal kept), and its rows are read for
+// keys when it has a key column and the unit may take more (maxUnitKeys).
+// Otherwise the rows give nothing, and an Execute's read keeps no Read. A
+// Query's rows were decided at its RowDescription. It runs on the server
+// side with s.mu held, at an answer's first row or, for one that sent none,
+// at its completion.
 func (s *session) decideRows(head *unit) {
 	tk := &s.take
 	tk.state = takeNone
@@ -282,35 +306,43 @@ func (s *session) decideRows(head *unit) {
 		return
 	}
 	r := &head.reads[i]
-	if !r.cols.known {
+	if c := r.cols; !c.known || c.gen != r.gen || c.reverts != s.reverts {
 		return
 	}
 	r.keys = &ReadKeys{Tables: slices.Clone(r.cols.tables), Param: r.param}
 	tk.unit, tk.read = head, i
-	tk.start(*r.cols, r.formats, MaxReadKeys)
+	tk.start(*r.cols, min(MaxReadKeys, maxUnitKeys-head.keys), bindFormat(r.formats, r.cols.fields))
 }
 
-// start makes tk read the rows for the key columns of c, sent in the result
-// formats codes (a Bind's: none for all text, one for all columns, or one
-// per column), taking at most room keys. A key column whose format codes
-// does not give leaves no key.
-func (tk *keyTake) start(c resultCols, codes []int16, room int) {
+// bindFormat gives the format of a key column's values from the result
+// format codes of a Bind: none for all text, one for all columns, or one per
+// column. ok is false when codes give none for it.
+func bindFormat(codes []int16, fields int) func(k keyCol) (format int16, ok bool) {
+	return func(k keyCol) (int16, bool) {
+		switch {
+		case len(codes) == 0:
+			return 0, true
+		case len(codes) == 1:
+			return codes[0], true
+		case len(codes) == fields:
+			return codes[k.at], true
+		}
+		return 0, false
+	}
+}
+
+// start makes tk read the rows for the key columns of c, taking at most room
+// keys; format gives the format of a key column's values, and a column whose
+// format it does not give leaves no key.
+func (tk *keyTake) start(c resultCols, room int, format func(k keyCol) (int16, bool)) {
 	if room <= 0 {
 		return
 	}
 	var cols []keyFormat
 	for _, k := range c.keys {
-		var format int16
-		switch {
-		case len(codes) == 0:
-		case len(codes) == 1:
-			format = codes[0]
-		case len(codes) == c.fields:
-			format = codes[k.at]
-		default:
-			continue
+		if f, ok := format(k); ok {
+			cols = append(cols, keyFormat{keyCol: k, format: f})
 		}
-		cols = append(cols, keyFormat{keyCol: k, format: format})
 	}
 	if len(cols) > 0 {
 		tk.state, tk.fields, tk.cols, tk.room = takeTaking, c.fields, cols, room
@@ -320,39 +352,46 @@ func (tk *keyTake) start(c resultCols, codes []int16, room int) {
 // describing notes, as the header of a RowDescription answering head is
 // read, what its body is for (rowDesc). In an extended-protocol unit it
 // answers the Describe at pos acks+1, whose cell it fills if describe noted
-// one. In a Query unit it starts a result set of the Query itself, whose
-// rows answer the Query's read if it may take keys, and no read otherwise.
-// It runs on the server side with s.mu held, before the RowDescription is
-// counted.
+// one; the notes of the Describes it has passed are dropped, so each is
+// looked at once. In a Query unit it starts a result set of the Query
+// itself, whose rows answer the Query's read if it may take keys, and no read
+// otherwise. It runs on the server side with s.mu held, before the
+// RowDescription is counted.
 func (s *session) describing(head *unit) {
 	if !head.query {
-		for _, c := range head.describes {
-			if c.pos == head.acks+1 {
-				s.desc.cell = c.cols
-			}
+		for len(head.describes) > 0 && head.describes[0].pos <= head.acks {
+			head.describes = head.describes[1:]
+		}
+		if len(head.describes) > 0 && head.describes[0].pos == head.acks+1 {
+			c := head.describes[0]
+			s.desc = rowDesc{cell: c.cols, gen: c.gen}
 		}
 		return
 	}
 	s.take.state = takeNone
 	if i := head.trackedRead(0); i >= 0 {
-		s.desc = rowDesc{unit: head, read: i, room: MaxReadKeys - len(head.reads[i].keys.Keys)}
+		room := min(MaxReadKeys-len(head.reads[i].keys.Keys), maxUnitKeys-head.keys)
+		s.desc = rowDesc{unit: head, read: i, room: room}
 	}
 }
 
 // rowDescription follows the body of a RowDescription the server side asked
-// for (rowDesc): it fills a Describe's cell, or decides the take for a
-// Query's result set. It runs on the server side without s.mu.
+// for (rowDesc): it fills a Describe's cell, noting the resolution the
+// Describe arrived under and the reverts so far, or decides the take for a
+// Query's result set, whose rows come in the formats it gives. It runs on the
+// server side without s.mu.
 func (s *session) rowDescription(body []byte) {
 	d := s.desc
 	s.desc = rowDesc{}
 	c := s.columns(body)
 	switch {
 	case d.cell != nil:
+		c.gen, c.reverts = d.gen, s.reverts
 		*d.cell = c
 	case d.unit != nil:
 		tk := &s.take
 		tk.unit, tk.read, tk.tables = d.unit, d.read, c.tables
-		tk.start(c, nil, d.room) // a Query's rows are all text
+		tk.start(c, d.room, func(k keyCol) (int16, bool) { return k.format, true })
 	}
 }
 
@@ -390,6 +429,7 @@ func (s *session) columns(body []byte) resultCols {
 		}
 		table := binary.BigEndian.Uint32(body[off:])
 		attr := binary.BigEndian.Uint16(body[off+4:])
+		format := int16(binary.BigEndian.Uint16(body[off+16:]))
 		off += 18 // table OID, attribute number, type OID, size, modifier, format
 		if table == 0 {
 			continue
@@ -406,7 +446,7 @@ func (s *session) columns(body []byte) resultCols {
 				c.tables = append(c.tables, table)
 			}
 			if attr == a.attr {
-				c.keys = append(c.keys, keyCol{at: i, table: table, typ: a.typ})
+				c.keys = append(c.keys, keyCol{at: i, table: table, typ: a.typ, format: format})
 			}
 		}
 	}
@@ -463,14 +503,15 @@ func (s *session) dataRow(body []byte) {
 }
 
 // settleKeys hands what the server side took from the answer that just ended
-// to the read it answers, in head, and starts the next answer undecided. It
-// runs with s.mu held, from settle.
+// to the read it answers, in head, counts it toward head's keys, and starts
+// the next answer undecided. It runs with s.mu held, from settle.
 func (s *session) settleKeys(head *unit) {
 	tk := s.take
 	s.take = keyTake{}
 	if tk.unit == nil || tk.unit != head {
 		return
 	}
+	head.keys += len(tk.keys)
 	r := head.reads[tk.read].keys
 	r.Keys = append(r.Keys, tk.keys...)
 	for _, t := range tk.tables {

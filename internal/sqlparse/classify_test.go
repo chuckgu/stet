@@ -1007,3 +1007,52 @@ func TestReadKey(t *testing.T) {
 		}
 	}
 }
+
+// Resolves marks what may change which table an unqualified name means, so a
+// statement the server planned before it may read another table after it:
+// search_path (SET SCHEMA too), the role and the session authorization, in
+// every SET and RESET form, RESET ALL, and DISCARD ALL, which runs RESET ALL
+// and SET SESSION AUTHORIZATION DEFAULT. Other settings do not.
+func TestResolves(t *testing.T) {
+	cases := []struct {
+		sql  string
+		want bool
+	}{
+		{"set search_path = crm", true},
+		{"set search_path = a, b", true},
+		{"set session search_path = a", true},
+		{"set local search_path = a", true},
+		{"set search_path to default", true},
+		{`set "SEARCH_PATH" = a`, true},
+		{"reset search_path", true},
+		{"set schema 'crm'", true},
+		{"set role agent", true},
+		{"set local role agent", true},
+		{"set role none", true},
+		{"reset role", true},
+		{"set session authorization agent", true},
+		{"set session authorization default", true},
+		{"reset session authorization", true},
+		{"reset all", true},
+		{"discard all", true},
+		{"select 1; set search_path = crm", true},
+		{"set stet.on_behalf_of = 'task-1'", false},
+		{"reset stet.on_behalf_of", false},
+		{"set timezone = 'UTC'", false},
+		{"set transaction isolation level serializable", false},
+		{"discard plans", false},
+		{"select id, title from contacts where id = 7", false},
+		{"show search_path", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		r, err := Classify(c.sql, readTables2)
+		if err != nil {
+			t.Errorf("%q: %v", c.sql, err)
+			continue
+		}
+		if r.Resolves != c.want {
+			t.Errorf("%q: Resolves = %v, want %v", c.sql, r.Resolves, c.want)
+		}
+	}
+}
