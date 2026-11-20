@@ -314,3 +314,23 @@ func TestReadHardNegatives(t *testing.T) {
 		t.Error("a false hold above 20% on hard negatives is noted even when it beats A2")
 	}
 }
+
+func TestModelVerdictsKeepRecordedStaleRead(t *testing.T) {
+	cfg := &config.Config{Model: config.Model{OnFailure: "pass"},
+		Tables: map[string]config.Table{"contacts": {Thresholds: config.DefaultThresholds()}}}
+	recs := []Record{
+		{ID: "stale", Table: "contacts", Verdict: decide.Reject, Reasons: []string{"stale_read"}},
+		{ID: "other", Table: "contacts", Verdict: decide.Reject, Reasons: []string{"odd"}},
+	}
+	got := ModelVerdicts(cfg, recs, nil)
+	want := map[string]Judged{
+		"stale": {decide.Reject, []string{"stale_read"}},
+		"other": {decide.Commit, nil},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+	if v, reasons := A0.Judge(recs[0]); v != decide.Reject || !reflect.DeepEqual(reasons, []string{"stale_read"}) {
+		t.Errorf("rule arm judged a recorded stale_read as %q %v", v, reasons)
+	}
+}

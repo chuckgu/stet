@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strconv"
 
 	"github.com/jackc/pgx/v5"
@@ -35,6 +36,7 @@ type Record struct {
 	RawState  json.RawMessage
 	Questions []decide.Question
 	Verdict   string // as recorded; unsupported writes stay unsupported in every arm
+	Reasons   []string
 	Executed  bool
 }
 
@@ -42,7 +44,7 @@ type Record struct {
 func Load(ctx context.Context, conn *pgx.Conn) ([]Record, error) {
 	rows, err := conn.Query(ctx, `
 		select id::text, agent_id, op, target_table, coalesce(target_pk #>> '{}', ''), statement,
-		       proposed, state::text, questions, verdict, executed
+		       proposed, state::text, questions, verdict, reasons, executed
 		from stet.decisions order by created_at, id`)
 	if err != nil {
 		return nil, err
@@ -51,7 +53,7 @@ func Load(ctx context.Context, conn *pgx.Conn) ([]Record, error) {
 		var r Record
 		var state *string
 		if err := row.Scan(&r.ID, &r.Agent, &r.Op, &r.Table, &r.PK, &r.Statement,
-			&r.Proposed, &state, &r.Questions, &r.Verdict, &r.Executed); err != nil {
+			&r.Proposed, &state, &r.Questions, &r.Verdict, &r.Reasons, &r.Executed); err != nil {
 			return r, err
 		}
 		if state == nil {
@@ -84,4 +86,11 @@ func text(v any) string {
 		return strconv.FormatBool(x)
 	}
 	return fmt.Sprint(v)
+}
+
+// StaleRead reports whether the gate rejected the write by the stale_read
+// rule. That rule asks nothing, so the write has no questions, and every arm
+// keeps the recorded verdict (spec-v0.2-stale 10, rule 4).
+func (r Record) StaleRead() bool {
+	return r.Verdict == decide.Reject && slices.Contains(r.Reasons, "stale_read")
 }

@@ -41,6 +41,9 @@ func (a RuleArm) Judge(r Record) (string, []string) {
 	if r.Verdict == decide.Unsupported {
 		return decide.Unsupported, nil
 	}
+	if r.StaleRead() {
+		return decide.Reject, []string{"stale_read"}
+	}
 	s := r.State
 	var reasons []string
 	if r.Op == "insert" {

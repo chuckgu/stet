@@ -197,6 +197,31 @@ type Input struct {
 
 	InTransaction bool // the write arrived in a transaction that had already run something else
 	NoLoginRole   bool // the session's login role is not known
+
+	// ReadCheck is what comparing the write's row with the version its login
+	// role read found (spec-v0.2-stale 6). nil: the table does not remember
+	// reads.
+	ReadCheck *ReadCheck
+}
+
+// The results of a write's read check (spec-v0.2-stale 6).
+const (
+	ReadFresh      = "fresh"
+	ReadStale      = "stale"
+	ReadNone       = "no_read"
+	ReadPending    = "read_pending"
+	ReadOwnWrite   = "own_write"
+	ReadNotChecked = "not_checked"
+)
+
+// ReadCheck is what comparing a write's row with the version its login role
+// read found. It is stored as stet.decisions.read_check.
+type ReadCheck struct {
+	Result         string  `json:"result"`
+	ReadVersion    string  `json:"read_version,omitempty"` // the xmin remembered; fresh and stale only
+	Version        *string `json:"version"`                // the row's xmin now; null when it is not there or was not read
+	ReadAgeMS      *int64  `json:"read_age_ms,omitempty"`  // fresh and stale only
+	ReadOnBehalfOf *string `json:"read_on_behalf_of"`      // of the read compared; null when it set none
 }
 
 // Verdict applies spec 6, with the cumulative limit of spec-v0.2-accounting
@@ -207,21 +232,24 @@ type Input struct {
 //  2. A write in a transaction that had already run something else
 //     (InTransaction): unsupported, in_transaction.
 //  3. A session whose login role is not known: unsupported, no_login_role.
-//  4. A measured write (Impact set) goes by its measurement: measuring
+//  4. A row changed after its login role read it (ReadCheck stale): reject,
+//     stale_read. The answers are not looked at.
+//  5. A measured write (Impact set) goes by its measurement: measuring
 //     failed is unsupported; too many rows, then too large a share, hold;
 //     then over the cumulative limit, then a cumulative usage that could
 //     not be read, hold; an estimate escalates; else commit.
-//  5. A single-row write over the cumulative limit, hold impact:cumulative;
+//  6. A single-row write over the cumulative limit, hold impact:cumulative;
 //     or whose usage could not be read, hold impact:cumulative_unknown. In
 //     shadow mode its questions were still asked; the answers are
 //     recorded, not used.
-//  6. State failure: on_failure decides.
-//  7. Model failure: on_failure decides.
-//  8. An answer the model is unsure of: escalate.
-//  9. A duplicate, a conflict, or a broken rule: hold.
-//  10. Otherwise commit.
+//  7. State failure: on_failure decides.
+//  8. Model failure: on_failure decides.
+//  9. An answer the model is unsure of: escalate.
 //
-// Rules 1 to 6 need no model answer; they are Deterministic's (CLAUDE.md
+// 10. A duplicate, a conflict, or a broken rule: hold.
+// 11. Otherwise commit.
+//
+// Rules 1 to 7 need no model answer; they are Deterministic's (CLAUDE.md
 // rule 5), and the model's answers are not looked at when one of them
 // decides.
 func Verdict(in Input) (string, []string) {
@@ -236,7 +264,7 @@ func Verdict(in Input) (string, []string) {
 		return onFailure(in, reason)
 	}
 
-	// Rule 8: an answer the model is unsure of. For choice answers that is
+	// Rule 9: an answer the model is unsure of. For choice answers that is
 	// low confidence; for a rule (noul) it is a break probability between
 	// policy_escalate and policy.
 	var low []string
@@ -295,7 +323,7 @@ func Deterministic(in Input) (verdict string, reasons []string, ok bool) {
 	return verdict, reasons, true
 }
 
-// deterministic is the front of Verdict: rules 1 to 6, in their order.
+// deterministic is the front of Verdict: rules 1 to 7, in their order.
 func deterministic(in Input) (string, []string, bool) {
 	switch {
 	case in.Unsupported != "":
@@ -304,6 +332,8 @@ func deterministic(in Input) (string, []string, bool) {
 		return Unsupported, []string{"in_transaction"}, true
 	case in.NoLoginRole:
 		return Unsupported, []string{"no_login_role"}, true
+	case in.ReadCheck != nil && in.ReadCheck.Result == ReadStale:
+		return Reject, []string{"stale_read"}, true
 	case in.Impact != nil:
 		v, reasons := impactVerdict(in)
 		return v, reasons, true

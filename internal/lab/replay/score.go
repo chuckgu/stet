@@ -38,6 +38,8 @@ func ModelVerdicts(cfg *config.Config, recs []Record, stored map[string]Judgment
 		switch {
 		case r.Verdict == decide.Unsupported:
 			out[r.ID] = Judged{Verdict: decide.Unsupported}
+		case r.StaleRead():
+			out[r.ID] = Judged{Verdict: decide.Reject, Reasons: []string{"stale_read"}}
 		case len(r.Questions) == 0:
 			out[r.ID] = Judged{Verdict: decide.Commit}
 		default:

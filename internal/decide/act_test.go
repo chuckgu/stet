@@ -468,3 +468,46 @@ func TestBlocked(t *testing.T) {
 		})
 	}
 }
+
+func TestActReject(t *testing.T) {
+	const prefix = "write refused by stet: "
+	const hint = "read the row again, then send the write again if it still applies"
+	cases := []struct {
+		name    string
+		reasons []string
+		facts   Facts
+		message string
+		hint    string
+	}{
+		{"changed", []string{"stale_read"}, Facts{}, prefix + "the row was changed after it was read", hint},
+		{"deleted", []string{"stale_read"}, Facts{RowGone: true}, prefix + "the row was deleted after it was read", hint},
+		{"first reason", []string{"stale_read", "rejudged"}, Facts{}, prefix + "the row was changed after it was read", hint},
+		{"unknown", []string{"odd"}, Facts{}, prefix + "it was rejected (odd)", ""},
+		{"none", nil, Facts{}, prefix + "it was rejected", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := Act(Reject, tc.reasons, tc.facts)
+			if a.Forward || a.Held || a.Code != "ST003" {
+				t.Errorf("Forward=%v Held=%v Code=%q; want a refusal with ST003", a.Forward, a.Held, a.Code)
+			}
+			if a.Message != tc.message {
+				t.Errorf("message\n got %q\nwant %q", a.Message, tc.message)
+			}
+			if got := a.Hint(""); got != tc.hint {
+				t.Errorf("Hint\n got %q\nwant %q", got, tc.hint)
+			}
+		})
+	}
+}
+
+func TestRejectIsNeverForwarded(t *testing.T) {
+	for _, f := range []Facts{{}, {Unsupported: "pass"}, {Unsupported: "pass", RowGone: true, Table: "t", Op: "update"},
+		{Unsupported: "pass", InTransaction: true}, {Unsupported: "pass", NoLoginRole: true}} {
+		for _, reasons := range [][]string{{"stale_read"}, {"odd"}, nil} {
+			if a := Act(Reject, reasons, f); a.Forward {
+				t.Errorf("Act(Reject, %v, %+v) forwards", reasons, f)
+			}
+		}
+	}
+}

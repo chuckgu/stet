@@ -12,11 +12,11 @@ import (
 	"github.com/stetdb/stet/internal/config"
 )
 
-// SQLSTATEs of the errors enforce mode returns (spec-v0.2-enforce 6). ST003,
-// a rejection by policy, keeps its place from spec-v0.1 but is not returned.
+// SQLSTATEs of the errors enforce mode returns (spec-v0.2-enforce 6).
 const (
 	CodeHeld        = "ST001" // hold, escalate: the write waits for a human
 	CodeUnsupported = "ST002" // unsupported, and the closed points of spec 7
+	CodeRejected    = "ST003" // reject: refused by a deterministic rule; reading again may let it through
 )
 
 // Facts are what an error message may mention. Nothing else of a write's
@@ -34,12 +34,13 @@ type Facts struct {
 	Cumulative    *Cumulative
 	InTransaction bool // the write arrived in a transaction that had already run something else
 	NoLoginRole   bool // the session's login role is not known
+	RowGone       bool // with stale_read: the row is not there now
 }
 
 // Action is what enforce mode does with a write once its verdict is known (spec 5).
 type Action struct {
 	Forward bool   // send the statement; the other fields are empty
-	Code    string // CodeHeld or CodeUnsupported
+	Code    string // CodeHeld, CodeUnsupported or CodeRejected
 	Held    bool   // keep the write in stet.held_writes (verdict hold or escalate)
 	Message string // the error's first line
 	hint    string // the HINT line, with heldMark where the held write is named
@@ -80,9 +81,12 @@ func Act(verdict string, reasons []string, f Facts) Action {
 			return Action{Forward: true}
 		}
 		a = Action{Code: CodeUnsupported, Message: "write refused by stet: "}
+	case Reject:
+		// Never forwarded and never held, whatever the table's unsupported
+		// setting: a deterministic rule refused it.
+		a = Action{Code: CodeRejected, Message: "write refused by stet: "}
 	default:
-		// No rule returns another verdict (reject is reserved). A verdict
-		// this table does not know is refused, never let through.
+		// A verdict this table does not know is refused, never let through.
 		a = Action{Code: CodeUnsupported, Message: "write refused by stet: "}
 	}
 	p, ok := explain(reasons, f)
@@ -90,6 +94,8 @@ func Act(verdict string, reasons []string, f Facts) Action {
 	case ok:
 	case a.Held:
 		p = needsReview(reasons)
+	case a.Code == CodeRejected:
+		p = phrase{msg: withReason("it was rejected", reasons)}
 	default:
 		p = generic(reasons)
 	}
@@ -237,6 +243,13 @@ func explain(reasons []string, f Facts) (phrase, bool) {
 		return phrase{}, false
 	}
 	first := reasons[0]
+	if first == "stale_read" {
+		msg := "the row was changed after it was read"
+		if f.RowGone {
+			msg = "the row was deleted after it was read"
+		}
+		return phrase{msg, "read the row again, then send the write again if it still applies"}, true
+	}
 	if p, ok := fixed[first]; ok {
 		return p, true
 	}

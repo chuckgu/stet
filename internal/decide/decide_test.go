@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -444,5 +445,58 @@ func TestCumulativeJSON(t *testing.T) {
 	b, _ = json.Marshal(Cumulative{Error: "x"})
 	if string(b) != `{"error":"x"}` {
 		t.Errorf("got %s", b)
+	}
+}
+
+func TestStaleReadRule(t *testing.T) {
+	in := Input{Op: "update", ReadCheck: &ReadCheck{Result: ReadStale}}
+	v, reasons, ok := Deterministic(in)
+	if v != Reject || !slices.Equal(reasons, []string{"stale_read"}) || !ok {
+		t.Errorf("Deterministic = %q, %v, %v; want reject, [stale_read], true", v, reasons, ok)
+	}
+	if v, reasons := Verdict(in); v != Reject || !slices.Equal(reasons, []string{"stale_read"}) {
+		t.Errorf("Verdict = %q, %v; want reject, [stale_read]", v, reasons)
+	}
+	for _, res := range []string{ReadFresh, ReadNone, ReadPending, ReadOwnWrite, ReadNotChecked} {
+		in := Input{Op: "update", ReadCheck: &ReadCheck{Result: res}}
+		if v, _, ok := Deterministic(in); v == Reject || !ok {
+			t.Errorf("%s: Deterministic = %q, %v; it is a write with no questions and must commit", res, v, ok)
+		}
+		if _, reasons, _ := Deterministic(in); slices.Contains(reasons, "stale_read") {
+			t.Errorf("%s decided stale_read", res)
+		}
+	}
+	if v, _ := Verdict(Input{Op: "update"}); v != Commit {
+		t.Errorf("nil ReadCheck: Verdict = %q, want commit", v)
+	}
+}
+
+func TestStaleReadOrder(t *testing.T) {
+	n := func(v int64) *int64 { return &v }
+	stale := &ReadCheck{Result: ReadStale}
+	qs := []Question{{ID: "duplicate", Type: "choice", Choices: []string{"4812", "none"}}}
+	cases := []struct {
+		name    string
+		in      Input
+		verdict string
+		reasons []string
+	}{
+		{"shape", Input{Unsupported: "multi_row"}, Unsupported, []string{"multi_row"}},
+		{"transaction", Input{InTransaction: true}, Unsupported, []string{"in_transaction"}},
+		{"login role", Input{NoLoginRole: true}, Unsupported, []string{"no_login_role"}},
+		{"cumulative over", Input{Cumulative: &Cumulative{Used: n(500), Planned: n(1), Limit: 500, WindowS: 600}}, Reject, []string{"stale_read"}},
+		{"cumulative unknown", Input{Cumulative: &Cumulative{Error: "x"}}, Reject, []string{"stale_read"}},
+		{"state error", Input{StateErr: errors.New("x"), OnFailure: "pass"}, Reject, []string{"stale_read"}},
+		{"answers", Input{Questions: qs, Answers: map[string]Answer{"duplicate": choice("4812", 0.95)}}, Reject, []string{"stale_read"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := tc.in
+			in.ReadCheck = stale
+			v, reasons, ok := Deterministic(in)
+			if !ok || v != tc.verdict || !slices.Equal(reasons, tc.reasons) {
+				t.Errorf("Deterministic = %q, %v, %v; want %q, %v", v, reasons, ok, tc.verdict, tc.reasons)
+			}
+		})
 	}
 }
