@@ -775,6 +775,9 @@ func TestStaleBeforeCumulative(t *testing.T) {
 	agent := e.agent(t, "a")
 	e.read(t, agent, e.table, 1)
 	mustExec(t, agent, "update "+e.table+" set title = 'x' where id = 2") // uses the limit
+	// Until that write's refresh has ended its mark: one that ends while the
+	// next write's state is read makes its comparison read_pending.
+	e.idle(t)
 	mustExec(t, e.admin, "update "+e.table+" set name = 'Admin' where id = 1")
 	_, err := agent.Exec(context.Background(), "update "+e.table+" set title = 'x' where id = 1")
 	wantRefused(t, err, "ST003", "the row was changed after it was read")
@@ -1196,6 +1199,9 @@ func TestUnansweredKeepsMarks(t *testing.T) {
 		waitUntil(t, "it committed", func() bool { return e.rowsWhere(t, "id = 1 and title = '"+title+"'") == 1 })
 		mustExec(t, a, "update "+e.table+" set title = 'own' where id = 1")
 		wantRead(t, 0, e.checkOf(t, e.table, "'own'"), "own_write")
+		// Until that write's own mark has ended with its refresh: while it
+		// is on, the next write is an own write whatever the lost marks do.
+		e.idle(t)
 		gate.ExpireLostMarks(e.gate)
 		mustExec(t, a, "update "+e.table+" set title = 'later' where id = 1")
 		wantRead(t, 1, e.checkOf(t, e.table, "'later'"), "no_read")
