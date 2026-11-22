@@ -53,15 +53,24 @@ func openClientSide(cfg *config.Config, log *slog.Logger) (*clientSide, *config.
 	if len(cs.accounts) == 0 {
 		return nil, nil, errors.New("the credentials file has no account; add one with stet agent add")
 	}
+	own, database, err := upstreamAccount(cfg.Upstream)
+	if err != nil {
+		return nil, nil, err
+	}
+	// A token of Stet's own account would open a session no gate sees, as
+	// the owner of the stet schema and a member of every agent role. Config
+	// sees that account only in agents.roles, and only when the URL names
+	// it; here it is the user Stet connects as, wherever that comes from.
+	if slices.Contains(cs.accounts, own) {
+		return nil, nil, fmt.Errorf("agents.credentials: %q is Stet's own account (the upstream user)", own)
+	}
+	cs.database = database
 	if len(cfg.AgentRoles) > 0 {
 		onlyRoles, onlyFile := differences(cfg.AgentRoles, cs.accounts)
 		if len(onlyRoles) > 0 || len(onlyFile) > 0 {
 			return nil, nil, fmt.Errorf("agents.roles and the credentials file name different accounts: "+
 				"only in agents.roles: %q; only in the file: %q", onlyRoles, onlyFile)
 		}
-	}
-	if cs.database, err = upstreamDatabase(cfg.Upstream); err != nil {
-		return nil, nil, err
 	}
 	if cs.login, err = custody.NewLogin(store, cfg.Upstream, cfg.UpstreamTLS, cfg.UpstreamPlainFallback); err != nil {
 		return nil, nil, err
@@ -92,18 +101,20 @@ func differences(a, b []string) (onlyA, onlyB []string) {
 	return onlyA, onlyB
 }
 
-// upstreamDatabase is the database the upstream address names, as Stet's own
-// connections read it: where Stet's start logs in as each account.
-func upstreamDatabase(upstream string) (string, error) {
+// upstreamAccount is the user and the database of the upstream address as
+// Stet's own connections read it (the URL, its query, PGUSER and the like,
+// else the user running stet): the account Stet connects as, and where
+// Stet's start logs in as each agent account.
+func upstreamAccount(upstream string) (user, database string, err error) {
 	pc, err := pgconn.ParseConfig(upstream)
 	if err != nil {
 		// pgconn's error can quote the address, and so its password.
-		return "", errors.New("upstream: the address cannot be read")
+		return "", "", errors.New("upstream: the address cannot be read")
 	}
 	if pc.Database == "" {
-		return pc.User, nil // as the server reads a startup packet without one
+		return pc.User, pc.User, nil // as the server reads a startup packet without one
 	}
-	return pc.Database, nil
+	return pc.User, pc.Database, nil
 }
 
 // accountCheckTimeout bounds the start's login as one account, and
@@ -115,24 +126,33 @@ var (
 )
 
 // checkAccounts logs in upstream once as each of cs's accounts, and warns of
-// each that cannot, with the kind of failure (spec-v0.2-server 8). It stops
-// nothing: the other accounts are to work, and the logins of that one are
-// refused anyway.
+// each that cannot, with the kind of failure (spec-v0.2-server 8). When the
+// time for all of them runs out, the account in progress and those not
+// reached are named in one warning as not checked. It stops nothing: the
+// other accounts are to work, and the logins of that one are refused anyway.
 func checkAccounts(ctx context.Context, cs *clientSide, log *slog.Logger) {
 	all, cancel := context.WithTimeout(ctx, accountChecksTimeout)
 	defer cancel()
+	outOfTime := func(left []string) {
+		if ctx.Err() == nil { // not when the start itself is being cancelled
+			log.Warn("the start ran out of time to log in as these accounts, so they are not checked",
+				"limit", accountChecksTimeout, "accounts", printable(left))
+		}
+	}
 	for i, account := range cs.accounts {
 		if all.Err() != nil {
-			if ctx.Err() == nil {
-				log.Warn("the start ran out of time to log in as the accounts left, which are not checked",
-					"accounts", printable(cs.accounts[i:]))
-			}
+			outOfTime(cs.accounts[i:])
 			return
 		}
 		one, cancelOne := context.WithTimeout(all, accountCheckTimeout)
 		err := cs.login.Check(one, account, cs.database)
 		cancelOne()
-		if err != nil {
+		switch {
+		case err == nil:
+		case all.Err() != nil: // the check of this account ran out of the time for all
+			outOfTime(cs.accounts[i:])
+			return
+		default:
 			log.Warn("an account of the credentials file cannot log in to the database: its agent's logins are refused until it can",
 				"account", safetext.Printable(account), "err", err)
 		}
@@ -179,12 +199,15 @@ type certFiles struct {
 
 	mu                sync.Mutex
 	cert              *tls.Certificate
-	certSeen, keySeen os.FileInfo // as last looked at, read or not; nil when it could not be
-	failing           bool        // the last attempt failed, and was logged
+	certSeen, keySeen os.FileInfo // as last read, or tried; nil when they could not be looked at
+	missing           bool        // they could not be looked at, which was logged
 }
 
 // get is the tls.Config's GetCertificate: the certificate in use, read again
-// first when either file looks different from the last time.
+// first when either file looks different from the last time. A reload is
+// tried, and a failed one logged, once per change; files that cannot be
+// looked at are logged once for as long as that lasts, since every
+// handshake looks.
 func (r *certFiles) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -192,30 +215,28 @@ func (r *certFiles) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	keyNow, keyErr := os.Stat(r.keyPath)
 	if err := errors.Join(certErr, keyErr); err != nil {
 		r.certSeen, r.keySeen = nil, nil
-		r.fail(err)
+		if !r.missing {
+			r.missing = true
+			r.failed(err)
+		}
 		return r.cert, nil
 	}
+	r.missing = false
 	if unchanged(r.certSeen, certNow) && unchanged(r.keySeen, keyNow) {
 		return r.cert, nil
 	}
 	r.certSeen, r.keySeen = certNow, keyNow
 	cert, err := tls.LoadX509KeyPair(r.certPath, r.keyPath)
 	if err != nil {
-		r.fail(err)
+		r.failed(err)
 		return r.cert, nil
 	}
 	r.cert = &cert
-	r.failing = false
 	r.log.Info("read listen_tls again; serving the new certificate from the next handshake")
 	return r.cert, nil
 }
 
-// fail logs err once for as long as reading the files fails.
-func (r *certFiles) fail(err error) {
-	if r.failing {
-		return
-	}
-	r.failing = true
+func (r *certFiles) failed(err error) {
 	r.log.Error("could not read listen_tls again; serving the certificate in use", "err", err)
 }
 

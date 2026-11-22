@@ -491,6 +491,75 @@ func startCheck(t *testing.T) *custodyRun {
 	return &custodyRun{r: r, out: out, c: c}
 }
 
+// silentServer accepts connections on loopback and never answers them, until
+// the test ends. It returns its address.
+func silentServer(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := make(chan net.Conn, 16)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			held <- c
+		}
+	}()
+	t.Cleanup(func() {
+		ln.Close()
+		for {
+			select {
+			case c := <-held:
+				c.Close()
+			default:
+				return
+			}
+		}
+	})
+	return ln.Addr().String()
+}
+
+// The start's logins keep to their limits, one account's and all of them
+// together, against a server that never answers: the account whose login
+// runs out of its own time is warned of, the ones in progress or not reached
+// when all the time is spent are named as not checked for want of time, and
+// the proxy starts.
+func TestStartCheckKeepsToItsTimeLimits(t *testing.T) {
+	one, all := accountCheckTimeout, accountChecksTimeout
+	accountCheckTimeout, accountChecksTimeout = time.Second, 1500*time.Millisecond
+	t.Cleanup(func() { accountCheckTimeout, accountChecksTimeout = one, all })
+
+	c := newCustody(t, "", map[string]string{"stet_chk_a": secret(t), "stet_chk_b": secret(t), "stet_chk_c": secret(t)})
+	began := time.Now()
+	r := start(t, parseConfig(t, "mode: shadow\nlisten: 127.0.0.1:0\nupstream: postgres://stet@%s/db?sslmode=disable\n"+
+		"agents: {credentials: %q}\n", silentServer(t), c.credentials))
+	waitListening(t, r)
+	// Without the limit of all, the three would take 3s.
+	if took := time.Since(began); took > 2500*time.Millisecond {
+		t.Errorf("the start took %s, want about 1.5s", took)
+	}
+
+	var cannot, outOfTime []string
+	for _, w := range warnings(r.log.String()) {
+		switch {
+		case strings.Contains(w, "cannot log in"):
+			cannot = append(cannot, w)
+		case strings.Contains(w, "ran out of time"):
+			outOfTime = append(outOfTime, w)
+		}
+	}
+	if len(cannot) != 1 || !strings.Contains(cannot[0], "account=stet_chk_a ") {
+		t.Errorf("warnings of an account that cannot log in %q, want one, of stet_chk_a", cannot)
+	}
+	if len(outOfTime) != 1 || !strings.Contains(outOfTime[0], "[stet_chk_b stet_chk_c]") {
+		t.Errorf("warnings of running out of time %q, want one naming stet_chk_b and stet_chk_c; log:\n%s", outOfTime, r.log)
+	}
+}
+
 // The scenarios above, run with the log at debug level and decision lines
 // on: no token, verifier or password is in the log, in the output, or in
 // stet.decisions.
@@ -567,6 +636,36 @@ func TestRolesMustMatchTheFile(t *testing.T) {
 			t.Errorf("run = %q, want the file's mode refused", err)
 		}
 	})
+
+	// An account that is Stet's own would get a session no gate sees, as the
+	// owner of the stet schema. With no gated table the start's checks of
+	// the agent roles do not run, so the file is checked against the user
+	// Stet connects as, wherever that user comes from.
+	const own = `agents.credentials: "stet_chk_own" is Stet's own account (the upstream user)`
+	for _, tc := range []struct {
+		name, upstream, roles string
+		env                   string // PGUSER
+	}{
+		{"OwnAccount", "postgres://stet_chk_own@127.0.0.1:1/db?sslmode=disable", "", ""},
+		{"OwnAccountListed", "postgres://127.0.0.1:1/db?user=stet_chk_own&sslmode=disable", "roles: [stet_chk_other, stet_chk_own], ", ""},
+		{"OwnAccountFromPGUSER", "postgres://127.0.0.1:1/db?sslmode=disable", "", "stet_chk_own"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.env != "" {
+				t.Setenv("PGUSER", tc.env)
+			}
+			for _, mode := range []string{"shadow", "enforce"} {
+				t.Run(mode, func(t *testing.T) {
+					c := newCustody(t, "", map[string]string{"stet_chk_own": secret(t), "stet_chk_other": secret(t)})
+					r := start(t, parseConfig(t, "mode: %s\nlisten: 127.0.0.1:0\nupstream: %s\nagents: {%scredentials: %q}\n",
+						mode, tc.upstream, tc.roles, c.credentials))
+					if err := refusedToStart(t, r); err.Error() != own {
+						t.Errorf("run = %q, want %q", err, own)
+					}
+				})
+			}
+		})
+	}
 }
 
 // askForTLS sends addr an SSLRequest, as a client does, and returns the
@@ -621,16 +720,45 @@ func certificateIn(t *testing.T, path string) []byte {
 	return block.Bytes
 }
 
-// copyFile writes the bytes of from over to, in place.
+// replaceFile puts b at path as a new file (a temporary file renamed over
+// it), so that the change shows in the file's identity whatever the
+// resolution of modification times.
+func replaceFile(t *testing.T, path string, b []byte) {
+	t.Helper()
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".replace-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tmp.Write(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := tmp.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// copyFile is replaceFile with the bytes of from.
 func copyFile(t *testing.T, from, to string) {
 	t.Helper()
 	b, err := os.ReadFile(from)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(to, b, 0o600); err != nil {
-		t.Fatal(err)
+	replaceFile(t, to, b)
+}
+
+// reloadErrors counts the errors of listen_tls in r's log.
+func reloadErrors(r *running) int {
+	n := 0
+	for line := range strings.SplitSeq(r.log.String(), "\n") {
+		if strings.Contains(line, "level=ERROR") && strings.Contains(line, "listen_tls") {
+			n++
+		}
 	}
+	return n
 }
 
 func listenTLSConfig(t *testing.T, certPath, keyPath string) *config.Config {
@@ -644,33 +772,45 @@ func TestCertificateReload(t *testing.T) {
 		certPath, keyPath, _ := pgtest.LocalCert(t)
 		r := start(t, listenTLSConfig(t, certPath, keyPath))
 		waitListening(t, r)
-		if got, want := servedCertificate(t, r), certificateIn(t, certPath); !bytes.Equal(got, want) {
-			t.Fatal("stet does not serve the certificate of listen_tls.cert")
-		}
-
-		otherCert, otherKey, _ := pgtest.LocalCert(t)
-		copyFile(t, otherCert, certPath)
-		copyFile(t, otherKey, keyPath)
-		second := certificateIn(t, certPath)
-		if got := servedCertificate(t, r); !bytes.Equal(got, second) {
-			t.Errorf("after the files changed, stet serves another certificate than the new one; log:\n%s", r.log)
-		}
-
-		if err := os.WriteFile(certPath, []byte("not a certificate\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if got := servedCertificate(t, r); !bytes.Equal(got, second) {
-			t.Errorf("after the file broke, stet serves another certificate than the one in use; log:\n%s", r.log)
-		}
-		var logged []string
-		for line := range strings.SplitSeq(r.log.String(), "\n") {
-			if strings.Contains(line, "level=ERROR") && strings.Contains(line, "listen_tls") {
-				logged = append(logged, line)
+		first := certificateIn(t, certPath)
+		// step is one change to the files, then a handshake: it wants the
+		// certificate served, and the errors logged so far.
+		step := func(what string, served []byte, logged int) {
+			t.Helper()
+			if got := servedCertificate(t, r); !bytes.Equal(got, served) {
+				t.Errorf("%s: stet serves another certificate than it should; log:\n%s", what, r.log)
+			}
+			if got := reloadErrors(r); got != logged {
+				t.Errorf("%s: %d errors of listen_tls logged, want %d; log:\n%s", what, got, logged, r.log)
 			}
 		}
-		if len(logged) != 1 {
-			t.Errorf("%d errors of listen_tls logged, want 1; log:\n%s", len(logged), r.log)
+		step("at start", first, 0)
+
+		// A pair replaced one file at a time: in between, the certificate
+		// does not match the key, and the one in use is kept.
+		otherCert, otherKey, _ := pgtest.LocalCert(t)
+		second := certificateIn(t, otherCert)
+		copyFile(t, otherCert, certPath)
+		step("the certificate replaced, not yet the key", first, 1)
+		copyFile(t, otherKey, keyPath)
+		step("the key replaced too", second, 1)
+
+		// Each failed reload of a change is logged.
+		replaceFile(t, certPath, []byte("not a certificate\n"))
+		step("the certificate broken", second, 2)
+		replaceFile(t, certPath, []byte("still not a certificate\n"))
+		step("the certificate broken again", second, 3)
+
+		// A file that is not there is logged once while it stays away.
+		if err := os.Remove(certPath); err != nil {
+			t.Fatal(err)
 		}
+		step("the certificate removed", second, 4)
+		step("the certificate still removed", second, 4)
+		thirdCert, thirdKey, _ := pgtest.LocalCert(t)
+		copyFile(t, thirdKey, keyPath)
+		copyFile(t, thirdCert, certPath)
+		step("a new pair in place", certificateIn(t, thirdCert), 4)
 	})
 
 	t.Run("MismatchAtStart", func(t *testing.T) {
