@@ -1,0 +1,74 @@
+package main
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestLoopbackHost(t *testing.T) {
+	for host, want := range map[string]bool{
+		"localhost": true, "127.0.0.1": true, "127.0.0.2": true, "::1": true,
+		"0.0.0.0": false, "::": false, "": false, "db.example.com": false, "10.0.0.5": false,
+	} {
+		if got := loopbackHost(host); got != want {
+			t.Errorf("loopbackHost(%q) = %v, want %v", host, got, want)
+		}
+	}
+}
+
+func TestTransportWarnings(t *testing.T) {
+	const (
+		plaintext  = "allows plaintext"
+		unverified = "certificate is not checked"
+		listenWarn = "is not a loopback address"
+	)
+	for _, tc := range []struct {
+		name, listen, upstream string
+		want                   []string // a fragment of each warning, in order
+	}{
+		{"remote disable", "127.0.0.1:6432", "db.example.com/d?sslmode=disable", []string{plaintext}},
+		{"remote prefer", "127.0.0.1:6432", "db.example.com/d?sslmode=prefer", []string{plaintext}},
+		{"remote no sslmode", "127.0.0.1:6432", "db.example.com/d", []string{plaintext}},
+		{"remote require", "127.0.0.1:6432", "db.example.com/d?sslmode=require", []string{unverified}},
+		{"remote verify-full", "127.0.0.1:6432", "db.example.com/d?sslmode=verify-full", nil},
+		{"remote verify-ca", "127.0.0.1:6432", "db.example.com/d?sslmode=verify-ca", nil},
+		{"loopback disable", "127.0.0.1:6432", "localhost/d?sslmode=disable", nil},
+		{"loopback require", "127.0.0.1:6432", "127.0.0.1/d?sslmode=require", nil},
+		{"loopback ipv6", "[::1]:6432", "[::1]/d?sslmode=prefer", nil},
+		{"listen on all", "0.0.0.0:6432", "127.0.0.1/d?sslmode=disable", []string{listenWarn}},
+		{"listen port only", ":6432", "127.0.0.1/d?sslmode=disable", []string{listenWarn}},
+		{"listen remote name", "stet.example.com:6432", "127.0.0.1/d", []string{listenWarn}},
+		{"both", "0.0.0.0:6432", "db.example.com/d?sslmode=disable", []string{plaintext, listenWarn}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := parseConfig(t, "mode: shadow\nlisten: %q\nupstream: postgres://stet@%s\n", tc.listen, tc.upstream)
+			got := transportWarnings(cfg)
+			if len(got) != len(tc.want) {
+				t.Fatalf("warnings = %q, want %d of them (%q)", got, len(tc.want), tc.want)
+			}
+			for i, w := range tc.want {
+				if !strings.Contains(got[i], w) {
+					t.Errorf("warning %d = %q, want it to contain %q", i, got[i], w)
+				}
+			}
+		})
+	}
+}
+
+func TestTransportWarningsNameNoPassword(t *testing.T) {
+	for _, mode := range []string{"disable", "prefer", "require"} {
+		cfg := parseConfig(t, "mode: shadow\nlisten: 0.0.0.0:6432\nupstream: postgres://stet:hunter2-secret@db.example.com:5432/d?sslmode=%s\n", mode)
+		warnings := transportWarnings(cfg)
+		if len(warnings) < 2 {
+			t.Fatalf("sslmode=%s: warnings = %q, want the upstream's and the listen address's", mode, warnings)
+		}
+		for _, w := range warnings {
+			if strings.Contains(w, "hunter2-secret") || strings.Contains(w, "5432") {
+				t.Errorf("sslmode=%s: warning %q names the password or the full address", mode, w)
+			}
+		}
+		if !strings.Contains(warnings[0], "upstream db.example.com ") {
+			t.Errorf("sslmode=%s: warning %q does not name the upstream host", mode, warnings[0])
+		}
+	}
+}

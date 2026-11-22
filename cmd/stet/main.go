@@ -120,6 +120,9 @@ func run(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog.Log
 		close(closed)
 	}()
 
+	for _, w := range transportWarnings(cfg) {
+		log.Warn(w)
+	}
 	log.Info("stet proxy listening", "listen", ln.Addr(), "upstream", cfg.UpstreamAddr(),
 		"mode", cfg.Mode, "agent_roles", cfg.AgentRoles, "gated_tables", len(cfg.Tables), "model", cfg.Model.Adapter)
 	err = srv.Serve(ln)
