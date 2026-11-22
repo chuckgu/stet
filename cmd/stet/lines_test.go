@@ -139,7 +139,9 @@ func TestDecisionLinePerJudgedWrite(t *testing.T) {
 	agent := connectTo(t, r.addr, db, "stet_scram", "scram-pw")
 
 	readRow(t, agent, gateOf(), "contacts", 1000)
-	for _, sql := range []string{
+	// A write is judged after it ran, so lines come in the order judging ends:
+	// wait for each write's line (after the banner) before sending the next.
+	for i, sql := range []string{
 		"update contacts set name = 'one' where id = 1000",
 		"update contacts set status = 'seen' where id <= 300",
 		"delete from contacts where id between 501 and 700",
@@ -147,6 +149,7 @@ func TestDecisionLinePerJudgedWrite(t *testing.T) {
 		if _, err := agent.Exec(ctx, sql); err != nil {
 			t.Fatalf("%s: %v; log:\n%s", sql, err, r.log)
 		}
+		waitLines(t, out, i+2, r.log)
 	}
 
 	got := waitLines(t, out, 4, r.log)
