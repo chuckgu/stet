@@ -33,20 +33,46 @@ func NewWriter(w io.Writer) *Writer {
 func (w *Writer) run() {
 	defer close(w.done)
 	for line := range w.queue {
-		// A failing output must not stop the others; there is nowhere to report it.
-		_, _ = io.WriteString(w.w, line+"\n")
+		w.write(line)
+		w.noticeIfDrained()
+	}
+	w.noticeIfDrained()
+}
+
+// write sends one line. A failing output must not stop the others; there is
+// nowhere to report it.
+func (w *Writer) write(line string) {
+	_, _ = io.WriteString(w.w, line+"\n")
+}
+
+// noticeIfDrained writes the dropped-lines notice once the queue holds nothing
+// older than the drop. Offer drops every line while a drop is pending, so
+// nothing can be queued behind the notice until it is taken here, and the
+// notice is written before the next line is read.
+func (w *Writer) noticeIfDrained() {
+	w.mu.Lock()
+	n := 0
+	if len(w.queue) == 0 {
+		n, w.dropped = w.dropped, 0
+	}
+	w.mu.Unlock()
+	switch {
+	case n == 1:
+		w.write("… 1 line dropped")
+	case n > 1:
+		w.write(fmt.Sprintf("… %d lines dropped", n))
 	}
 }
 
 // Offer queues line. It never blocks: with the queue full the line is
-// dropped and counted, and "… N lines dropped" is written once there is room.
+// dropped and counted, and "… N lines dropped" is written once the lines
+// queued before the drop are out.
 func (w *Writer) Offer(line string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
 		return
 	}
-	w.flushNotice()
 	if w.dropped > 0 {
 		w.dropped++
 		return
@@ -58,28 +84,11 @@ func (w *Writer) Offer(line string) {
 	}
 }
 
-// flushNotice queues the dropped-lines notice when there is room. w.mu is held.
-func (w *Writer) flushNotice() {
-	if w.dropped == 0 {
-		return
-	}
-	notice := "… 1 line dropped"
-	if w.dropped > 1 {
-		notice = fmt.Sprintf("… %d lines dropped", w.dropped)
-	}
-	select {
-	case w.queue <- notice:
-		w.dropped = 0
-	default:
-	}
-}
-
 // Close writes what is queued and stops. It gives up after 2 seconds when w
 // does not take it.
 func (w *Writer) Close() {
 	w.mu.Lock()
 	if !w.closed {
-		w.flushNotice()
 		w.closed = true
 		close(w.queue)
 	}

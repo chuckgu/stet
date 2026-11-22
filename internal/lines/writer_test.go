@@ -153,3 +153,97 @@ func TestWriterSurvivesWriteErrors(t *testing.T) {
 		t.Fatal("Close hung")
 	}
 }
+
+// slow is an io.Writer that takes a fixed time per Write without blocking.
+type slow struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func spin(d time.Duration) {
+	for end := time.Now().Add(d); time.Now().Before(end); {
+	}
+}
+
+func (s *slow) Write(p []byte) (int, error) {
+	spin(200 * time.Microsecond)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lines = append(s.lines, strings.TrimSuffix(string(p), "\n"))
+	return len(p), nil
+}
+
+func TestWriterKeepsWritingRealLinesUnderOverload(t *testing.T) {
+	s := &slow{}
+	w := NewWriter(s)
+	const run = 1500 * time.Millisecond
+	start := time.Now()
+	n, lateOffered := 0, 0
+	for time.Since(start) < run {
+		late := time.Since(start) > run*2/3
+		w.Offer(fmt.Sprintf("real %d", n))
+		if late {
+			lateOffered++
+		}
+		n++
+		spin(100 * time.Microsecond)
+	}
+	w.Close()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lateWritten, notices := 0, 0
+	last := -1
+	for i, l := range s.lines {
+		if strings.HasPrefix(l, "…") {
+			notices++
+			if i > 0 && strings.HasPrefix(s.lines[i-1], "…") {
+				t.Errorf("adjacent notices: %q then %q", s.lines[i-1], l)
+			}
+			continue
+		}
+		var k int
+		fmt.Sscanf(l, "real %d", &k)
+		if k <= last {
+			t.Errorf("out of order: %d after %d", k, last)
+		}
+		last = k
+		if k >= n-lateOffered {
+			lateWritten++
+		}
+	}
+	if lateWritten == 0 || notices == 0 {
+		t.Fatalf("late real lines written=%d (offered %d), notices=%d", lateWritten, lateOffered, notices)
+	}
+}
+
+func TestNoticeAppearsWithoutAnotherOffer(t *testing.T) {
+	g := newGate()
+	var b safeBuf
+	w := NewWriter(&tee{g, &b})
+	w.Offer("first")
+	<-g.entered
+	for i := 0; i < QueueSize+5; i++ {
+		w.Offer("x")
+	}
+	close(g.release)
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.HasSuffix(b.String(), "… 5 lines dropped\n") && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !strings.HasSuffix(b.String(), "… 5 lines dropped\n") {
+		t.Fatal("notice never written without a further Offer")
+	}
+	w.Close()
+}
+
+type tee struct {
+	g *gate
+	b *safeBuf
+}
+
+func (t *tee) Write(p []byte) (int, error) {
+	if _, err := t.g.Write(p); err != nil {
+		return 0, err
+	}
+	return t.b.Write(p)
+}
