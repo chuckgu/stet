@@ -1,11 +1,13 @@
 package custody
 
 import (
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -45,6 +47,15 @@ func TestCheckMode(t *testing.T) {
 		{0o644, 0, false}, {0o660, 0, false},
 		{0o600, other, false}, {0o400, other, false}, {0o640, other, false},
 	}
+	// A root process: its own (root-owned) files must have no group access.
+	for _, c := range []struct {
+		mode fs.FileMode
+		ok   bool
+	}{{0o600, true}, {0o400, true}, {0o640, false}, {0o440, false}} {
+		if err := CheckMode(c.mode, 0, 0); (err == nil) != c.ok {
+			t.Errorf("CheckMode(%04o, owner 0, uid 0) = %v, want ok=%v", c.mode, err, c.ok)
+		}
+	}
 	for _, c := range cases {
 		err := CheckMode(c.mode, c.owner, me)
 		if (err == nil) != c.ok {
@@ -68,6 +79,7 @@ func TestReadValidates(t *testing.T) {
 		"64 byte name":    {"agents:\n  " + strings.Repeat("a", 64) + ":\n    token: " + good + "\n    password: " + pw + "\n", strings.Repeat("a", 64)},
 		"unknown key":     {"agents:\n  alice:\n    token: " + good + "\n    password: " + pw + "\n    colour: blue\n", "alice"},
 		"bad time":        {"agents:\n  alice:\n    token: " + good + "\n    password: " + pw + "\n    added: " + pw + "\n", "alice"},
+		"two bad":         {"agents:\n  bob:\n    colour: x\n  alice:\n    colour: y\n", "alice"},
 		"unknown top key": {"agents: {}\nextra: 1\n", "extra"},
 		"short mock":      {"mock_secret: c2hvcnQ=\nagents: {}\n", "mock_secret"},
 		"mock not base64": {"mock_secret: \"!!pw-secret-1\"\nagents: {}\n", "mock_secret"},
@@ -85,6 +97,9 @@ func TestReadValidates(t *testing.T) {
 			msg := err.Error()
 			if !strings.Contains(msg, c.want) {
 				t.Errorf("error %q does not mention %q", msg, c.want)
+			}
+			if strings.Contains(msg, "account") && strings.Contains(msg, "line") {
+				t.Errorf("error %q gives a line number inside an account", msg)
 			}
 			for _, secret := range []string{pw, good, "junk-secret"} {
 				if strings.Contains(msg, secret) {
@@ -234,5 +249,71 @@ func TestFileRoundTripsOddAccountNames(t *testing.T) {
 		if _, ok := got.Agents[n]; !ok {
 			t.Errorf("account %q did not come back", n)
 		}
+	}
+}
+
+func TestReadRefusesWhatIsNotARegularFileOrIsHuge(t *testing.T) {
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := Read(fifo); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "regular") {
+			t.Errorf("Read of a FIFO = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Read of a FIFO blocked")
+	}
+	if _, err := Read(dir); err == nil {
+		t.Error("Read of a directory succeeded")
+	}
+
+	big := filepath.Join(dir, "big.yaml")
+	writeRaw(t, big, "agents: {}\n#"+strings.Repeat("x", 1<<20), 0o600)
+	if _, err := Read(big); err == nil || !strings.Contains(err.Error(), "larger") {
+		t.Errorf("Read of a file over 1 MiB = %v", err)
+	}
+}
+
+func TestWriteRefusesAnExistingPathThatReadWouldRefuse(t *testing.T) {
+	dir := t.TempDir()
+	open := filepath.Join(dir, "open.yaml")
+	writeRaw(t, open, "agents: {}\n", 0o644)
+	err := Write(open, sample(t))
+	if err == nil || !strings.Contains(err.Error(), "nothing written") {
+		t.Errorf("Write over a 0644 file = %v", err)
+	}
+	if b, _ := os.ReadFile(open); string(b) != "agents: {}\n" {
+		t.Error("the 0644 file was changed")
+	}
+
+	sub := filepath.Join(dir, "sub")
+	if err := os.Mkdir(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err = Write(sub, sample(t))
+	if err == nil || !strings.Contains(err.Error(), "nothing written") {
+		t.Errorf("Write over a directory = %v", err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 2 {
+		t.Errorf("a temporary file was left in the directory: %d entries", len(entries))
+	}
+}
+
+func TestWriteCleansUpWhenTheRenameFails(t *testing.T) {
+	dir := t.TempDir()
+	old := renameFile
+	renameFile = func(string, string) error { return errors.New("rename failed") }
+	t.Cleanup(func() { renameFile = old })
+	path := filepath.Join(dir, "creds.yaml")
+	if err := Write(path, sample(t)); err == nil {
+		t.Fatal("Write succeeded")
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("%d files left behind", len(entries))
 	}
 }

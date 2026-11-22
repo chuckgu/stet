@@ -25,6 +25,7 @@ import (
 const (
 	maxAccountName = 63
 	mockSecretLen  = 32
+	maxFileSize    = 1 << 20
 	fileComment    = "# Written by stet agent. It holds database passwords: keep it private.\n"
 )
 
@@ -46,18 +47,20 @@ type File struct {
 	Agents     map[string]Agent `yaml:"agents"`
 }
 
-// CheckMode applies the rule for who may read the file: owned by uid with no
-// access for group or others, or owned by root with at most group read.
+// CheckMode applies the rule for who may read the file, as PostgreSQL does
+// for its key files: when owner is uid (the effective uid, root included) the
+// file must give no access to group or others; otherwise, when it is owned by
+// root, at most group read; a file of any other owner is refused.
 func CheckMode(mode fs.FileMode, owner, uid uint32) error {
 	perm := mode.Perm()
 	switch {
-	case owner == 0:
-		if perm&0o037 != 0 {
-			return fmt.Errorf("mode %04o is too open for a file owned by root: allow at most group read (0640)", perm)
-		}
 	case owner == uid:
 		if perm&0o077 != 0 {
 			return fmt.Errorf("mode %04o is too open: allow no access for group or others (0600)", perm)
+		}
+	case owner == 0:
+		if perm&0o037 != 0 {
+			return fmt.Errorf("mode %04o is too open for a file owned by root: allow at most group read (0640)", perm)
 		}
 	default:
 		return fmt.Errorf("the file belongs to uid %d, who is neither you (uid %d) nor root", owner, uid)
@@ -76,6 +79,14 @@ func ownerOf(info fs.FileInfo) (uid, gid uint32, ok bool) {
 // Read reads and validates the file at path, CheckMode included. Its errors
 // name the account and what is wrong, never a value.
 func Read(path string) (*File, error) {
+	// Decide from a Stat before opening: opening a FIFO would block.
+	pre, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !pre.Mode().IsRegular() {
+		return nil, fmt.Errorf("credentials file %s: not a regular file", path)
+	}
 	fh, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -85,14 +96,20 @@ func Read(path string) (*File, error) {
 	if err != nil {
 		return nil, err
 	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("credentials file %s: not a regular file", path)
+	}
 	if uid, _, ok := ownerOf(info); ok {
-		if err := CheckMode(info.Mode(), uid, uint32(os.Getuid())); err != nil {
+		if err := CheckMode(info.Mode(), uid, uint32(os.Geteuid())); err != nil {
 			return nil, fmt.Errorf("credentials file %s: %w", path, err)
 		}
 	}
 	var b bytes.Buffer
-	if _, err := b.ReadFrom(fh); err != nil {
+	if _, err := b.ReadFrom(io.LimitReader(fh, maxFileSize+1)); err != nil {
 		return nil, err
+	}
+	if b.Len() > maxFileSize {
+		return nil, fmt.Errorf("credentials file %s: larger than %d bytes", path, maxFileSize)
 	}
 	f, err := parse(b.Bytes())
 	if err != nil {
@@ -112,7 +129,7 @@ var (
 )
 
 // plain describes a YAML error without any value the error quotes.
-func plain(err error) string {
+func plain(err error, withLine bool) string {
 	var te *yaml.TypeError
 	msg := err.Error()
 	if errors.As(err, &te) && len(te.Errors) > 0 {
@@ -121,8 +138,11 @@ func plain(err error) string {
 	if m := reField.FindStringSubmatch(msg); m != nil {
 		return fmt.Sprintf("unknown key %q", m[1])
 	}
-	if m := reLine.FindStringSubmatch(msg); m != nil {
+	if m := reLine.FindStringSubmatch(msg); m != nil && withLine {
 		return "not valid here, at line " + m[1]
+	}
+	if reLine.MatchString(msg) {
+		return "not valid here" // a line within a fragment is not a line of the file
 	}
 	return "not valid YAML"
 }
@@ -139,10 +159,16 @@ func parse(b []byte) (*File, error) {
 		if errors.Is(err, io.EOF) {
 			return nil, errors.New("the file is empty")
 		}
-		return nil, errors.New(plain(err))
+		return nil, errors.New(plain(err, true))
 	}
 	f := &File{MockSecret: raw.MockSecret, Agents: map[string]Agent{}}
-	for name, node := range raw.Agents {
+	names := make([]string, 0, len(raw.Agents))
+	for name := range raw.Agents {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		node := raw.Agents[name]
 		// Decode each account on its own, strictly, so an error can name it.
 		nb, err := yaml.Marshal(&node)
 		if err != nil {
@@ -150,7 +176,7 @@ func parse(b []byte) (*File, error) {
 		}
 		var a Agent
 		if err := strict(nb, &a); err != nil {
-			return nil, fmt.Errorf("account %q: %s", name, plain(err))
+			return nil, fmt.Errorf("account %q: %s", name, plain(err, false))
 		}
 		f.Agents[name] = a
 	}
@@ -201,6 +227,9 @@ func sortedNames(m map[string]Agent) []string {
 	return names
 }
 
+// renameFile is os.Rename; a test replaces it to make the last step fail.
+var renameFile = os.Rename
+
 // Write puts f at path whole: a temporary file in the same directory, then a
 // rename. A file already there keeps its owner, group and mode; when that
 // cannot be kept, nothing is written. A new file is the caller's, 0600. An
@@ -227,8 +256,16 @@ func Write(path string, f *File) (err error) {
 	var keep fs.FileInfo
 	if info, err := os.Stat(path); err == nil {
 		keep = info
-		if uid, _, ok := ownerOf(info); ok && uid != uint32(os.Getuid()) && os.Getuid() != 0 {
-			return fmt.Errorf("credentials file %s belongs to uid %d and only they or root can keep it so: nothing written", path, uid)
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("credentials file %s is not a regular file: nothing written", path)
+		}
+		if uid, _, ok := ownerOf(info); ok {
+			if err := CheckMode(info.Mode(), uid, uint32(os.Geteuid())); err != nil {
+				return fmt.Errorf("credentials file %s: %w: fix that first; nothing written", path, err)
+			}
+			if uid != uint32(os.Geteuid()) && os.Geteuid() != 0 {
+				return fmt.Errorf("credentials file %s belongs to uid %d and only they or root can keep it so: nothing written", path, uid)
+			}
 		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return err
@@ -248,9 +285,6 @@ func Write(path string, f *File) (err error) {
 		return err
 	}
 	if keep != nil {
-		if err = tmp.Chmod(keep.Mode().Perm()); err != nil {
-			return err
-		}
 		if uid, gid, ok := ownerOf(keep); ok {
 			if cur, serr := tmp.Stat(); serr == nil {
 				if cu, cg, _ := ownerOf(cur); cu != uid || cg != gid {
@@ -260,6 +294,10 @@ func Write(path string, f *File) (err error) {
 				}
 			}
 		}
+		// Chmod after Chown: a change of owner can clear mode bits.
+		if err = tmp.Chmod(keep.Mode().Perm()); err != nil {
+			return err
+		}
 	}
 	if err = tmp.Sync(); err != nil {
 		return err
@@ -267,7 +305,20 @@ func Write(path string, f *File) (err error) {
 	if err = tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	if err = renameFile(tmp.Name(), path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
+
+// syncDir makes the rename survive a crash.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // encode writes f with its accounts in name order.

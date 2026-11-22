@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/stetdb/stet/internal/scram"
 )
@@ -21,6 +22,7 @@ type Entry struct {
 // opened; tokens and passwords follow the file.
 type Store struct {
 	path     string
+	read     func(string) (*File, error) // Read; a test replaces it
 	log      *slog.Logger
 	mock     []byte
 	accounts []string // sorted, fixed
@@ -30,9 +32,14 @@ type Store struct {
 	failing  bool        // the last attempt to read the file failed, and was logged
 	entries  map[string]Entry
 	password map[string]string // the password in use per account, kept while the account is removed
-	envName  map[string]string // the password_env each account was opened with, "" for a literal password
-	warned   map[string]bool   // accounts seen only after start, already warned about
+	envValue map[string]string // the environment's values by variable name, as read when opened
+	warned   map[string]bool   // accounts seen only after start, and account/variable pairs, already warned about
+	lastTry  time.Time         // when the file was last read, while that is failing
 }
+
+// retryEvery is how soon a failed read of the file is tried again; a test
+// shortens it.
+var retryEvery = 200 * time.Millisecond
 
 // OpenStore reads path. env reads the environment, once, for password_env.
 func OpenStore(path string, env func(string) string, log *slog.Logger) (*Store, error) {
@@ -46,11 +53,12 @@ func OpenStore(path string, env func(string) string, log *slog.Logger) (*Store, 
 	}
 	s := &Store{
 		path:     path,
+		read:     Read,
 		log:      log,
 		seen:     fi,
 		entries:  map[string]Entry{},
 		password: map[string]string{},
-		envName:  map[string]string{},
+		envValue: map[string]string{},
 		warned:   map[string]bool{},
 	}
 
@@ -75,8 +83,8 @@ func OpenStore(path string, env func(string) string, log *slog.Logger) (*Store, 
 		}
 		pw := a.Password
 		if a.PasswordEnv != "" {
-			s.envName[name] = a.PasswordEnv
 			pw = env(a.PasswordEnv)
+			s.envValue[a.PasswordEnv] = pw
 			if pw == "" {
 				log.Warn("the environment variable for an account's password is empty or not set",
 					"account", name, "variable", a.PasswordEnv)
@@ -92,7 +100,7 @@ func OpenStore(path string, env func(string) string, log *slog.Logger) (*Store, 
 // MockSecret returns the secret that unknown accounts' verifiers derive from:
 // the file's as read when the store was opened, or random bytes made then. It
 // does not follow the file. Do not print it.
-func (s *Store) MockSecret() []byte { return s.mock }
+func (s *Store) MockSecret() []byte { return append([]byte(nil), s.mock...) }
 
 // Accounts returns the accounts the store was opened with, sorted.
 func (s *Store) Accounts() []string {
@@ -122,15 +130,23 @@ func (s *Store) refresh() {
 		return
 	}
 	if s.seen != nil && s.same(s.seen, fi) {
-		return
+		// Unchanged. Only a read that failed is tried again, now and then:
+		// what made it fail may not show in the file's stat.
+		if !s.failing || time.Since(s.lastTry) < retryEvery {
+			return
+		}
 	}
 	s.seen = fi
-	f, err := Read(s.path)
+	s.lastTry = time.Now()
+	f, err := s.read(s.path)
 	if err != nil {
 		s.fail(err)
 		return
 	}
-	s.failing = false
+	if s.failing {
+		s.failing = false
+		s.log.Info("read the credentials file again; following it once more")
+	}
 	s.apply(f)
 }
 
@@ -167,11 +183,14 @@ func (s *Store) apply(f *File) {
 		switch {
 		case a.Password != "":
 			pw = a.Password
-		case a.PasswordEnv == s.envName[name]:
-			// the variable it was opened with: the value read then
 		default:
-			s.log.Warn("the credentials file now names another environment variable for an account's password; keeping the password in use until stet restarts",
-				"account", name, "variable", a.PasswordEnv)
+			if v, read := s.envValue[a.PasswordEnv]; read {
+				pw = v // the value read at open
+			} else if key := name + "\x00" + a.PasswordEnv; !s.warned[key] {
+				s.warned[key] = true
+				s.log.Warn("the credentials file now names an environment variable that was not read when stet started; keeping the password in use until stet restarts",
+					"account", name, "variable", a.PasswordEnv)
+			}
 		}
 		s.password[name] = pw
 		next[name] = Entry{Token: v, Password: pw}

@@ -2,12 +2,14 @@ package custody
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -106,11 +108,17 @@ func TestStoreFollowsTheFile(t *testing.T) {
 	if err := Write(path, f); err != nil {
 		t.Fatal(err)
 	}
-	for range 3 {
+	for i := range 3 {
 		if _, ok := s.Lookup("carol"); ok {
 			t.Error("an account added after start was accepted")
 		}
+		// Each change makes the next Lookup read the file again.
+		f.Agents["alice"] = Agent{Token: f.Agents["alice"].Token, Password: fmt.Sprintf("pw-again-%d", i)}
+		if err := Write(path, f); err != nil {
+			t.Fatal(err)
+		}
 	}
+	s.Lookup("carol")
 	if n := count(buf, `account "carol" was added after stet started; restart stet proxy to accept it`); n != 1 {
 		t.Errorf("warned %d times about carol, want 1:\n%s", n, buf)
 	}
@@ -260,18 +268,23 @@ func TestStorePasswordEnv(t *testing.T) {
 		t.Errorf("password followed the environment: %q", e.Password)
 	}
 
-	// A file that points at another variable keeps the old value, with a warning.
+	// A file that points at another variable keeps the old value, with a
+	// warning once, however often the file is read again.
 	f.Agents["carol"] = Agent{Token: newToken(t), PasswordEnv: "OTHER_PW"}
 	envs["OTHER_PW"] = "other"
-	if err := Write(path, f); err != nil {
-		t.Fatal(err)
+	var e Entry
+	for i := range 3 {
+		if err := Write(path, f); err != nil {
+			t.Fatal(err)
+		}
+		e, _ = s.Lookup("carol")
+		f.Agents["bob"] = Agent{Token: newToken(t), PasswordEnv: "BOB_PW", Added: time.Unix(int64(i+1), 0)}
 	}
-	e, _ := s.Lookup("carol")
 	if e.Password != "carol-env" || e.Token.Text() != f.Agents["carol"].Token {
 		t.Errorf("Lookup(carol) = %+v; want the old password and the new token", e)
 	}
-	if n := count(buf, "account=carol"); n < 1 {
-		t.Errorf("no warning about carol:\n%s", buf)
+	if n := count(buf, "account=carol"); n != 1 {
+		t.Errorf("%d warnings about carol, want 1:\n%s", n, buf)
 	}
 
 	// A literal password in the file takes over from an environment one.
@@ -281,6 +294,15 @@ func TestStorePasswordEnv(t *testing.T) {
 	}
 	if e, _ := s.Lookup("alice"); e.Password != "literal" {
 		t.Errorf("password = %q, want the file's", e.Password)
+	}
+
+	// Back to the variable it was opened with: the value read at open.
+	f.Agents["alice"] = Agent{Token: f.Agents["alice"].Token, PasswordEnv: "ALICE_PW"}
+	if err := Write(path, f); err != nil {
+		t.Fatal(err)
+	}
+	if e, _ := s.Lookup("alice"); e.Password != "from-env" {
+		t.Errorf("password = %q, want the value read at open", e.Password)
 	}
 }
 
@@ -294,6 +316,10 @@ func TestStoreMockSecret(t *testing.T) {
 		t.Errorf("a file with a mock_secret was warned about:\n%s", buf)
 	}
 	first := append([]byte(nil), s.MockSecret()...)
+	s.MockSecret()[0] ^= 0xff // a caller changing what it got changes nothing
+	if !bytes.Equal(s.MockSecret(), first) {
+		t.Fatal("MockSecret returns the internal slice")
+	}
 	f.MockSecret = "" // a rewrite with a new secret does not move the store's
 	if err := Write(path, f); err != nil {
 		t.Fatal(err)
@@ -378,5 +404,89 @@ func TestStoreIsSafeForConcurrentUse(t *testing.T) {
 	wg.Wait()
 	if e, ok := s.Lookup("alice"); !ok || e.Password != "pw-20" {
 		t.Errorf("final Lookup = %+v, %v", e, ok)
+	}
+}
+
+func TestStoreRetriesAFailedRead(t *testing.T) {
+	old := retryEvery
+	retryEvery = 30 * time.Millisecond
+	t.Cleanup(func() { retryEvery = old })
+
+	f := &File{Agents: map[string]Agent{"alice": {Token: newToken(t), Password: "pw-a"}}}
+	s, path, buf := openSample(t, f, noEnv)
+
+	// A read that fails for a reason the file's stat does not show.
+	var mu sync.Mutex
+	broken := true
+	s.mu.Lock()
+	s.read = func(p string) (*File, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if broken {
+			return nil, errors.New("too many open files")
+		}
+		return Read(p)
+	}
+	s.mu.Unlock()
+
+	f.Agents["alice"] = Agent{Token: newToken(t), Password: "pw-new"}
+	if err := Write(path, f); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if e, _ := s.Lookup("alice"); e.Password != "pw-a" {
+			t.Fatalf("Lookup = %q while the read fails, want the old password", e.Password)
+		}
+	}
+	mu.Lock()
+	broken = false
+	mu.Unlock()
+	if e, _ := s.Lookup("alice"); e.Password != "pw-a" {
+		t.Errorf("retried at once, before %v", retryEvery)
+	}
+	time.Sleep(2 * retryEvery)
+	e, ok := s.Lookup("alice")
+	if !ok || e.Password != "pw-new" || e.Token.Text() != f.Agents["alice"].Token {
+		t.Fatalf("after the retry interval Lookup = %+v, %v", e, ok)
+	}
+	if n := count(buf, "level=ERROR"); n != 1 {
+		t.Errorf("%d error logs, want 1:\n%s", n, buf)
+	}
+	if n := count(buf, "following it once more"); n != 1 {
+		t.Errorf("%d recovery lines, want 1:\n%s", n, buf)
+	}
+
+	// A file read well is not read again until it changes.
+	reads := 0
+	s.mu.Lock()
+	s.read = func(p string) (*File, error) { reads++; return Read(p) }
+	s.mu.Unlock()
+	time.Sleep(2 * retryEvery)
+	for range 5 {
+		s.Lookup("alice")
+	}
+	if reads != 0 {
+		t.Errorf("read an unchanged file %d times", reads)
+	}
+}
+
+func TestStoreKeepsTheLastGoodFileWhenItBecomesAFIFO(t *testing.T) {
+	f := &File{Agents: map[string]Agent{"alice": {Token: newToken(t), Password: "pw-a"}}}
+	s, path, _ := openSample(t, f, noEnv)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan Entry, 1)
+	go func() { e, _ := s.Lookup("alice"); done <- e }()
+	select {
+	case e := <-done:
+		if e.Password != "pw-a" {
+			t.Errorf("Lookup = %q", e.Password)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Lookup blocked on a FIFO")
 	}
 }
