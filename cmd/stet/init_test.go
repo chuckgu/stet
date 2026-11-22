@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -494,6 +495,10 @@ func TestInitOutputNeverShowsThePassword(t *testing.T) {
 		{name: "other scheme", password: initPassword, address: "mysql://app:" + initPassword + "@db.example.com/crm", args: []string{"-yes"}},
 		{name: "keyword/value", password: initPassword, address: "host=db.example.com user=app password=" + initPassword, args: []string{"-yes"}},
 		{name: "no host", password: initPassword, address: "postgres://app:" + initPassword + "@/crm", args: []string{"-yes"}},
+		{name: "host in the query", password: initPassword, address: "postgres://app:" + initPassword + "@localhost/crm?host=/tmp", args: []string{"-yes"}},
+		{name: "several hosts", password: initPassword, address: "postgres://app:" + initPassword + "@h1:5432,h2:5432/crm", args: []string{"-yes"}},
+		{name: "the address given to -listen", password: initPassword, address: dbAddress(pg, db, role, initPassword),
+			args: []string{"-yes", "-listen", "postgres://app:" + initPassword + "@db.example.com:5432/crm"}},
 		{name: "refused without -yes", password: initPassword, address: dbAddress(pg, db, role, initPassword)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -518,7 +523,12 @@ func TestInitOutputNeverShowsThePassword(t *testing.T) {
 }
 
 func TestInitStops(t *testing.T) {
-	const address = "postgres://app:pw@127.0.0.1:1/crm"
+	const (
+		address  = "postgres://app:pw@127.0.0.1:1/crm"
+		listen   = "-listen must be host:port with a port from 1 to 65535"
+		inQuery  = "the database address sets host, hostaddr or port in its query; write the host and port in the address itself"
+		manyHost = "the database address lists more than one host; stet relays to one server, so give one host"
+	)
 	for _, tc := range []struct {
 		name string
 		args []string
@@ -527,9 +537,17 @@ func TestInitStops(t *testing.T) {
 		{"no address", nil, "no database address: set DATABASE_URL, or pass the address as the last argument"},
 		{"empty address", []string{""}, "no database address: set DATABASE_URL, or pass the address as the last argument"},
 		{"flags after the address", []string{address, "-yes"}, "flags go before the address"},
-		{"listen without a port", []string{"-listen", "6432", address}, `-listen "6432": want host:port, such as 127.0.0.1:6432`},
-		{"listen with no port number", []string{"-listen", "127.0.0.1:pg", address}, `-listen "127.0.0.1:pg": want host:port, such as 127.0.0.1:6432`},
+		{"listen without a port", []string{"-listen", "6432", address}, listen},
+		{"listen with no port number", []string{"-listen", "127.0.0.1:pg", address}, listen},
+		{"listen on port 0", []string{"-listen", "127.0.0.1:0", address}, listen},
 		{"no host", []string{"postgres://app:pw@:5432/crm"}, "the database address has no host"},
+		// pgx connects where these say; the proxy would relay to the URL's own host and port.
+		{"host in the query", []string{"postgres://app:pw@localhost/crm?host=/cloudsql/p:r:i"}, inQuery},
+		{"hostaddr in the query", []string{"postgres://app:pw@db.example.com/crm?sslmode=require&hostaddr=10.0.0.9"}, inQuery},
+		{"port in the query", []string{"postgres://app:pw@db.example.com/crm?port=5433"}, inQuery},
+		{"host in the query, its name encoded", []string{"postgres://app:pw@db.example.com/crm?ho%73t=other.example.com"}, inQuery},
+		{"several hosts", []string{"postgres://app:pw@h1:5432,h2:5432/crm"}, manyHost},
+		{"several hosts, the comma encoded", []string{"postgres://app:pw@h1%2Ch2/crm"}, manyHost},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out, err := initOut(append([]string{"-config", filepath.Join(t.TempDir(), "stet.yaml")}, tc.args...), "", false)
@@ -683,3 +701,55 @@ func TestInitShowsServerTextWithoutControlCharacters(t *testing.T) {
 
 // unsafeRune is what printable replaces.
 func unsafeRune(r rune) bool { return printable(string(r)) != string(r) }
+
+// stet init never writes a file stet proxy refuses, and the reason it gives
+// holds no password, though config's errors may quote the address whole.
+func TestInitChecksTheConfigBeforeWriting(t *testing.T) {
+	const prefix = "stet proxy would not accept the config for this address: "
+	render := func(t *testing.T, upstream string) []byte {
+		t.Helper()
+		file, err := renderConfig(upstream, "127.0.0.1:6432", []initTable{{Name: "contacts", PK: "id", Stale: true}}, "dev", time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return file
+	}
+	for _, tc := range []struct{ name, upstream, reason string }{
+		// PostgreSQL 17 takes it, so chooseSSLMode connects; the config refuses it.
+		{"sslnegotiation=direct", "postgres://app:" + initPassword + "@db.example.com:5432/crm?sslmode=require&sslnegotiation=direct",
+			"upstream: sslnegotiation=direct is not supported"},
+		{"a reason that quotes the address", "postgres://app:" + initPassword + "@/crm",
+			`upstream: "<the database address>" has no host`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkConfig(render(t, tc.upstream), tc.upstream)
+			if err == nil || !strings.HasPrefix(err.Error(), prefix) || !strings.Contains(err.Error(), tc.reason) {
+				t.Errorf("err = %v, want %q followed by a reason with %q", err, prefix, tc.reason)
+			}
+			if err != nil && strings.Contains(err.Error(), initPassword) {
+				t.Errorf("the error holds the password: %v", err)
+			}
+		})
+	}
+
+	t.Run("accepted", func(t *testing.T) {
+		const upstream = "postgres://app:" + initPassword + "@db.example.com:5432/crm?sslmode=verify-full"
+		if err := checkConfig(render(t, upstream), upstream); err != nil {
+			t.Errorf("err = %v, want none", err)
+		}
+	})
+
+	t.Run("every form of the password", func(t *testing.T) {
+		const upstream = `postgres://app:s3cr%2Bt@/crm?application_name=a"b&password=q%22ry`
+		secrets := []string{upstream, strconv.Quote(upstream), "s3cr%2Bt", "s3cr+t", "q%22ry", `q"ry`, `q\"ry`}
+		got := withoutSecrets(strings.Join(secrets, " | "), upstream)
+		for _, s := range secrets {
+			if strings.Contains(got, s) {
+				t.Errorf("%q holds %q", got, s)
+			}
+		}
+		if want := "<the database address> | \"<the database address>\" | <password>"; !strings.HasPrefix(got, want) {
+			t.Errorf("got %q, want it to start with %q", got, want)
+		}
+	})
+}

@@ -31,6 +31,9 @@ const (
 	errNoAddress   = "no database address: set DATABASE_URL, or pass the address as the last argument"
 	errFlagsAfter  = "flags go before the address"
 	errNoHost      = "the database address has no host"
+	errQueryHost   = "the database address sets host, hostaddr or port in its query; write the host and port in the address itself"
+	errHosts       = "the database address lists more than one host; stet relays to one server, so give one host"
+	errListen      = "-listen must be host:port with a port from 1 to 65535" // never the value: it may be the address
 	errNotTerminal = "this is not a terminal, so stet init cannot ask; read the lines above and pass -yes to continue"
 	errStopped     = "stopped; nothing was written"
 	errNoTable     = "no table can be watched"
@@ -87,9 +90,10 @@ func runInit(args []string, stdin io.Reader, stdout io.Writer, interactive bool,
 	case raw == "":
 		return errors.New(errNoAddress)
 	case !listenAddress(*listen):
-		return fmt.Errorf("-listen %q: want host:port, such as 127.0.0.1:6432", *listen)
-	case hostless(raw):
-		return errors.New(errNoHost)
+		return errors.New(errListen)
+	}
+	if err := checkAddress(raw); err != nil {
+		return err
 	}
 
 	// A file that is there stops it before it connects.
@@ -126,6 +130,9 @@ func runInit(args []string, stdin io.Reader, stdout io.Writer, interactive bool,
 	}
 	file, err := renderConfig(upstream, *listen, facts.Tables, version, time.Now())
 	if err != nil {
+		return err
+	}
+	if err := checkConfig(file, upstream); err != nil {
 		return err
 	}
 	agent, err := agentURL(upstream, *listen)
@@ -167,15 +174,120 @@ func listenAddress(listen string) bool {
 	return err == nil && n > 0
 }
 
-// hostless reports whether raw is a postgres URL with no host, which pgx
-// would take for a Unix socket and the config refuses. Any other address
-// that is not a postgres URL is chooseSSLMode's to refuse.
-func hostless(raw string) bool {
+// checkAddress refuses, before stet init connects, a postgres URL that pgx
+// would connect with somewhere other than where the proxy relays the agents'
+// sessions, which is the URL's own one host and port (config.UpstreamAddr).
+// It refuses one with no host, which pgx takes for a Unix socket; one whose
+// query sets host, hostaddr or port, which pgx takes over the URL's own; and
+// one that lists several hosts, which pgx tries in turn. Its errors never
+// quote the address, which holds the password. Any other address that is not
+// a postgres URL is chooseSSLMode's to refuse.
+func checkAddress(raw string) error {
 	if !strings.HasPrefix(raw, "postgres://") && !strings.HasPrefix(raw, "postgresql://") {
-		return false
+		return nil
 	}
-	u, err := url.Parse(raw)
-	return err == nil && u.Hostname() == ""
+	if u, err := url.Parse(raw); err == nil && u.Hostname() == "" {
+		return errors.New(errNoHost)
+	}
+	query, _ := uriQuery(raw)
+	for pair := range strings.SplitSeq(query, "&") {
+		key, _, _ := strings.Cut(pair, "=")
+		if k, _ := url.PathUnescape(key); k == "host" || k == "hostaddr" || k == "port" {
+			return errors.New(errQueryHost)
+		}
+	}
+	// pgx splits the host list at commas after decoding it, so %2C is one.
+	hosts := uriHosts(raw)
+	if decoded, _ := url.PathUnescape(hosts); strings.Contains(hosts, ",") || strings.Contains(decoded, ",") {
+		return errors.New(errHosts)
+	}
+	return nil
+}
+
+// uriHosts returns the host list of the connection URI raw as pgconn reads
+// it (as uriQuery does the query): what follows the user name and password,
+// up to the path or the query.
+func uriHosts(raw string) string {
+	_, rest, _ := strings.Cut(raw, "://")
+	if i := strings.IndexAny(rest, "@/"); i >= 0 && rest[i] == '@' {
+		rest = rest[i+1:]
+	}
+	if i := strings.IndexAny(rest, "/?"); i >= 0 {
+		rest = rest[:i]
+	}
+	return rest
+}
+
+// checkConfig returns nil when stet proxy accepts file, the config rendered
+// for upstream, and else why not. config's reasons may quote upstream whole
+// (validateUpstream), so upstream and its passwords are taken out of the
+// reason (withoutSecrets), and the rest is made printable.
+func checkConfig(file []byte, upstream string) error {
+	if _, err := config.Parse(file); err != nil {
+		return errors.New("stet proxy would not accept the config for this address: " + printable(withoutSecrets(err.Error(), upstream)))
+	}
+	return nil
+}
+
+// withoutSecrets is s with upstream replaced by <the database address> and
+// its passwords by <password>: the one in its user information and any
+// password or sslpassword in its query, each as written and decoded. Each is
+// also replaced as %q writes it, inside quotes, as config's errors and
+// net/url's quote an address.
+func withoutSecrets(s, upstream string) string {
+	type secret struct{ text, shown string }
+	secrets := []secret{{upstream, "<the database address>"}}
+	for _, p := range addressPasswords(upstream) {
+		secrets = append(secrets, secret{p, "<password>"})
+	}
+	var pairs []secret
+	for _, x := range secrets {
+		if x.text == "" {
+			continue
+		}
+		quoted := strconv.Quote(x.text)
+		pairs = append(pairs, x, secret{quoted[1 : len(quoted)-1], x.shown})
+	}
+	// The longest first: a replacer prefers the earlier of two that start
+	// at the same place, and upstream holds the passwords.
+	slices.SortStableFunc(pairs, func(a, b secret) int { return len(b.text) - len(a.text) })
+	var args []string
+	for _, p := range pairs {
+		args = append(args, p.text, p.shown)
+	}
+	return strings.NewReplacer(args...).Replace(s)
+}
+
+// addressPasswords returns the passwords in the URL raw, each as written and
+// decoded: the one in its user information as net/url splits it (as the
+// config reads the address), and the values of password and sslpassword in
+// its query.
+func addressPasswords(raw string) []string {
+	var written []string
+	_, rest, _ := strings.Cut(raw, "://")
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		rest = rest[:i]
+	}
+	if i := strings.LastIndex(rest, "@"); i >= 0 {
+		if _, password, ok := strings.Cut(rest[:i], ":"); ok {
+			written = append(written, password)
+		}
+	}
+	query, _ := uriQuery(raw)
+	for pair := range strings.SplitSeq(query, "&") {
+		key, value, _ := strings.Cut(pair, "=")
+		if k, _ := url.PathUnescape(key); k == "password" || k == "sslpassword" {
+			written = append(written, value)
+		}
+	}
+	var all []string
+	for _, p := range written {
+		all = append(all, p)
+		if decoded, err := url.PathUnescape(p); err == nil {
+			all = append(all, decoded)
+		}
+	}
+	return all
 }
 
 // tableNames is the list of -tables: names separated by commas.
@@ -376,7 +488,7 @@ func agentURL(upstream, listen string) (string, error) {
 	}
 	host, port, err := net.SplitHostPort(listen)
 	if err != nil {
-		return "", fmt.Errorf("-listen %q: want host:port, such as 127.0.0.1:6432", listen)
+		return "", errors.New(errListen)
 	}
 	if host == "" || host == "0.0.0.0" || host == "::" {
 		host = "127.0.0.1"
