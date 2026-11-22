@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/pem"
@@ -17,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -35,7 +37,9 @@ import (
 // Stet's side of the clients' leg (listen_tls), which clients also trust as
 // their root, the test server's certificate for the upstream leg, and a
 // credentials file. secrets is what no log, output or decision may show:
-// each token, its verifier, the verifier's keys, and each stored password.
+// each token, its verifier, the verifier's keys, each stored password (or
+// password_env variable's value), and the file's mock_secret, as its base64
+// text and its bytes in hex.
 type custodyCase struct {
 	certPath, keyPath string
 	upstreamRoot      string // "" when the test has no test server
@@ -80,7 +84,19 @@ func newCustody(t *testing.T, pg string, passwords map[string]string) *custodyCa
 	if err := custody.Write(c.credentials, f); err != nil {
 		t.Fatal(err)
 	}
+	c.secrets = append(c.secrets, mockSecretForms(t, f.MockSecret)...)
 	return c
+}
+
+// mockSecretForms is how a credentials file's mock_secret could show: as the
+// file writes it (base64), and its bytes in hex.
+func mockSecretForms(t *testing.T, mock string) []string {
+	t.Helper()
+	b, err := base64.StdEncoding.DecodeString(mock)
+	if err != nil || len(b) == 0 {
+		t.Fatalf("the file's mock_secret is not base64 of some bytes: %v", err)
+	}
+	return []string{mock, hex.EncodeToString(b)}
 }
 
 // agent is the credentials file's entry of account with password and a new
@@ -660,9 +676,62 @@ func TestStartCheckKeepsToItsTimeLimits(t *testing.T) {
 	}
 }
 
+func TestCredentialsFileReReadFails(t *testing.T) { rereadFails(t) }
+
+// While the running proxy cannot read the credentials file again (a verifier
+// in it broken, then whole but open to others), both accounts
+// go on logging in with what it last read, one of them with its password
+// from the environment, and each cause is logged as an error once.
+func rereadFails(t *testing.T) *custodyRun {
+	pg := testPG(t)
+	ctx := context.Background()
+	inFile, inFilePassword := newAgentRole(t, pg)
+	inEnv, inEnvPassword := newAgentRole(t, pg)
+	c := newCustody(t, pg, map[string]string{inFile: inFilePassword})
+	variable := "STET_CHK_PASSWORD_" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	t.Setenv(variable, inEnvPassword) // stet proxy reads it at start
+	f, err := custody.Read(c.credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := c.agent(t, inEnv, inEnvPassword) // its value among c's secrets
+	a.Password, a.PasswordEnv = "", variable
+	f.Agents[inEnv] = a
+	if err := custody.Write(c.credentials, f); err != nil {
+		t.Fatal(err)
+	}
+	r, out, _ := startCustody(t, c.config(t, "shadow", pg, "stet_test", ""))
+	waitListening(t, r)
+	logIn := func(when string) {
+		t.Helper()
+		for _, account := range []string{inFile, inEnv} {
+			var user string
+			conn := c.connect(t, r, "stet_test", account)
+			if err := conn.QueryRow(ctx, "select current_user").Scan(&user); err != nil || user != account {
+				t.Errorf("%s: current_user %q, %v; want %s", when, user, err, account)
+			}
+			conn.Close(ctx)
+		}
+	}
+	logIn("at start")
+
+	good := fileBytes(t, c.credentials)
+	replaceFile(t, c.credentials, bytes.Replace(good, []byte("$4096:"), []byte("$4096:!"), 1))
+	logIn("a verifier broken")
+	replaceFile(t, c.credentials, good)
+	if err := os.Chmod(c.credentials, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	logIn("the file open to others")
+	if n := strings.Count(r.log.String(), `level=ERROR msg="could not read the credentials file again`); n != 2 {
+		t.Errorf("%d errors of reading the file again, want 2, one per cause; log:\n%s", n, r.log)
+	}
+	return &custodyRun{r: r, out: out, c: c}
+}
+
 // The scenarios above, run with the log at debug level and decision lines
-// on: no token, verifier or password is in the log, in the output, or in
-// stet.decisions.
+// on: no token, verifier, password (or password_env variable's value) or
+// mock_secret is in the log, in the output, or in stet.decisions.
 func TestNoSecretInAnyLog(t *testing.T) {
 	for _, sc := range []struct {
 		name string
@@ -672,6 +741,7 @@ func TestNoSecretInAnyLog(t *testing.T) {
 		{"Enforce", custodyEnforce},
 		{"TokenRotation", tokenRotation},
 		{"StartCheck", startCheck},
+		{"ReReadFails", rereadFails},
 	} {
 		t.Run(sc.name, func(t *testing.T) {
 			cr := sc.run(t)

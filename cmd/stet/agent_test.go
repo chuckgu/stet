@@ -266,15 +266,19 @@ func tokenOutput(account, token string) string {
 }
 
 // fileSecrets is what of the credentials file at path no output may show:
-// each account's verifier, its salt and keys, and its password. Nothing
-// when there is no file.
+// each account's verifier, its salt and keys, and its password, and the
+// file's mock_secret (mockSecretForms). Nothing when there is no file.
 func fileSecrets(t *testing.T, path string) []string {
 	t.Helper()
 	if _, err := os.Stat(path); err != nil {
 		return nil
 	}
+	f := readFile(t, path)
 	var out []string
-	for _, a := range readFile(t, path).Agents {
+	if f.MockSecret != "" {
+		out = mockSecretForms(t, f.MockSecret)
+	}
+	for _, a := range f.Agents {
 		_, rest, _ := strings.Cut(a.Token, ":") // <salt>$<StoredKey>:<ServerKey>
 		salt, keys, _ := strings.Cut(rest, "$") // <StoredKey>:<ServerKey>
 		stored, server, _ := strings.Cut(keys, ":")
@@ -751,15 +755,17 @@ func TestAgentKeepsTheFileMode(t *testing.T) {
 }
 
 // Every command's output and error, its failures too, shows no password or
-// verifier, nor Stet's own password or the upstream address; each token is
-// shown once, by the add or token that made it.
+// verifier, no password_env variable's value, nor the file's mock_secret,
+// Stet's own password or the upstream address; each token is shown once, by
+// the add or token that made it.
 func TestAgentOutputShowsTheTokenOnce(t *testing.T) {
 	pg := testPG(t)
 	account, password := newAgentRole(t, pg)
 	ac := newAgentCase(t, pg)
-	changed := secret(t)
+	changed := secret(t) // also the value of the variable name
 	name := "STET_CHK_PASSWORD_" + strconv.FormatInt(time.Now().UnixNano(), 10)
-	secrets := []string{password, changed, "scram-pw"}
+	wrongEnv := secret(t) // the value of a variable that holds a wrong password
+	secrets := []string{password, changed, wrongEnv, "scram-pw"}
 
 	type step struct {
 		args   []string
@@ -779,6 +785,7 @@ func TestAgentOutputShowsTheTokenOnce(t *testing.T) {
 		{args: []string{"password", account}, stdin: password + "\n",
 			before: func() { mustExec(t, superuser(t, pg), "alter role "+account+" password '"+changed+"'") }},
 		{args: []string{"password", account}, stdin: changed + "\n", ok: true},
+		{args: []string{"password", "-password-env", name, account}, env: map[string]string{name: wrongEnv}},
 		{args: []string{"password", "-password-env", name, account}, env: map[string]string{name: changed}, ok: true},
 		{args: []string{"password", account}}, // its password is the variable's
 		{args: []string{"list"}, ok: true},
