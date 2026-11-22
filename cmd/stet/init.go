@@ -33,6 +33,7 @@ const (
 	errNoHost      = "the database address has no host"
 	errQueryHost   = "the database address sets host, hostaddr or port in its query; write the host and port in the address itself"
 	errHosts       = "the database address lists more than one host; stet relays to one server, so give one host"
+	errSpace       = "the database address contains a space; percent-encode it (%20) or remove it"
 	errListen      = "-listen must be host:port with a port from 1 to 65535" // never the value: it may be the address
 	errNotTerminal = "this is not a terminal, so stet init cannot ask; read the lines above and pass -yes to continue"
 	errStopped     = "stopped; nothing was written"
@@ -177,14 +178,19 @@ func listenAddress(listen string) bool {
 // checkAddress refuses, before stet init connects, a postgres URL that pgx
 // would connect with somewhere other than where the proxy relays the agents'
 // sessions, which is the URL's own one host and port (config.UpstreamAddr).
-// It refuses one with no host, which pgx takes for a Unix socket; one whose
-// query sets host, hostaddr or port, which pgx takes over the URL's own; and
-// one that lists several hosts, which pgx tries in turn. Its errors never
-// quote the address, which holds the password. Any other address that is not
-// a postgres URL is chooseSSLMode's to refuse.
+// It refuses one with a space, which pgx drops around a query key where the
+// rest of stet does not; one with no host, which pgx takes for a Unix
+// socket; one whose query sets host, hostaddr or port, which pgx takes over
+// the URL's own; one that lists several hosts, which pgx tries in turn; and
+// last any other the two read differently (config.OneTarget). Its errors
+// never quote the address, which holds the password. Any other address that
+// is not a postgres URL is chooseSSLMode's to refuse.
 func checkAddress(raw string) error {
 	if !strings.HasPrefix(raw, "postgres://") && !strings.HasPrefix(raw, "postgresql://") {
 		return nil
+	}
+	if strings.Contains(raw, " ") {
+		return errors.New(errSpace)
 	}
 	if u, err := url.Parse(raw); err == nil && u.Hostname() == "" {
 		return errors.New(errNoHost)
@@ -201,7 +207,7 @@ func checkAddress(raw string) error {
 	if decoded, _ := url.PathUnescape(hosts); strings.Contains(hosts, ",") || strings.Contains(decoded, ",") {
 		return errors.New(errHosts)
 	}
-	return nil
+	return config.OneTarget(raw)
 }
 
 // uriHosts returns the host list of the connection URI raw as pgconn reads

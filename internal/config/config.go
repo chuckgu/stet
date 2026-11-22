@@ -320,7 +320,11 @@ func Parse(b []byte) (*Config, error) {
 	}
 	if err := validateUpstream(c.Upstream); err != nil {
 		fail("upstream: %v", err)
-	} else if err := c.readUpstreamTLS(); err != nil {
+	} else if pc, err := pgconn.ParseConfig(c.Upstream); err != nil {
+		fail("upstream: %v", err)
+	} else if err := oneTarget(c.Upstream, pc); err != nil {
+		fail("upstream: %v", err)
+	} else if err := c.readUpstreamTLS(pc); err != nil {
 		fail("upstream: %v", err)
 	}
 	if raw.Retention != "" {
@@ -712,8 +716,13 @@ func policyRules(v any) ([]string, error) {
 
 // UpstreamAddr is the host:port the proxy dials. Clients authenticate to it
 // with their own credentials; any user in the URL is for Stet's own queries.
-func (c *Config) UpstreamAddr() string {
-	u, err := url.Parse(c.Upstream)
+func (c *Config) UpstreamAddr() string { return relayAddr(c.Upstream) }
+
+// relayAddr is the host and port of the URL upstream as net/url reads it,
+// with PostgreSQL's port when it names none: where the proxy relays to. ""
+// when upstream is not a URL.
+func relayAddr(upstream string) string {
+	u, err := url.Parse(upstream)
 	if err != nil {
 		return ""
 	}
@@ -724,13 +733,48 @@ func (c *Config) UpstreamAddr() string {
 	return net.JoinHostPort(u.Hostname(), port)
 }
 
-// readUpstreamTLS reads the TLS parameters of the upstream URL the way Stet's
-// own connections do, and refuses what a relayed session cannot honour.
-func (c *Config) readUpstreamTLS() error {
-	pc, err := pgconn.ParseConfig(c.Upstream)
+// errTwoTargets is OneTarget's error. It names neither host nor port: when
+// the two readings differ, they may be pieces of the password.
+const errTwoTargets = "stet's own connections and the proxy would reach different hosts or ports for this address; " +
+	"write one host and one port in the address itself (not in its query, PGHOST, PGPORT or a service file), " +
+	"and percent-encode special characters in the password"
+
+// OneTarget reports an error when Stet's own connections and the proxy's
+// leg would not reach the same single host and port for upstream: its own
+// connections read the address as pgconn does (query parameters, several
+// hosts, PGHOST, PGPORT, a service file), the proxy relays to UpstreamAddr.
+// The error never quotes the address.
+//
+// An address pgconn cannot read at all is not its to refuse: reading it
+// otherwise (Parse, openPool) says why.
+func OneTarget(upstream string) error {
+	pc, err := pgconn.ParseConfig(upstream)
 	if err != nil {
-		return err
+		return nil
 	}
+	return oneTarget(upstream, pc)
+}
+
+// oneTarget is OneTarget with upstream as pgconn read it, pc: every host and
+// port pgconn would try, the first and each fallback, must be relayAddr's.
+func oneTarget(upstream string, pc *pgconn.Config) error {
+	relay := relayAddr(upstream)
+	at := func(host string, port uint16) string { return net.JoinHostPort(host, strconv.Itoa(int(port))) }
+	if at(pc.Host, pc.Port) != relay {
+		return errors.New(errTwoTargets)
+	}
+	for _, f := range pc.Fallbacks {
+		if at(f.Host, f.Port) != relay {
+			return errors.New(errTwoTargets)
+		}
+	}
+	return nil
+}
+
+// readUpstreamTLS reads the TLS parameters of the upstream URL from pc, as
+// pgconn read it for Stet's own connections, and refuses what a relayed
+// session cannot honour.
+func (c *Config) readUpstreamTLS(pc *pgconn.Config) error {
 	if pc.SSLNegotiation == "direct" {
 		return errors.New("sslnegotiation=direct is not supported: stet asks for TLS with an SSLRequest; remove it")
 	}
@@ -777,19 +821,22 @@ func (c *Config) UpstreamTransport() Transport {
 	return TransportVerified
 }
 
+// validateUpstream checks that upstream is a postgres URL with a host. Its
+// errors never quote the address, nor url.Parse's error, which does: the
+// address holds the password.
 func validateUpstream(s string) error {
 	if s == "" {
 		return errors.New("required")
 	}
 	u, err := url.Parse(s)
 	if err != nil {
-		return err
+		return errors.New("is not a valid URL")
 	}
 	if u.Scheme != "postgres" && u.Scheme != "postgresql" {
-		return fmt.Errorf("%q must be a postgres:// URL", s)
+		return errors.New("must be a postgres:// or postgresql:// URL")
 	}
 	if u.Host == "" {
-		return fmt.Errorf("%q has no host", s)
+		return errors.New("has no host")
 	}
 	return nil
 }

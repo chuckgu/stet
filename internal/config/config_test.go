@@ -877,3 +877,83 @@ func TestSendFieldsOptionalWithoutAModel(t *testing.T) {
 		t.Errorf("err = %v, want %q", err, want)
 	}
 }
+
+// twoTargets is OneTarget's error.
+const twoTargets = "stet's own connections and the proxy would reach different hosts or ports for this address; " +
+	"write one host and one port in the address itself (not in its query, PGHOST, PGPORT or a service file), " +
+	"and percent-encode special characters in the password"
+
+func TestOneTarget(t *testing.T) {
+	const pw = "s3cr3t-pw"
+	services := filepath.Join(t.TempDir(), "pg_service.conf")
+	if err := os.WriteFile(services, []byte("[elsewhere]\nport=5433\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, upstream string
+		env            map[string]string
+		ok             bool
+	}{
+		{name: "one host and port", upstream: "postgres://app:" + pw + "@db.example.com:5432/crm?sslmode=disable", ok: true},
+		{name: "the default port", upstream: "postgres://app:" + pw + "@db.example.com/crm", ok: true},
+		// prefer tries TLS, then plaintext: two fallbacks to one place.
+		{name: "prefer", upstream: "postgres://app:" + pw + "@db.example.com:5432/crm?sslmode=prefer", ok: true},
+		{name: "IPv6", upstream: "postgres://app:" + pw + "@[::1]:5432/crm", ok: true},
+
+		// pgconn drops spaces around a query key; net/url keeps them.
+		{name: "a space before a query key", upstream: "postgres://app:" + pw + "@db.example.com/crm?sslmode=disable& host=evil.example.com"},
+		{name: "a space after a query key", upstream: "postgres://app:" + pw + "@db.example.com/crm?host =evil.example.com"},
+		// pgconn ends the user information at the first @ before a /; net/url
+		// ends the authority at /, ? or #.
+		{name: "# in the password", upstream: "postgres://app:#" + pw + "@db.example.com/crm?sslmode=verify-full"},
+		{name: "? in the password", upstream: "postgres://app:12?" + pw + "@db.example.com/crm"},
+		{name: "? in the user name, no host for pgconn", upstream: "postgres://h?x:" + pw + "@/crm"},
+		{name: "? in the user name, no password", upstream: "postgres://h?@/crm"},
+		// Where the URL has no port, the environment or a service file gives it.
+		{name: "PGPORT", upstream: "postgres://app:" + pw + "@db.example.com/crm", env: map[string]string{"PGPORT": "5433"}},
+		{name: "a service file's port", upstream: "postgres://app:" + pw + "@db.example.com/crm?service=elsewhere",
+			env: map[string]string{"PGSERVICEFILE": services}},
+		{name: "host in the query", upstream: "postgres://app:" + pw + "@db.example.com/crm?host=other.example.com"},
+		{name: "port in the query", upstream: "postgres://app:" + pw + "@db.example.com:5432/crm?port=5433"},
+		{name: "several hosts", upstream: "postgres://app:" + pw + "@h1:5432,h2:5432/crm"},
+		{name: "several hosts, one port", upstream: "postgres://app:" + pw + "@db.example.com,db2.example.com/crm"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearPGEnv(t)
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			err := OneTarget(tc.upstream)
+			switch {
+			case tc.ok && err != nil:
+				t.Errorf("err = %v, want none", err)
+			case !tc.ok && (err == nil || err.Error() != twoTargets):
+				t.Errorf("err = %v, want %q", err, twoTargets)
+			case err != nil && strings.Contains(err.Error(), pw):
+				t.Errorf("the error holds the password: %v", err)
+			}
+		})
+	}
+}
+
+func TestParseRefusesAnUpstreamReadTwoWays(t *testing.T) {
+	clearPGEnv(t)
+	// The proxy would relay to app:12, Stet's own connections go to db.example.com.
+	_, err := parseUpstream(t, "postgres://app:12?s3cr3t-pw@db.example.com/crm")
+	if want := "upstream: " + twoTargets; err == nil || err.Error() != want {
+		t.Errorf("err = %v, want %q", err, want)
+	}
+}
+
+func TestUpstreamErrorsNeverQuoteTheAddress(t *testing.T) {
+	clearPGEnv(t)
+	for upstream, want := range map[string]string{
+		"mysql://app:s3cr3t-pw@db.example.com/crm":         "upstream: must be a postgres:// or postgresql:// URL",
+		"postgres://app:s3cr3t-pw@/crm":                    "upstream: has no host",
+		"postgres://app:s3cr3t-pw@db.example.com:port/crm": "upstream: is not a valid URL",
+	} {
+		if _, err := parseUpstream(t, upstream); err == nil || err.Error() != want {
+			t.Errorf("%s: err = %v, want %q", upstream, err, want)
+		}
+	}
+}

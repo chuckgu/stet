@@ -473,14 +473,14 @@ func TestInitOutputNeverShowsThePassword(t *testing.T) {
 	pg := testPG(t)
 	db, role := ownDatabase(t, pg, initPassword)
 	mustExec(t, connectTo(t, pg, db, role, initPassword), "create table contacts (id int primary key)")
-	remote := func() func() { return setRemoteHost(func(string) bool { return true }) }
+	remote := func(t *testing.T) { t.Cleanup(setRemoteHost(func(string) bool { return true })) }
 
 	for _, tc := range []struct {
 		name     string
 		password string // the address's
 		address  string
 		args     []string
-		setup    func() (restore func())
+		setup    func(t *testing.T)
 		ok       bool
 	}{
 		{name: "success", password: initPassword, address: dbAddress(pg, db, role, initPassword), args: []string{"-yes"}, ok: true},
@@ -497,13 +497,23 @@ func TestInitOutputNeverShowsThePassword(t *testing.T) {
 		{name: "no host", password: initPassword, address: "postgres://app:" + initPassword + "@/crm", args: []string{"-yes"}},
 		{name: "host in the query", password: initPassword, address: "postgres://app:" + initPassword + "@localhost/crm?host=/tmp", args: []string{"-yes"}},
 		{name: "several hosts", password: initPassword, address: "postgres://app:" + initPassword + "@h1:5432,h2:5432/crm", args: []string{"-yes"}},
+		// Read one way by pgx and another by the proxy; refused before connecting.
+		{name: "a space before a query key", password: initPassword,
+			address: "postgres://app:" + initPassword + "@127.0.0.1:1/crm?sslmode=disable& host=127.0.0.2", args: []string{"-yes"}},
+		{name: "# in the password", password: initPassword, address: "postgres://app:#" + initPassword + "@127.0.0.1:1/crm", args: []string{"-yes"}},
+		{name: "? in the password", password: initPassword, address: "postgres://app:12?" + initPassword + "@127.0.0.1:1/crm", args: []string{"-yes"}},
+		{name: "? in the user name", password: initPassword, address: "postgres://h?x:" + initPassword + "@/crm", args: []string{"-yes"}},
+		{name: "PGPORT", password: initPassword, address: "postgres://app:" + initPassword + "@127.0.0.1/crm", args: []string{"-yes"},
+			setup: func(t *testing.T) { t.Setenv("PGPORT", "1") }},
+		{name: "a space before the password key", password: initPassword,
+			address: "postgres://app@127.0.0.1:1/crm?sslmode=disable& password=" + initPassword, args: []string{"-yes"}},
 		{name: "the address given to -listen", password: initPassword, address: dbAddress(pg, db, role, initPassword),
 			args: []string{"-yes", "-listen", "postgres://app:" + initPassword + "@db.example.com:5432/crm"}},
 		{name: "refused without -yes", password: initPassword, address: dbAddress(pg, db, role, initPassword)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.setup != nil {
-				defer tc.setup()()
+				tc.setup(t)
 			}
 			path := filepath.Join(t.TempDir(), "stet.yaml")
 			out, err := initOut(append(tc.args, "-config", path, tc.address), "", false)
@@ -528,6 +538,10 @@ func TestInitStops(t *testing.T) {
 		listen   = "-listen must be host:port with a port from 1 to 65535"
 		inQuery  = "the database address sets host, hostaddr or port in its query; write the host and port in the address itself"
 		manyHost = "the database address lists more than one host; stet relays to one server, so give one host"
+		space    = "the database address contains a space; percent-encode it (%20) or remove it"
+		twoWays  = "stet's own connections and the proxy would reach different hosts or ports for this address; " +
+			"write one host and one port in the address itself (not in its query, PGHOST, PGPORT or a service file), " +
+			"and percent-encode special characters in the password"
 	)
 	for _, tc := range []struct {
 		name string
@@ -548,6 +562,15 @@ func TestInitStops(t *testing.T) {
 		{"host in the query, its name encoded", []string{"postgres://app:pw@db.example.com/crm?ho%73t=other.example.com"}, inQuery},
 		{"several hosts", []string{"postgres://app:pw@h1:5432,h2:5432/crm"}, manyHost},
 		{"several hosts, the comma encoded", []string{"postgres://app:pw@h1%2Ch2/crm"}, manyHost},
+		// pgx drops spaces around a query key; the proxy's reading keeps them.
+		{"a space before a query key", []string{"postgres://app:pw@127.0.0.1:1/crm?sslmode=disable& host=127.0.0.2"}, space},
+		{"a space after a query key", []string{"postgres://app:pw@127.0.0.1:1/crm?host =127.0.0.2"}, space},
+		{"a space before the password key", []string{"postgres://app@127.0.0.1:1/crm?sslmode=disable& password=secret"}, space},
+		// pgx ends the user name and password at the first @ before a /; the
+		// proxy's reading ends the host part at /, ? or #.
+		{"# in the password", []string{"postgres://app:#hunter2@127.0.0.1:1/crm"}, twoWays},
+		{"? in the password", []string{"postgres://app:12?34@127.0.0.1:1/crm"}, twoWays},
+		{"? in the user name", []string{"postgres://h?@/crm"}, twoWays},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out, err := initOut(append([]string{"-config", filepath.Join(t.TempDir(), "stet.yaml")}, tc.args...), "", false)
@@ -556,6 +579,14 @@ func TestInitStops(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("PGPORT", func(t *testing.T) {
+		t.Setenv("PGPORT", "1") // pgx would connect to 127.0.0.1:1, the proxy relay to 127.0.0.1:5432
+		out, err := initOut([]string{"-config", filepath.Join(t.TempDir(), "stet.yaml"), "postgres://app:pw@127.0.0.1/crm"}, "", false)
+		if err == nil || err.Error() != twoWays || out != "" {
+			t.Errorf("err = %v, output %q; want %q and no output", err, out, twoWays)
+		}
+	})
 
 	t.Run("DATABASE_URL", func(t *testing.T) {
 		var out bytes.Buffer
@@ -718,8 +749,7 @@ func TestInitChecksTheConfigBeforeWriting(t *testing.T) {
 		// PostgreSQL 17 takes it, so chooseSSLMode connects; the config refuses it.
 		{"sslnegotiation=direct", "postgres://app:" + initPassword + "@db.example.com:5432/crm?sslmode=require&sslnegotiation=direct",
 			"upstream: sslnegotiation=direct is not supported"},
-		{"a reason that quotes the address", "postgres://app:" + initPassword + "@/crm",
-			`upstream: "<the database address>" has no host`},
+		{"a reason about the address", "postgres://app:" + initPassword + "@/crm", "upstream: has no host"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := checkConfig(render(t, tc.upstream), tc.upstream)
@@ -737,6 +767,24 @@ func TestInitChecksTheConfigBeforeWriting(t *testing.T) {
 		if err := checkConfig(render(t, upstream), upstream); err != nil {
 			t.Errorf("err = %v, want none", err)
 		}
+	})
+
+	// PGSSLMODE=allow lets stet init connect to an address that writes no
+	// sslmode; the config refuses allow, so stet init writes nothing.
+	t.Run("through stet init", func(t *testing.T) {
+		pg := testPG(t)
+		address := strings.TrimSuffix(contactsDatabase(t, pg, false), "?sslmode=disable")
+		t.Setenv("PGSSLMODE", "allow")
+		path := filepath.Join(t.TempDir(), "stet.yaml")
+		out, err := initOut([]string{"-yes", "-config", path, address}, "", false)
+		want := prefix + "upstream: sslmode=allow is not supported"
+		if err == nil || !strings.HasPrefix(err.Error(), want) {
+			t.Errorf("err = %v, want it to start with %q; output:\n%s", err, want, out)
+		}
+		if strings.Contains(out, "scram-pw") || err != nil && strings.Contains(err.Error(), "scram-pw") {
+			t.Errorf("the output or the error holds the password:\n%s\nerror: %v", out, err)
+		}
+		wantNoFile(t, path)
 	})
 
 	t.Run("every form of the password", func(t *testing.T) {
