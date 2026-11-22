@@ -10,12 +10,13 @@ import (
 	"maps"
 	"net"
 	"strings"
-	"unicode"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/stetdb/stet/internal/proxy"
+	"github.com/stetdb/stet/internal/safetext"
 	"github.com/stetdb/stet/internal/scram"
 )
 
@@ -49,7 +50,7 @@ func (l *Login) Verifier(account string) (v scram.Verifier, known bool) {
 }
 
 // Open logs in upstream as account with its stored password and hands the
-// session over.
+// session over. It applies no time limit of its own: ctx should carry one.
 func (l *Login) Open(ctx context.Context, account, database string, params map[string]string) (*proxy.Opened, error) {
 	e, ok := l.store.Lookup(account)
 	if !ok {
@@ -63,7 +64,8 @@ func (l *Login) Open(ctx context.Context, account, database string, params map[s
 }
 
 // Check logs in as account and closes the session: what stet proxy does at
-// start and stet agent before it writes. Its error carries no secret.
+// start and stet agent before it writes. Its error carries no secret. It
+// applies no time limit of its own: ctx should carry one.
 func (l *Login) Check(ctx context.Context, account, database string) error {
 	e, ok := l.store.Lookup(account)
 	if !ok {
@@ -72,7 +74,8 @@ func (l *Login) Check(ctx context.Context, account, database string) error {
 	return l.up.check(ctx, account, e.Password, database)
 }
 
-// TryPassword is Check with a password that is not in the store yet.
+// TryPassword is Check with a password that is not in the store yet. It
+// applies no time limit of its own: ctx should carry one.
 func TryPassword(ctx context.Context, upstream string, tlsConfig *tls.Config, plainFallback bool, account, password, database string) error {
 	up, err := newUpstream(upstream, tlsConfig, plainFallback)
 	if err != nil {
@@ -88,17 +91,21 @@ var (
 
 // upstream is how to log in to the database for an account.
 type upstream struct {
-	base          *pgconn.Config // the address as pgconn reads it; copied for each login
+	base          *pgconn.Config // the address as Stet's own pool reads it; copied for each login
 	tls           *tls.Config    // with no client certificate; nil: plaintext
 	plainFallback bool
 }
 
 func newUpstream(address string, tlsConfig *tls.Config, plainFallback bool) (*upstream, error) {
-	base, err := pgconn.ParseConfig(address)
+	// Read as Stet's own pool reads it (cmd/stet's openPool), so that pgx's
+	// and pgxpool's own keys (pool_max_conns, statement_cache_capacity, …)
+	// are taken out and not sent as startup parameters.
+	pool, err := pgxpool.ParseConfig(address)
 	if err != nil {
-		// pgconn's error can quote the address, and so its password.
+		// pgx's error can quote the address, and so its password.
 		return nil, errors.New("the upstream address cannot be read")
 	}
+	base := &pool.ConnConfig.Config
 	if tlsConfig != nil {
 		// A client certificate is for Stet's own connections only.
 		tlsConfig = tlsConfig.Clone()
@@ -110,9 +117,9 @@ func newUpstream(address string, tlsConfig *tls.Config, plainFallback bool) (*up
 
 // config is what to log in with as account: the address's host, port and
 // other settings, with account, password and database, params as the
-// startup parameters, and TLS as the proxy's leg has it. The password is
-// the one given and no other: pgconn's own from the environment or a
-// password file is replaced, and an empty one is refused.
+// startup parameters, TLS as the proxy's leg has it, and protocol 3.0. The
+// password is the one given and no other: pgconn's own from the environment
+// or a password file is replaced, and an empty one is refused.
 func (u *upstream) config(account, password, database string, params map[string]string) (*pgconn.Config, error) {
 	if password == "" {
 		return nil, errNoPassword
@@ -135,14 +142,20 @@ func (u *upstream) config(account, password, database string, params map[string]
 	if u.plainFallback {
 		cfg.Fallbacks = []*pgconn.FallbackConfig{{Host: cfg.Host, Port: cfg.Port}}
 	}
+	// Stet answers its clients as protocol 3.0. A 3.2 session, which the
+	// address or PGMAXPROTOCOLVERSION could ask for, would hand a 3.0 client
+	// a cancel key longer than it can read.
+	cfg.MinProtocolVersion = "3.0"
+	cfg.MaxProtocolVersion = "3.0"
 	cfg.OnNotice = nil // notices during the login are dropped
 	cfg.OnNotification = nil
 	return cfg, nil
 }
 
 // check logs in as account and closes the session. The session carries the
-// startup parameters the address names (application_name, options), as
-// Stet's own sessions do.
+// run-time parameters the address names (application_name, options), as
+// Stet's own pool reads them from it; the settings openPool adds on top are
+// not sent.
 func (u *upstream) check(ctx context.Context, account, password, database string) error {
 	cfg, err := u.config(account, password, database, u.base.RuntimeParams)
 	if err != nil {
@@ -255,14 +268,17 @@ func (e *loginError) Error() string {
 func describe(err error) *loginError {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
-		e := &loginError{kind: kindOther, code: printable(pgErr.Code), message: printable(pgErr.Message)}
+		e := &loginError{kind: kindOther, code: safetext.Printable(pgErr.Code), message: safetext.Printable(pgErr.Message)}
 		if pgErr.Code == "28P01" {
 			e.kind = kindWrongPassword
 		}
 		return e
 	}
 	switch {
-	case strings.Contains(err.Error(), "server refused TLS connection"): // pgconn's words for an N
+	case strings.Contains(err.Error(), "server refused TLS connection"):
+		// pgconn's words for an N; it has no error type for it. Should they
+		// change, TestLoginErrorsCarryNoSecrets/RefusedTLS and
+		// TestOpenFallsBackToPlaintextOnlyWhenAllowed/NotAllowed fail.
 		return &loginError{kind: kindRefusedTLS}
 	case badCertificate(err):
 		return &loginError{kind: kindCertificate}
@@ -293,16 +309,4 @@ func unreachable(err error) bool {
 	return errors.As(err, &dns) ||
 		(errors.As(err, &op) && op.Op == "dial") ||
 		pgconn.Timeout(err) || errors.Is(err, context.DeadlineExceeded)
-}
-
-// printable is s, text a server sent, with what a terminal would act on or
-// an eye misread replaced by spaces: control characters, line and paragraph
-// separators, direction controls.
-func printable(s string) string {
-	return strings.Map(func(r rune) rune {
-		if unicode.Is(unicode.Cc, r) || r == 0x2028 || r == 0x2029 || (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069) {
-			return ' '
-		}
-		return r
-	}, s)
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/stetdb/stet/internal/config"
+	"github.com/stetdb/stet/internal/safetext"
 )
 
 // noEnv is an environment without DATABASE_URL.
@@ -731,7 +732,7 @@ func TestInitReportsWhatItLeftOut(t *testing.T) {
 func TestInitShowsServerTextWithoutControlCharacters(t *testing.T) {
 	const dirty = "a\x1b[2Jb\u202ec\u2028d\u2066e\x00f\ng\x7fh"
 	const clean = "a [2Jb c d e f g h"
-	if got := printable(dirty); got != clean {
+	if got := safetext.Printable(dirty); got != clean {
 		t.Errorf("printable = %q, want %q", got, clean)
 	}
 
@@ -756,7 +757,7 @@ func TestInitShowsServerTextWithoutControlCharacters(t *testing.T) {
 	if want := "server error: FATAL: " + clean + "\n" + poolerHint; err.Error() != want {
 		t.Errorf("err = %q, want %q", err, want)
 	}
-	if err := printableError(errors.New(dirty + "\n" + poolerHint + "!")); err.Error() != printable(dirty+"\n"+poolerHint+"!") {
+	if err := printableError(errors.New(dirty + "\n" + poolerHint + "!")); err.Error() != safetext.Printable(dirty+"\n"+poolerHint+"!") {
 		t.Errorf("err = %q, want every line break replaced", err)
 	}
 
@@ -773,7 +774,7 @@ func TestInitShowsServerTextWithoutControlCharacters(t *testing.T) {
 		if err == nil || err.Error() != notTerminal {
 			t.Fatalf("err = %v, want %q; output:\n%s", err, notTerminal, out)
 		}
-		if want := `in database "` + printable(name) + `" as "stet_scram"`; !strings.Contains(out, want) {
+		if want := `in database "` + safetext.Printable(name) + `" as "stet_scram"`; !strings.Contains(out, want) {
 			t.Errorf("the output has no %q:\n%s", want, out)
 		}
 		if strings.ContainsFunc(strings.ReplaceAll(out, "\n", ""), unsafeRune) {
@@ -782,8 +783,8 @@ func TestInitShowsServerTextWithoutControlCharacters(t *testing.T) {
 	})
 }
 
-// unsafeRune is what printable replaces.
-func unsafeRune(r rune) bool { return printable(string(r)) != string(r) }
+// unsafeRune is what safetext.Printable replaces.
+func unsafeRune(r rune) bool { return safetext.Printable(string(r)) != string(r) }
 
 // stet init never writes a file stet proxy refuses, and the reason it gives
 // holds no password, though config's errors may quote the address whole.

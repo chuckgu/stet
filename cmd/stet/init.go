@@ -18,12 +18,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/jackc/pgx/v5"
 	"go.yaml.in/yaml/v3"
 
 	"github.com/stetdb/stet/internal/config"
+	"github.com/stetdb/stet/internal/safetext"
 )
 
 // What stet init stops with (spec-v0.2-tryout 4).
@@ -65,8 +65,8 @@ const configHeader = `# Written by stet init (stet %s) on %s.
 // there (spec-v0.2-tryout 4). It writes one file, the config, whole or not
 // at all, readable by its owner only: the database password is in it and
 // nowhere else, not in what it prints, not in an error. Text the server sent
-// is printed with its control characters as spaces (printable): the server
-// is not trusted either.
+// is printed with its control characters as spaces (safetext.Printable): the
+// server is not trusted either.
 func runInit(args []string, stdin io.Reader, stdout io.Writer, interactive bool, env func(string) string) error {
 	flags := flag.NewFlagSet("init", flag.ContinueOnError)
 	path := flags.String("config", "stet.yaml", "the config file to write")
@@ -134,7 +134,7 @@ func runInit(args []string, stdin io.Reader, stdout io.Writer, interactive bool,
 		return printableError(err)
 	}
 	if notice != "" {
-		fmt.Fprintln(stdout, printable(notice))
+		fmt.Fprintln(stdout, safetext.Printable(notice))
 	}
 
 	facts, err := initFactsAt(ctx, upstream, tableNames(*tables))
@@ -266,7 +266,7 @@ func uriHosts(raw string) string {
 // reason (withoutSecrets), and the rest is made printable.
 func checkConfig(file []byte, upstream string) error {
 	if _, err := config.Parse(file); err != nil {
-		return errors.New("stet proxy would not accept the config for this address: " + printable(withoutSecrets(err.Error(), upstream)))
+		return errors.New("stet proxy would not accept the config for this address: " + safetext.Printable(withoutSecrets(err.Error(), upstream)))
 	}
 	return nil
 }
@@ -368,7 +368,7 @@ func initFactsAt(ctx context.Context, upstream string, only []string) (*initFact
 func checkInitFacts(f *initFacts) error {
 	switch {
 	case f.VersionNum < 140000:
-		return fmt.Errorf("PostgreSQL 14 or newer is needed; this server is %s", printable(f.Version))
+		return fmt.Errorf("PostgreSQL 14 or newer is needed; this server is %s", safetext.Printable(f.Version))
 	case !f.SchemaExists && !f.CanCreate:
 		return fmt.Errorf("the stet schema is not there and %s may not create it; as the database's owner run: GRANT CREATE ON DATABASE %s TO %s;",
 			identifier(f.User), identifier(f.Database), identifier(f.User))
@@ -434,29 +434,18 @@ func confirmed(stdin io.Reader, stdout io.Writer) bool {
 // identifier is name, which the server sent, printable and quoted as an SQL
 // identifier.
 func identifier(name string) string {
-	return pgx.Identifier{printable(name)}.Sanitize()
+	return pgx.Identifier{safetext.Printable(name)}.Sanitize()
 }
 
-// printable is s, text the server sent, with what a terminal would act on or
-// an eye misread as spaces: control characters, line and paragraph
-// separators, direction controls (the characters internal/lines replaces).
-func printable(s string) string {
-	return strings.Map(func(r rune) rune {
-		if unicode.Is(unicode.Cc, r) || r == 0x2028 || r == 0x2029 || (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069) {
-			return ' '
-		}
-		return r
-	}, s)
-}
-
-// printableError is err with its text printable, but for the line of its own
-// that chooseSSLMode puts the hint about connection poolers on.
+// printableError is err with its text made printable (safetext.Printable),
+// but for the line of its own that chooseSSLMode puts the hint about
+// connection poolers on.
 func printableError(err error) error {
 	msg := err.Error()
 	if head, ok := strings.CutSuffix(msg, "\n"+poolerHint); ok {
-		return errors.New(printable(head) + "\n" + poolerHint)
+		return errors.New(safetext.Printable(head) + "\n" + poolerHint)
 	}
-	return errors.New(printable(msg))
+	return errors.New(safetext.Printable(msg))
 }
 
 // renderConfig returns the config file stet init writes.

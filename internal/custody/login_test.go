@@ -482,13 +482,13 @@ func TestOpenPresentsNoClientCertificate(t *testing.T) {
 					return
 				}
 				c.Write([]byte{'S'})
-				tc := tls.Server(c, &tls.Config{Certificates: []tls.Certificate{serverCert}, ClientAuth: tls.RequestClientCert})
-				tc.SetDeadline(time.Now().Add(5 * time.Second))
-				if err := tc.Handshake(); err != nil {
+				tlsConn := tls.Server(c, &tls.Config{Certificates: []tls.Certificate{serverCert}, ClientAuth: tls.RequestClientCert})
+				tlsConn.SetDeadline(time.Now().Add(5 * time.Second))
+				if err := tlsConn.Handshake(); err != nil {
 					return
 				}
 				select {
-				case seen <- len(tc.ConnectionState().PeerCertificates):
+				case seen <- len(tlsConn.ConnectionState().PeerCertificates):
 				default:
 				}
 			})
@@ -751,7 +751,9 @@ func TestLoginErrorsCarryNoSecrets(t *testing.T) {
 func TestCheckAndTryPassword(t *testing.T) {
 	app := uniqueApp()
 	front, count := relay(t, testServer(t))
-	up, tlsc := verified(t, front, url.Values{"application_name": {app}})
+	// pgx's and pgxpool's own keys, which Stet's own pool takes from the
+	// same address, are not startup parameters.
+	up, tlsc := verified(t, front, url.Values{"application_name": {app}, "pool_max_conns": {"4"}, "default_query_exec_mode": {"exec"}})
 	l := newLogin(t, storeOf(t, map[string]string{"stet_md5": "md5-pw", "stet_scram": "not-scram-pw"}), up, tlsc, false)
 	ctx := testCtx(t)
 
@@ -849,6 +851,108 @@ func TestOpenFallsBackToPlaintextOnlyWhenAllowed(t *testing.T) {
 			t.Errorf("err = %v, want refused TLS", err)
 		}
 	})
+}
+
+// trusting serves in the server's place: it takes any login without asking
+// for a password, as trust does, and reports the protocol version each
+// startup packet asked for.
+func trusting(t *testing.T, versions chan<- uint32) string {
+	return fakeUpstream(t, func(c net.Conn) {
+		var head [8]byte
+		if _, err := io.ReadFull(c, head[:]); err != nil {
+			return
+		}
+		n := binary.BigEndian.Uint32(head[0:4])
+		if n < 8 || n > 10000 {
+			return
+		}
+		if _, err := io.CopyN(io.Discard, c, int64(n-8)); err != nil {
+			return
+		}
+		select {
+		case versions <- binary.BigEndian.Uint32(head[4:8]):
+		default:
+		}
+		var out []byte
+		out, _ = (&pgproto3.AuthenticationOk{}).Encode(out)
+		out, _ = (&pgproto3.BackendKeyData{ProcessID: 1, SecretKey: []byte{1, 2, 3, 4}}).Encode(out)
+		out, _ = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(out)
+		c.Write(out)
+		io.Copy(io.Discard, c)
+	})
+}
+
+// Every login speaks protocol 3.0, which Stet speaks to clients, whatever
+// the address or Stet's environment asks for: a 3.2 session would hand a
+// 3.0 client a cancel key it cannot read.
+func TestLoginsAskForProtocol30(t *testing.T) {
+	newest := url.Values{"min_protocol_version": {"3.2"}, "max_protocol_version": {"latest"}}
+	for _, tc := range []struct {
+		name  string
+		query url.Values // in the address
+		env   bool       // in PGMINPROTOCOLVERSION and PGMAXPROTOCOLVERSION
+	}{
+		{"InTheAddress", newest, false},
+		{"InTheEnvironment", nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.env {
+				t.Setenv("PGMINPROTOCOLVERSION", "3.2")
+				t.Setenv("PGMAXPROTOCOLVERSION", "latest")
+			}
+			s := storeOf(t, map[string]string{"stet_scram": "scram-pw"})
+
+			// What each login asks for, seen by a fake server.
+			versions := make(chan uint32, 8)
+			fake := (&url.URL{Scheme: "postgres", User: url.User("x"), Host: trusting(t, versions), Path: "/d", RawQuery: tc.query.Encode()}).String()
+			l := newLogin(t, s, fake, nil, false)
+			logins := map[string]func(ctx context.Context) error{
+				"Open": func(ctx context.Context) error {
+					op, err := l.Open(ctx, "stet_scram", "d", nil)
+					if err == nil {
+						op.Conn.Close()
+					}
+					return err
+				},
+				"Check":       func(ctx context.Context) error { return l.Check(ctx, "stet_scram", "d") },
+				"TryPassword": func(ctx context.Context) error { return TryPassword(ctx, fake, nil, false, "stet_scram", "pw", "d") },
+			}
+			for name, login := range logins {
+				if err := login(testCtx(t)); err != nil {
+					t.Errorf("%s: %v", name, err)
+					continue
+				}
+				select {
+				case v := <-versions:
+					if v != pgproto3.ProtocolVersion30 {
+						t.Errorf("%s asked for protocol %d.%d, want 3.0", name, v>>16, v&0xffff)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatalf("%s: the fake server got no startup packet", name)
+				}
+			}
+
+			// The test server, which speaks only 3.0, takes each login.
+			up, tlsc := verified(t, testServer(t), tc.query)
+			l = newLogin(t, s, up, tlsc, false)
+			op, err := l.Open(testCtx(t), "stet_scram", "stet_test", nil)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			if len(op.SecretKey) != 4 {
+				t.Errorf("the cancel key is %d bytes, want 4", len(op.SecretKey))
+			}
+			if got := newSession(t, op).query(t, "select current_user"); !slices.Equal(got, []string{"stet_scram"}) {
+				t.Errorf("current_user = %q, want stet_scram", got)
+			}
+			if err := l.Check(testCtx(t), "stet_scram", "stet_test"); err != nil {
+				t.Errorf("Check: %v", err)
+			}
+			if err := TryPassword(testCtx(t), up, tlsc, false, "stet_scram", "scram-pw", "stet_test"); err != nil {
+				t.Errorf("TryPassword: %v", err)
+			}
+		})
+	}
 }
 
 // The bytes a frontend has read and not handed out are the last it read:

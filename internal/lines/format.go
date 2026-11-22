@@ -6,10 +6,10 @@ import (
 	"math"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/stetdb/stet/internal/decide"
+	"github.com/stetdb/stet/internal/safetext"
 	"github.com/stetdb/stet/internal/store"
 )
 
@@ -18,7 +18,7 @@ const (
 	maxStatement = 80
 	// statementScan is how many bytes of a statement statement reads. 80
 	// runes are at most 320 bytes of UTF-8; the rest leaves room for the
-	// white space and unsafe characters that collapse into one space
+	// white space and control characters that collapse into one space
 	// (indentation, line breaks). So a statement of megabytes costs the
 	// judging goroutine no more than one of 4 KiB. One longer than that
 	// whose first 4 KiB collapse to fewer than 80 characters is shown as
@@ -50,9 +50,9 @@ func Format(d *store.Decision, loc *time.Location) string {
 	} else if verdict == "commit" {
 		verdict = "ok"
 	}
-	cols = append(cols, fmt.Sprintf("%-*s", verdictWidth, plain(verdict)))
+	cols = append(cols, fmt.Sprintf("%-*s", verdictWidth, safetext.Printable(verdict)))
 
-	if ot := strings.TrimSpace(strings.ToUpper(plain(d.Op)) + " " + plain(d.TargetTable)); ot != "" {
+	if ot := strings.TrimSpace(strings.ToUpper(safetext.Printable(d.Op)) + " " + safetext.Printable(d.TargetTable)); ot != "" {
 		cols = append(cols, ot)
 	}
 	if f := facts(d); f != "" {
@@ -61,7 +61,7 @@ func Format(d *store.Decision, loc *time.Location) string {
 	if len(d.Reasons) > 0 {
 		rs := make([]string, len(d.Reasons))
 		for i, r := range d.Reasons {
-			rs[i] = plain(r)
+			rs[i] = safetext.Printable(r)
 		}
 		cols = append(cols, "["+strings.Join(rs, ", ")+"]")
 	}
@@ -126,7 +126,7 @@ func facts(d *store.Decision) string {
 		var names []string
 		seen := map[string]bool{}
 		for _, c := range impact.Cascades {
-			t := plain(c.Table)
+			t := safetext.Printable(c.Table)
 			if !seen[t] {
 				seen[t] = true
 				names = append(names, t)
@@ -152,34 +152,17 @@ func facts(d *store.Decision) string {
 		}
 	}
 	if d.Refused != nil {
-		out = append(out, "refused "+plain(*d.Refused))
+		out = append(out, "refused "+safetext.Printable(*d.Refused))
 	} else if !d.Executed {
 		out = append(out, "not executed")
 	}
 	return strings.Join(out, ", ")
 }
 
-// unsafe reports the characters a terminal would act on or an eye misread:
-// control characters, line and paragraph separators, direction controls.
-func unsafe(r rune) bool {
-	return unicode.Is(unicode.Cc, r) || r == 0x2028 || r == 0x2029 ||
-		(r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069)
-}
-
-// plain replaces every unsafe character with a space.
-func plain(s string) string {
-	return strings.Map(func(r rune) rune {
-		if unsafe(r) {
-			return ' '
-		}
-		return r
-	}, s)
-}
-
-// statement makes s one line: unsafe characters and runs of white space
-// become one space, the ends are trimmed, and it is cut to maxStatement runes.
-// Only its first statementScan bytes are read, cut back to the start of a
-// rune.
+// statement makes s one line: the characters safetext.Printable replaces and
+// runs of white space become one space, the ends are trimmed, and it is cut to
+// maxStatement runes. Only its first statementScan bytes are read, cut back to
+// the start of a rune.
 func statement(s string) string {
 	cut := len(s) > statementScan
 	if cut {
@@ -189,7 +172,7 @@ func statement(s string) string {
 		}
 		s = s[:i]
 	}
-	s = strings.Join(strings.Fields(plain(s)), " ")
+	s = strings.Join(strings.Fields(safetext.Printable(s)), " ")
 	r := []rune(s)
 	switch {
 	case len(r) > maxStatement, cut && len(r) == maxStatement:
