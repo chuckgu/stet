@@ -79,6 +79,14 @@ func ownerOf(info fs.FileInfo) (uid, gid uint32, ok bool) {
 // Read reads and validates the file at path, CheckMode included. Its errors
 // name the account and what is wrong, never a value.
 func Read(path string) (*File, error) {
+	return read(path, func(mode fs.FileMode, owner uint32) error {
+		return CheckMode(mode, owner, uint32(os.Geteuid()))
+	})
+}
+
+// read reads and validates the regular file at path, once allow accepts
+// its mode and owner.
+func read(path string, allow func(mode fs.FileMode, owner uint32) error) (*File, error) {
 	// Decide from a Stat before opening: opening a FIFO would block.
 	pre, err := os.Stat(path)
 	if err != nil {
@@ -97,7 +105,7 @@ func Read(path string) (*File, error) {
 		return nil, err
 	}
 	if uid, _, ok := ownerOf(info); ok {
-		if err := CheckMode(info.Mode(), uid, uint32(os.Geteuid())); err != nil {
+		if err := allow(info.Mode(), uid); err != nil {
 			return nil, fmt.Errorf("credentials file %s: %w", path, err)
 		}
 	}
@@ -216,11 +224,10 @@ func validate(f *File) error {
 	}
 	for _, name := range sortedNames(f.Agents) {
 		a := f.Agents[name]
+		if err := CheckAccountName(name); err != nil {
+			return err
+		}
 		switch {
-		case name == "":
-			return errors.New("an account has an empty name")
-		case len(name) > maxAccountName:
-			return fmt.Errorf("account %q: the name is longer than %d bytes", name, maxAccountName)
 		case a.Token == "":
 			return fmt.Errorf("account %q: token is missing", name)
 		case a.Password != "" && a.PasswordEnv != "":
@@ -231,6 +238,18 @@ func validate(f *File) error {
 		if _, err := scram.ParseVerifier(a.Token); err != nil {
 			return fmt.Errorf("account %q: token is not a valid verifier: %w", name, err)
 		}
+	}
+	return nil
+}
+
+// CheckAccountName is the rule for an account's name in the file: not empty,
+// and at most 63 bytes, PostgreSQL's limit for a name.
+func CheckAccountName(name string) error {
+	switch {
+	case name == "":
+		return errors.New("the account name is empty")
+	case len(name) > maxAccountName:
+		return fmt.Errorf("account %q: the name is longer than %d bytes", name, maxAccountName)
 	}
 	return nil
 }

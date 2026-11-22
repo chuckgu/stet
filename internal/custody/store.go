@@ -72,7 +72,7 @@ func OpenStore(path string, env func(string) string, log *slog.Logger) (*Store, 
 		if _, err := rand.Read(s.mock); err != nil {
 			return nil, err
 		}
-		log.Warn("the credentials file has no mock_secret: after a restart a login attempt can tell an unknown account from a known one; run any stet agent command to add one")
+		log.Warn("the credentials file has no mock_secret: after a restart a login attempt can tell an unknown account from a known one; run a stet agent command that changes the file (add, token, password or remove) to add one")
 	}
 
 	for _, name := range sortedNames(f.Agents) {

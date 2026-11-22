@@ -341,7 +341,7 @@ func TestStoreMockSecret(t *testing.T) {
 	if len(h1.MockSecret()) != 32 || bytes.Equal(h1.MockSecret(), h2.MockSecret()) {
 		t.Error("want 32 fresh random bytes per open")
 	}
-	want := "the credentials file has no mock_secret: after a restart a login attempt can tell an unknown account from a known one; run any stet agent command to add one"
+	want := "the credentials file has no mock_secret: after a restart a login attempt can tell an unknown account from a known one; run a stet agent command that changes the file (add, token, password or remove) to add one"
 	if n := count(hb, want); n != 2 {
 		t.Errorf("warned %d times for two opens, want 2:\n%s", n, hb)
 	}

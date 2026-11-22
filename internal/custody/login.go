@@ -84,6 +84,14 @@ func TryPassword(ctx context.Context, upstream string, tlsConfig *tls.Config, pl
 	return up.check(ctx, account, password, database)
 }
 
+// WrongPassword reports whether err, from Check or TryPassword, is the
+// server refusing the password, as against not being reached or refusing
+// for another reason.
+func WrongPassword(err error) bool {
+	var le *loginError
+	return errors.As(err, &le) && le.kind == kindWrongPassword
+}
+
 var (
 	errNoAccount  = errors.New("the account is not in the credentials file")
 	errNoPassword = errors.New("the account's password is empty; not logging in")
