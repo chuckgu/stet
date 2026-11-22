@@ -335,7 +335,7 @@ tables:
   - `sslmode`: `disable`(평문), `prefer`(TLS를 청하고 서버가 거절하면 평문. 인증서 확인 없음), `require`(TLS만. 인증서 확인 없음. `sslrootcert`가 있으면 `verify-ca`와 같다), `verify-ca`(발급자 확인), `verify-full`(발급자와 호스트 이름 확인. `sslrootcert`가 없으면 시스템의 루트 인증서). 적지 않으면 `prefer`다. v0.2의 써 보는 길부터는 프록시 구간도 이를 따르므로, `sslmode`를 적지 않은 설정의 에이전트 세션은 서버가 TLS를 받으면 TLS로 간다.
   - `sslrootcert`는 두 구간에 함께 쓴다. `sslcert`와 `sslkey`(클라이언트 인증서)는 Stet 자신의 연결에만 쓴다. 중계하는 세션에는 인증서를 내지 않는다. 호스트가 IP가 아니면 TLS 인사에 서버 이름(SNI)을 넣고, `sslsni=0`이면 넣지 않는다.
   - 받지 않는 것: `sslmode=allow`, `sslnegotiation=direct`. 설정 검증에서 거부한다.
-  - 호스트와 포트는 URL에 하나만 적는다. 프록시는 URL의 호스트와 포트(없으면 5432)로 중계한다. 질의 파라미터의 `host`·`hostaddr`·`port`, 호스트 여럿, `PGHOST`·`PGPORT`·서비스 파일, 비밀번호의 인코딩하지 않은 특수 문자 때문에 Stet 자신의 연결이 다른 곳에 닿는 URL은 거부한다(`stet's own connections and the proxy would reach different hosts or ports for this address; …`). `upstream`에 관한 에러는 URL을 인용하지 않는다. 비밀번호가 들어 있기 때문이다.
+  - 호스트와 포트는 URL에 하나만 적는다. 프록시는 URL의 호스트와 포트(없으면 5432)로 중계한다. 질의 파라미터의 `host`·`hostaddr`·`port`, 호스트 여럿, `PGHOST`·`PGPORT`·서비스 파일, 비밀번호의 인코딩하지 않은 특수 문자 때문에 Stet 자신의 연결이 다른 곳에 닿는 URL은 거부한다(`stet's own connections and the proxy would reach different hosts or ports for this address; …`). Stet이 만든 `upstream`의 에러는 URL을 인용하지 않는다. 비밀번호가 들어 있기 때문이다. pgconn이 읽지 못하는 URL(예: `sslmode=foo`)은 pgconn의 에러가 그대로 나오고, 그 에러는 비밀번호를 `xxxxx`로 가린 채 URL을 인용한다(``upstream: cannot parse `postgres://app:xxxxx@…`: …``). pgx는 이 가림을 best effort라고 적는다.
   - 호스트가 이 기기(`localhost`, 루프백 IP)가 아닌데 평문이 될 수 있거나(`disable`, `prefer`, 적지 않음) 인증서를 확인하지 않으면(`require`에 `sslrootcert` 없음) 시작할 때 경고한다.
 - `listen`이 루프백 주소가 아니면 시작할 때 경고한다. 클라이언트와 Stet 사이는 암호화되지 않는다.
 

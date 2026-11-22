@@ -104,7 +104,12 @@ then give the agent this address instead of the database's. The user and passwor
 
 **묻는 것.** 데이터베이스에 `stet` 스키마가 없으면, `stet proxy`를 처음 띄울 때 그 스키마가 어느 계정으로 생기는지, 그 밖에는 아무것도 바꾸지 않는다는 것, 지우는 문장을 보이고 계속할지 묻는다. `y`나 `yes`(대소문자 무관)면 계속하고, 그 밖의 답은 `stopped; nothing was written`으로 멈춘다. 스키마가 이미 있으면 묻지 않는다.
 
-**`-yes`.** 묻지 않고 쓴다. 표준 입력이 터미널이 아니면(파이프, CI) 물을 수 없으므로, `-yes`가 없으면 `this is not a terminal, so stet init cannot ask; read the lines above and pass -yes to continue`로 멈춘다. 위의 안내를 읽고 `-yes`를 준다.
+**`-yes`.** 묻지 않고 쓴다. 묻는 것은 `stet` 스키마가 없을 때뿐이다. 그때 `-yes`가 없으면, 사람이 답할 수 없는 표준 입력에서는 둘 가운데 하나로 멈춘다.
+
+- 표준 입력이 파이프나 파일이면 묻지 못하고 `this is not a terminal, so stet init cannot ask; read the lines above and pass -yes to continue`로 멈춘다.
+- 표준 입력이 `/dev/null`이면(CI 러너, `-i` 없는 `docker run`에서 흔하다) Stet은 문자 장치를 터미널로 보므로 묻는다. 그리고 입력의 끝(EOF)을 "아니오"로 읽어 `stopped; nothing was written`으로 멈춘다.
+
+어느 쪽이든 아무것도 쓰지 않는다. 위의 안내를 읽고 `-yes`를 준다.
 
 **`-tables a,b,c`.** 그 테이블만 넣는다. 그 가운데 아래 조건에 맞지 않는 것이 있으면 테이블마다 이유를 대고 멈춘다(예: `table "nosuch": not found`). 이때는 100개 상한이 없다.
 
@@ -117,7 +122,7 @@ then give the agent this address instead of the database's. The user and passwor
    - 적혀 있지 않고 호스트가 이 기기(`localhost`나 루프백 IP)면 주소를 그대로 둔다.
    - 적혀 있지 않고 호스트가 다른 기기면 `sslmode=verify-full`(시스템의 루트 인증서)로 붙어 본다. 인증서를 확인하지 못하면 `sslmode=require`로 낮춰 붙고 이렇게 알린다: `the server's certificate could not be checked (…), so upstream uses sslmode=require: the connection is encrypted, but the server is not verified. To verify it, add sslrootcert=<the service's CA file> and sslmode=verify-full to upstream in the config file.` 서버가 TLS를 받지 않으면 `the server does not accept TLS; to connect in plaintext anyway, write sslmode=disable in the address yourself`로 멈춘다. 다른 기기로 평문을 쓰는 것은 사용자가 직접 적어야 한다.
    - 붙기 전에 거부하는 주소: 호스트가 없는 것, 공백이 든 것, 질의 파라미터에 `host`·`hostaddr`·`port`가 있는 것, 호스트가 여럿인 것, 그 밖에 Stet 자신의 연결과 프록시가 서로 다른 서버로 읽는 것(10장). 에러는 주소를 인용하지 않는다. 비밀번호가 들어 있기 때문이다.
-2. **붙어서 확인한다.** `stet proxy`와 같은 방식으로 붙는다. 붙지 못하면 서버의 에러를 보이고, 그 아래에 `if this address goes through a connection pooler, use the direct connection address instead`를 붙이고 멈춘다. 한 번 붙어 보는 데 15초, 붙어서 읽는 데 30초를 넘기면 멈춘다. PostgreSQL 14보다 낮으면 멈춘다. `stet` 스키마가 없고 그 계정이 만들 수도 없으면 데이터베이스 소유자가 실행할 문장(`GRANT CREATE ON DATABASE … TO …;`)을 보이고 멈춘다. 서버가 보낸 글자는 제어 문자를 공백으로 바꿔 보인다.
+2. **붙어서 확인한다.** `stet proxy`와 같은 방식으로 붙는다. 붙지 못하면 서버의 에러를 보이고, 그 아래에 `if this address goes through a connection pooler, use the direct connection address instead`를 붙이고 멈춘다. pgconn이 읽지 못하는 주소(예: `sslmode=foo`)는 pgconn의 에러(``cannot parse `postgres://app:xxxxx@…`: …``)가 나오는데, 이 에러는 비밀번호를 `xxxxx`로 가린 채 주소를 보인다. pgx는 이 가림을 best effort라고 적는다. 한 번 붙어 보는 데 15초, 붙어서 읽는 데 30초를 넘기면 멈춘다. PostgreSQL 14보다 낮으면 멈춘다. `stet` 스키마가 없고 그 계정이 만들 수도 없으면 데이터베이스 소유자가 실행할 문장(`GRANT CREATE ON DATABASE … TO …;`)을 보이고 멈춘다. 서버가 보낸 글자는 제어 문자를 공백으로 바꿔 보인다.
 3. **테이블을 고른다.** 다음을 모두 채우는 테이블이다.
    - 일반 테이블이거나 파티션을 나눈 테이블이다. 파티션 하나하나는 고르지 않는다(부모를 고른다). 시스템 스키마와 `stet` 스키마의 것이 아니다.
    - 스키마 없이 적은 이름이 그 계정의 `search_path`에서 그 테이블로 풀린다.
@@ -198,7 +203,7 @@ docker run --rm -it --user "$(id -u):$(id -g)" -e DATABASE_URL -v "$PWD:/work" -
 - `-e DATABASE_URL`은 이 셸의 값을 명령줄에 적지 않고 넘긴다.
 - `-listen 0.0.0.0:6432`: 컨테이너 안의 Stet은 컨테이너의 모든 주소에서 받아야 바깥에 연 포트가 닿는다. 에이전트에게 알려 주는 주소는 그래도 `127.0.0.1:6432`로 적는다.
 - `--user`: 이미지는 root가 아닌 사용자(65532)로 돈다. 설정 파일은 소유자만 읽을 수 있으므로(`0600`), 컨테이너를 이 기기의 사용자로 돌려야 그 파일을 쓰고 나중에 읽는다.
-- DB가 이 기기에 있으면 Docker Desktop에서는 주소의 호스트를 `host.docker.internal`로 쓴다. `init`에게 그것은 다른 기기다. `verify-full`로 붙어 보고, 인증서가 그 이름의 것이 아니면 `require`로 낮추고 알린다. DB가 TLS를 받지 않으면 주소에 `sslmode=disable`을 직접 적는다.
+- DB가 이 기기에 있으면 Docker Desktop에서는 주소의 호스트를 `host.docker.internal`로 쓴다. Linux의 Docker Engine에서는 그 이름이 그냥은 풀리지 않으므로, 두 `docker run`(`init`과 `proxy`)에 `--add-host=host.docker.internal:host-gateway`를 더한다. 이 Linux 경우는 돌려 보지 않았다(확인한 기기는 macOS의 Docker Desktop뿐이다). `init`에게 `host.docker.internal`은 다른 기기다. `verify-full`로 붙어 보고, 인증서가 그 이름의 것이 아니면 `require`로 낮추고 알린다. DB가 TLS를 받지 않으면 주소에 `sslmode=disable`을 직접 적는다.
 
 ```sh
 docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/stet.yaml:/stet.yaml:ro" -p 127.0.0.1:6432:6432 stet:local proxy -config /stet.yaml -decisions on
@@ -383,7 +388,7 @@ psql "$DATABASE_URL" -c "select created_at, verdict, reasons, op, target_table, 
 
 ## 11. 기록에 남는 값
 
-모델이 없으면 밖으로 보내는 것이 없다. 그래서 `send_fields`(모델이 볼 컬럼 목록)가 없어도 된다. 그때 판단 기록의 `state` 안의 `proposed`와 `current`는 빈다(`{}`).
+모델이 없으면 밖으로 보내는 것이 없다. 그래서 `send_fields`(모델이 볼 컬럼 목록)가 없어도 된다. 그때 한 행에 쓰는 쓰기(Stet이 그 행의 상태를 읽은 쓰기)의 판단 기록에서 `state` 안의 `proposed`와 `current`는 빈다(`{}`). 여러 행에 쓰는 쓰기는 상태를 읽지 않으므로 `state` 자체가 없다(NULL).
 
 그래도 쓰려던 값은 기록에 남는다.
 
@@ -391,4 +396,4 @@ psql "$DATABASE_URL" -c "select created_at, verdict, reasons, op, target_table, 
 - `statement`: 에이전트가 보낸 문장 그대로. `psql -c`처럼 값을 문장에 적어 보내면 값이 여기에 있다.
 - `params`: 값을 따로 보내는 클라이언트(확장 질의 프로토콜)의 바인딩 값. 문장에 값을 적어 보내면 비어 있다.
 
-`send_fields`는 모델로 나가는 것을 고르는 목록이고, 사용자 자신의 DB에 남는 기록을 줄이는 목록이 아니다. 기록은 그 데이터베이스의 `stet` 스키마에 있고, 그 계정으로 읽을 수 있다. 계정이 하나면 에이전트도 읽을 수 있다. 판단 기록은 지울 수 없다(append-only. 라벨 컬럼 밖의 `UPDATE`, `DELETE`, `TRUNCATE`는 `ST004`로 거부된다). 없애려면 9장대로 스키마를 지운다.
+`send_fields`는 모델로 나가는 것을 고르는 목록이고, 사용자 자신의 DB에 남는 기록을 줄이는 목록이 아니다. 기록은 그 데이터베이스의 `stet` 스키마에 있고, 그 계정으로 읽을 수 있다. 계정이 하나면 에이전트도 읽을 수 있다. 트리거가 판단 기록의 수정과 삭제를 막는다(append-only. 라벨 컬럼 밖의 `UPDATE`, `DELETE`, `TRUNCATE`는 `ST004`로 거부된다). 그러나 계정이 하나면 그 계정이 `stet.decisions`의 소유자라서 트리거를 끄고 기록을 고치거나 지울 수 있고, 에이전트도 그 계정이다. 이 길에서 트리거는 실수를 막을 뿐 기록을 지키지 못한다(10장의 "계정이 하나면 기록을 지킬 수 없다"). 기록을 없애려면 9장대로 스키마를 지운다.

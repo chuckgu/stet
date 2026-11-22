@@ -89,7 +89,7 @@ stet: watching 2 tables on 127.0.0.1:6432 (shadow: nothing is blocked)
 - `sslcert`와 `sslkey`(클라이언트 인증서)는 Stet 자신의 연결에만 쓴다. 중계하는 세션에는 인증서를 내지 않는다. 서버가 인증서로 계정을 정하는 설정(`cert`)이면 에이전트의 세션이 Stet의 신원으로 로그인되기 때문이다.
 - `sslnegotiation=direct`(PostgreSQL 17의 바로 TLS)는 받지 않는다. 설정 검증에서 거부한다.
 - **Stet 자신의 연결과 프록시 구간은 같은 호스트와 포트 하나에 닿아야 한다.** 프록시는 URL의 호스트와 포트(없으면 5432)로 중계하고, Stet 자신의 연결은 `pgconn`이 읽는 대로 붙는다. 둘이 다르게 읽는 주소는 설정 검증에서 거부한다(`config.OneTarget`): 질의 파라미터의 `host`·`hostaddr`·`port`, 호스트 여럿(장애 조치 목록), URL에 포트가 없는데 `PGPORT`나 서비스 파일이 다른 포트를 주는 것, 비밀번호의 인코딩하지 않은 `?`·`#`처럼 두 해석이 갈리는 것. 에러는 `upstream: stet's own connections and the proxy would reach different hosts or ports for this address; write one host and one port in the address itself (not in its query, PGHOST, PGPORT or a service file), and percent-encode special characters in the password`다. 처음 설계는 "호스트가 여럿이면 첫 호스트만 쓴다(바뀌지 않는다)"였으나, 실제로는 프록시가 다른 서버로 중계할 수 있어 거부로 바꿨다.
-- `upstream`에 관한 에러는 주소를 인용하지 않는다(`has no host`, `is not a valid URL`, `must be a postgres:// or postgresql:// URL` 등). 비밀번호가 들어 있기 때문이다.
+- Stet이 만든 `upstream`의 에러는 주소를 인용하지 않는다(`has no host`, `is not a valid URL`, `must be a postgres:// or postgresql:// URL`, 위의 한 대상 에러). 비밀번호가 들어 있기 때문이다. pgconn이 읽지 못하는 주소(예: `sslmode=foo`)는 다르다. pgconn의 에러가 그대로 나오고, 그 에러는 비밀번호를 `xxxxx`로 가린 채 주소를 인용한다: ``stet: stet.yaml: upstream: cannot parse `postgres://app:xxxxx@db.example.invalid:5432/crm?sslmode=foo`: failed to configure TLS (sslmode is invalid)``. 계정, 호스트, 데이터베이스, 파라미터는 보인다. pgconn이 가리는 것은 사용자 정보의 비밀번호와 `password=` 파라미터이고, pgx는 이 가림을 best effort라고 적는다(형식이 망가진 주소는 다 가리지 못할 수 있다). `stet init`도 같은 주소에서 같은 에러를 낸다.
 
 ### 프록시 구간의 절차
 
@@ -133,7 +133,7 @@ stet init [-config stet.yaml] [-listen 127.0.0.1:6432] [-tables a,b,c] [-yes] [-
 
 DB 주소는 인자로 받고, 없으면 환경 변수 `DATABASE_URL`에서 읽는다. 문서는 환경 변수를 먼저 권한다. 인자의 비밀번호는 셸 기록과 프로세스 목록에 남는다. 플래그는 주소 앞에 둔다. 주소 뒤에 오면 `flags go before the address`로 멈춘다.
 
-`init`은 DB에 아무것도 쓰지 않는다. 읽기 전용 트랜잭션에서만 묻는다. 비밀번호는 쓰는 설정 파일 하나에만 나간다. 출력과 에러에는 넣지 않는다. 서버가 보낸 글자(버전, 계정과 데이터베이스 이름, 서버의 에러, 인증서 에러)는 제어 문자, U+2028·U+2029, 방향 제어 문자를 공백으로 바꿔 보인다. 서버도 믿지 않는다(규칙 5).
+`init`은 DB에 아무것도 쓰지 않는다. 읽기 전용 트랜잭션에서만 묻는다. 비밀번호는 쓰는 설정 파일 하나에만 나간다. `init`이 만든 출력과 에러에는 넣지 않는다. pgconn이 읽지 못하는 주소에서는 pgconn의 에러가 주소를 인용하고, 비밀번호는 pgconn이 best effort로 `xxxxx`로 가린다(3장). 서버가 보낸 글자(버전, 계정과 데이터베이스 이름, 서버의 에러, 인증서 에러)는 제어 문자, U+2028·U+2029, 방향 제어 문자를 공백으로 바꿔 보인다. 서버도 믿지 않는다(규칙 5).
 
 **하는 일**
 
@@ -368,7 +368,7 @@ Stet은 이 문장을 스스로 실행하지 않는다.
 - [x] `latency_test.go`의 예산을 지킨다. TLS 업스트림의 값을 적는다. `TestTLSUpstreamLatencyBudget`: `select 1` 2,000회 왕복에서 더해진 p95가 31.4µs와 31.9µs(Task 4, `-race`), 32.1µs(2026-11-22 다시 잼, `-race`)다. `-race` 없이는 19.8µs다. 예산은 2ms다.
 - [x] `scripts/release.sh`가 이 기기용 묶음을 만들고, 그 안의 `stet version`이 준 버전을 낸다. darwin/arm64에서 `scripts/release.sh 0.2.0-test`가 `dist/stet_0.2.0-test_darwin_arm64.tar.gz`를 만들고, `shasum -a 256 --ignore-missing -c checksums.txt`가 `OK`, 묶음 안의 `stet version`이 `stet 0.2.0-test (commit 23b4da6d9e99, go1.27.3)`다(Task 8에서는 `fd9c72035c2f`). 묶음에는 `LICENSE`, `README.md`, `stet`, `stet.example.yaml`이 있다. `TestVersionCommand`(cmd/stet).
 - [x] Docker 이미지가 빌드되고, 그 이미지로 띄운 Stet을 거쳐 쓰기가 판단된다. Task 8: 이미지 사용자 `65532`, 시험 서버의 테이블에 보낸 쓰기가 `09:57:39  ok            UPDATE task8_probe  1 row  update task8_probe set v='z' where id=1`로 나오고 기록됐다. 2026-11-22: quickstart 4장의 명령 그대로 컨테이너에서 `init`(`host.docker.internal`이라 `require`로 낮추고 알렸다)과 `proxy -decisions on`을 돌려 `11:40:35  ok            UPDATE contacts  1 row, fresh read  update contacts set status = 'customer' where id = 7`을 봤다. 이미지와 컨테이너는 지웠다.
-- [x] `docs/quickstart.md`의 명령을 처음부터 끝까지 그대로 따라 해서 2장의 예와 같은 줄을 본다. 2026-11-22: 묶음을 빈 디렉터리에 풀고 시험 서버에 데이터베이스와 계정을 하나씩 만들어 2·7·8·9장의 명령을 그대로 쳤다. 1장의 세 줄과 시각만 다른 세 줄이 나왔다(1장의 예가 그 줄이다). `stet init`은 표준 입력이 터미널일 때 묻고 `y`에 썼다. 지운 뒤 데이터베이스에는 `public` 스키마만 남았다.
+- [x] `docs/quickstart.md`의 명령을 처음부터 끝까지 그대로 따라 해서 1장의 예와 같은 줄을 본다(처음 설계의 문장은 "2장의 예"였으나 예는 1장에 있다). 2026-11-22: 묶음을 빈 디렉터리에 풀고 시험 서버에 데이터베이스와 계정을 하나씩 만들어 2·7·8·9장의 명령을 그대로 쳤다. 1장의 세 줄과 시각만 다른 세 줄이 나왔다(1장의 예가 그 줄이다). `stet init`은 표준 입력이 터미널일 때 묻고 `y`에 썼다. 지운 뒤 데이터베이스에는 `public` 스키마만 남았다.
 - [ ] (이 단계에서 확인하지 못한다) 릴리스 워크플로가 네 대상에서 묶음을 만든다. 저장소에 올린 뒤 손으로 돌려야 알 수 있다. 이 단계는 저장소에 올리지 않는다. 확인한 것은 YAML이 읽히고, 대상이 `macos-15`, `macos-15-intel`, `ubuntu-24.04`, `ubuntu-24.04-arm`이고, `workflow_dispatch`와 `v*` 태그에서 돈다는 것까지다(Task 8).
 - [ ] (계정이 있어야 한다) Neon, Supabase, RDS 가운데 하나에서 `init`부터 줄을 보기까지 된다. 계정이 없어 하지 못했다. 원격 호스트로 가는 `init`의 길(`verify-full`을 해 보고 `require`로 낮추며 알리는 것)은 컨테이너에서 `host.docker.internal`로 로컬 시험 서버에 붙어서만 봤다.
 
@@ -392,7 +392,7 @@ Stet은 이 문장을 스스로 실행하지 않는다.
 - P6(6장): 끝낼 때 줄은 2초까지만 기다린다.
 - P7(4·6장): 터미널인지는 문자 장치인지로 본다.
 - P8(4장): 에이전트 주소에서 지우는 파라미터의 목록. 진행 중에 `host`, `hostaddr`, `port`를 더했고(에이전트를 Stet을 건너 서버로 보낸다), `password` 파라미터를 가리게 했다.
-- 3장: Stet 자신의 연결과 프록시 구간이 다른 서버에 닿을 수 있는 `upstream`은 거부한다(`config.OneTarget`). "호스트가 여럿이면 첫 호스트만 쓴다"를 대신한다. `upstream`의 에러는 주소를 인용하지 않는다.
+- 3장: Stet 자신의 연결과 프록시 구간이 다른 서버에 닿을 수 있는 `upstream`은 거부한다(`config.OneTarget`). "호스트가 여럿이면 첫 호스트만 쓴다"를 대신한다. Stet이 만든 `upstream`의 에러는 주소를 인용하지 않는다. pgconn이 읽지 못하는 주소는 pgconn의 에러가 비밀번호를 `xxxxx`로 가린 채 인용한다(pgx는 best effort라고 적는다).
 - 3장: `sslmode`를 적지 않은 설정의 프록시 구간도 TLS를 먼저 청한다.
 - 4장: `init`은 서버가 보낸 글자의 제어 문자를 공백으로 바꿔 보인다. 호스트가 없거나, 공백이 있거나, 질의에 `host`·`hostaddr`·`port`가 있거나, 호스트가 여럿인 주소는 붙기 전에 거부한다. 한 번 붙어 보는 데 15초, 읽는 데 30초까지 기다린다. 쓰기 전에 그 파일을 `config.Parse`에 넣어 본다. PostgreSQL 14에서 `ANALYZE`하지 않은 파티션 부모는 100개 상한에서 빠질 수 있고, 그대로 둔다.
 - 6장: 줄의 시각은 쓰기가 들어온 시각이고, 줄은 판단이 기록된 순서로 나온다. 시작 줄도 대기열을 거친다. 대기열이 넘치면 빌 때까지 새 줄을 버린 뒤 버린 수를 알린다.
