@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -358,6 +359,81 @@ func TestShadowCustodyWarnsOfAMissingMembership(t *testing.T) {
 	}
 	if len(told) != 1 {
 		t.Errorf("%d warnings that %s, want 1; log:\n%s", len(told), want, r.log)
+	}
+}
+
+// A row changed through a session logged in with a token, on a table under
+// undo.tables, is recorded in stet.history with the account as its agent and
+// login role, linked to its decision; once Stet has stopped, stet.undo_plan
+// and stet.undo restore it.
+func TestUndoThroughACustodySession(t *testing.T) {
+	pg := testPG(t)
+	ctx := context.Background()
+	account, password := newAgentRole(t, pg)
+	mustExec(t, superuser(t, pg), "grant "+account+" to stet_scram")
+	db := cleanDatabase(t, pg)
+	pool := stetPoolIn(t, pg, db)
+	admin := connectTo(t, pg, db, "stet_scram", "scram-pw")
+	table := freshTable(t, admin, 2)
+	mustExec(t, admin, "grant select, update on "+table+" to "+account)
+	captureOn(t, admin, table, table, "id")
+	c := newCustody(t, pg, map[string]string{account: password})
+	r, _, _ := startCustody(t, c.config(t, "shadow", pg, db, "tables:\n  "+table+": {pk: id}\nundo:\n  tables:\n    "+table+":\n"))
+	waitListening(t, r)
+	var since time.Time
+	if err := admin.QueryRow(ctx, "select clock_timestamp()").Scan(&since); err != nil {
+		t.Fatal(err)
+	}
+
+	write := "update " + table + " set name = 'changed' where id = 1"
+	if _, err := c.connect(t, r, db, account).Exec(ctx, write); err != nil {
+		t.Fatalf("the write: %v; log:\n%s", err, r.log)
+	}
+	d := decisionsRecorded(t, pool, table, 1, r.log)[0]
+	l := lineFor(t, historyOn(t, pool, table), "1")
+	if l.AgentRole != account || l.LoginRole != account || orNull(l.Query) != write || orNull(l.Name) != "changed" {
+		t.Errorf("stet.history: agent_role %s, login_role %s, query %s, name %s; want %s, %s, %q, changed",
+			l.AgentRole, l.LoginRole, orNull(l.Query), orNull(l.Name), account, account, write)
+	}
+	wantLinkedTo(t, "the change made through custody", l, d)
+	if err := r.stop(t); err != nil {
+		t.Fatalf("run = %v, want nil", err)
+	}
+
+	outcomes := func(tx pgx.Tx, function string) []string {
+		t.Helper()
+		rows, err := tx.Query(ctx, "select key, action, outcome from stet."+function+"($1, $2)", account, since)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (string, error) {
+			var key, action *string
+			var outcome string
+			err := r.Scan(&key, &action, &outcome)
+			return fmt.Sprintf("%s %s %s", orNull(key), orNull(action), outcome), err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	tx, err := admin.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if got, want := outcomes(tx, "undo_plan"), []string{"1 update would_restore"}; !slices.Equal(got, want) {
+		t.Errorf("stet.undo_plan says %q, want %q", got, want)
+	}
+	if got, want := outcomes(tx, "undo"), []string{"1 update restored"}; !slices.Equal(got, want) {
+		t.Errorf("stet.undo says %q, want %q", got, want)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var name string
+	if err := admin.QueryRow(ctx, "select name from "+table+" where id = 1").Scan(&name); err != nil || name != "n1" {
+		t.Errorf("row 1 holds %q, %v after the undo; want n1, what it held before", name, err)
 	}
 }
 
