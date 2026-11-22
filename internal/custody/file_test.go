@@ -71,20 +71,22 @@ func TestReadValidates(t *testing.T) {
 		content string
 		want    string // in the error
 	}{
-		"no token":        {"agents:\n  alice:\n    password: " + pw + "\n", "alice"},
-		"broken token":    {"agents:\n  alice:\n    token: SCRAM-SHA-256$junk-secret\n    password: " + pw + "\n", "alice"},
-		"both":            {"agents:\n  alice:\n    token: " + good + "\n    password: " + pw + "\n    password_env: X\n", "alice"},
-		"neither":         {"agents:\n  alice:\n    token: " + good + "\n", "alice"},
-		"empty name":      {"agents:\n  \"\":\n    token: " + good + "\n    password: " + pw + "\n", "empty"},
-		"64 byte name":    {"agents:\n  " + strings.Repeat("a", 64) + ":\n    token: " + good + "\n    password: " + pw + "\n", strings.Repeat("a", 64)},
-		"unknown key":     {"agents:\n  alice:\n    token: " + good + "\n    password: " + pw + "\n    colour: blue\n", "alice"},
-		"bad time":        {"agents:\n  alice:\n    token: " + good + "\n    password: " + pw + "\n    added: " + pw + "\n", "alice"},
-		"two bad":         {"agents:\n  bob:\n    colour: x\n  alice:\n    colour: y\n", "alice"},
-		"unknown top key": {"agents: {}\nextra: 1\n", "extra"},
-		"short mock":      {"mock_secret: c2hvcnQ=\nagents: {}\n", "mock_secret"},
-		"mock not base64": {"mock_secret: \"!!pw-secret-1\"\nagents: {}\n", "mock_secret"},
-		"empty file":      {"", "empty"},
-		"not yaml":        {"agents: [pw-secret-1\n", "line 1"},
+		"no token":          {"agents:\n  alice:\n    password: " + pw + "\n", "alice"},
+		"broken token":      {"agents:\n  alice:\n    token: SCRAM-SHA-256$junk-secret\n    password: " + pw + "\n", "alice"},
+		"both":              {"agents:\n  alice:\n    token: " + good + "\n    password: " + pw + "\n    password_env: X\n", "alice"},
+		"neither":           {"agents:\n  alice:\n    token: " + good + "\n", "alice"},
+		"empty name":        {"agents:\n  \"\":\n    token: " + good + "\n    password: " + pw + "\n", "empty"},
+		"64 byte name":      {"agents:\n  " + strings.Repeat("a", 64) + ":\n    token: " + good + "\n    password: " + pw + "\n", strings.Repeat("a", 64)},
+		"unknown key":       {"agents:\n  alice:\n    token: " + good + "\n    password: " + pw + "\n    colour: blue\n", "alice"},
+		"bad time":          {"agents:\n  alice:\n    token: " + good + "\n    password: " + pw + "\n    added: " + pw + "\n", "alice"},
+		"two bad":           {"agents:\n  bob:\n    colour: x\n  alice:\n    colour: y\n", "alice"},
+		"account not a map": {"agents:\n  alice: [1, 2]\n", "alice"},
+		"token a list":      {"agents:\n  alice:\n    token: [1]\n", "alice"},
+		"unknown top key":   {"agents: {}\nextra: 1\n", "extra"},
+		"short mock":        {"mock_secret: c2hvcnQ=\nagents: {}\n", "mock_secret"},
+		"mock not base64":   {"mock_secret: \"!!pw-secret-1\"\nagents: {}\n", "mock_secret"},
+		"empty file":        {"", "empty"},
+		"not yaml":          {"agents: [pw-secret-1\n", "line 1"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -315,5 +317,67 @@ func TestWriteCleansUpWhenTheRenameFails(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
 		t.Errorf("%d files left behind", len(entries))
+	}
+}
+
+func TestCheckReplaceable(t *testing.T) {
+	cases := []struct {
+		mode  fs.FileMode
+		owner uint32
+		ok    bool
+	}{
+		{0o640, 0, true}, {0o600, 0, true}, {0o440, 0, true}, {0o400, 0, true},
+		{0o644, 0, false}, {0o660, 0, false}, {0o641, 0, false}, {0o700, 0, false},
+		{0o600, 1000, true}, {0o400, 1000, true},
+		{0o640, 1000, false}, {0o644, 1000, false}, {0o604, 1000, false},
+	}
+	for _, c := range cases {
+		if err := checkReplaceable(c.mode, c.owner); (err == nil) != c.ok {
+			t.Errorf("checkReplaceable(%04o, owner %d) = %v, want ok=%v", c.mode, c.owner, err, c.ok)
+		}
+	}
+}
+
+func TestOpenRegularDoesNotBlockOnAFIFO(t *testing.T) {
+	fifo := filepath.Join(t.TempDir(), "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		fh, err := openRegular(fifo)
+		if fh != nil {
+			fh.Close()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "regular") {
+			t.Errorf("openRegular of a FIFO = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("openRegular blocked on a FIFO")
+	}
+}
+
+func TestWriteReportsAFileInPlaceThatCouldNotBeSynced(t *testing.T) {
+	old := syncDirectory
+	syncDirectory = func(string) error { return errors.New("sync failed") }
+	t.Cleanup(func() { syncDirectory = old })
+	path := filepath.Join(t.TempDir(), "creds.yaml")
+	f := sample(t)
+	err := Write(path, f)
+	if !errors.Is(err, ErrNotSynced) {
+		t.Fatalf("Write = %v, want ErrNotSynced", err)
+	}
+	if !strings.Contains(err.Error(), "was written") || !strings.Contains(err.Error(), "crash") {
+		t.Errorf("error text %q", err)
+	}
+	if got, rerr := Read(path); rerr != nil || !reflect.DeepEqual(got, f) {
+		t.Fatalf("the file is not in place: %+v, %v", got, rerr)
+	}
+	if entries, _ := os.ReadDir(filepath.Dir(path)); len(entries) != 1 {
+		t.Errorf("%d entries, want only the file", len(entries))
 	}
 }

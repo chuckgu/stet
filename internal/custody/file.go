@@ -87,7 +87,7 @@ func Read(path string) (*File, error) {
 	if !pre.Mode().IsRegular() {
 		return nil, fmt.Errorf("credentials file %s: not a regular file", path)
 	}
-	fh, err := os.Open(path)
+	fh, err := openRegular(path)
 	if err != nil {
 		return nil, err
 	}
@@ -95,9 +95,6 @@ func Read(path string) (*File, error) {
 	info, err := fh.Stat()
 	if err != nil {
 		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("credentials file %s: not a regular file", path)
 	}
 	if uid, _, ok := ownerOf(info); ok {
 		if err := CheckMode(info.Mode(), uid, uint32(os.Geteuid())); err != nil {
@@ -116,6 +113,26 @@ func Read(path string) (*File, error) {
 		return nil, fmt.Errorf("credentials file %s: %w", path, err)
 	}
 	return f, nil
+}
+
+// openRegular opens path for reading and refuses what is not a regular file.
+// The Stat before it can be out of date (the path may have been replaced by a
+// FIFO since), so it opens without blocking and checks what it got.
+func openRegular(path string) (*os.File, error) {
+	fh, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, err := fh.Stat()
+	if err != nil {
+		fh.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		fh.Close()
+		return nil, fmt.Errorf("credentials file %s: not a regular file", path)
+	}
+	return fh, nil
 }
 
 type rawFile struct {
@@ -227,13 +244,39 @@ func sortedNames(m map[string]Agent) []string {
 	return names
 }
 
+// checkReplaceable is what Write accepts of a file that is already there: it
+// must not give anyone access beyond what Read allows, whoever is writing. A
+// root-owned file may be group-readable (0640); any other owner's file may not
+// be open to group or others.
+func checkReplaceable(mode fs.FileMode, owner uint32) error {
+	perm := mode.Perm()
+	if owner == 0 {
+		if perm&^0o640 != 0 {
+			return fmt.Errorf("mode %04o is too open for a file owned by root: allow at most group read (0640)", perm)
+		}
+		return nil
+	}
+	if perm&0o077 != 0 {
+		return fmt.Errorf("mode %04o is too open: allow no access for group or others (0600)", perm)
+	}
+	return nil
+}
+
+// ErrNotSynced is what Write returns, wrapped, when the new file is in place
+// but the directory could not be synced: the change may not survive a crash.
+var ErrNotSynced = errors.New("the credentials file was written, but the directory could not be synced, so the change may not survive a crash")
+
+// syncDirectory is syncDir; a test replaces it to make that step fail.
+var syncDirectory = syncDir
+
 // renameFile is os.Rename; a test replaces it to make the last step fail.
 var renameFile = os.Rename
 
 // Write puts f at path whole: a temporary file in the same directory, then a
 // rename. A file already there keeps its owner, group and mode; when that
 // cannot be kept, nothing is written. A new file is the caller's, 0600. An
-// empty f.MockSecret is filled with a fresh random value first.
+// empty f.MockSecret is filled with a fresh random value first. An error that
+// wraps ErrNotSynced is the one error that means the file is in place.
 func Write(path string, f *File) (err error) {
 	if f.MockSecret == "" {
 		raw := make([]byte, mockSecretLen)
@@ -260,11 +303,11 @@ func Write(path string, f *File) (err error) {
 			return fmt.Errorf("credentials file %s is not a regular file: nothing written", path)
 		}
 		if uid, _, ok := ownerOf(info); ok {
-			if err := CheckMode(info.Mode(), uid, uint32(os.Geteuid())); err != nil {
+			if err := checkReplaceable(info.Mode(), uid); err != nil {
 				return fmt.Errorf("credentials file %s: %w: fix that first; nothing written", path, err)
 			}
 			if uid != uint32(os.Geteuid()) && os.Geteuid() != 0 {
-				return fmt.Errorf("credentials file %s belongs to uid %d and only they or root can keep it so: nothing written", path, uid)
+				return fmt.Errorf("credentials file %s belongs to uid %d: only that user or root can replace it and keep it theirs; nothing written", path, uid)
 			}
 		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
@@ -308,7 +351,10 @@ func Write(path string, f *File) (err error) {
 	if err = renameFile(tmp.Name(), path); err != nil {
 		return err
 	}
-	return syncDir(filepath.Dir(path))
+	if serr := syncDirectory(filepath.Dir(path)); serr != nil {
+		return fmt.Errorf("credentials file %s: %w (%v)", path, ErrNotSynced, serr)
+	}
+	return nil
 }
 
 // syncDir makes the rename survive a crash.

@@ -418,10 +418,12 @@ func TestStoreRetriesAFailedRead(t *testing.T) {
 	// A read that fails for a reason the file's stat does not show.
 	var mu sync.Mutex
 	broken := true
+	calls := 0
 	s.mu.Lock()
 	s.read = func(p string) (*File, error) {
 		mu.Lock()
 		defer mu.Unlock()
+		calls++
 		if broken {
 			return nil, errors.New("too many open files")
 		}
@@ -440,11 +442,22 @@ func TestStoreRetriesAFailedRead(t *testing.T) {
 	}
 	mu.Lock()
 	broken = false
+	failedCalls := calls
 	mu.Unlock()
+	s.mu.Lock()
+	s.lastTry = time.Now().Add(time.Hour) // as if the failed try was just now
+	s.mu.Unlock()
 	if e, _ := s.Lookup("alice"); e.Password != "pw-a" {
-		t.Errorf("retried at once, before %v", retryEvery)
+		t.Errorf("Lookup = %q, want the old password: no retry before the interval", e.Password)
 	}
-	time.Sleep(2 * retryEvery)
+	mu.Lock()
+	if calls != failedCalls {
+		t.Errorf("read the file %d more times before the interval was over", calls-failedCalls)
+	}
+	mu.Unlock()
+	s.mu.Lock()
+	s.lastTry = time.Now().Add(-time.Hour) // the interval is over
+	s.mu.Unlock()
 	e, ok := s.Lookup("alice")
 	if !ok || e.Password != "pw-new" || e.Token.Text() != f.Agents["alice"].Token {
 		t.Fatalf("after the retry interval Lookup = %+v, %v", e, ok)
