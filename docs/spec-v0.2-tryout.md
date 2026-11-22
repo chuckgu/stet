@@ -84,6 +84,8 @@ stet: watching 2 tables on 127.0.0.1:6432 (shadow: nothing is blocked)
 
 **`sslmode`를 적지 않은 기존 설정이 바뀐다.** 이 판 전에는 Stet 자신의 연결(pgx)만 `prefer`로 TLS를 청했고, 프록시 구간은 늘 평문이었다. 이 판부터는 프록시 구간도 `prefer`를 따른다. 서버가 TLS를 받으면 에이전트의 세션도 TLS로 서버에 닿고, 그 세션의 인증 방식 목록이 고쳐진다(아래 "인증 방식 목록"). 서버가 TLS를 받지 않으면 전처럼 평문이다. 전과 같이 평문으로 두려면 `sslmode=disable`을 적는다. 기존 테스트의 세션도 `sslmode`를 적지 않은 것은 TLS 업스트림을 지나고, 단언은 고치지 않고 통과한다(12장).
 
+**`prefer`의 프록시 구간이 평문으로 가는 것은 서버가 TLS 요청에 `N`으로 답할 때뿐이다.** 서버가 `S`로 답한 뒤 TLS 인사가 실패하면 프록시 구간은 평문으로 다시 붙지 않는다. 에이전트의 세션은 `08001`(`stet: TLS to upstream <호스트:포트> failed: …`)로 끝난다. Stet 자신의 연결(pgx)은 인사가 실패해도 평문으로 다시 붙는다. 그래서 그런 서버에서는 Stet은 뜨지만 에이전트는 붙지 못한다. 그런 서버에는 `sslmode=disable`이나 `require`를 적는다. `disable`이면 두 구간이 모두 평문으로 붙고, `require`면 두 구간이 같은 이유로 실패한다.
+
 - `sslrootcert`는 Stet 자신의 연결과 프록시 구간에 함께 쓴다.
 - 호스트가 IP 주소가 아니면 TLS 인사에 서버 이름(SNI)을 넣는다. `sslsni=0`이면 넣지 않는다. Neon은 이 이름으로 대상을 고른다.
 - `sslcert`와 `sslkey`(클라이언트 인증서)는 Stet 자신의 연결에만 쓴다. 중계하는 세션에는 인증서를 내지 않는다. 서버가 인증서로 계정을 정하는 설정(`cert`)이면 에이전트의 세션이 Stet의 신원으로 로그인되기 때문이다.
@@ -125,6 +127,8 @@ stet: watching 2 tables on 127.0.0.1:6432 (shadow: nothing is blocked)
 
 경고는 고칠 방법을 함께 말한다(`fix: add sslmode=verify-full to upstream` 등). 이 기기인지는 호스트가 `localhost`이거나 루프백 IP인지로 본다. 경고에는 `upstream`의 호스트만 적고 주소 전체는 적지 않는다.
 
+시작 로그 줄(`stet proxy listening`, INFO)은 `upstream_tls`로 프록시 구간의 보호를 적는다. `off`(`disable`), `preferred`(`prefer`, 적지 않음), `unverified`(`sslrootcert` 없는 `require`), `verified`(`verify-ca`, `verify-full`, `sslrootcert`가 있는 `require`)다. 루프백 업스트림에는 경고가 없으므로, `sslmode`를 적지 않은 설정으로 이 판에 올린 사람은 이 값(`preferred`)으로 프록시 구간이 이제 TLS를 청한다는 것을 본다.
+
 ## 4. `stet init`
 
 ```
@@ -132,6 +136,8 @@ stet init [-config stet.yaml] [-listen 127.0.0.1:6432] [-tables a,b,c] [-yes] [-
 ```
 
 DB 주소는 인자로 받고, 없으면 환경 변수 `DATABASE_URL`에서 읽는다. 문서는 환경 변수를 먼저 권한다. 인자의 비밀번호는 셸 기록과 프로세스 목록에 남는다. 플래그는 주소 앞에 둔다. 주소 뒤에 오면 `flags go before the address`로 멈춘다.
+
+`stet init -h`는 사용법과 플래그를 표준 출력에 내고 0으로 끝난다. 모르는 플래그는 에러를 한 번만 내고(`stet: flag provided but not defined: -x`) 1로 끝난다. 처음에는 `-h`가 사용법을 표준 에러에 낸 뒤 `stet: flag: help requested`로 1로 끝났고, 모르는 플래그의 에러는 두 번 나왔다.
 
 `init`은 DB에 아무것도 쓰지 않는다. 읽기 전용 트랜잭션에서만 묻는다. 비밀번호는 쓰는 설정 파일 하나에만 나간다. `init`이 만든 출력과 에러에는 넣지 않는다. pgconn이 읽지 못하는 주소에서는 pgconn의 에러가 주소를 인용하고, 비밀번호는 pgconn이 best effort로 `xxxxx`로 가린다(3장). 서버가 보낸 글자(버전, 계정과 데이터베이스 이름, 서버의 에러, 인증서 에러)는 제어 문자, U+2028·U+2029, 방향 제어 문자를 공백으로 바꿔 보인다. 서버도 믿지 않는다(규칙 5).
 
@@ -144,6 +150,7 @@ DB 주소는 인자로 받고, 없으면 환경 변수 `DATABASE_URL`에서 읽�
      - 질의 파라미터에 `host`·`hostaddr`·`port`가 있는 것(`the database address sets host, hostaddr or port in its query; write the host and port in the address itself`).
      - 호스트가 여럿인 것(`the database address lists more than one host; stet relays to one server, so give one host`).
      - 그 밖에 Stet 자신의 연결과 프록시 구간이 다르게 읽는 것. 설정 검증과 같은 검사(`config.OneTarget`, 3장)다.
+     - 사용자 이름이나 비밀번호에 인코딩하지 않은 `?`나 `#`가 있는 것(`the database address has a ? or # in its user or password; percent-encode it (%3F, %23)`). pgconn은 사용자 정보를 `/` 앞의 첫 `@`까지로 읽고, net/url은 `?`나 `#`에서 질의나 조각을 시작한다. 사용자 이름이 호스트와 같으면(`postgres://db:?s3cret@db/crm`) 두 해석이 같은 서버에 닿아 위의 검사를 모두 지난다. 그러나 에이전트에게 알려 줄 주소는 net/url로 읽으므로 비밀번호의 나머지가 보인다(`postgres://127.0.0.1:6432?s3cret@db/crm&sslmode=disable`). 이 검사는 `config.OneTarget` 뒤에 한다. 두 해석이 다른 서버에 닿는 주소는 앞의 에러가 난다.
    - `sslmode`가 적혀 있으면 그대로 쓴다(`allow`는 거부).
    - 적혀 있지 않고 호스트가 이 기기면 그대로 둔다. 이 기기인지는 호스트가 `localhost`이거나 루프백 IP인지로 본다.
    - 적혀 있지 않고 호스트가 다른 기기면 `verify-full`로 붙어 본다. 인증서 확인에서 실패하면 `require`로 낮춰 붙고, 그 사실과 고치는 법(`sslrootcert`에 서비스의 CA 파일을 준다)을 알린다: `the server's certificate could not be checked (<이유>), so upstream uses sslmode=require: the connection is encrypted, but the server is not verified. To verify it, add sslrootcert=<the service's CA file> and sslmode=verify-full to upstream in the config file.` 서버가 TLS를 받지 않으면 멈추고, 평문으로 쓰려면 `sslmode=disable`을 직접 적으라고 말한다(`the server does not accept TLS; to connect in plaintext anyway, write sslmode=disable in the address yourself`). 원격 평문은 사용자가 적어야 한다.
@@ -245,7 +252,7 @@ tables:
 | OP, 테이블 | `UPDATE contacts`. OP는 대문자로 적는다 |
 | 사실들 | 쉼표로 잇는다. 없는 것은 뺀다. 아래 순서다 |
 | 이유들 | 판단 기록의 `reasons`를 쉼표로 이어 대괄호에 넣는다. 비면 칸을 뺀다 |
-| 문장 | 줄바꿈, 연속된 공백, 아래의 문자를 공백 하나로 바꾸고 양 끝을 다듬는다. 80자를 넘으면 79자와 `…`로 자른다 |
+| 문장 | 줄바꿈, 연속된 공백, 아래의 문자를 공백 하나로 바꾸고 양 끝을 다듬는다. 80자를 넘으면 79자와 `…`로 자른다. 앞 4 KiB(4,096바이트)만 읽는다. 수 MB의 `INSERT`도 판단하는 고루틴에서 4 KiB짜리만큼만 일한다. 4 KiB를 넘는 문장의 앞 4 KiB가 80자가 되지 않으면(공백이 아주 많은 문장) 그 글자와 `…`를 적는다 |
 
 문장, 테이블 이름, 이유, 연쇄 테이블 이름은 에이전트나 DB가 쓴 글자다(규칙 5). 제어 문자(Unicode `Cc`), U+2028·U+2029, 방향 제어 문자(U+202A–202E, U+2066–2069)를 공백으로 바꿔 넣는다(P5). 처음 설계는 줄바꿈과 연속된 공백만 말했다.
 
@@ -268,6 +275,8 @@ tables:
 
 - 출력은 세션과 판단을 세우지 않는다. 줄은 1,024줄짜리 대기열을 거쳐 따로 쓴다. 대기열이 차면 새 줄을 버린다. 버린 것이 있는 동안에는 대기열에 자리가 나도 새 줄을 모두 버리고 센다. 그 앞에 들어간 줄이 다 나가면 버린 수를 한 줄로 알리고(`… 37 lines dropped`, 하나면 `… 1 line dropped`), 그 뒤로 다시 받는다. 알림이 계속 밀려 진짜 줄이 하나도 나가지 못하는 일을 막기 위해서다. 알림은 다음 줄이 오지 않아도 나온다.
 - 쓰다가 실패해도 다음 줄을 계속 쓴다. 실패를 알릴 곳은 없다.
+- 읽는 쪽이 닫힌 출력도 프록시를 끝내지 않는다(`stet proxy -decisions on | head -1`). Go 런타임은 표준 출력이나 표준 에러에 쓰다가 읽는 쪽이 닫힌 파이프를 만나면 SIGPIPE로 프로세스를 끝낸다. 그래서 `stet proxy`는 시작할 때 SIGPIPE를 무시한다. 그 쓰기는 EPIPE로 실패하고 줄은 버려진다. 표준 에러가 닫히면 로그도 같은 식으로 버려지고, 프록시는 계속 돈다. 처음에는 첫 판단의 줄에서 프로세스가 SIGPIPE로 끝났고(셸의 종료 코드 141), 모든 에이전트의 세션이 함께 끊겼다.
+- 줄을 만들다가 패닉이 나면 그 줄만 빠진다. 판단의 id를 적은 에러 로그 한 줄(`decision line not printed: making it panicked`)을 남기고, 판단과 프로세스는 계속된다. 게이트는 판단한 고루틴에서 `Decided`를 부르고, 그 고루틴에는 패닉을 받는 곳이 없기 때문이다.
 - 끝낼 때는 대기열에 남은 줄을 쓰되, 받는 쪽이 멈춰 있으면 2초까지만 기다린다(P6). 처음 설계는 끝낼 때를 말하지 않았고, 끝까지 기다리면 `stet`이 끝나지 않는다.
 - 기록(`stet.decisions`)에 넣지 못한 판단도 줄은 낸다.
 - 줄에 넣는 것은 판단 기록에 이미 있는 값뿐이다. 새로 DB에 묻지 않는다.
@@ -345,27 +354,29 @@ Stet은 이 문장을 스스로 실행하지 않는다.
 - [x] `sslmode`가 `require`, `verify-ca`, `verify-full`인 `upstream`으로 띄운 Stet을 거쳐 `psql`과 pgx가 SCRAM 계정으로 로그인하고 문장을 실행한다. 서버 쪽에서 그 세션이 TLS다(`pg_stat_ssl`).
   - `TestSessionsReachTheServerOverTLS`(cmd/stet): 세 `sslmode`마다 pgx(SCRAM 계정, md5 계정)와 `psql`(SCRAM 계정)이 붙어 `pg_stat_ssl.ssl`이 참이고, 에이전트의 쓰기가 실행되고 기록된다. 경고는 없다. `TestSessionOverTLSIsTLSOnTheServer`(internal/proxy).
 - [x] 3장의 표와 절차의 줄마다 테스트가 있다(11장의 표).
-  - `sslmode`별 접속: `TestUpstreamTLSBySSLMode`, `TestUpstreamRejectsAllowAndDirect`(internal/config). `TestUpstreamDeclinesTLS`(`Required`는 `08001`, `Preferred`는 평문으로 붙는다), `TestUpstreamCertificateIsChecked`(`verify-full`에서 이름이 다르면 `08001`), `TestOddTLSAnswerIsRefused`(internal/proxy).
+  - `sslmode`별 접속: `TestUpstreamTLSBySSLMode`, `TestUpstreamRejectsAllowAndDirect`(internal/config). `TestUpstreamDeclinesTLS`(`Required`는 `08001`, `Preferred`는 평문으로 붙는다), `TestUpstreamCertificateIsChecked`(`verify-full`에서 이름이 다르면 `08001`), `TestOddTLSAnswerIsRefused`(internal/proxy). `TestStartInProcessRelaysAsTheUpstreamSays`(internal/lab/bench, 벤치가 띄우는 Stet의 프록시 구간도 `sslmode=require`면 서버에서 TLS다).
   - 인증: `TestPsqlLogsInThroughTLSUpstream`(`psql`로 SCRAM, md5, `password`, `trust` 계정과 틀린 비밀번호), `TestPassthroughOverTLS/AuthMethodsPassThrough`(pgx로 같은 넷)(internal/proxy).
   - 목록 고치기: `TestSASLListOverTLSHasNoPlus`, `TestSASLListOverPlaintextIsTheServers`, `TestOnlyChannelBoundAuthIsRefused`, `TestStripPlus`, `TestAuthTapBecomesInner`, `TestAuthTapRefusesChannelBoundOnly`(internal/proxy).
   - 취소: `TestCancelOverTLSNeedsTLS`, `TestPassthroughOverTLS/CancelRequestReachesUpstream`(internal/proxy).
   - 클라이언트 인증서: `TestRelayedSessionShowsNoClientCertificate`(cmd/stet), `TestUpstreamTLSCarriesNoClientCertificate`(internal/config).
-  - 한 바이트: `TestSSLAnswerIsReadAlone`(internal/proxy).
+  - 한 바이트: `TestSSLAnswerIsReadAlone`(internal/proxy). 가짜 서버는 `S`와 그 뒤의 평문을 보낸 다음 진짜 TLS 서버로 인사를 받는다. 답을 한 바이트만 읽으면 프록시의 인사가 그 평문에서 바로 실패한다. 평문을 `S`와 함께 읽은 프록시는 인사를 마친다. 테스트는 그것을 보고 곧바로 실패한다. 그 평문을 클라이언트에 넘기는 프록시라면 클라이언트가 받은 AuthenticationOk로 실패한다. 처음의 가짜 서버는 평문 뒤에 말이 없어서, 버퍼로 읽는 프록시가 5초 시간 제한끼리의 경주로만 드러났다.
+  - 연결 중의 패닉: `TestPanicInDialLeavesNothingBehind`(internal/proxy). 서버 인증서를 확인하는 함수에서 패닉이 나도 그 세션만 끝나고, 서버 쪽 연결이 닫히고, `Close`가 돌아온다.
   - 한 대상: `TestOneTarget`, `TestParseRefusesAnUpstreamReadTwoWays`, `TestUpstreamErrorsNeverQuoteTheAddress`(internal/config).
-  - 시작할 때의 경고: `TestTransportWarnings`, `TestTransportWarningsNameNoPassword`(cmd/stet).
+  - 시작할 때의 경고: `TestTransportWarnings`, `TestTransportWarningsNameNoPassword`(cmd/stet). 시작 로그의 `upstream_tls`: `TestListeningLineSaysHowUpstreamIsProtected`(cmd/stet), `TestTransportString`(internal/config).
   - 지연: `TestTLSUpstreamLatencyBudget`(internal/proxy).
 - [x] 취소 요청이 TLS 업스트림에서 전달된다. `TestPassthroughOverTLS/CancelRequestReachesUpstream`이 TLS 업스트림에서 `pg_sleep(10)`을 취소한다. `TestCancelOverTLSNeedsTLS`는 취소 요청도 TLS로 가는 것을 본다.
 - [x] 평문 업스트림에서 클라이언트가 받는 바이트는 이 단계 전과 같다. `TestSASLListOverPlaintextIsTheServers`(`Relayed`, `Watched`, `Enforced`)가 서버가 보낸 인증 바이트와 클라이언트가 받은 바이트가 같음을 본다. `TestPassthrough`, `TestWatchedPassthrough`는 단언을 고치지 않고 통과한다.
-- [x] `stet init`이 만든 설정으로 `stet proxy`가 뜨고, 그 테이블들에 보낸 쓰기가 판단되어 기록된다. `init`은 DB에 아무것도 쓰지 않는다. `TestInitThenProxy`(경고 없이 뜨고, 쓰기 셋이 `commit`, `hold`, `hold`로 기록된다. `init` 뒤에 `stet` 스키마가 없다), `TestReadInitFactsWritesNothing`(읽기 전용 트랜잭션), `TestInitDeclinedWritesNothing`(cmd/stet). quickstart를 따라 한 결과도 같다(아래).
-- [x] `init`이 알려 준 접속 문자열로 `psql`이 붙는다. `TestInitThenProxy`가 출력된 주소에 비밀번호만 넣어 `psql`로 쓴다. quickstart를 따라 할 때도 그 주소로 붙었다.
+- [x] `stet init`이 만든 설정으로 `stet proxy`가 뜨고, 그 테이블들에 보낸 쓰기가 판단되어 기록된다. `init`은 DB에 아무것도 쓰지 않는다. `TestInitThenProxy`(경고 없이 뜨고, 쓰기 셋이 `commit`, `hold`, `hold`로 기록된다. `init` 뒤에 `stet` 스키마가 없다), `TestReadInitFactsWritesNothing`(읽기 전용 트랜잭션), `TestInitDeclinedWritesNothing`(cmd/stet). quickstart를 따라 한 결과도 같다(아래). `TestInitThenProxy`는 `-listen`에 준 포트를 `stet proxy`에 넘길 때까지 쥐고 있다. `TestInitHelpAndUnknownFlag`(`-h`와 모르는 플래그), `TestChooseSSLModeKnowsAServerThatRefusesTLS`(SSLRequest에 `N`으로 답하는 진짜 리스너에 `openPool`로 붙어, pgx의 문구가 바뀌면 실패한다)(cmd/stet).
+- [x] `init`이 알려 준 접속 문자열로 `psql`이 붙는다. `TestInitThenProxy`가 출력된 주소에 비밀번호만 넣어 `psql`로 쓴다. quickstart를 따라 할 때도 그 주소로 붙었다. 그 주소에 비밀번호의 일부가 보일 주소(사용자 정보의 `?`·`#`, 4장)는 붙기 전에 거부한다: `TestInitStops`, `TestInitOutputNeverShowsThePassword`(cmd/stet).
 - [x] 계정 하나, 모델 없음, `send_fields` 없음으로 뜬다. `TestInitThenProxy`(한 계정이 `upstream`이자 에이전트), `TestRecordsWithoutSendFields`(cmd/stet, 상태 안의 `proposed`와 `current`가 비고 `proposed` 컬럼에 값이 있다), `TestSendFieldsOptionalWithoutAModel`(internal/config).
-- [x] 판단한 쓰기마다 6장의 모양으로 한 줄이 나온다. 표준 출력이 터미널이 아니면 기본으로 나오지 않는다. `TestFormatLines`, `TestFormatCutsTheStatement`, `TestLineHasNoControlCharacters`(internal/lines), `TestDecisionLinePerJudgedWrite`, `TestEnforceLineShowsTheRefusal`, `TestLineWhenTheRecordFails`, `TestDecisionsFlag`(`auto`는 파일과 파이프에서 끈다), `TestRunWithoutOutWritesNothing`(cmd/stet).
-- [x] 출력을 받는 쪽이 멈춰도 에이전트의 쓰기가 끝난다. `TestBlockedOutputDoesNotHoldWrites`(cmd/stet, 멈춘 출력 뒤에서 쓰기 2,000개가 끝나고 기록된다), `TestOfferNeverBlocks`, `TestCloseGivesUpOnABlockedWriter`(internal/lines).
+- [x] 판단한 쓰기마다 6장의 모양으로 한 줄이 나온다. 표준 출력이 터미널이 아니면 기본으로 나오지 않는다. `TestFormatLines`, `TestFormatCutsTheStatement`, `TestLineHasNoControlCharacters`(internal/lines), `TestDecisionLinePerJudgedWrite`, `TestEnforceLineShowsTheRefusal`, `TestLineWhenTheRecordFails`, `TestDecisionsFlag`(`auto`는 파일과 파이프에서 끈다), `TestRunWithoutOutWritesNothing`(cmd/stet). `TestStatementWorkDoesNotGrowWithTheStatement`(internal/lines, 16 MiB 문장도 한 번에 약 37KB만 할당한다. 고치기 전에는 143MB였다). `TestPanicInALineGoesNoFurther`(cmd/stet, 줄을 만들다 난 패닉은 에러 로그 한 줄로 남고, 다음 쓰기의 판단과 줄은 그대로 나온다).
+- [x] 출력을 받는 쪽이 멈춰도 에이전트의 쓰기가 끝난다. `TestBlockedOutputDoesNotHoldWrites`(cmd/stet, 멈춘 출력 뒤에서 쓰기 2,000개가 끝나고 기록된다), `TestOfferNeverBlocks`, `TestCloseGivesUpOnABlockedWriter`(internal/lines). 읽는 쪽이 닫힌 출력: `TestClosedOutputDoesNotEndTheProxy`(cmd/stet). 빌드한 `stet proxy -decisions on -v`를 띄워 표준 출력이나 표준 에러의 읽는 쪽을 시작 뒤에 닫는다. 그 뒤의 쓰기가 판단되어 기록되고, 다음 세션이 붙고, SIGTERM에 0으로 끝난다. 고치기 전에는 두 경우 모두 `signal: broken pipe`로 끝났다.
 - [x] 기존 테스트가 단언을 고치지 않고 통과한다. 고친 것이 있으면 이유와 함께 적는다. 2026-11-22의 전체 실행(`STET_TEST_PG=127.0.0.1:55432 go test -race ./...`)에서 테스트가 있는 19개 패키지가 모두 `ok`다. 고친 것:
   - `TestTablesNeedSendFields`(internal/config): 설정을 `adapter: none`에서 버전을 고정한 `jev` 모델로 바꿨다. 단언은 그대로다. 5장이 모델 없는 설정의 `send_fields`를 선택으로 만들었으므로, 예전 설정은 이 단계가 없앤 동작을 단언하고 있었다.
   - 테스트의 헬퍼만 고쳤고 단언은 그대로다: `proxy.New`의 새 시그니처에 맞춘 헬퍼, 이름이 겹친 `decisionsOn`을 `decisionsRecorded`로 바꾼 것(`history_test.go`, `undo_test.go`), `start`와 `runPsql`에서 `startOn`과 `psqlWith`를 떼어 낸 것(cmd/stet), `latency_test.go`의 측정 고리를 `measureAdded`로 떼어 낸 것(기존 `Test…` 함수의 본문과 단언은 그대로다).
   - `sslmode`를 적지 않은 기존 테스트의 세션은 이제 TLS 업스트림을 지난다(3장). 단언은 고치지 않았다.
-- [x] `latency_test.go`의 예산을 지킨다. TLS 업스트림의 값을 적는다. `TestTLSUpstreamLatencyBudget`: `select 1` 2,000회 왕복에서 더해진 p95가 31.4µs와 31.9µs(Task 4, `-race`), 32.1µs(2026-11-22 다시 잼, `-race`)다. `-race` 없이는 19.8µs다. 예산은 2ms다.
+  - 최종 리뷰 뒤의 고침에서 고친 테스트: `TestSSLAnswerIsReadAlone`(가짜 서버를 바꾸고 단언을 더했다. 원래의 단언은 그대로다), `TestInitThenProxy`(포트를 닫았다가 `cfg.Listen`으로 다시 여는 대신 쥐고 있다가 넘기고, `cfg.Listen`이 그 주소인지 본다). 헬퍼만 고친 것: `startStet`에서 데이터베이스를 만드는 부분을 `itemsDatabase`로 떼어 냈다(internal/lab/bench).
+- [x] `latency_test.go`의 예산을 지킨다. TLS 업스트림의 값을 적는다. `TestTLSUpstreamLatencyBudget`: `select 1` 2,000회 왕복에서 더해진 p95가 31.4µs와 31.9µs(Task 4, `-race`), 32.1µs(2026-11-22 다시 잼, `-race`), 35.1µs(최종 리뷰 뒤의 고침 뒤, `-race`)다. `-race` 없이는 19.8µs다. 예산은 2ms다.
 - [x] `scripts/release.sh`가 이 기기용 묶음을 만들고, 그 안의 `stet version`이 준 버전을 낸다. darwin/arm64에서 `scripts/release.sh 0.2.0-test`가 `dist/stet_0.2.0-test_darwin_arm64.tar.gz`를 만들고, `shasum -a 256 --ignore-missing -c checksums.txt`가 `OK`, 묶음 안의 `stet version`이 `stet 0.2.0-test (commit 23b4da6d9e99, go1.27.3)`다(Task 8에서는 `fd9c72035c2f`). 묶음에는 `LICENSE`, `README.md`, `stet`, `stet.example.yaml`이 있다. `TestVersionCommand`(cmd/stet).
 - [x] Docker 이미지가 빌드되고, 그 이미지로 띄운 Stet을 거쳐 쓰기가 판단된다. Task 8: 이미지 사용자 `65532`, 시험 서버의 테이블에 보낸 쓰기가 `09:57:39  ok            UPDATE task8_probe  1 row  update task8_probe set v='z' where id=1`로 나오고 기록됐다. 2026-11-22: quickstart 4장의 명령 그대로 컨테이너에서 `init`(`host.docker.internal`이라 `require`로 낮추고 알렸다)과 `proxy -decisions on`을 돌려 `11:40:35  ok            UPDATE contacts  1 row, fresh read  update contacts set status = 'customer' where id = 7`을 봤다. 이미지와 컨테이너는 지웠다.
 - [x] `docs/quickstart.md`의 명령을 처음부터 끝까지 그대로 따라 해서 1장의 예와 같은 줄을 본다(처음 설계의 문장은 "2장의 예"였으나 예는 1장에 있다). 2026-11-22: 묶음을 빈 디렉터리에 풀고 시험 서버에 데이터베이스와 계정을 하나씩 만들어 2·7·8·9장의 명령을 그대로 쳤다. 1장의 세 줄과 시각만 다른 세 줄이 나왔다(1장의 예가 그 줄이다). `stet init`은 표준 입력이 터미널일 때 묻고 `y`에 썼다. 지운 뒤 데이터베이스에는 `public` 스키마만 남았다.
@@ -398,6 +409,17 @@ Stet은 이 문장을 스스로 실행하지 않는다.
 - 6장: 줄의 시각은 쓰기가 들어온 시각이고, 줄은 판단이 기록된 순서로 나온다. 시작 줄도 대기열을 거친다. 대기열이 넘치면 빌 때까지 새 줄을 버린 뒤 버린 수를 알린다.
 - 8장: 묶음 안의 디렉터리 하나, 실행 이미지 `gcr.io/distroless/base-debian12:nonroot`.
 - 11장: 시험 인증서에 `DNS:127.0.0.1`을 더했다(libpq 14).
+
+**최종 리뷰 뒤의 고침** (2026-11-22, 해당 장에 옮겨 적었다)
+
+- 6장: `stet proxy`는 SIGPIPE를 무시한다. 읽는 쪽이 닫힌 표준 출력이나 표준 에러에 쓰는 것은 실패하고 버려지며, 프록시는 계속 돈다. 전에는 닫힌 뒤에 처음 쓰는 줄이나 로그에서 프로세스가 끝나 모든 세션이 끊겼다.
+- 6장: 줄을 만들다가 난 패닉은 판단의 id를 적은 에러 로그 한 줄로 남고, 그 줄만 빠진다. 전에는 프로세스가 끝났다.
+- 6장: 문장은 앞 4 KiB만 읽는다. 그 안에서 80자가 되지 않는 긴 문장은 읽은 만큼과 `…`로 적는다. 4 KiB 이하의 문장은 전과 같다.
+- 4장: 사용자 이름이나 비밀번호에 인코딩하지 않은 `?`·`#`가 있는 주소는 붙기 전에 거부한다. 전에는 사용자 이름이 호스트와 같으면 에이전트에게 알려 주는 주소에 비밀번호의 일부가 보였다.
+- 4장: `stet init -h`는 사용법을 표준 출력에 내고 0으로 끝난다. 모르는 플래그의 에러는 한 번 나온다.
+- 3장: 시작 로그 줄에 `upstream_tls`(`off`, `preferred`, `unverified`, `verified`)를 더했다. `prefer`가 평문으로 가는 것은 `N`을 받았을 때뿐이라는 것(전부터 그랬다)과, 인사가 실패하는 서버에 적을 `sslmode`를 적었다.
+- 3장의 절차: 연결 중에 패닉이 나도(서버 인증서를 확인하는 함수 등) 프록시는 서버 쪽 연결을 닫고 그 연결을 세던 것을 놓는다. 전에는 `Close`가 끝나지 않았다.
+- 벤치(`internal/lab/bench`)가 띄우는 Stet의 프록시 구간도 `upstream`의 `sslmode`를 따른다. 전에는 늘 평문이었다.
 
 **남긴 것**
 

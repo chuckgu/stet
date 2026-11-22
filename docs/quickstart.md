@@ -113,7 +113,7 @@ then give the agent this address instead of the database's. The user and passwor
 
 **`-tables a,b,c`.** 그 테이블만 넣는다. 그 가운데 아래 조건에 맞지 않는 것이 있으면 테이블마다 이유를 대고 멈춘다(예: `table "nosuch": not found`). 이때는 100개 상한이 없다.
 
-그 밖의 플래그: `-config`(쓸 파일, 기본 `stet.yaml`), `-listen`(`stet proxy`가 받을 주소, 기본 `127.0.0.1:6432`), `-force`(파일이 있으면 덮어쓴다). 플래그는 주소 앞에 둔다. 주소 뒤에 오면 `flags go before the address`로 멈춘다.
+그 밖의 플래그: `-config`(쓸 파일, 기본 `stet.yaml`), `-listen`(`stet proxy`가 받을 주소, 기본 `127.0.0.1:6432`), `-force`(파일이 있으면 덮어쓴다). 플래그는 주소 앞에 둔다. 주소 뒤에 오면 `flags go before the address`로 멈춘다. `stet init -h`는 플래그를 모두 보인다.
 
 ### 하는 일
 
@@ -121,7 +121,7 @@ then give the agent this address instead of the database's. The user and passwor
    - 주소에 `sslmode`가 적혀 있으면 그대로 쓴다. `sslmode=allow`는 받지 않는다.
    - 적혀 있지 않고 호스트가 이 기기(`localhost`나 루프백 IP)면 주소를 그대로 둔다.
    - 적혀 있지 않고 호스트가 다른 기기면 `sslmode=verify-full`(시스템의 루트 인증서)로 붙어 본다. 인증서를 확인하지 못하면 `sslmode=require`로 낮춰 붙고 이렇게 알린다: `the server's certificate could not be checked (…), so upstream uses sslmode=require: the connection is encrypted, but the server is not verified. To verify it, add sslrootcert=<the service's CA file> and sslmode=verify-full to upstream in the config file.` 서버가 TLS를 받지 않으면 `the server does not accept TLS; to connect in plaintext anyway, write sslmode=disable in the address yourself`로 멈춘다. 다른 기기로 평문을 쓰는 것은 사용자가 직접 적어야 한다.
-   - 붙기 전에 거부하는 주소: 호스트가 없는 것, 공백이 든 것, 질의 파라미터에 `host`·`hostaddr`·`port`가 있는 것, 호스트가 여럿인 것, 그 밖에 Stet 자신의 연결과 프록시가 서로 다른 서버로 읽는 것(10장). 에러는 주소를 인용하지 않는다. 비밀번호가 들어 있기 때문이다.
+   - 붙기 전에 거부하는 주소: 호스트가 없는 것, 공백이 든 것, 질의 파라미터에 `host`·`hostaddr`·`port`가 있는 것, 호스트가 여럿인 것, 그 밖에 Stet 자신의 연결과 프록시가 서로 다른 서버로 읽는 것(10장), 사용자 이름이나 비밀번호에 인코딩하지 않은 `?`·`#`가 있는 것(`the database address has a ? or # in its user or password; percent-encode it (%3F, %23)`). 마지막 것은 에이전트에게 알려 줄 주소에 비밀번호의 일부가 보일 수 있어서다. 에러는 주소를 인용하지 않는다. 비밀번호가 들어 있기 때문이다.
 2. **붙어서 확인한다.** `stet proxy`와 같은 방식으로 붙는다. 붙지 못하면 서버의 에러를 보이고, 그 아래에 `if this address goes through a connection pooler, use the direct connection address instead`를 붙이고 멈춘다. pgconn이 읽지 못하는 주소(예: `sslmode=foo`)는 pgconn의 에러(``cannot parse `postgres://app:xxxxx@…`: …``)가 나오는데, 이 에러는 비밀번호를 `xxxxx`로 가린 채 주소를 보인다. pgx는 이 가림을 best effort라고 적는다. 한 번 붙어 보는 데 15초, 붙어서 읽는 데 30초를 넘기면 멈춘다. PostgreSQL 14보다 낮으면 멈춘다. `stet` 스키마가 없고 그 계정이 만들 수도 없으면 데이터베이스 소유자가 실행할 문장(`GRANT CREATE ON DATABASE … TO …;`)을 보이고 멈춘다. 서버가 보낸 글자는 제어 문자를 공백으로 바꿔 보인다.
 3. **테이블을 고른다.** 다음을 모두 채우는 테이블이다.
    - 일반 테이블이거나 파티션을 나눈 테이블이다. 파티션 하나하나는 고르지 않는다(부모를 고른다). 시스템 스키마와 `stet` 스키마의 것이 아니다.
@@ -178,12 +178,14 @@ stet proxy -config stet.yaml
 
 ```
 stet: watching 2 tables on 127.0.0.1:6432 (shadow: nothing is blocked)
-time=2026-11-22T20:39:39.590+09:00 level=INFO msg="stet proxy listening" listen=127.0.0.1:6432 upstream=db.example.com:5432 mode=shadow agent_roles=[] gated_tables=2 model=none
+time=2026-11-22T20:39:39.590+09:00 level=INFO msg="stet proxy listening" listen=127.0.0.1:6432 upstream=db.example.com:5432 upstream_tls=verified mode=shadow agent_roles=[] gated_tables=2 model=none
 ```
 
 - 처음 띄울 때 그 데이터베이스에 `stet` 스키마가 생긴다. 판단 기록(`stet.decisions`)이 거기에 남는다.
 - 판단한 쓰기마다 한 줄을 표준 출력에 낸다(6장). 첫 줄 `stet: watching …`은 받기 시작했다는 표시다. 로그(`time=… level=…`)는 표준 에러로 간다.
+- 로그의 `upstream_tls`는 Stet과 DB 사이 구간의 보호다. `off`(`sslmode=disable`), `preferred`(`prefer`나 적지 않음: 서버가 TLS를 받으면 TLS, 인증서는 확인하지 않는다), `unverified`(`sslrootcert` 없는 `require`), `verified`(`verify-ca`, `verify-full`, `sslrootcert`가 있는 `require`)다.
 - 줄은 표준 출력이 터미널일 때만 낸다(`-decisions auto`, 기본). 파일이나 파이프로 보내면 내지 않는다. 문장에는 값이 들어 있어서, 로그 수집기로 흘러가는 출력에는 기본으로 내지 않는다. `-decisions on`이면 늘 내고, `off`면 내지 않는다.
+- 줄을 받는 쪽이 먼저 끝나도(`stet proxy -config stet.yaml -decisions on | head -5`) Stet은 계속 돈다. 그 뒤의 줄은 버려진다. 표준 에러를 받는 쪽이 끝나면 로그가 같은 식으로 버려진다.
 - 끌 때는 Ctrl-C다. 판단 중인 쓰기를 기록하고 끝난다. 아직 쓰지 못한 줄은 2초까지만 기다린다.
 
 시작할 때 다음 경우에는 경고를 남긴다. 막지는 않는다.
@@ -268,7 +270,7 @@ enforce로 돌면 `would`가 빠진다(`hold`, `escalate`, `reject`). 이 문서
 
 나머지는 [spec-v0.2-impact](spec-v0.2-impact.md), [spec-v0.2-stale](spec-v0.2-stale.md), [spec-v0.1](spec-v0.1.md) 6장에 있다.
 
-**문장.** 줄바꿈, 연속된 공백, 제어 문자를 공백 하나로 바꾸고, 80자를 넘으면 79자와 `…`로 자른다. 문장, 테이블 이름, 이유는 에이전트나 DB가 쓴 글자라서 터미널에 그대로 내지 않는다.
+**문장.** 줄바꿈, 연속된 공백, 제어 문자를 공백 하나로 바꾸고, 80자를 넘으면 79자와 `…`로 자른다. 아주 긴 문장은 앞 4 KiB만 본다. 문장, 테이블 이름, 이유는 에이전트나 DB가 쓴 글자라서 터미널에 그대로 내지 않는다.
 
 **버린 줄.** 줄은 1,024줄짜리 대기열을 거쳐 쓴다. 터미널이 따라오지 못해 대기열이 차면, 대기열이 빌 때까지 새 줄을 버리고 버린 수를 한 줄로 알린다: `… 37 lines dropped`. 쓰기와 판단은 출력을 기다리지 않는다. 버린 줄의 판단도 `stet.decisions`에는 있다.
 
@@ -369,6 +371,8 @@ psql "$DATABASE_URL" -c "select created_at, verdict, reasons, op, target_table, 
    rm stet.yaml
    ```
 
+   `stet init`이 파일을 쓰는 도중에 끊긴 적이 있으면(Ctrl-C, `kill`) 설정 파일 옆에 이름 앞에 `.`, 뒤에 `.<숫자>`가 붙은 파일이 남아 있을 수 있다(`stet.yaml`이면 `.stet.yaml.123456789`). 쓰던 설정이고 비밀번호가 들어 있다. 권한은 `0600`이다. 있으면 함께 지운다: `rm -f .stet.yaml.*`
+
 되돌리기(`undo`)를 켠 적이 있으면 3 전에 `stet undo-sql -config stet.yaml -drop`이 내는 문장으로 캡처 트리거를 지운다. 이 문서의 길에서는 켜지 않는다.
 
 7장에서 만든 테이블은 `drop table deals, contacts;`로 지우거나, 데이터베이스째 지운다.
@@ -380,6 +384,7 @@ psql "$DATABASE_URL" -c "select created_at, verdict, reasons, op, target_table, 
 - **에이전트와 Stet 사이는 평문이다.** 같은 기기 안이라는 전제다. 루프백이 아닌 주소로 받으면 경고한다.
 - **채널 바인딩을 요구하는 클라이언트는 붙지 못한다.** `sslmode=require`를 적은 클라이언트도 같다. 접속 주소를 `init`이 알려 준 것으로 바꿔야 한다.
 - **`require`와 `prefer`는 서버를 확인하지 않는다.** `prefer`는 중간에서 TLS를 거절당하면 평문으로 간다. libpq와 같은 뜻이다. 원격 DB에는 `verify-full`을 쓴다.
+- **`prefer`(`sslmode`를 적지 않은 주소도)의 프록시 구간이 평문으로 가는 것은 서버가 TLS 요청을 거절(`N`)할 때뿐이다.** 서버가 TLS를 받겠다고 하고 인사에서 실패하면, Stet 자신의 연결은 평문으로 다시 붙어 Stet은 뜨지만 에이전트의 세션은 `08001`(`stet: TLS to upstream … failed: …`)로 끝난다. 그런 서버에는 `sslmode=disable`이나 `require`를 적는다.
 - **연결 풀러를 거친 주소는 지원하지 않는다.** Stet 자신의 연결은 시작 파라미터와 세션 상태를 쓴다. 풀러에 따라 접속이 거부되거나, 붙더라도 Stet의 읽기와 에이전트의 세션이 어긋날 수 있다. 직접 접속 주소를 쓴다.
 - **주소에는 호스트와 포트를 하나만 적는다.** 호스트 여럿(장애 조치 목록), 질의 파라미터나 `PGHOST`·`PGPORT`·서비스 파일로 정한 호스트와 포트는 받지 않는다. Stet 자신의 연결과 에이전트의 세션이 다른 서버에 닿을 수 있기 때문이다.
 - **인증서로 하는 에이전트 인증은 지나가지 못한다.** 중계하는 세션에는 클라이언트 인증서를 내지 않는다.
