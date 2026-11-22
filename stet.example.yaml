@@ -28,11 +28,30 @@ mode: shadow                 # shadow | enforce
 #   GRANT USAGE ON SCHEMA stet TO reviewer;
 #   GRANT SELECT ON stet.review TO reviewer;
 #   GRANT EXECUTE ON FUNCTION stet.approve(uuid, text, bigint), stet.reject(uuid, text) TO reviewer;
+# 클라이언트(에이전트)를 받는 주소. 클라이언트와 Stet 사이는 암호화되지 않는다. 루프백(127.0.0.1)이 아니면 시작할 때
+# 경고한다. 믿는 네트워크 안에서만 연다. 같은 기기에서 써 보는 길은 127.0.0.1:6432이고, 컨테이너 안에서는
+# 0.0.0.0:6432로 받고 포트는 127.0.0.1에만 연다(docs/quickstart.md 4장).
 listen: 0.0.0.0:6432
-upstream: postgres://app@db:5432/crm
+# Stet이 붙는 DB. 주소의 계정은 Stet 자신의 연결(상태 조회, 판단 기록)에 쓴다. 에이전트의 세션은 자기 계정 그대로
+# 같은 서버에 중계된다(프록시 구간). TLS는 주소의 질의 파라미터로 정하고, 두 구간이 같은 값을 따른다.
+#   sslmode=disable      평문
+#   sslmode=prefer       TLS를 청하고, 서버가 거절하면 평문으로 간다. 인증서는 확인하지 않는다. 적지 않으면 이것이다
+#   sslmode=require      TLS가 아니면 붙지 않는다. 인증서는 확인하지 않는다. sslrootcert가 있으면 verify-ca와 같다
+#   sslmode=verify-ca    인증서의 발급자를 확인한다
+#   sslmode=verify-full  발급자와 호스트 이름을 확인한다. sslrootcert가 없으면 시스템의 루트 인증서를 쓴다
+#   sslrootcert=<CA 파일> 두 구간에 함께 쓴다. sslcert·sslkey(클라이언트 인증서)는 Stet 자신의 연결에만 쓴다
+#   sslsni=0             TLS 인사에 서버 이름(SNI)을 넣지 않는다. 기본은 호스트가 IP가 아니면 넣는다
+# 받지 않는 것(설정 오류): sslmode=allow(평문으로 먼저 붙고 거절당하면 TLS로 다시 붙는 방식은 중계하는 세션에서
+# 흉내 낼 수 없다), sslnegotiation=direct(Stet은 SSLRequest로 TLS를 청한다).
+# 호스트와 포트는 주소에 하나만 적는다. 질의 파라미터의 host·hostaddr·port, 호스트 여럿, PGHOST·PGPORT·서비스
+# 파일로 정한 호스트와 포트처럼 Stet 자신의 연결과 프록시 구간이 다른 서버에 닿을 수 있는 주소는 거부한다.
+# 호스트가 이 기기가 아닌데 평문이 될 수 있거나(disable, prefer, 적지 않음) 인증서를 확인하지 않으면(require에
+# sslrootcert 없음) 시작할 때 경고한다. 다른 기기의 DB에는 verify-full을 쓴다.
+upstream: postgres://app@db:5432/crm?sslmode=verify-full
 
 # jev는 환경 변수 TYPESAFE_API_KEY가 필요하다. 키는 이 파일에 두지 않는다.
-# 모델 없이 상태·쓰기·결과만 기록하려면 model: {adapter: none}으로 둔다. enforce에서 adapter: none은
+# 모델 없이 상태·쓰기·결과만 기록하려면 model: {adapter: none}으로 둔다. 그때는 밖으로 보내는 것이 없으므로
+# 테이블의 send_fields를 적지 않아도 된다. enforce에서 adapter: none은
 # on_failure: pass를 직접 적어야 받는다(값 판단 없이 영향 한도만 쓴다는 뜻).
 model:
   adapter: jev
@@ -46,7 +65,9 @@ tables:
   contacts:
     pk: id
     entity: "B2B CRM contact"
-    send_fields: [name, email, company_id, title, status, notes]   # 필수. 모델이 볼 컬럼
+    # 모델이 볼 컬럼. 모델을 쓰면 필수다. adapter: none이면 적지 않아도 되고, 그때 판단 기록의 state 안
+    # proposed·current는 빈다. 판단 기록의 proposed 컬럼, statement, params에는 쓰려던 값이 그대로 남는다
+    send_fields: [name, email, company_id, title, status, notes]
     candidates:              # pg_trgm 필요. 고른 컬럼이 그대로 모델로 가며, PK를 꼭 고른다
       sql: |
         SELECT id, name, email, company_id, title, updated_at

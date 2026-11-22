@@ -133,7 +133,7 @@ Simple Query와 Extended Query(Parse/Bind/Execute) 둘 다 처리한다. 바인�
   - 녹화된 상태를 그대로 재생하므로, 녹화 전에 설정해야 한다.
 - `candidates`: 테이블 설정의 후보 조회 SQL을 실행한다. `:name` 파라미터는 쓰기 후의 행(현재 행에 proposed를 덮은 값)으로 채운다. 대상 행 자신은 뺀다. 후보 SQL이 고른 컬럼이 그대로 모델로 가므로, 후보 SQL이 곧 후보의 허용 목록이다. duplicate 질문의 선택지를 만들려면 PK 컬럼을 골라야 한다.
 - `recent_changes`: 같은 행(테이블 + PK)에 대한, 실행된 최근 쓰기다(`recent_window` 이내, 기본 30분, 최대 10개). 기록된 판단과 아직 판단 중인 쓰기(프로세스 메모리)를 합친다. 판단이 비동기라서 메모리 쪽이 없으면 방금 끝난 다른 에이전트의 쓰기를 놓친다.
-- 필드 허용 목록(`send_fields`)에 있는 컬럼만 모델로 보낸다. `proposed`, `current`, `recent_changes`에 적용한다. 판단 모델 API는 외부 서비스라 데이터가 조직 밖으로 나간다. 그래서 `send_fields`는 필수 설정이다.
+- 필드 허용 목록(`send_fields`)에 있는 컬럼만 모델로 보낸다. `proposed`, `current`, `recent_changes`에 적용한다. 판단 모델 API는 외부 서비스라 데이터가 조직 밖으로 나간다. 그래서 모델을 쓰면 `send_fields`는 필수 설정이다. `model.adapter`가 `none`이면 밖으로 보내는 것이 없으므로 적지 않아도 된다. 그때 상태의 `proposed`와 `current`는 빈다(spec-v0.2-tryout 5장).
 - 상태 크기에 상한을 둔다. 넘으면 후보 수부터 줄인다. (미구현)
 
 ## 5. 판단
@@ -262,7 +262,7 @@ HINT:   update contacts.id=4812 instead of inserting a new row
 - `params jsonb` 추가: 바인딩 값의 텍스트 배열. 실험에서 쓰기 스트림을 재생하려면 문장과 값이 둘 다 있어야 한다.
 - `op`에 `merge`, `copy`, `truncate` 추가: 미지원 형태도 기록하기 때문이다.
 - `proposed`, `state`, `questions`, `answers`는 NULL 허용: 판단하지 않은 쓰기(미지원, 상태 조립 실패, 모델을 부르지 않은 경우)가 있기 때문이다.
-- `proposed`는 send_fields로 거르기 전의 전체 값이다(같은 DB 안에 남는다). 모델에 실제로 보낸 것은 `state`다.
+- `proposed`는 send_fields로 거르기 전의 전체 값이다(같은 DB 안에 남는다). 모델에 실제로 보낸 것은 `state`다. `send_fields`가 없어도(모델 없음) `proposed` 컬럼, `statement`, `params`에는 쓰려던 값이 그대로 남는다.
 - `id`는 Stet이 만든다. 아직 판단 중인 쓰기를 최근 변경 목록에서 중복 없이 합치기 위해서다.
 - `created_at`은 쓰기가 들어온 시각이다(판단이 끝난 시각이 아니다).
 - append-only를 트리거로 강제한다. 라벨 컬럼(`label`, `label_by`, `labeled_at`) 외의 UPDATE, DELETE, TRUNCATE는 `ST004`로 거부된다.
@@ -289,8 +289,8 @@ CREATE TABLE stet.held_writes (
 
 ```yaml
 mode: shadow                 # shadow | enforce
-listen: 0.0.0.0:6432
-upstream: postgres://app@db:5432/crm
+listen: 0.0.0.0:6432         # 루프백이 아니면 시작할 때 경고한다
+upstream: postgres://app@db:5432/crm?sslmode=verify-full
 
 model:
   adapter: jev
@@ -304,7 +304,7 @@ tables:
   contacts:
     pk: id
     entity: "B2B CRM contact"
-    send_fields: [name, email, company_id, title, status, notes]
+    send_fields: [name, email, company_id, title, status, notes]   # 모델을 쓰면 필수
     candidates:              # pg_trgm 필요
       sql: |
         SELECT id, name, email, company_id, title, updated_at
@@ -326,11 +326,18 @@ tables:
     unsupported: reject
 ```
 
-- `send_fields`는 테이블마다 필수다. 모델이 볼 수 있는 컬럼을 명시적으로 고르게 하기 위해서다.
+- `send_fields`는 모델을 쓰면 테이블마다 필수다. 모델이 볼 수 있는 컬럼을 명시적으로 고르게 하기 위해서다. 없으면 `tables.<이름>.send_fields: required: list the columns the model may see`로 시작하지 않는다. `model.adapter`가 `none`이면 적지 않아도 된다(4장, spec-v0.2-tryout 5장).
 - `policy`는 한 줄에 규칙 하나인 텍스트나 규칙 목록이다. 빈 줄은 무시한다. `thresholds.policy`와 `policy_escalate`는 확률(0~1)이다. 예전의 1~5 점수(`policy: 4`)는 설정 검증에서 거부된다.
 - `recent_window`의 기본값은 30분이다.
 - Jev 어댑터 전까지는 `model: {adapter: none}`으로 둔다(5장).
-- `upstream` URL의 계정은 Stet 자신의 연결(상태 조회, 판단 기록)에 쓴다. 이 계정은 게이트 대상 테이블 SELECT 권한과 `stet` 스키마를 만들 권한이 있어야 한다. 비밀번호는 URL이나 `PGPASSWORD`·`.pgpass`로 준다.
+- `upstream` URL의 계정은 Stet 자신의 연결(상태 조회, 판단 기록)에 쓴다. 이 계정은 게이트 대상 테이블 SELECT 권한과 `stet` 스키마를 만들 권한이 있어야 한다. 비밀번호는 URL이나 `PGPASSWORD`·`.pgpass`로 준다. 에이전트의 세션은 자기 계정 그대로 같은 서버로 중계된다(프록시 구간).
+- `upstream`의 TLS는 URL의 질의 파라미터로 정한다. 새 설정 키는 없다. Stet 자신의 연결과 프록시 구간이 `pgconn.ParseConfig`가 읽은 같은 값을 따른다(spec-v0.2-tryout 3장).
+  - `sslmode`: `disable`(평문), `prefer`(TLS를 청하고 서버가 거절하면 평문. 인증서 확인 없음), `require`(TLS만. 인증서 확인 없음. `sslrootcert`가 있으면 `verify-ca`와 같다), `verify-ca`(발급자 확인), `verify-full`(발급자와 호스트 이름 확인. `sslrootcert`가 없으면 시스템의 루트 인증서). 적지 않으면 `prefer`다. v0.2의 써 보는 길부터는 프록시 구간도 이를 따르므로, `sslmode`를 적지 않은 설정의 에이전트 세션은 서버가 TLS를 받으면 TLS로 간다.
+  - `sslrootcert`는 두 구간에 함께 쓴다. `sslcert`와 `sslkey`(클라이언트 인증서)는 Stet 자신의 연결에만 쓴다. 중계하는 세션에는 인증서를 내지 않는다. 호스트가 IP가 아니면 TLS 인사에 서버 이름(SNI)을 넣고, `sslsni=0`이면 넣지 않는다.
+  - 받지 않는 것: `sslmode=allow`, `sslnegotiation=direct`. 설정 검증에서 거부한다.
+  - 호스트와 포트는 URL에 하나만 적는다. 프록시는 URL의 호스트와 포트(없으면 5432)로 중계한다. 질의 파라미터의 `host`·`hostaddr`·`port`, 호스트 여럿, `PGHOST`·`PGPORT`·서비스 파일, 비밀번호의 인코딩하지 않은 특수 문자 때문에 Stet 자신의 연결이 다른 곳에 닿는 URL은 거부한다(`stet's own connections and the proxy would reach different hosts or ports for this address; …`). `upstream`에 관한 에러는 URL을 인용하지 않는다. 비밀번호가 들어 있기 때문이다.
+  - 호스트가 이 기기(`localhost`, 루프백 IP)가 아닌데 평문이 될 수 있거나(`disable`, `prefer`, 적지 않음) 인증서를 확인하지 않으면(`require`에 `sslrootcert` 없음) 시작할 때 경고한다.
+- `listen`이 루프백 주소가 아니면 시작할 때 경고한다. 클라이언트와 Stet 사이는 암호화되지 않는다.
 
 ## 10. 실패 처리와 보안
 
