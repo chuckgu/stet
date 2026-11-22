@@ -16,6 +16,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/term"
 
 	"github.com/stetdb/stet/internal/apply"
 	"github.com/stetdb/stet/internal/config"
@@ -38,6 +39,8 @@ commands:
              -decisions prints a line per judged write on standard output (auto: only on a terminal)
   undo-sql   print the SQL a table owner runs to capture undo.tables (stet undo-sql -config stet.yaml [-drop]),
              or with -grant <role> the grants that let a role review and undo
+  agent      keep the accounts stet proxy logs agents in as, each with a token in place of its database password
+             (stet agent add|token|password|remove [-config stet.yaml] <account>, stet agent list); see stet agent -h
   bench-jev  time single Jev calls (needs TYPESAFE_API_KEY)
   version    print the version, commit and Go version
 `
@@ -57,6 +60,15 @@ func main() {
 		err = runProxy(os.Args[2:])
 	case "undo-sql":
 		err = runUndoSQL(os.Args[2:], os.Stdout)
+	case "agent":
+		err = runAgent(os.Args[2:], agentIO{
+			stdin:    os.Stdin,
+			stdout:   os.Stdout,
+			terminal: term.IsTerminal(int(os.Stdin.Fd())),
+			env:      os.Getenv,
+			secret:   readSecret,
+			now:      time.Now,
+		})
 	case "bench-jev":
 		err = runBenchJev(os.Args[2:])
 	case "version":
