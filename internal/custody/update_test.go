@@ -356,3 +356,26 @@ func TestWrongPassword(t *testing.T) {
 		}
 	}
 }
+
+// A FIFO where the file's directory should be is an error at once: opening
+// it to take the lock does not wait for a writer.
+func TestUpdateRefusesAFIFOForItsDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "creds")
+	if err := syscall.Mkfifo(dir, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- Update(filepath.Join(dir, "agents.yaml"), func(*File) error { return nil }) }()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "cannot lock its directory") {
+			t.Errorf("Update = %v, want that it cannot lock its directory", err)
+		}
+	case <-time.After(2 * time.Second):
+		// A writer lets the blocked open go, and the Update end.
+		if w, err := os.OpenFile(dir, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+			w.Close()
+		}
+		t.Fatal("Update blocked opening a FIFO where its directory should be")
+	}
+}

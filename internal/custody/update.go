@@ -66,9 +66,11 @@ func mayChange(mode fs.FileMode, owner, euid uint32) error {
 }
 
 // lockDir takes an exclusive advisory lock on the directory dir, waiting
-// for it, and returns its release.
+// for it, and returns its release. It opens dir as a directory only: a FIFO
+// in its place is an error at once, where a plain open would wait for a
+// writer.
 func lockDir(dir string) (unlock func(), err error) {
-	d, err := os.Open(dir)
+	d, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_DIRECTORY, 0)
 	if err != nil {
 		return nil, err
 	}

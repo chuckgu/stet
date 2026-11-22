@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/stetdb/stet/internal/safetext"
 	"github.com/stetdb/stet/internal/scram"
 )
 
@@ -30,6 +31,7 @@ type Store struct {
 	mu       sync.Mutex
 	seen     os.FileInfo // the file as last looked at, read or not; nil when it could not be statted
 	failing  bool        // the last attempt to read the file failed, and was logged
+	cause    string      // the text of the failure last logged, while failing
 	entries  map[string]Entry
 	password map[string]string // the password in use per account, kept while the account is removed
 	envValue map[string]string // the environment's values by variable name, as read when opened
@@ -87,7 +89,7 @@ func OpenStore(path string, env func(string) string, log *slog.Logger) (*Store, 
 			s.envValue[a.PasswordEnv] = pw
 			if pw == "" {
 				log.Warn("the environment variable for an account's password is empty or not set",
-					"account", name, "variable", a.PasswordEnv)
+					"account", safetext.Printable(name), "variable", a.PasswordEnv)
 			}
 		}
 		s.accounts = append(s.accounts, name)
@@ -144,7 +146,7 @@ func (s *Store) refresh() {
 		return
 	}
 	if s.failing {
-		s.failing = false
+		s.failing, s.cause = false, ""
 		s.log.Info("read the credentials file again; following it once more")
 	}
 	s.apply(f)
@@ -154,12 +156,14 @@ func (s *Store) same(a, b os.FileInfo) bool {
 	return a.ModTime().Equal(b.ModTime()) && a.Size() == b.Size() && a.Mode() == b.Mode() && os.SameFile(a, b)
 }
 
-// fail logs an error once for as long as the failure lasts.
+// fail logs an error once for as long as the failure lasts, and again when
+// its cause (the error's text) changes: removed, then put back open to
+// others, is two causes.
 func (s *Store) fail(err error) {
-	if s.failing {
+	if s.failing && err.Error() == s.cause {
 		return
 	}
-	s.failing = true
+	s.failing, s.cause = true, err.Error()
 	s.log.Error("could not read the credentials file again; keeping the accounts as they were", "err", err)
 }
 
@@ -171,7 +175,7 @@ func (s *Store) apply(f *File) {
 		if !known {
 			if !s.warned[name] {
 				s.warned[name] = true
-				s.log.Warn("account \"" + name + "\" was added after stet started; restart stet proxy to accept it")
+				s.log.Warn("account \"" + safetext.Printable(name) + "\" was added after stet started; restart stet proxy to accept it")
 			}
 			continue
 		}
@@ -189,7 +193,7 @@ func (s *Store) apply(f *File) {
 			} else if key := name + "\x00" + a.PasswordEnv; !s.warned[key] {
 				s.warned[key] = true
 				s.log.Warn("the credentials file now names an environment variable that was not read when stet started; keeping the password in use until stet restarts",
-					"account", name, "variable", a.PasswordEnv)
+					"account", safetext.Printable(name), "variable", a.PasswordEnv)
 			}
 		}
 		s.password[name] = pw

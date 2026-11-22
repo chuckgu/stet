@@ -503,3 +503,81 @@ func TestStoreKeepsTheLastGoodFileWhenItBecomesAFIFO(t *testing.T) {
 		t.Fatal("Lookup blocked on a FIFO")
 	}
 }
+
+// A failure is logged once while its cause lasts, and again when the cause
+// (the error's text) changes: the file removed, then put back open to
+// others, is two errors.
+func TestStoreLogsEachNewCauseOfAFailure(t *testing.T) {
+	f := &File{Agents: map[string]Agent{"alice": {Token: newToken(t), Password: "pw-a"}}}
+	s, path, buf := openSample(t, f, noEnv)
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookups := func(label string, errors int) {
+		t.Helper()
+		for range 3 {
+			if e, ok := s.Lookup("alice"); !ok || e.Password != "pw-a" {
+				t.Fatalf("%s: Lookup = %+v, %v; want the last good entry", label, e, ok)
+			}
+		}
+		if n := count(buf, "level=ERROR"); n != errors {
+			t.Errorf("%s: %d error logs, want %d:\n%s", label, n, errors, buf)
+		}
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	lookups("removed", 1)
+	writeRaw(t, path, string(good), 0o644)
+	lookups("back, open to others", 2)
+	if !strings.Contains(buf.String(), "mode 0644 is too open") {
+		t.Errorf("the second error does not say why:\n%s", buf)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lookups("back as it should be", 2)
+	if n := count(buf, "following it once more"); n != 1 {
+		t.Errorf("%d recovery lines, want 1:\n%s", n, buf)
+	}
+}
+
+// Account names from the file reach the log with the characters a terminal
+// would act on made spaces (safetext.Printable), as the names clients send
+// do: one whose password variable is empty at open, one whose file entry
+// names another variable later, and one added after start.
+func TestStoreLogsAccountNamesPrintable(t *testing.T) {
+	const (
+		odd  = "odd\x1b[31m\nlevel=ERROR msg=forged"
+		late = "late\x1b]0;title\x07"
+	)
+	f := &File{Agents: map[string]Agent{
+		"alice": {Token: newToken(t), Password: "pw-a"},
+		odd:     {Token: newToken(t), PasswordEnv: "ODD_PW"},
+	}}
+	s, path, buf := openSample(t, f, noEnv)
+	f.Agents[odd] = Agent{Token: f.Agents[odd].Token, PasswordEnv: "OTHER_PW"}
+	f.Agents[late] = Agent{Token: newToken(t), Password: "pw-l"}
+	if err := Write(path, f); err != nil {
+		t.Fatal(err)
+	}
+	s.Lookup("alice")
+
+	log := buf.String()
+	for _, bad := range []string{"\x1b", "\x07", `\x1b`, `\u001b`, `\x07`, `\a`, `\n`} {
+		if strings.Contains(log, bad) {
+			t.Errorf("the log holds %q:\n%s", bad, log)
+		}
+	}
+	for _, want := range []string{
+		`msg="the environment variable for an account's password is empty or not set" account="odd [31m level=ERROR msg=forged"`,
+		`msg="the credentials file now names an environment variable that was not read when stet started; keeping the password in use until stet restarts" account="odd [31m level=ERROR msg=forged"`,
+		`account "late ]0;title " was added after stet started`,
+	} {
+		if !strings.Contains(log, want) {
+			t.Errorf("the log does not hold %q:\n%s", want, log)
+		}
+	}
+}
