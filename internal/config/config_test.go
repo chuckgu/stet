@@ -972,3 +972,160 @@ func TestUpstreamErrorsNeverQuoteTheAddress(t *testing.T) {
 		}
 	}
 }
+
+func TestLoopbackHost(t *testing.T) {
+	for host, want := range map[string]bool{
+		"localhost": true, "127.0.0.1": true, "127.0.0.2": true, "::1": true,
+		"0.0.0.0": false, "::": false, "": false, "db.example.com": false, "10.0.0.5": false,
+	} {
+		if got := LoopbackHost(host); got != want {
+			t.Errorf("LoopbackHost(%q) = %v, want %v", host, got, want)
+		}
+	}
+}
+
+func TestListenTLS(t *testing.T) {
+	c, err := Parse([]byte(minimal + "listen_tls: {cert: /etc/stet/c.pem, key: /etc/stet/k.pem}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ListenTLS == nil || c.ListenTLS.Cert != "/etc/stet/c.pem" || c.ListenTLS.Key != "/etc/stet/k.pem" {
+		t.Errorf("ListenTLS = %+v", c.ListenTLS)
+	}
+	for name, yml := range map[string]string{
+		"cert only": "listen_tls: {cert: /c.pem}\n",
+		"key only":  "listen_tls: {key: /k.pem}\n",
+		"empty":     "listen_tls: {}\n",
+	} {
+		_, err := Parse([]byte(minimal + yml))
+		if err == nil || !strings.Contains(err.Error(), "listen_tls: cert and key are both required") {
+			t.Errorf("%s: err = %v", name, err)
+		}
+	}
+	c, err = Parse([]byte(minimal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ListenTLS != nil {
+		t.Errorf("ListenTLS = %+v, want nil", c.ListenTLS)
+	}
+}
+
+const custodyListen = "listen: 127.0.0.1:6432\n"
+
+func custodyYAML(listen, upstream, extra string) []byte {
+	return []byte("listen: " + listen + "\nupstream: " + upstream + "\nagents: {credentials: creds.yaml}\n" + extra)
+}
+
+func TestCustodyNeedsAVerifiedUpstream(t *testing.T) {
+	clearPGEnv(t)
+	root, _ := writeCert(t, t.TempDir())
+	const remote = "postgres://app:s3cret-pw@db.example.com:5432/crm"
+	const want = "upstream: with agents.credentials the server must be verified"
+	for query, ok := range map[string]bool{
+		"?sslmode=disable":                       false,
+		"":                                       false,
+		"?sslmode=prefer":                        false,
+		"?sslmode=require":                       false,
+		"?sslmode=verify-full":                   true,
+		"?sslmode=verify-ca&sslrootcert=" + root: true,
+		"?sslmode=require&sslrootcert=" + root:   true,
+		"?sslmode=verify-full&sslrootcert=" + root: true,
+	} {
+		c, err := Parse(custodyYAML("127.0.0.1:6432", remote+query, ""))
+		if ok {
+			if err != nil {
+				t.Errorf("%q: %v", query, err)
+			} else if c.Credentials != "creds.yaml" {
+				t.Errorf("%q: Credentials = %q", query, c.Credentials)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: err = %v", query, err)
+		} else if strings.Contains(err.Error(), "s3cret-pw") || strings.Contains(err.Error(), "db.example.com") {
+			t.Errorf("%q: error quotes the address: %v", query, err)
+		}
+	}
+	for _, q := range []string{"?sslmode=disable", "", "?sslmode=require"} {
+		if _, err := Parse(custodyYAML("127.0.0.1:6432", "postgres://app@127.0.0.1:5432/crm"+q, "")); err != nil {
+			t.Errorf("loopback %q: %v", q, err)
+		}
+	}
+	// Without custody a remote require passes, as before.
+	if _, err := Parse([]byte(custodyListen + "upstream: " + remote + "?sslmode=require\n")); err != nil {
+		t.Errorf("no custody: %v", err)
+	}
+}
+
+func TestCustodyNeedsTLSOnARemoteListen(t *testing.T) {
+	clearPGEnv(t)
+	const up = "postgres://app:s3cret-pw@127.0.0.1:5432/crm"
+	const tlsKey = "listen_tls: {cert: c.pem, key: k.pem}\n"
+	for _, listen := range []string{"0.0.0.0:6432", ":6432", "10.0.0.5:6432"} {
+		_, err := Parse(custodyYAML(listen, up, ""))
+		if err == nil || !strings.Contains(err.Error(), "listen: with agents.credentials a listen address that is not loopback needs listen_tls") {
+			t.Errorf("%q without listen_tls: err = %v", listen, err)
+		} else if strings.Contains(err.Error(), "s3cret-pw") || strings.Contains(err.Error(), listen) {
+			t.Errorf("%q: error quotes an address: %v", listen, err)
+		}
+		if _, err := Parse(custodyYAML(listen, up, tlsKey)); err != nil {
+			t.Errorf("%q with listen_tls: %v", listen, err)
+		}
+	}
+	if _, err := Parse(custodyYAML("127.0.0.1:6432", up, "")); err != nil {
+		t.Errorf("loopback listen: %v", err)
+	}
+	// Without custody a remote listen needs nothing.
+	if _, err := Parse([]byte("listen: 0.0.0.0:6432\nupstream: " + up + "\n")); err != nil {
+		t.Errorf("no custody: %v", err)
+	}
+}
+
+func TestEnforceWithCredentialsNeedsNoRoles(t *testing.T) {
+	const model = "model: {adapter: jev, version: jev-1.13.0}\n"
+	c, err := Parse([]byte(minimal + "mode: enforce\nagents: {credentials: creds.yaml}\n" + model))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.AgentRoles) != 0 || c.Credentials != "creds.yaml" {
+		t.Errorf("AgentRoles = %v, Credentials = %q", c.AgentRoles, c.Credentials)
+	}
+	_, err = Parse([]byte(minimal + "mode: enforce\n" + model))
+	if err == nil || !strings.Contains(err.Error(), "agents.roles: required in enforce mode; list the login roles of the agents") {
+		t.Errorf("no roles, no credentials: err = %v", err)
+	}
+}
+
+func TestLoadResolvesPathsAgainstTheConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	abs := filepath.Join(t.TempDir(), "abs-cert.pem")
+	write := func(yml string) *Config {
+		t.Helper()
+		p := filepath.Join(dir, "stet.yaml")
+		if err := os.WriteFile(p, []byte(yml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	c := write(minimal + "agents: {credentials: creds.yaml}\nlisten_tls: {cert: tls/c.pem, key: ../k.pem}\n")
+	if c.Credentials != filepath.Join(dir, "creds.yaml") {
+		t.Errorf("Credentials = %q", c.Credentials)
+	}
+	if c.ListenTLS.Cert != filepath.Join(dir, "tls/c.pem") || c.ListenTLS.Key != filepath.Join(dir, "../k.pem") {
+		t.Errorf("ListenTLS = %+v", c.ListenTLS)
+	}
+	c = write(minimal + "agents: {credentials: " + abs + "}\nlisten_tls: {cert: " + abs + ", key: " + abs + "}\n")
+	if c.Credentials != abs || c.ListenTLS.Cert != abs || c.ListenTLS.Key != abs {
+		t.Errorf("absolute paths changed: %q %+v", c.Credentials, c.ListenTLS)
+	}
+	// Parse leaves them as written.
+	c, err := Parse([]byte(minimal + "agents: {credentials: creds.yaml}\n"))
+	if err != nil || c.Credentials != "creds.yaml" {
+		t.Errorf("Parse: %q, %v", c.Credentials, err)
+	}
+}

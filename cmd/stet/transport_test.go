@@ -5,17 +5,6 @@ import (
 	"testing"
 )
 
-func TestLoopbackHost(t *testing.T) {
-	for host, want := range map[string]bool{
-		"localhost": true, "127.0.0.1": true, "127.0.0.2": true, "::1": true,
-		"0.0.0.0": false, "::": false, "": false, "db.example.com": false, "10.0.0.5": false,
-	} {
-		if got := loopbackHost(host); got != want {
-			t.Errorf("loopbackHost(%q) = %v, want %v", host, got, want)
-		}
-	}
-}
-
 func TestTransportWarnings(t *testing.T) {
 	const (
 		plaintext  = "allows plaintext"

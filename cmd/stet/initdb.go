@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/stetdb/stet/internal/config"
 	"github.com/stetdb/stet/internal/gate"
 )
 
@@ -23,7 +24,7 @@ var maxInitTables = 100
 
 // remoteHost reports whether host is another machine. A variable so a test
 // can have the test server, which is on this machine, taken for a remote one.
-var remoteHost = func(host string) bool { return !loopbackHost(host) }
+var remoteHost = func(host string) bool { return !config.LoopbackHost(host) }
 
 // What chooseSSLMode answers with (spec-v0.2-tryout 4, step 1).
 const (

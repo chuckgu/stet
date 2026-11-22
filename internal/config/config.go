@@ -9,8 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -48,6 +50,13 @@ type Config struct {
 	// all. 200000 unless set; 0 when no table has stale.
 	StaleMaxKeys int
 
+	// ListenTLS, when set, is the certificate the proxy answers clients' TLS
+	// requests with (spec-v0.2-server 3). nil: they are declined.
+	ListenTLS *ListenTLS
+	// Credentials is agents.credentials: the path of the credentials file.
+	// Not empty: stet authenticates the agents itself (custody).
+	Credentials string
+
 	// UpstreamTLS is the TLS setting of the proxy's leg to upstream, read from
 	// the same URL parameters Stet's own connections read (pgconn.ParseConfig).
 	// nil: plaintext. It never carries a client certificate: sslcert and sslkey
@@ -60,6 +69,19 @@ type Config struct {
 	// Hash identifies the config file's bytes. Decisions record it as
 	// policy_version.
 	Hash string
+}
+
+// ListenTLS names the certificate and key the proxy serves clients with.
+type ListenTLS struct{ Cert, Key string }
+
+// LoopbackHost reports whether host is this machine: "localhost" or a
+// loopback IP address. An empty or unspecified host (0.0.0.0, ::) is not.
+func LoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.IsLoopback()
 }
 
 // Held bounds the approval of held writes (spec-v0.2-approve 9). Validated in
@@ -179,9 +201,11 @@ type rawConfig struct {
 	Model     *rawModel           `yaml:"model"`
 	Retention string              `yaml:"retention"`
 	Tables    map[string]rawTable `yaml:"tables"`
-	Agents    *struct {
-		Roles []string `yaml:"roles"`
-	} `yaml:"agents"`
+	ListenTLS *struct {
+		Cert string `yaml:"cert"`
+		Key  string `yaml:"key"`
+	} `yaml:"listen_tls"`
+	Agents *rawAgents `yaml:"agents"`
 	// A pointer: max_inflight: 0 must be told apart from absence.
 	Limits *struct {
 		MaxInflight *int `yaml:"max_inflight"`
@@ -194,6 +218,11 @@ type rawConfig struct {
 	Stale *struct {
 		MaxKeys *int `yaml:"max_keys"`
 	} `yaml:"stale"`
+}
+
+type rawAgents struct {
+	Roles       []string `yaml:"roles"`
+	Credentials string   `yaml:"credentials"`
 }
 
 // rawUndo is the undo clause. A table's value may be null (`contacts:`).
@@ -288,6 +317,18 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	// Relative paths are read against the config file's directory.
+	dir := filepath.Dir(path)
+	rel := func(p string) string {
+		if p == "" || filepath.IsAbs(p) {
+			return p
+		}
+		return filepath.Join(dir, p)
+	}
+	c.Credentials = rel(c.Credentials)
+	if c.ListenTLS != nil {
+		c.ListenTLS = &ListenTLS{Cert: rel(c.ListenTLS.Cert), Key: rel(c.ListenTLS.Key)}
+	}
 	return c, nil
 }
 
@@ -318,6 +359,7 @@ func Parse(b []byte) (*Config, error) {
 	if c.Listen == "" {
 		fail("listen: required")
 	}
+	upstreamRead := false
 	if err := validateUpstream(c.Upstream); err != nil {
 		fail("upstream: %v", err)
 	} else if pc, err := pgconn.ParseConfig(c.Upstream); err != nil {
@@ -326,6 +368,8 @@ func Parse(b []byte) (*Config, error) {
 		fail("upstream: %v", err)
 	} else if err := c.readUpstreamTLS(pc); err != nil {
 		fail("upstream: %v", err)
+	} else {
+		upstreamRead = true
 	}
 	if raw.Retention != "" {
 		d, err := parseDuration(raw.Retention)
@@ -368,7 +412,20 @@ func Parse(b []byte) (*Config, error) {
 		fail("model: required when tables are configured")
 	}
 
-	c.AgentRoles = resolveRoles(raw.Agents, c.Mode, c.Upstream, fail)
+	if raw.ListenTLS != nil {
+		if raw.ListenTLS.Cert == "" || raw.ListenTLS.Key == "" {
+			fail("listen_tls: cert and key are both required")
+		} else {
+			c.ListenTLS = &ListenTLS{Cert: raw.ListenTLS.Cert, Key: raw.ListenTLS.Key}
+		}
+	}
+	if raw.Agents != nil {
+		c.Credentials = raw.Agents.Credentials
+	}
+	c.AgentRoles = resolveRoles(raw.Agents, c.Mode, c.Upstream, c.Credentials != "", fail)
+	if c.Credentials != "" {
+		c.checkCustody(raw.ListenTLS != nil, upstreamRead, fail)
+	}
 
 	c.MaxInflight = 32
 	if raw.Limits != nil && raw.Limits.MaxInflight != nil {
@@ -480,21 +537,39 @@ func resolveUndo(ru *rawUndo, tables map[string]Table, fail func(string, ...any)
 	return u
 }
 
+// checkCustody refuses what would let stet hand a database password, or a
+// logged-in session, to the wrong party. It sees only what the file alone
+// shows. Its errors never quote an address.
+func (c *Config) checkCustody(hasListenTLS, upstreamRead bool, fail func(string, ...any)) {
+	if upstreamRead && !LoopbackHost(hostOf(c.UpstreamAddr())) && c.UpstreamTransport() != TransportVerified {
+		fail("upstream: with agents.credentials the server must be verified, or stet could hand a database password to whoever answers; use sslmode=verify-full (and sslrootcert=<CA file> when the server's CA is not a public one)")
+	}
+	if c.Listen != "" && !LoopbackHost(hostOf(c.Listen)) && !hasListenTLS {
+		fail("listen: with agents.credentials a listen address that is not loopback needs listen_tls: on a plaintext connection whoever sits in between can take over a session once the agent has logged in")
+	}
+}
+
+func hostOf(addr string) string {
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	return addr
+}
+
 // maxRoleName is Postgres's identifier limit in bytes.
 const maxRoleName = 63
 
 // resolveRoles checks agents.roles. Names are compared exactly, case
 // included. Stet's own account is known here only when the upstream URL
 // names a user; otherwise the startup check looks at it.
-func resolveRoles(agents *struct {
-	Roles []string `yaml:"roles"`
-}, mode Mode, upstream string, fail func(string, ...any)) []string {
+func resolveRoles(agents *rawAgents, mode Mode, upstream string, custody bool, fail func(string, ...any)) []string {
 	var roles []string
 	if agents != nil {
 		roles = agents.Roles
 	}
 	if len(roles) == 0 {
-		if mode == ModeEnforce {
+		// With custody the accounts come from the credentials file at start.
+		if mode == ModeEnforce && !custody {
 			fail("agents.roles: required in enforce mode; list the login roles of the agents")
 		}
 		return nil
