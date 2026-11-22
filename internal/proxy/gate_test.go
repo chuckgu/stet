@@ -3503,7 +3503,7 @@ func TestPanicEndsOnlyItsSession(t *testing.T) {
 				t.Fatal(err)
 			}
 			var logs syncLog
-			srv := proxy.New(upstream(t), slog.New(slog.NewTextHandler(&logs, nil)), g, mode.policy)
+			srv := proxy.New(proxy.Upstream{Addr: upstream(t)}, slog.New(slog.NewTextHandler(&logs, nil)), g, mode.policy)
 			go srv.Serve(ln)
 			t.Cleanup(func() { srv.Close() })
 			addr := ln.Addr().String()
@@ -3608,7 +3608,7 @@ func TestPanicHoldingTheSessionLockEndsTheSession(t *testing.T) {
 				t.Fatal(err)
 			}
 			var logs syncLog
-			srv := proxy.New(upstream(t), slog.New(slog.NewTextHandler(&logs, nil)), g, mode.policy)
+			srv := proxy.New(proxy.Upstream{Addr: upstream(t)}, slog.New(slog.NewTextHandler(&logs, nil)), g, mode.policy)
 			go srv.Serve(ln)
 
 			fe, pid := rawSessionWith(t, ln.Addr().String(), "stet_trust", nil)

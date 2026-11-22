@@ -30,16 +30,15 @@ const (
 	maxStartupLen = 10000
 
 	startupTimeout = 10 * time.Second
-	dialTimeout    = 5 * time.Second
 	fatalTimeout   = 5 * time.Second // to write the error of a session the proxy ends
 	bufSize        = 32 << 10
 )
 
 type Server struct {
-	upstream string
-	log      *slog.Logger
-	gate     Gate
-	policy   Policy
+	up     Upstream
+	log    *slog.Logger
+	gate   Gate
+	policy Policy
 
 	mu     sync.Mutex
 	ln     net.Listener
@@ -48,11 +47,11 @@ type Server struct {
 	wg     sync.WaitGroup
 }
 
-// New returns a proxy that forwards clients to upstream (host:port). The gate
-// is shown the sessions policy watches; the others, and every session when
-// gate is nil, are a plain passthrough.
-func New(upstream string, log *slog.Logger, gate Gate, policy Policy) *Server {
-	return &Server{upstream: upstream, log: log, gate: gate, policy: policy, conns: make(map[net.Conn]struct{})}
+// New returns a proxy that forwards clients to the server, reached as up
+// says. The gate is shown the sessions policy watches; the others, and every
+// session when gate is nil, are a plain passthrough.
+func New(up Upstream, log *slog.Logger, gate Gate, policy Policy) *Server {
+	return &Server{up: up, log: log, gate: gate, policy: policy, conns: make(map[net.Conn]struct{})}
 }
 
 // Serve accepts connections on ln until Close is called, then returns nil.
@@ -156,25 +155,23 @@ func (s *Server) handle(client net.Conn) {
 		return
 	}
 
-	server, err := net.DialTimeout("tcp", s.upstream, dialTimeout)
+	server, secure, release, err := s.dialUpstream()
 	if err != nil {
-		s.log.Warn("upstream unreachable", "upstream", s.upstream, "err", err)
-		writeFatal(client, "08001", fmt.Sprintf("stet: cannot connect to upstream %s: %v", s.upstream, err))
+		if s.isClosed() { // Close ended the dial, and closed the client too
+			return
+		}
+		s.log.Warn("upstream unreachable", "upstream", s.up.Addr, "err", err)
+		writeFatal(client, "08001", "stet: "+err.Error())
 		return
 	}
-	if !s.track(server) {
-		server.Close()
-		return
-	}
-	defer s.wg.Done()
-	defer s.untrack(server)
+	defer release()
 	defer server.Close()
 
 	if _, err := server.Write(pkt); err != nil {
 		return
 	}
 	start := time.Now()
-	s.log.Debug("session started", "remote", client.RemoteAddr())
+	s.log.Debug("session started", "remote", client.RemoteAddr(), "upstream_tls", secure)
 	if ss := s.watch(pkt); ss == nil {
 		relay(client, server, nil, nil, nil, nil, nil)
 	} else {
@@ -204,14 +201,47 @@ func (s *Server) watch(pkt []byte) *session {
 	return ss
 }
 
-// forwardCancel passes a CancelRequest to upstream on a fresh connection.
-// Backend keys reach the client unchanged, so no translation is needed.
-func (s *Server) forwardCancel(pkt []byte) {
-	c, err := net.DialTimeout("tcp", s.upstream, dialTimeout)
+// dialUpstream is s.up.dial with the TCP connection tracked from the moment it
+// opens, so Close also ends a dial still waiting on the server's answer to
+// the TLS request or its handshake. release, called once conn is closed,
+// gives up that tracking.
+func (s *Server) dialUpstream() (conn net.Conn, secure bool, release func(), err error) {
+	var raw net.Conn
+	up := s.up
+	up.opened = func(c net.Conn) bool {
+		if !s.track(c) {
+			return false
+		}
+		raw = c
+		return true
+	}
+	conn, secure, err = up.dial()
+	release = func() {}
+	if raw != nil {
+		release = func() {
+			s.untrack(raw)
+			s.wg.Done()
+		}
+	}
 	if err != nil {
-		s.log.Warn("cancel not forwarded", "upstream", s.upstream, "err", err)
+		release()
+		return nil, false, nil, err
+	}
+	return conn, secure, release, nil
+}
+
+// forwardCancel passes a CancelRequest to upstream on a fresh connection,
+// over TLS as a session would be. Backend keys reach the client unchanged,
+// so no translation is needed.
+func (s *Server) forwardCancel(pkt []byte) {
+	c, _, release, err := s.dialUpstream()
+	if err != nil {
+		if !s.isClosed() {
+			s.log.Warn("cancel not forwarded", "upstream", s.up.Addr, "err", err)
+		}
 		return
 	}
+	defer release()
 	defer c.Close()
 	if _, err := c.Write(pkt); err != nil {
 		return

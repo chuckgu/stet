@@ -76,7 +76,7 @@ func (e *env) restart(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := proxy.New(os.Getenv("STET_TEST_PG"), slog.New(slog.DiscardHandler), g, proxy.Policy{Agents: e.cfg.AgentRoles, Enforce: e.cfg.Mode == config.ModeEnforce})
+	srv := proxy.New(proxy.Upstream{Addr: os.Getenv("STET_TEST_PG")}, slog.New(slog.DiscardHandler), g, proxy.Policy{Agents: e.cfg.AgentRoles, Enforce: e.cfg.Mode == config.ModeEnforce})
 	go srv.Serve(ln)
 	t.Cleanup(func() {
 		srv.Close()

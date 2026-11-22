@@ -3,6 +3,8 @@ package proxy_test
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -15,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/stetdb/stet/internal/pgtest"
 	"github.com/stetdb/stet/internal/proxy"
 )
 
@@ -42,11 +45,32 @@ func startProxy(t *testing.T, upstreamAddr string, gate proxy.Gate) (string, *pr
 
 func startProxyWith(t *testing.T, upstreamAddr string, gate proxy.Gate, policy proxy.Policy) (string, *proxy.Server) {
 	t.Helper()
+	return startProxyTo(t, proxy.Upstream{Addr: upstreamAddr}, gate, policy)
+}
+
+// tlsUpstream is the test server reached over TLS, its certificate checked
+// against the one it presents and its host name.
+func tlsUpstream(t *testing.T) proxy.Upstream {
+	t.Helper()
+	addr := upstream(t)
+	cert, _ := pgtest.ServerCert(t, addr)
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(cert)
+	return proxy.Upstream{Addr: addr, TLS: &tls.Config{RootCAs: roots, ServerName: host}}
+}
+
+// startProxyTo serves a proxy to up on loopback until the test ends.
+func startProxyTo(t *testing.T, up proxy.Upstream, gate proxy.Gate, policy proxy.Policy) (string, *proxy.Server) {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := proxy.New(upstreamAddr, slog.New(slog.DiscardHandler), gate, policy)
+	srv := proxy.New(up, slog.New(slog.DiscardHandler), gate, policy)
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(ln) }()
 	t.Cleanup(func() {
@@ -134,6 +158,26 @@ func TestWatchedPassthrough(t *testing.T) {
 	for _, sc := range scenarios {
 		t.Run(sc.name, func(t *testing.T) {
 			addr, srv := startProxy(t, upstream(t), newRecordingGate(isWrite))
+			sc.run(t, addr, srv)
+		})
+	}
+}
+
+// The same scenarios with the proxy's leg to the server over TLS: cancel
+// requests go over TLS too.
+func TestPassthroughOverTLS(t *testing.T) {
+	for _, sc := range scenarios {
+		t.Run(sc.name, func(t *testing.T) {
+			addr, srv := startProxyTo(t, tlsUpstream(t), nil, proxy.Policy{})
+			sc.run(t, addr, srv)
+		})
+	}
+}
+
+func TestWatchedPassthroughOverTLS(t *testing.T) {
+	for _, sc := range scenarios {
+		t.Run(sc.name, func(t *testing.T) {
+			addr, srv := startProxyTo(t, tlsUpstream(t), newRecordingGate(isWrite), proxy.Policy{})
 			sc.run(t, addr, srv)
 		})
 	}

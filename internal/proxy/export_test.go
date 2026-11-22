@@ -51,6 +51,15 @@ func SetMaxInspect(n int64) (restore func()) {
 	return func() { maxInspect = old }
 }
 
+// SetDialTimeout changes how long the proxy waits for upstream to accept a
+// connection, and then to answer the TLS request and finish the handshake,
+// until restore is called; as SetMaxInspect.
+func SetDialTimeout(d time.Duration) (restore func()) {
+	old := dialTimeout
+	dialTimeout = d
+	return func() { dialTimeout = old }
+}
+
 // SetServerHook makes every session call f with the type of each server
 // message it follows, with the session's lock held, until restore is called:
 // tests use it to panic where the proxy holds that lock. Tests that use it

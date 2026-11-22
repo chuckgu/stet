@@ -110,7 +110,7 @@ func run(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog.Log
 	if g != nil {
 		pg = g
 	}
-	srv := proxy.New(cfg.UpstreamAddr(), log, pg, proxy.Policy{Agents: cfg.AgentRoles, Enforce: cfg.Mode == config.ModeEnforce})
+	srv := proxy.New(proxy.Upstream{Addr: cfg.UpstreamAddr(), TLS: cfg.UpstreamTLS, PlainFallback: cfg.UpstreamPlainFallback}, log, pg, proxy.Policy{Agents: cfg.AgentRoles, Enforce: cfg.Mode == config.ModeEnforce})
 	ctx, stop := context.WithCancel(ctx)
 	defer stop()
 	closed := make(chan struct{})

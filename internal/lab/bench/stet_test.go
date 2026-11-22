@@ -94,7 +94,7 @@ func startStet(t *testing.T) (addr, database string, n Names) {
 		t.Fatal(err)
 	}
 	t.Cleanup(g.Close)
-	srv := proxy.New(cfg.UpstreamAddr(), log, g, proxy.Policy{Agents: cfg.AgentRoles, Enforce: true})
+	srv := proxy.New(proxy.Upstream{Addr: cfg.UpstreamAddr()}, log, g, proxy.Policy{Agents: cfg.AgentRoles, Enforce: true})
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

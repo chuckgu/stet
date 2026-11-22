@@ -189,7 +189,7 @@ func setup(t *testing.T, d decide.Decider, yamlFormat ...string) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := proxy.New(addr, slog.New(slog.DiscardHandler), e.gate, proxy.Policy{Agents: cfg.AgentRoles, Enforce: cfg.Mode == config.ModeEnforce})
+	srv := proxy.New(proxy.Upstream{Addr: addr}, slog.New(slog.DiscardHandler), e.gate, proxy.Policy{Agents: cfg.AgentRoles, Enforce: cfg.Mode == config.ModeEnforce})
 	e.srv = srv
 	go srv.Serve(ln)
 	t.Cleanup(func() {
