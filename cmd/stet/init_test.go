@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -660,6 +661,42 @@ func TestInitStops(t *testing.T) {
 		}
 		wantNoFile(t, path)
 	})
+}
+
+// -h prints the usage on standard output and is no error (exit 0); a flag
+// stet init does not know is an error that main prints, once: the flag
+// package prints nothing of its own.
+func TestInitHelpAndUnknownFlag(t *testing.T) {
+	stderr := os.Stderr
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pr.Close()
+	os.Stderr = pw
+	defer func() { os.Stderr = stderr }()
+
+	for _, help := range []string{"-h", "-help", "--help"} {
+		out, err := initOut([]string{help}, "", false)
+		if err != nil {
+			t.Errorf("%s: err = %v, want none", help, err)
+		}
+		for _, s := range []string{"usage: stet init [flags] [<database address>]\n", "-config", "-listen", "-tables", "-yes", "-force"} {
+			if !strings.Contains(out, s) {
+				t.Errorf("%s: the output has no %q:\n%s", help, s, out)
+			}
+		}
+	}
+	out, err := initOut([]string{"-nope", "postgres://app:pw@127.0.0.1:1/crm"}, "", false)
+	if want := "flag provided but not defined: -nope"; err == nil || err.Error() != want || out != "" {
+		t.Errorf("err = %v, output %q; want %q and no output", err, out, want)
+	}
+
+	os.Stderr = stderr
+	pw.Close()
+	if b, _ := io.ReadAll(pr); len(b) != 0 {
+		t.Errorf("stet init wrote %q to standard error, want nothing", b)
+	}
 }
 
 func TestInitReportsWhatItLeftOut(t *testing.T) {

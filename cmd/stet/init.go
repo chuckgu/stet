@@ -74,7 +74,21 @@ func runInit(args []string, stdin io.Reader, stdout io.Writer, interactive bool,
 	tables := flags.String("tables", "", fmt.Sprintf("the tables to watch, as a,b,c (default: every table stet can watch, up to %d)", maxInitTables))
 	yes := flags.Bool("yes", false, "write the config without asking")
 	force := flags.Bool("force", false, "overwrite the config file if it is there")
+	flags.Usage = func() {
+		fmt.Fprint(flags.Output(), "usage: stet init [flags] [<database address>]\n\n"+
+			"stet init reads the database and writes a shadow-mode config for stet proxy. The address defaults\n"+
+			"to DATABASE_URL, which is safer: an argument stays in the shell's history.\n\nflags:\n")
+		flags.PrintDefaults()
+	}
+	// The flag package prints nothing itself: -h prints the usage on stdout
+	// and is no error, and any other error is returned for main to print, once.
+	flags.SetOutput(io.Discard)
 	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			flags.SetOutput(stdout)
+			flags.Usage()
+			return nil
+		}
 		return err
 	}
 
