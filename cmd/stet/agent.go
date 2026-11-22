@@ -10,9 +10,12 @@ import (
 	"io/fs"
 	"maps"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -34,13 +37,50 @@ type agentIO struct {
 	now      func() time.Time
 }
 
-// readSecret is main's agentIO.secret: it shows prompt and reads what is
-// typed on the terminal of standard input, without echo.
+// readSecret is main's agentIO.secret: it shows prompt on standard error,
+// so that standard output holds only what the command prints, and reads
+// what is typed on the terminal of standard input, without echo. An
+// interrupt while it waits puts the terminal back as it was and ends stet
+// with 130, rather than leave echo off.
 func readSecret(prompt string) (string, error) {
-	fmt.Fprint(os.Stdout, prompt)
-	b, err := term.ReadPassword(int(os.Stdin.Fd()))
-	fmt.Fprintln(os.Stdout)
+	fd := int(os.Stdin.Fd())
+	state, err := term.GetState(fd)
+	if err != nil {
+		return "", err
+	}
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	stop := onInterrupt(sigs, func() {
+		term.Restore(fd, state)
+		fmt.Fprintln(os.Stderr)
+	}, os.Exit)
+	defer func() {
+		signal.Stop(sigs)
+		stop()
+	}()
+	fmt.Fprint(os.Stderr, prompt)
+	b, err := term.ReadPassword(fd)
+	fmt.Fprintln(os.Stderr)
 	return string(b), err
+}
+
+// onInterrupt calls restore and then exit(130) when a signal comes on sigs,
+// until stop is called; stop returns once it has stopped looking.
+func onInterrupt(sigs <-chan os.Signal, restore func(), exit func(int)) (stop func()) {
+	done, finished := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(finished)
+		select {
+		case <-sigs:
+			restore()
+			exit(130)
+		case <-done:
+		}
+	}()
+	return func() {
+		close(done)
+		<-finished
+	}
 }
 
 const agentUsage = `usage: stet agent <command> [flags] [<account>]
@@ -63,41 +103,45 @@ commands:
 The password is asked for on a terminal, without echo; otherwise it is the first line of standard input.
 With -password-env NAME stet keeps the name of an environment variable instead, which stet proxy reads
 at start; stet agent reads it here to check it.
+
+Run stet agent as the file's owner, or as root (sudo), which keeps the file's owner, group and mode.
 `
 
 // What stet agent stops with (spec-v0.2-server 7).
 const (
 	errNoCredentials = "the config has no agents.credentials; add it first"
 	errEmptyPassword = "the password is empty"
-	errEmptyAccount  = "the account name is empty"
-	errNoEnvName     = "-password-env needs the name of an environment variable"
+	errEnvValue      = "-password-env takes the name of an environment variable, not its value"
 )
 
-// maxAccountName is the longest account name the credentials file takes, in
-// bytes: PostgreSQL's limit for a name, as custody.Read applies it.
-const maxAccountName = 63
+// envName is what -password-env takes: the name of an environment variable.
+var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // agentCheckTimeout bounds the login add and password try with the password
 // given, as stet proxy bounds its own (spec-v0.2-server 4).
 const agentCheckTimeout = 5 * time.Second
 
-// writeCredentials is custody.Write; a test replaces it to make the sync of
-// the directory fail.
-var writeCredentials = custody.Write
+// updateCredentials is custody.Update; a test replaces it to make the sync
+// of the directory fail.
+var updateCredentials = custody.Update
 
 // runAgent is stet agent (spec-v0.2-server 7). It keeps the accounts of the
 // credentials file agents.credentials names: add checks an account's
 // database password by logging in once, as stet proxy logs in, then keeps
 // it with the verifier of a new token; token replaces the verifier; password
 // replaces the password, checked the same way; remove drops the account;
-// list shows them. It writes the file whole (custody.Write), once every
-// check has passed, and never creates its directory. It neither creates nor
-// changes an account in the database.
+// list shows them. It neither creates nor changes an account in the
+// database, and never creates the file's directory.
 //
-// A token is printed once, by the add or token that made it. A password or
-// verifier is printed nowhere, in an error neither. Text from outside (the
-// server's messages, names in the file) is printed printable, and an account
-// named on the command line is quoted.
+// It reads the file as its owner or root may (custody.ReadForUpdate) and
+// changes it under a lock (custody.Update), applying only its own account's
+// change to the file as it is by then, so that two runs never undo each
+// other. It asks for the password, and logs in, holding no lock.
+//
+// A token is printed once, by the add or token that made it, and only once
+// it is written. A password or verifier is printed nowhere, in an error
+// neither. Text from outside (the server's messages, names in the file) is
+// printed printable, and an account named on the command line is quoted.
 func runAgent(args []string, a agentIO) error {
 	usageErr := errors.New(strings.TrimSuffix(agentUsage, "\n"))
 	if len(args) == 0 {
@@ -115,9 +159,9 @@ func runAgent(args []string, a agentIO) error {
 
 	flags := flag.NewFlagSet("agent "+cmd, flag.ContinueOnError)
 	path := flags.String("config", "stet.yaml", "config file")
-	envName := new(string)
+	env := new(string)
 	if cmd == "add" || cmd == "password" {
-		envName = flags.String("password-env", "", "keep the name of this environment variable instead of the password")
+		env = flags.String("password-env", "", "keep the name of this environment variable instead of the password")
 	}
 	// The flag package prints nothing itself: -h prints the usage on stdout
 	// and is no error, and any other error is returned for main to print, once.
@@ -129,6 +173,13 @@ func runAgent(args []string, a agentIO) error {
 		}
 		return err
 	}
+	given := map[string]bool{}
+	flags.Visit(func(f *flag.Flag) { given[f.Name] = true })
+	// What is not a name may be the value, the password itself: refused
+	// first, and never echoed.
+	if given["password-env"] && !envName.MatchString(*env) {
+		return errors.New(errEnvValue)
+	}
 	accounts := 1
 	if cmd == "list" {
 		accounts = 0
@@ -136,14 +187,12 @@ func runAgent(args []string, a agentIO) error {
 	if flags.NArg() != accounts {
 		return usageErr
 	}
-	given := false
-	flags.Visit(func(f *flag.Flag) { given = given || f.Name == "password-env" })
-	if given && *envName == "" {
-		return errors.New(errNoEnvName)
+	c := &agentCmd{account: flags.Arg(0), envName: *env, io: a}
+	if given["config"] {
+		c.configFlag = *path
 	}
-	account := flags.Arg(0)
 	if accounts == 1 {
-		if err := checkAccountName(account); err != nil {
+		if err := custody.CheckAccountName(c.account); err != nil {
 			return err
 		}
 	}
@@ -155,59 +204,56 @@ func runAgent(args []string, a agentIO) error {
 	if cfg.Credentials == "" {
 		return errors.New(errNoCredentials)
 	}
+	c.cfg = cfg
 	switch cmd {
 	case "add":
-		return agentAdd(cfg, account, *envName, a)
+		return c.add()
 	case "token":
-		return agentToken(cfg.Credentials, account, a)
+		return c.token()
 	case "password":
-		return agentPassword(cfg, account, *envName, a)
+		return c.password()
 	case "remove":
-		return agentRemove(cfg.Credentials, account, a.stdout)
+		return c.remove()
 	}
-	return agentList(cfg.Credentials, a.stdout)
+	return c.list()
 }
 
-// checkAccountName applies custody.Read's rule for an account's name.
-func checkAccountName(name string) error {
-	switch {
-	case name == "":
-		return errors.New(errEmptyAccount)
-	case len(name) > maxAccountName:
-		return fmt.Errorf("account %q: the name is longer than %d bytes", name, maxAccountName)
-	}
-	return nil
+// agentCmd is one run of a stet agent command.
+type agentCmd struct {
+	cfg        *config.Config
+	configFlag string // -config as given; "" when it was not
+	account    string // "" for list
+	envName    string // -password-env; "" when it was not given
+	io         agentIO
 }
 
-// agentAdd is stet agent add. It asks for nothing before it knows the
-// account can be added, and writes nothing unless the password logs in.
-func agentAdd(cfg *config.Config, account, envName string, a agentIO) error {
-	own, database, err := upstreamAccount(cfg.Upstream)
+// add is stet agent add. It asks for nothing before it knows the account
+// can be added, and writes nothing unless the password logs in.
+func (c *agentCmd) add() error {
+	own, database, err := upstreamAccount(c.cfg.Upstream)
 	if err != nil {
 		return err
 	}
 	// A token of Stet's own account would open a session no gate sees, and
 	// stet proxy refuses to start with it in the file (openClientSide).
-	if account == own {
-		return fmt.Errorf("%q is the account stet itself connects as; an agent needs its own", account)
+	if c.account == own {
+		return fmt.Errorf("%q is the account stet itself connects as; an agent needs its own", c.account)
 	}
-	f, there, err := readCredentials(cfg.Credentials)
+	if err := checkDirectory(c.cfg.Credentials); err != nil {
+		return err
+	}
+	f, err := custody.ReadForUpdate(c.cfg.Credentials)
 	if err != nil {
 		return err
 	}
-	if !there {
-		if err := checkDirectory(cfg.Credentials); err != nil {
-			return err
-		}
+	if _, ok := f.Agents[c.account]; ok {
+		return c.alreadyThere()
 	}
-	if _, ok := f.Agents[account]; ok {
-		return fmt.Errorf("%q is already there; use stet agent token or stet agent password", account)
-	}
-	password, err := readPassword(account, envName, a)
+	password, err := readPassword(c.account, c.envName, c.io)
 	if err != nil {
 		return err
 	}
-	if err := checkPassword(cfg, account, password, database); err != nil {
+	if err := checkPassword(c.cfg, c.account, password, database); err != nil {
 		return err
 	}
 
@@ -215,125 +261,160 @@ func agentAdd(cfg *config.Config, account, envName string, a agentIO) error {
 	if err != nil {
 		return err
 	}
-	now := a.now().UTC().Truncate(time.Second)
+	now := c.io.now().UTC().Truncate(time.Second)
 	entry := custody.Agent{Token: v.Text(), Added: now, TokenIssued: now}
-	if envName != "" {
-		entry.PasswordEnv = envName
+	if c.envName != "" {
+		entry.PasswordEnv = c.envName
 	} else {
 		entry.Password = password
 	}
-	f.Agents[account] = entry
-	warning, err := saveCredentials(cfg.Credentials, f)
-	if err != nil {
-		return err
-	}
-	printToken(a.stdout, account, token)
-	fmt.Fprintf(a.stdout, "\nnext:\n"+
-		"  - in the agent's connection string, put this server's address as the host and the token as the password; the user stays %q\n"+
-		"  - if anything else knew this account's database password, change it in the database, then run: stet agent password %s\n",
-		account, shellWord(account))
-	if envName != "" {
-		fmt.Fprintf(a.stdout, "  - stet proxy must have %s in its environment\n", safetext.Printable(envName))
-	}
-	fmt.Fprintln(a.stdout, "  - restart stet proxy: an account added while it runs is not accepted")
-	printWarning(a.stdout, warning)
-	return nil
-}
-
-// agentToken is stet agent token: a new token for account, which the
-// running stet proxy takes from the next login.
-func agentToken(path, account string, a agentIO) error {
-	f, entry, err := accountIn(path, account)
-	if err != nil {
-		return err
-	}
-	token, v, err := scram.NewToken()
-	if err != nil {
-		return err
-	}
-	entry.Token = v.Text()
-	entry.TokenIssued = a.now().UTC().Truncate(time.Second)
-	f.Agents[account] = entry
-	warning, err := saveCredentials(path, f)
-	if err != nil {
-		return err
-	}
-	printToken(a.stdout, account, token)
-	fmt.Fprintln(a.stdout, "\nthe old token stops working at the next login; no restart is needed")
-	printWarning(a.stdout, warning)
-	return nil
-}
-
-// agentPassword is stet agent password: the account's new database
-// password, kept once it logs in. An account whose password is an
-// environment variable's has nothing to change in the file, unless
-// -password-env names one again: stet proxy reads the variable at start.
-func agentPassword(cfg *config.Config, account, envName string, a agentIO) error {
-	f, entry, err := accountIn(cfg.Credentials, account)
-	if err != nil {
-		return err
-	}
-	if envName == "" && entry.PasswordEnv != "" {
-		fmt.Fprintf(a.stdout, "%q takes its password from %s; change it in stet proxy's environment and restart stet proxy\n",
-			account, safetext.Printable(entry.PasswordEnv))
+	warning, err := c.update(func(f *custody.File) error {
+		if _, ok := f.Agents[c.account]; ok { // added meanwhile
+			return c.alreadyThere()
+		}
+		f.Agents[c.account] = entry
 		return nil
-	}
-	_, database, err := upstreamAccount(cfg.Upstream)
+	})
 	if err != nil {
 		return err
 	}
-	password, err := readPassword(account, envName, a)
-	if err != nil {
-		return err
+	out := c.io.stdout
+	printToken(out, c.account, token)
+	fmt.Fprintf(out, "\nnext:\n"+
+		"  - in the agent's connection string, put this server's address as the host and the token as the password; the user stays %q\n"+
+		"  - if anything else knew this account's database password, change it in the database, then run: %s\n",
+		c.account, c.command("password"))
+	if c.envName != "" {
+		fmt.Fprintf(out, "  - stet proxy must have %s in its environment\n", c.envName)
 	}
-	if err := checkPassword(cfg, account, password, database); err != nil {
-		return err
+	if c.rolesWritten() && !slices.Contains(c.cfg.AgentRoles, c.account) {
+		fmt.Fprintf(out, "  - add %q to agents.roles in the config: %s\n", c.account, rolesMustMatch)
 	}
-	if envName != "" {
-		entry.Password, entry.PasswordEnv = "", envName
-	} else {
-		entry.Password, entry.PasswordEnv = password, ""
-	}
-	f.Agents[account] = entry
-	warning, err := saveCredentials(cfg.Credentials, f)
-	if err != nil {
-		return err
-	}
-	if envName != "" {
-		name := safetext.Printable(envName)
-		fmt.Fprintf(a.stdout, "%q now takes its password from %s; stet proxy must have %s in its environment: restart stet proxy\n",
-			account, name, name)
-	} else {
-		fmt.Fprintf(a.stdout, "password for %q updated; no restart is needed\n", account)
-	}
-	printWarning(a.stdout, warning)
-	return nil
-}
-
-// agentRemove is stet agent remove.
-func agentRemove(path, account string, out io.Writer) error {
-	f, _, err := accountIn(path, account)
-	if err != nil {
-		return err
-	}
-	delete(f.Agents, account)
-	warning, err := saveCredentials(path, f)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(out, "%q removed; it is refused from the next login\n", account)
+	fmt.Fprintln(out, "  - restart stet proxy: an account added while it runs is not accepted")
 	printWarning(out, warning)
 	return nil
 }
 
-// agentList is stet agent list: a line for each account, in the order of
-// their names, with where its password is and when it was added and its
-// token issued, in UTC.
-func agentList(path string, out io.Writer) error {
-	f, _, err := readCredentials(path)
+// token is stet agent token: a new token for the account, which the
+// running stet proxy takes from the next login.
+func (c *agentCmd) token() error {
+	token, v, err := scram.NewToken()
 	if err != nil {
 		return err
 	}
+	issued := c.io.now().UTC().Truncate(time.Second)
+	warning, err := c.update(func(f *custody.File) error {
+		e, ok := f.Agents[c.account]
+		if !ok {
+			return c.noAccount()
+		}
+		e.Token, e.TokenIssued = v.Text(), issued
+		f.Agents[c.account] = e
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	printToken(c.io.stdout, c.account, token)
+	fmt.Fprintln(c.io.stdout, "\nthe old token stops working at the next login; no restart is needed")
+	printWarning(c.io.stdout, warning)
+	return nil
+}
+
+// password is stet agent password: the account's new database password,
+// kept once it logs in. An account whose password is an environment
+// variable's has nothing to change in the file, unless -password-env names
+// one again: stet proxy reads the variable at start.
+func (c *agentCmd) password() error {
+	f, err := custody.ReadForUpdate(c.cfg.Credentials)
+	if err != nil {
+		return err
+	}
+	e, ok := f.Agents[c.account]
+	if !ok {
+		return c.noAccount()
+	}
+	if c.envName == "" && e.PasswordEnv != "" {
+		fmt.Fprintf(c.io.stdout, "%q takes its password from %s; change it in stet proxy's environment and restart stet proxy\n",
+			c.account, safetext.Printable(e.PasswordEnv))
+		return nil
+	}
+	_, database, err := upstreamAccount(c.cfg.Upstream)
+	if err != nil {
+		return err
+	}
+	password, err := readPassword(c.account, c.envName, c.io)
+	if err != nil {
+		return err
+	}
+	if err := checkPassword(c.cfg, c.account, password, database); err != nil {
+		return err
+	}
+	warning, err := c.update(func(f *custody.File) error {
+		e, ok := f.Agents[c.account] // as it is now: its token may be newer
+		if !ok {
+			return c.noAccount()
+		}
+		if c.envName == "" && e.PasswordEnv != "" { // moved to a variable meanwhile
+			return fmt.Errorf("%q takes its password from %s now, so nothing was written; change it in stet proxy's environment and restart stet proxy",
+				c.account, safetext.Printable(e.PasswordEnv))
+		}
+		if c.envName != "" {
+			e.Password, e.PasswordEnv = "", c.envName
+		} else {
+			e.Password, e.PasswordEnv = password, ""
+		}
+		f.Agents[c.account] = e
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if c.envName != "" {
+		fmt.Fprintf(c.io.stdout, "%q now takes its password from %s; stet proxy must have %s in its environment: restart stet proxy\n",
+			c.account, c.envName, c.envName)
+	} else {
+		fmt.Fprintf(c.io.stdout, "password for %q updated; no restart is needed\n", c.account)
+	}
+	printWarning(c.io.stdout, warning)
+	return nil
+}
+
+// remove is stet agent remove.
+func (c *agentCmd) remove() error {
+	left := 0
+	warning, err := c.update(func(f *custody.File) error {
+		if _, ok := f.Agents[c.account]; !ok {
+			return c.noAccount()
+		}
+		delete(f.Agents, c.account)
+		left = len(f.Agents)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	out := c.io.stdout
+	fmt.Fprintf(out, "%q removed; it is refused from the next login\n", c.account)
+	if c.rolesWritten() && slices.Contains(c.cfg.AgentRoles, c.account) {
+		fmt.Fprintf(out, "remove %q from agents.roles in the config: %s\n", c.account, rolesMustMatch)
+	}
+	if left == 0 {
+		fmt.Fprintln(out, "the credentials file has no account left: stet proxy will not start until one is added")
+	}
+	printWarning(out, warning)
+	return nil
+}
+
+// list is stet agent list: a line for each account, in the order of their
+// names, with where its password is and when it was added and its token
+// issued, in UTC.
+func (c *agentCmd) list() error {
+	f, err := custody.ReadForUpdate(c.cfg.Credentials)
+	if err != nil {
+		return err
+	}
+	out := c.io.stdout
 	if len(f.Agents) == 0 {
 		fmt.Fprintln(out, "no accounts")
 		return nil
@@ -351,6 +432,42 @@ func agentList(path string, out io.Writer) error {
 	return tw.Flush()
 }
 
+// rolesMustMatch is why a change to the file's accounts may need one to
+// agents.roles: stet proxy compares the two at start.
+const rolesMustMatch = "it must list the same accounts as the credentials file, or stet proxy will not start"
+
+// rolesWritten reports whether the config writes agents.roles, which then
+// must list the file's accounts.
+func (c *agentCmd) rolesWritten() bool { return len(c.cfg.AgentRoles) > 0 }
+
+func (c *agentCmd) alreadyThere() error {
+	return fmt.Errorf("%q is already there; use stet agent token or stet agent password", c.account)
+}
+
+func (c *agentCmd) noAccount() error { return fmt.Errorf("no account %q", c.account) }
+
+// command is the stet agent command line of sub for the account, with
+// -config as it was given.
+func (c *agentCmd) command(sub string) string {
+	s := "stet agent " + sub
+	if c.configFlag != "" {
+		s += " -config " + shellWord(c.configFlag)
+	}
+	return s + " " + shellWord(c.account)
+}
+
+// update changes the credentials file with change, under its lock
+// (updateCredentials). When only the sync of the directory failed, the file
+// is in place: then it returns no error, and a warning to print once the
+// command has said what it did.
+func (c *agentCmd) update(change func(*custody.File) error) (warning string, err error) {
+	err = updateCredentials(c.cfg.Credentials, change)
+	if errors.Is(err, custody.ErrNotSynced) {
+		return "warning: " + safetext.Printable(err.Error()), nil
+	}
+	return "", err
+}
+
 // listTime is t as list shows it: in UTC, to the minute; "-" when the file
 // has none.
 func listTime(t time.Time) string {
@@ -360,35 +477,8 @@ func listTime(t time.Time) string {
 	return t.UTC().Format("2006-01-02 15:04")
 }
 
-// readCredentials reads the credentials file at path (custody.Read). A file
-// that is not there reads as one with no account; there says which.
-func readCredentials(path string) (f *custody.File, there bool, err error) {
-	f, err = custody.Read(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return &custody.File{Agents: map[string]custody.Agent{}}, false, nil
-	}
-	if err != nil {
-		return nil, false, err
-	}
-	return f, true, nil
-}
-
-// accountIn reads the credentials file at path and account's entry in it.
-// No file, like no such entry, is no account.
-func accountIn(path, account string) (*custody.File, custody.Agent, error) {
-	f, _, err := readCredentials(path)
-	if err != nil {
-		return nil, custody.Agent{}, err
-	}
-	entry, ok := f.Agents[account]
-	if !ok {
-		return nil, custody.Agent{}, fmt.Errorf("no account %q", account)
-	}
-	return f, entry, nil
-}
-
 // checkDirectory stops add, before it asks for anything, when the
-// directory a new credentials file at path goes in is not there: stet agent
+// directory the credentials file at path goes in is not there: stet agent
 // does not create it.
 func checkDirectory(path string) error {
 	dir := filepath.Dir(path)
@@ -406,7 +496,7 @@ func readPassword(account, envName string, a agentIO) (string, error) {
 	if envName != "" {
 		v := a.env(envName)
 		if v == "" {
-			return "", fmt.Errorf("-password-env: %s is empty or not set in this environment", safetext.Printable(envName))
+			return "", fmt.Errorf("-password-env: %s is empty or not set in this environment", envName)
 		}
 		return v, nil
 	}
@@ -431,28 +521,21 @@ func readPassword(account, envName string, a agentIO) (string, error) {
 }
 
 // checkPassword logs in to database as account with password, as stet proxy
-// will (custody.TryPassword), within agentCheckTimeout. Its error names the
-// kind of failure and carries the server's message, printable; it quotes
-// neither the address nor the password.
+// will (custody.TryPassword), within agentCheckTimeout. Its error says
+// whether the server refused the password or the login failed otherwise,
+// names the kind of failure and carries the server's message, printable; it
+// quotes neither the address nor the password.
 func checkPassword(cfg *config.Config, account, password, database string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), agentCheckTimeout)
 	defer cancel()
 	err := custody.TryPassword(ctx, cfg.Upstream, cfg.UpstreamTLS, cfg.UpstreamPlainFallback, account, password, database)
-	if err != nil {
-		return fmt.Errorf("could not log in to the database as %q with that password, so nothing was written: %v", account, err)
+	switch {
+	case err == nil:
+		return nil
+	case custody.WrongPassword(err):
+		return fmt.Errorf("the database refused that password for %q, so nothing was written: %v", account, err)
 	}
-	return nil
-}
-
-// saveCredentials writes f to path (writeCredentials). When only the sync of
-// the directory failed, the file is in place: then it returns no error, and
-// a warning to print once the command has said what it did.
-func saveCredentials(path string, f *custody.File) (warning string, err error) {
-	err = writeCredentials(path, f)
-	if errors.Is(err, custody.ErrNotSynced) {
-		return "warning: " + safetext.Printable(err.Error()), nil
-	}
-	return "", err
+	return fmt.Errorf("could not log in to the database as %q to check the password, so nothing was written: %v", account, err)
 }
 
 func printWarning(out io.Writer, warning string) {

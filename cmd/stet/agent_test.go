@@ -213,16 +213,52 @@ func tokenBlock(account, token string) string {
 	return fmt.Sprintf("token for %q (shown once; stet keeps only what it needs to check it):\n  %s\n", account, token)
 }
 
-// addOutput is what add prints for account and token; env is the
-// -password-env given, if any.
-func addOutput(account, token, env string) string {
+// addOutput is what add prints for account and token: config is the
+// -config given ("" when none), and bullets are the lines it adds to next
+// before the restart, each without its "  - ".
+func addOutput(account, token, config string, bullets ...string) string {
+	command := "stet agent password " + account
+	if config != "" {
+		command = "stet agent password -config " + config + " " + account
+	}
 	s := tokenBlock(account, token) + "\nnext:\n" +
 		fmt.Sprintf("  - in the agent's connection string, put this server's address as the host and the token as the password; the user stays %q\n", account) +
-		"  - if anything else knew this account's database password, change it in the database, then run: stet agent password " + account + "\n"
-	if env != "" {
-		s += "  - stet proxy must have " + env + " in its environment\n"
+		"  - if anything else knew this account's database password, change it in the database, then run: " + command + "\n"
+	for _, b := range bullets {
+		s += "  - " + b + "\n"
 	}
 	return s + "  - restart stet proxy: an account added while it runs is not accepted\n"
+}
+
+// envBullet is add's line of next for -password-env name.
+func envBullet(name string) string { return "stet proxy must have " + name + " in its environment" }
+
+// The lines that say what stet proxy will refuse to start with.
+func rolesAddBullet(account string) string {
+	return fmt.Sprintf("add %q to agents.roles in the config: it must list the same accounts as the credentials file, or stet proxy will not start", account)
+}
+
+func rolesRemoveLine(account string) string {
+	return fmt.Sprintf("remove %q from agents.roles in the config: it must list the same accounts as the credentials file, or stet proxy will not start\n", account)
+}
+
+const noAccountLeft = "the credentials file has no account left: stet proxy will not start until one is added\n"
+
+func removeOutput(account string) string {
+	return fmt.Sprintf("%q removed; it is refused from the next login\n", account)
+}
+
+// setRoles writes agents.roles into ac's config.
+func (ac *agentCase) setRoles(t *testing.T, roles ...string) {
+	t.Helper()
+	b := fileBytes(t, ac.cfgPath)
+	quoted := make([]string, len(roles))
+	for i, r := range roles {
+		quoted[i] = strconv.Quote(r)
+	}
+	text := strings.Replace(string(b), "agents: {credentials: agents.yaml}",
+		"agents: {credentials: agents.yaml, roles: ["+strings.Join(quoted, ", ")+"]}", 1)
+	writeConfig(t, ac.cfgPath, text)
 }
 
 func tokenOutput(account, token string) string {
@@ -265,7 +301,7 @@ func TestAgentAdd(t *testing.T) {
 		t.Fatalf("add: %v; output:\n%s", err, out)
 	}
 	token := tokenIn(t, out)
-	if want := addOutput(account, token, ""); out != want {
+	if want := addOutput(account, token, ac.cfgPath); out != want {
 		t.Errorf("add printed:\n%s\nwant:\n%s", out, want)
 	}
 	if n := strings.Count(out, token); n != 1 {
@@ -301,6 +337,21 @@ func TestAgentAdd(t *testing.T) {
 		t.Error("the file has no mock_secret")
 	}
 
+	// Without -config the command it suggests has none either: it reads the
+	// same default, stet.yaml in the directory it is run in.
+	other, otherPassword := newAgentRole(t, pg)
+	t.Chdir(filepath.Dir(ac.cfgPath))
+	out, err = agentRun([]string{"add", other}, otherPassword+"\n", nil)
+	if err != nil {
+		t.Fatalf("add without -config: %v; output:\n%s", err, out)
+	}
+	if want := addOutput(other, tokenIn(t, out), ""); out != want {
+		t.Errorf("add without -config printed:\n%s\nwant:\n%s", out, want)
+	}
+	if readFile(t, ac.credentials).MockSecret != f.MockSecret {
+		t.Error("the second add changed mock_secret")
+	}
+
 	ac.wantLogin(t, ac.start(t), account, token)
 }
 
@@ -309,8 +360,9 @@ func TestAgentAddRefusesAWrongPassword(t *testing.T) {
 	account, password := newAgentRole(t, pg)
 	wantWrong := func(t *testing.T, out string, err error) {
 		t.Helper()
-		if err == nil || !strings.Contains(err.Error(), "wrong password") || !strings.Contains(err.Error(), "28P01") {
-			t.Errorf("add = %v, want an error that says wrong password, with the server's code", err)
+		want := fmt.Sprintf("the database refused that password for %q, so nothing was written: upstream login: wrong password: ", account)
+		if err == nil || !strings.HasPrefix(err.Error(), want) || !strings.Contains(err.Error(), "28P01") {
+			t.Errorf("add = %v, want an error that starts %q, with the server's code", err, want)
 		}
 		if out != "" {
 			t.Errorf("add printed %q, want nothing", out)
@@ -366,7 +418,7 @@ func TestAgentAddPasswordEnv(t *testing.T) {
 		t.Fatalf("add: %v; output:\n%s", err, out)
 	}
 	token := tokenIn(t, out.String())
-	if want := addOutput(account, token, name); out.String() != want {
+	if want := addOutput(account, token, ac.cfgPath, envBullet(name)); out.String() != want {
 		t.Errorf("add printed:\n%s\nwant:\n%s", out, want)
 	}
 	e := readFile(t, ac.credentials).Agents[account]
@@ -439,6 +491,17 @@ func TestAgentPassword(t *testing.T) {
 	}
 	token := tokenIn(t, out)
 	verifier := readFile(t, ac.credentials).Agents[account].Token
+	// Another account, which no password command here may touch, nor the
+	// file's mock_secret.
+	ac.seed(t, map[string]string{"stet_chk_bystander": secret(t)})
+	first := readFile(t, ac.credentials)
+	untouched := func(t *testing.T) {
+		t.Helper()
+		f := readFile(t, ac.credentials)
+		if f.MockSecret != first.MockSecret || f.Agents["stet_chk_bystander"] != first.Agents["stet_chk_bystander"] {
+			t.Error("password changed mock_secret or another account's entry")
+		}
+	}
 	r := ac.start(t)
 
 	// The operator changes the password in the database: until stet agent
@@ -455,8 +518,9 @@ func TestAgentPassword(t *testing.T) {
 	t.Run("Wrong", func(t *testing.T) {
 		before := fileBytes(t, ac.credentials)
 		out, err := ac.run([]string{"password", account}, "wrong-"+changed+"\n", nil)
-		if err == nil || !strings.Contains(err.Error(), "wrong password") {
-			t.Errorf("password = %v, want an error that says wrong password", err)
+		want := fmt.Sprintf("the database refused that password for %q, so nothing was written: upstream login: wrong password: ", account)
+		if err == nil || !strings.HasPrefix(err.Error(), want) {
+			t.Errorf("password = %v, want an error that starts %q", err, want)
 		}
 		if out != "" {
 			t.Errorf("password printed %q, want nothing", out)
@@ -478,6 +542,7 @@ func TestAgentPassword(t *testing.T) {
 		t.Errorf("the new password kept: %v, the token kept: %v, token issued %s; want true, true, %s",
 			e.Password == changed, e.Token == verifier, e.TokenIssued, agentNowUTC)
 	}
+	untouched(t)
 	ac.wantLogin(t, r, account, token) // no restart
 
 	// -password-env moves the account's password to a variable of stet
@@ -495,6 +560,7 @@ func TestAgentPassword(t *testing.T) {
 	if e.PasswordEnv != name || e.Password != "" || e.Token != verifier {
 		t.Errorf("password_env %q, a password: %v, the token kept: %v; want %s, false, true", e.PasswordEnv, e.Password != "", e.Token == verifier, name)
 	}
+	untouched(t)
 
 	// An account whose password is a variable's: the file is not changed, and
 	// the operator is told where to change it.
@@ -744,8 +810,9 @@ func TestAgentOutputShowsTheTokenOnce(t *testing.T) {
 	// An upstream that is not there.
 	far := newAgentCase(t, "")
 	out, err := far.run([]string{"add", account}, password+"\n", nil)
-	if err == nil || !strings.Contains(err.Error(), "cannot reach the server") || out != "" {
-		t.Errorf("add over an upstream that is not there = %v, output %q; want an error that says cannot reach the server", err, out)
+	unreachable := fmt.Sprintf("could not log in to the database as %q to check the password, so nothing was written: upstream login: cannot reach the server", account)
+	if err == nil || err.Error() != unreachable || out != "" {
+		t.Errorf("add over an upstream that is not there = %v, output %q; want %q", err, out, unreachable)
 	} else if strings.Contains(err.Error(), far.upstream) {
 		t.Errorf("the error shows the upstream address: %v", err)
 	}
@@ -772,9 +839,9 @@ func TestAgentOutputShowsTheTokenOnce(t *testing.T) {
 func TestAgentGoesOnWhenTheDirectoryIsNotSynced(t *testing.T) {
 	ac := newAgentCase(t, "")
 	ac.seed(t, map[string]string{"stet_chk_sync": secret(t), "stet_chk_other": secret(t)})
-	defer func(w func(string, *custody.File) error) { writeCredentials = w }(writeCredentials)
-	writeCredentials = func(path string, f *custody.File) error {
-		if err := custody.Write(path, f); err != nil {
+	defer func(u func(string, func(*custody.File) error) error) { updateCredentials = u }(updateCredentials)
+	updateCredentials = func(path string, change func(*custody.File) error) error {
+		if err := custody.Update(path, change); err != nil {
 			return err
 		}
 		return fmt.Errorf("credentials file %s: %w (sync: input/output error)", path, custody.ErrNotSynced)
@@ -878,14 +945,29 @@ func TestAgentStops(t *testing.T) {
 		wantNoFile(t, ac.credentials)
 	})
 
-	t.Run("EmptyPasswordEnv", func(t *testing.T) {
+	// What is not a variable's name may be its value, the password: it is
+	// refused before anything else, in words that do not quote it.
+	t.Run("PasswordEnvIsAName", func(t *testing.T) {
+		const want = "-password-env takes the name of an environment variable, not its value"
 		ac := newAgentCase(t, "")
-		for _, cmd := range []string{"add", "password"} {
-			a, _ := asking(t, nil)
-			if err := runAgent(ac.args(cmd, "-password-env", "", "stet_chk_x"), a); err == nil ||
-				err.Error() != "-password-env needs the name of an environment variable" {
-				t.Errorf("%s -password-env \"\" = %v", cmd, err)
+		for _, value := range []string{"S3cr3t-Value!", "", "1PASSWORD", "A=B", "has space", "pw\n", "ÄGENT"} {
+			for _, args := range [][]string{
+				ac.args("add", "-password-env", value, "stet_chk_x"),
+				ac.args("password", "-password-env", value, "stet_chk_x"),
+				{"add", "-password-env", value},                                     // no account
+				{"add", "-config", "/nonexistent.yaml", "-password-env", value, ""}, // no config, no name
+			} {
+				a, out := asking(t, nil)
+				err := runAgent(args, a)
+				if err == nil || err.Error() != want || out.Len() != 0 {
+					t.Errorf("%q = %v, output %q; want %q", args, err, out, want)
+				}
 			}
+		}
+		// A name goes on to what follows.
+		a, _ := asking(t, nil)
+		if err := runAgent(ac.args("password", "-password-env", "_Agent_PW1", "stet_chk_x"), a); err == nil || err.Error() != `no account "stet_chk_x"` {
+			t.Errorf("password -password-env _Agent_PW1 = %v, want no account", err)
 		}
 	})
 
@@ -928,4 +1010,247 @@ func TestAgentStops(t *testing.T) {
 			}
 		}
 	})
+}
+
+// While add or password waits for its password, another stet agent removes
+// one account and gives another a new token. The first then changes only
+// its own account, in the file as it is by then: the removed account stays
+// removed, and the new token works.
+func TestAgentKeepsChangesMadeWhileItAsks(t *testing.T) {
+	pg := testPG(t)
+	for _, cmd := range []string{"add", "password"} {
+		t.Run(cmd, func(t *testing.T) {
+			gone, gonePassword := newAgentRole(t, pg)
+			rotated, rotatedPassword := newAgentRole(t, pg)
+			ac := newAgentCase(t, pg)
+			ac.seed(t, map[string]string{gone: gonePassword, rotated: rotatedPassword})
+			oldGone, oldRotated := ac.tokens[gone], ac.tokens[rotated]
+			// add adds an account of its own; password gives rotated the
+			// password the operator just set in the database.
+			target, password := rotated, secret(t)
+			if cmd == "add" {
+				target, password = newAgentRole(t, pg)
+			} else {
+				mustExec(t, superuser(t, pg), "alter role "+rotated+" password '"+password+"'")
+			}
+
+			var newToken string
+			done := make(chan struct{})
+			a, out := testIO(unread{t}, nil)
+			a.terminal = true
+			a.secret = func(string) (string, error) {
+				go func() { // another operator, meanwhile
+					defer close(done)
+					if _, err := ac.run([]string{"remove", gone}, "", nil); err != nil {
+						t.Errorf("remove, meanwhile: %v", err)
+					}
+					o, err := ac.run([]string{"token", rotated}, "", nil)
+					if err != nil {
+						t.Errorf("token, meanwhile: %v", err)
+					}
+					newToken = tokenShape.FindString(o)
+				}()
+				select {
+				case <-done:
+				case <-time.After(10 * time.Second):
+					t.Error("the other stet agent waited for this one: the file is locked while it asks")
+				}
+				return password, nil
+			}
+			if err := runAgent(ac.args(cmd, target), a); err != nil {
+				t.Fatalf("%s: %v", cmd, err)
+			}
+			<-done
+			f := readFile(t, ac.credentials)
+			if _, there := f.Agents[gone]; there {
+				t.Errorf("%s, removed meanwhile, is back in the file", gone)
+			}
+			if f.Agents[target].Password != password {
+				t.Errorf("%s does not hold its password", cmd)
+			}
+			r := ac.start(t)
+			ac.wantRefusedLogin(t, r, gone, oldGone)
+			ac.wantRefusedLogin(t, r, rotated, oldRotated)
+			ac.wantLogin(t, r, rotated, newToken)
+			if cmd == "add" {
+				ac.wantLogin(t, r, target, tokenIn(t, out.String()))
+			}
+		})
+	}
+}
+
+// token and remove change their own account and nothing else: the other
+// account's entry and mock_secret stay as they were.
+func TestAgentTouchesOnlyItsAccount(t *testing.T) {
+	ac := newAgentCase(t, "")
+	ac.seed(t, map[string]string{"stet_chk_mine": secret(t), "stet_chk_yours": secret(t)})
+	before := readFile(t, ac.credentials)
+	for _, args := range [][]string{{"token", "stet_chk_mine"}, {"remove", "stet_chk_mine"}} {
+		if _, err := ac.run(args, "", nil); err != nil {
+			t.Fatalf("%s: %v", args[0], err)
+		}
+		after := readFile(t, ac.credentials)
+		if after.MockSecret != before.MockSecret {
+			t.Errorf("%s changed mock_secret", args[0])
+		}
+		if after.Agents["stet_chk_yours"] != before.Agents["stet_chk_yours"] {
+			t.Errorf("%s changed another account's entry", args[0])
+		}
+		if mine, ok := after.Agents["stet_chk_mine"]; ok {
+			was := before.Agents["stet_chk_mine"]
+			if mine.Token == was.Token || mine.Password != was.Password || !mine.Added.Equal(was.Added) {
+				t.Errorf("%s: want only the token and its date changed", args[0])
+			}
+		}
+	}
+}
+
+// A write that fails (here: the directory is read-only) shows no token,
+// changes nothing, and is the command's error.
+func TestAgentWritesNothingWhenTheWriteFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can write anywhere")
+	}
+	ac := newAgentCase(t, "")
+	ac.seed(t, map[string]string{"stet_chk_stuck": secret(t), "stet_chk_other": secret(t)})
+	before := fileBytes(t, ac.credentials)
+	dir := filepath.Dir(ac.credentials)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	for _, cmd := range []string{"token", "remove"} {
+		out, err := ac.run([]string{cmd, "stet_chk_stuck"}, "", nil)
+		if err == nil || out != "" {
+			t.Errorf("%s in a read-only directory = %v, output %q; want an error and no output", cmd, err, out)
+		}
+		if !bytes.Equal(fileBytes(t, ac.credentials), before) {
+			t.Errorf("%s changed the file", cmd)
+		}
+	}
+}
+
+// What would keep stet proxy from starting is said: agents.roles that no
+// longer lists the file's accounts, and a file with no account left.
+func TestAgentSaysWhatStopsTheProxy(t *testing.T) {
+	t.Run("Remove", func(t *testing.T) {
+		ac := newAgentCase(t, "")
+		ac.seed(t, map[string]string{"stet_chk_a": secret(t), "stet_chk_b": secret(t), "stet_chk_c": secret(t)})
+		ac.setRoles(t, "stet_chk_a", "stet_chk_b")
+		for _, c := range []struct{ account, want string }{
+			{"stet_chk_c", removeOutput("stet_chk_c")}, // not in agents.roles
+			{"stet_chk_a", removeOutput("stet_chk_a") + rolesRemoveLine("stet_chk_a")},
+			{"stet_chk_b", removeOutput("stet_chk_b") + rolesRemoveLine("stet_chk_b") + noAccountLeft},
+		} {
+			if out, err := ac.run([]string{"remove", c.account}, "", nil); err != nil || out != c.want {
+				t.Errorf("remove %s = %v, printed:\n%s\nwant:\n%s", c.account, err, out, c.want)
+			}
+		}
+	})
+
+	t.Run("RemoveTheLast", func(t *testing.T) {
+		ac := newAgentCase(t, "")
+		ac.seed(t, map[string]string{"stet_chk_last": secret(t)})
+		if out, err := ac.run([]string{"remove", "stet_chk_last"}, "", nil); err != nil || out != removeOutput("stet_chk_last")+noAccountLeft {
+			t.Errorf("remove = %v, printed:\n%s", err, out)
+		}
+	})
+
+	t.Run("Add", func(t *testing.T) {
+		pg := testPG(t)
+		listed, listedPassword := newAgentRole(t, pg)
+		unlisted, unlistedPassword := newAgentRole(t, pg)
+		ac := newAgentCase(t, pg)
+		ac.setRoles(t, listed)
+		out, err := ac.run([]string{"add", listed}, listedPassword+"\n", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := addOutput(listed, tokenIn(t, out), ac.cfgPath); out != want {
+			t.Errorf("add of an account agents.roles lists printed:\n%s\nwant:\n%s", out, want)
+		}
+		out, err = ac.run([]string{"add", unlisted}, unlistedPassword+"\n", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := addOutput(unlisted, tokenIn(t, out), ac.cfgPath, rolesAddBullet(unlisted)); out != want {
+			t.Errorf("add of an account agents.roles does not list printed:\n%s\nwant:\n%s", out, want)
+		}
+	})
+}
+
+// An interrupt while the password is asked for puts the terminal back, then
+// ends stet with 130; once stopped, nothing is done.
+func TestOnInterruptRestoresTheTerminal(t *testing.T) {
+	sigs := make(chan os.Signal, 1)
+	var calls []string
+	exited := make(chan int, 1)
+	stop := onInterrupt(sigs, func() { calls = append(calls, "restore") }, func(code int) {
+		calls = append(calls, "exit")
+		exited <- code
+	})
+	sigs <- os.Interrupt
+	select {
+	case code := <-exited:
+		if code != 130 {
+			t.Errorf("exit(%d), want 130", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("an interrupt did not end stet")
+	}
+	stop()
+	if len(calls) != 2 || calls[0] != "restore" || calls[1] != "exit" {
+		t.Errorf("calls %q, want restore then exit", calls)
+	}
+
+	called := false
+	stop = onInterrupt(make(chan os.Signal), func() { called = true }, func(int) { called = true })
+	stop()
+	if called {
+		t.Error("stopped, it still did something")
+	}
+}
+
+// What add and password checked before asking is checked again when they
+// write: an account added meanwhile is not added twice, one removed
+// meanwhile is not brought back. Nothing is written, and no token shown.
+func TestAgentChecksAgainWhenItWrites(t *testing.T) {
+	pg := testPG(t)
+	for _, c := range []struct {
+		cmd, meanwhile string
+		want           func(account string) string
+	}{
+		{"add", "add", func(a string) string {
+			return fmt.Sprintf("%q is already there; use stet agent token or stet agent password", a)
+		}},
+		{"password", "remove", func(a string) string { return fmt.Sprintf("no account %q", a) }},
+	} {
+		t.Run(c.cmd, func(t *testing.T) {
+			account, password := newAgentRole(t, pg)
+			ac := newAgentCase(t, pg)
+			if c.cmd == "password" {
+				ac.seed(t, map[string]string{account: password})
+			}
+			var after []byte
+			a, out := testIO(unread{t}, nil)
+			a.terminal = true
+			a.secret = func(string) (string, error) {
+				if o, err := ac.run([]string{c.meanwhile, account}, password+"\n", nil); err != nil {
+					t.Errorf("%s, meanwhile: %v; output:\n%s", c.meanwhile, err, o)
+				}
+				after = fileBytes(t, ac.credentials)
+				return password, nil
+			}
+			err := runAgent(ac.args(c.cmd, account), a)
+			if want := c.want(account); err == nil || err.Error() != want {
+				t.Errorf("%s = %v, want %q", c.cmd, err, want)
+			}
+			if out.Len() != 0 {
+				t.Errorf("%s printed %q, want nothing", c.cmd, out)
+			}
+			if !bytes.Equal(fileBytes(t, ac.credentials), after) {
+				t.Errorf("%s changed the file", c.cmd)
+			}
+		})
+	}
 }
