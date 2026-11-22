@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -395,6 +396,57 @@ tables:
 
 	if err := r.stop(t); err != nil {
 		t.Fatalf("run = %v, want nil once its context is cancelled", err)
+	}
+}
+
+// Without a model nothing is sent anywhere, so a table needs no send_fields:
+// the decision is recorded with no column values in its state.
+func TestRecordsWithoutSendFields(t *testing.T) {
+	pg := testPG(t)
+	ctx := context.Background()
+	db, table, admin := agentTable(t, pg, 1)
+
+	r := start(t, parseConfig(t, `mode: shadow
+agents: {roles: [stet_md5]}
+listen: 127.0.0.1:0
+upstream: postgres://stet_scram:scram-pw@%[1]s/%[3]s?sslmode=disable
+model: {adapter: none}
+tables:
+  %[2]s: {pk: id}
+`, pg, table, db))
+	agent := connectTo(t, r.addr, db, "stet_md5", "md5-pw")
+	if _, err := agent.Exec(ctx, "update "+table+" set name = 'written-value' where id = 1"); err != nil {
+		t.Fatalf("update: %v; log:\n%s", err, r.log)
+	}
+
+	var verdict, state, proposed string
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := admin.QueryRow(ctx, `select verdict, coalesce(state::text, 'null'), coalesce(proposed::text, 'null')
+			from stet.decisions where target_table = $1`, table).Scan(&verdict, &state, &proposed)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, pgx.ErrNoRows) || time.Now().After(deadline) {
+			t.Fatalf("no decision recorded: %v; log:\n%s", err, r.log)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if verdict != "commit" {
+		t.Errorf("verdict = %q, want commit", verdict)
+	}
+	var inState struct{ Proposed, Current map[string]any }
+	if err := json.Unmarshal([]byte(state), &inState); err != nil {
+		t.Fatalf("state %s: %v", state, err)
+	}
+	if len(inState.Proposed) != 0 || len(inState.Current) != 0 {
+		t.Errorf("state carries column values without send_fields: %s", state)
+	}
+	if !strings.Contains(proposed, "written-value") {
+		t.Errorf("proposed column = %s, want it to hold the written value", proposed)
+	}
+	if err := r.stop(t); err != nil {
+		t.Fatalf("run = %v, want nil", err)
 	}
 }
 

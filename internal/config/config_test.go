@@ -1,10 +1,21 @@
 package config
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
+	"math/big"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const minimal = `
@@ -200,7 +211,7 @@ tables:
 }
 
 func TestTablesNeedSendFields(t *testing.T) {
-	_, err := Parse([]byte(minimal + "model: {adapter: none}\ntables: {contacts: {pk: id}}\n"))
+	_, err := Parse([]byte(minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id}}\n"))
 	if err == nil || !strings.Contains(err.Error(), "send_fields") {
 		t.Fatalf("err = %v, want send_fields required", err)
 	}
@@ -679,5 +690,190 @@ func TestStaleSettings(t *testing.T) {
 				t.Error("reads lost")
 			}
 		})
+	}
+}
+
+// clearPGEnv keeps the machine's libpq variables out of the URL parameters
+// under test.
+func clearPGEnv(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{"PGSSLMODE", "PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY", "PGSSLSNI",
+		"PGSSLNEGOTIATION", "PGSSLPASSWORD", "PGSSLCRL", "PGHOST", "PGPORT", "PGSERVICE", "PGSERVICEFILE", "PGPASSFILE"} {
+		t.Setenv(k, "")
+	}
+}
+
+// writeCert writes a self-signed certificate and its key into dir.
+func writeCert(t *testing.T, dir string) (certFile, keyFile string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "stet-test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		IsCA:         true,
+		KeyUsage:     x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certFile = filepath.Join(dir, "cert.pem")
+	keyFile = filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return certFile, keyFile
+}
+
+func parseUpstream(t *testing.T, upstream string) (*Config, error) {
+	t.Helper()
+	return Parse([]byte("listen: 127.0.0.1:6432\nupstream: " + upstream + "\n"))
+}
+
+func TestUpstreamTLSBySSLMode(t *testing.T) {
+	clearPGEnv(t)
+	root, _ := writeCert(t, t.TempDir())
+
+	cases := []struct {
+		name, query, host string
+		wantTLS           bool
+		wantFallback      bool
+		wantInsecure      bool
+		wantVerifyPeer    bool
+		wantServerName    string
+	}{
+		{name: "disable", query: "?sslmode=disable", host: "db.example.com"},
+		{name: "not written", query: "", host: "db.example.com", wantTLS: true, wantFallback: true, wantInsecure: true, wantServerName: "db.example.com"},
+		{name: "prefer", query: "?sslmode=prefer", host: "db.example.com", wantTLS: true, wantFallback: true, wantInsecure: true, wantServerName: "db.example.com"},
+		{name: "require", query: "?sslmode=require", host: "db.example.com", wantTLS: true, wantInsecure: true, wantServerName: "db.example.com"},
+		{name: "require with sslrootcert", query: "?sslmode=require&sslrootcert=" + root, host: "db.example.com", wantTLS: true, wantInsecure: true, wantVerifyPeer: true, wantServerName: "db.example.com"},
+		{name: "verify-ca", query: "?sslmode=verify-ca&sslrootcert=" + root, host: "db.example.com", wantTLS: true, wantInsecure: true, wantVerifyPeer: true, wantServerName: "db.example.com"},
+		{name: "verify-full", query: "?sslmode=verify-full&sslrootcert=" + root, host: "db.example.com", wantTLS: true, wantServerName: "db.example.com"},
+		{name: "require to an IP", query: "?sslmode=require", host: "10.1.2.3", wantTLS: true, wantInsecure: true},
+		{name: "require with sslsni=0", query: "?sslmode=require&sslsni=0", host: "db.example.com", wantTLS: true, wantInsecure: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := parseUpstream(t, "postgres://app@"+tc.host+":5432/crm"+tc.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (c.UpstreamTLS != nil) != tc.wantTLS {
+				t.Fatalf("UpstreamTLS = %v, want present: %v", c.UpstreamTLS, tc.wantTLS)
+			}
+			if c.UpstreamPlainFallback != tc.wantFallback {
+				t.Errorf("UpstreamPlainFallback = %v, want %v", c.UpstreamPlainFallback, tc.wantFallback)
+			}
+			if !tc.wantTLS {
+				return
+			}
+			if c.UpstreamTLS.InsecureSkipVerify != tc.wantInsecure {
+				t.Errorf("InsecureSkipVerify = %v, want %v", c.UpstreamTLS.InsecureSkipVerify, tc.wantInsecure)
+			}
+			if (c.UpstreamTLS.VerifyPeerCertificate != nil) != tc.wantVerifyPeer {
+				t.Errorf("VerifyPeerCertificate set = %v, want %v", c.UpstreamTLS.VerifyPeerCertificate != nil, tc.wantVerifyPeer)
+			}
+			if c.UpstreamTLS.ServerName != tc.wantServerName {
+				t.Errorf("ServerName = %q, want %q", c.UpstreamTLS.ServerName, tc.wantServerName)
+			}
+		})
+	}
+}
+
+func TestUpstreamTLSCarriesNoClientCertificate(t *testing.T) {
+	clearPGEnv(t)
+	dir := t.TempDir()
+	cert, key := writeCert(t, dir)
+	addr := "postgres://app@db.example.com:5432/crm?sslmode=require&sslcert=" + cert + "&sslkey=" + key
+
+	pc, err := pgconn.ParseConfig(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pc.TLSConfig.Certificates) != 1 {
+		t.Fatalf("pgconn.ParseConfig carries %d certificates, want 1 (the premise of this test)", len(pc.TLSConfig.Certificates))
+	}
+	c, err := parseUpstream(t, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(c.UpstreamTLS.Certificates); n != 0 {
+		t.Errorf("UpstreamTLS carries %d certificates, want none", n)
+	}
+	if c.UpstreamTLS.GetClientCertificate != nil {
+		t.Error("UpstreamTLS.GetClientCertificate is set, want nil")
+	}
+}
+
+func TestUpstreamRejectsAllowAndDirect(t *testing.T) {
+	clearPGEnv(t)
+	for query, want := range map[string]string{
+		"?sslmode=allow":                         "upstream: sslmode=allow is not supported: it connects in plaintext first, which a relayed session cannot retry; use disable, prefer, require, verify-ca or verify-full",
+		"?sslmode=require&sslnegotiation=direct": "upstream: sslnegotiation=direct is not supported: stet asks for TLS with an SSLRequest; remove it",
+	} {
+		_, err := parseUpstream(t, "postgres://app@db.example.com:5432/crm"+query)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: err = %v, want it to contain %q", query, err, want)
+		}
+	}
+}
+
+func TestUpstreamPassesParseErrorsAndHidesThePassword(t *testing.T) {
+	clearPGEnv(t)
+	_, err := parseUpstream(t, "postgres://app:s3cret-pw@db.example.com:5432/crm?sslmode=verify-full&sslrootcert=/no/such/file.pem")
+	if err == nil || !strings.HasPrefix(err.Error(), "upstream: ") {
+		t.Fatalf("err = %v, want an upstream: error", err)
+	}
+	if strings.Contains(err.Error(), "s3cret-pw") {
+		t.Errorf("the error shows the password: %v", err)
+	}
+}
+
+func TestUpstreamTransport(t *testing.T) {
+	clearPGEnv(t)
+	root, _ := writeCert(t, t.TempDir())
+	for query, want := range map[string]Transport{
+		"?sslmode=disable":                       TransportPlain,
+		"":                                       TransportPreferred,
+		"?sslmode=prefer":                        TransportPreferred,
+		"?sslmode=require":                       TransportUnverified,
+		"?sslmode=require&sslrootcert=" + root:   TransportVerified,
+		"?sslmode=verify-ca&sslrootcert=" + root: TransportVerified,
+		"?sslmode=verify-full&sslrootcert=" + root: TransportVerified,
+	} {
+		c, err := parseUpstream(t, "postgres://app@db.example.com:5432/crm"+query)
+		if err != nil {
+			t.Fatalf("%q: %v", query, err)
+		}
+		if got := c.UpstreamTransport(); got != want {
+			t.Errorf("%q: UpstreamTransport = %d, want %d", query, got, want)
+		}
+	}
+}
+
+func TestSendFieldsOptionalWithoutAModel(t *testing.T) {
+	c, err := Parse([]byte(minimal + "model: {adapter: none}\ntables: {contacts: {pk: id}}\n"))
+	if err != nil {
+		t.Fatalf("adapter none without send_fields: %v", err)
+	}
+	if n := len(c.Tables["contacts"].SendFields); n != 0 {
+		t.Errorf("%d send_fields, want none", n)
+	}
+	_, err = Parse([]byte(minimal + "model: {adapter: jev, version: jev-1.13.0}\ntables: {contacts: {pk: id}}\n"))
+	want := "tables.contacts.send_fields: required: list the columns the model may see"
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Errorf("err = %v, want %q", err, want)
 	}
 }

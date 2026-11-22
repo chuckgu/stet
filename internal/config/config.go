@@ -4,6 +4,7 @@ package config
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -45,6 +47,15 @@ type Config struct {
 	// StaleMaxKeys is stale.max_keys: how many row versions are remembered in
 	// all. 200000 unless set; 0 when no table has stale.
 	StaleMaxKeys int
+
+	// UpstreamTLS is the TLS setting of the proxy's leg to upstream, read from
+	// the same URL parameters Stet's own connections read (pgconn.ParseConfig).
+	// nil: plaintext. It never carries a client certificate: sslcert and sslkey
+	// are for Stet's own connections only.
+	UpstreamTLS *tls.Config
+	// UpstreamPlainFallback: sslmode is prefer, or not written. A session
+	// continues in plaintext when the server declines TLS.
+	UpstreamPlainFallback bool
 
 	// Hash identifies the config file's bytes. Decisions record it as
 	// policy_version.
@@ -309,6 +320,8 @@ func Parse(b []byte) (*Config, error) {
 	}
 	if err := validateUpstream(c.Upstream); err != nil {
 		fail("upstream: %v", err)
+	} else if err := c.readUpstreamTLS(); err != nil {
+		fail("upstream: %v", err)
 	}
 	if raw.Retention != "" {
 		d, err := parseDuration(raw.Retention)
@@ -371,7 +384,7 @@ func Parse(b []byte) (*Config, error) {
 	c.Tables = make(map[string]Table, len(raw.Tables))
 	for name, rt := range raw.Tables {
 		reads, stale, cumulative := keys.present(name)
-		t, tErrs := resolveTable(name, rt, reads, stale, cumulative)
+		t, tErrs := resolveTable(name, rt, reads, stale, cumulative, c.Model.Adapter == RecordOnly)
 		errs = append(errs, tErrs...)
 		c.Tables[name] = t
 	}
@@ -505,8 +518,9 @@ func resolveRoles(agents *struct {
 
 // resolveTable checks one table. hasReads and hasCumulative say whether its
 // reads key, its stale key and its impact.cumulative key are present, with a
-// value or not.
-func resolveTable(name string, rt rawTable, hasReads, hasStale, hasCumulative bool) (Table, []error) {
+// value or not. noModel: the model adapter is none, so nothing is sent
+// anywhere and send_fields may be left out.
+func resolveTable(name string, rt rawTable, hasReads, hasStale, hasCumulative, noModel bool) (Table, []error) {
 	var errs []error
 	fail := func(field, format string, args ...any) {
 		errs = append(errs, fmt.Errorf("tables.%s.%s: %s", name, field, fmt.Sprintf(format, args...)))
@@ -531,7 +545,7 @@ func resolveTable(name string, rt rawTable, hasReads, hasStale, hasCumulative bo
 		fail("pk", "required")
 	}
 	// The model is an outside service; what it may see is listed, never assumed.
-	if len(t.SendFields) == 0 {
+	if len(t.SendFields) == 0 && !noModel {
 		fail("send_fields", "required: list the columns the model may see")
 	}
 	t.RecentWindow = 30 * time.Minute
@@ -708,6 +722,59 @@ func (c *Config) UpstreamAddr() string {
 		port = "5432"
 	}
 	return net.JoinHostPort(u.Hostname(), port)
+}
+
+// readUpstreamTLS reads the TLS parameters of the upstream URL the way Stet's
+// own connections do, and refuses what a relayed session cannot honour.
+func (c *Config) readUpstreamTLS() error {
+	pc, err := pgconn.ParseConfig(c.Upstream)
+	if err != nil {
+		return err
+	}
+	if pc.SSLNegotiation == "direct" {
+		return errors.New("sslnegotiation=direct is not supported: stet asks for TLS with an SSLRequest; remove it")
+	}
+	var same *pgconn.FallbackConfig
+	for _, f := range pc.Fallbacks {
+		if f.Host == pc.Host && f.Port == pc.Port {
+			same = f
+			break
+		}
+	}
+	if pc.TLSConfig == nil {
+		if same != nil && same.TLSConfig != nil {
+			return errors.New("sslmode=allow is not supported: it connects in plaintext first, which a relayed session cannot retry; use disable, prefer, require, verify-ca or verify-full")
+		}
+		return nil
+	}
+	cfg := pc.TLSConfig.Clone()
+	cfg.Certificates = nil
+	cfg.GetClientCertificate = nil
+	c.UpstreamTLS = cfg
+	c.UpstreamPlainFallback = same != nil && same.TLSConfig == nil
+	return nil
+}
+
+// Transport says how well the leg to upstream is protected.
+type Transport int
+
+const (
+	TransportPlain      Transport = iota // sslmode=disable
+	TransportPreferred                   // prefer, or not written: TLS when the server takes it, unverified
+	TransportUnverified                  // require without sslrootcert
+	TransportVerified                    // verify-ca, verify-full, require with sslrootcert
+)
+
+func (c *Config) UpstreamTransport() Transport {
+	switch {
+	case c.UpstreamTLS == nil:
+		return TransportPlain
+	case c.UpstreamPlainFallback:
+		return TransportPreferred
+	case c.UpstreamTLS.InsecureSkipVerify && c.UpstreamTLS.VerifyPeerCertificate == nil:
+		return TransportUnverified
+	}
+	return TransportVerified
 }
 
 func validateUpstream(s string) error {
