@@ -289,8 +289,13 @@ CREATE TABLE stet.held_writes (
 
 ```yaml
 mode: shadow                 # shadow | enforce
-listen: 0.0.0.0:6432         # 루프백이 아니면 시작할 때 경고한다
+listen: 0.0.0.0:6432         # 루프백이 아닌데 listen_tls가 없으면 시작할 때 경고한다
+listen_tls:                  # 선택. 클라이언트 쪽 TLS
+  cert: tls/server.crt
+  key: tls/server.key
 upstream: postgres://app@db:5432/crm?sslmode=verify-full
+agents:
+  credentials: agents.yaml   # 선택. 자격 증명 보관. 에이전트는 토큰으로 Stet에 로그인한다
 
 model:
   adapter: jev
@@ -330,14 +335,20 @@ tables:
 - `policy`는 한 줄에 규칙 하나인 텍스트나 규칙 목록이다. 빈 줄은 무시한다. `thresholds.policy`와 `policy_escalate`는 확률(0~1)이다. 예전의 1~5 점수(`policy: 4`)는 설정 검증에서 거부된다.
 - `recent_window`의 기본값은 30분이다.
 - Jev 어댑터 전까지는 `model: {adapter: none}`으로 둔다(5장).
-- `upstream` URL의 계정은 Stet 자신의 연결(상태 조회, 판단 기록)에 쓴다. 이 계정은 게이트 대상 테이블 SELECT 권한과 `stet` 스키마를 만들 권한이 있어야 한다. 비밀번호는 URL이나 `PGPASSWORD`·`.pgpass`로 준다. 에이전트의 세션은 자기 계정 그대로 같은 서버로 중계된다(프록시 구간).
+- `upstream` URL의 계정은 Stet 자신의 연결(상태 조회, 판단 기록)에 쓴다. 이 계정은 게이트 대상 테이블 SELECT 권한과 `stet` 스키마를 만들 권한이 있어야 한다. 비밀번호는 URL이나 `PGPASSWORD`·`.pgpass`로 준다. 에이전트의 세션은 자기 계정 그대로 같은 서버로 중계된다(프록시 구간). `agents.credentials`가 있으면 중계하지 않고, Stet이 에이전트 계정의 진짜 비밀번호(자격 증명 파일의 것만. 환경 변수와 `.pgpass`의 것은 쓰지 않는다)로 같은 호스트와 포트, 같은 TLS 설정으로 로그인한다.
 - `upstream`의 TLS는 URL의 질의 파라미터로 정한다. 새 설정 키는 없다. Stet 자신의 연결과 프록시 구간이 `pgconn.ParseConfig`가 읽은 같은 값을 따른다(spec-v0.2-tryout 3장).
   - `sslmode`: `disable`(평문), `prefer`(TLS를 청하고 서버가 거절하면 평문. 인증서 확인 없음), `require`(TLS만. 인증서 확인 없음. `sslrootcert`가 있으면 `verify-ca`와 같다), `verify-ca`(발급자 확인), `verify-full`(발급자와 호스트 이름 확인. `sslrootcert`가 없으면 시스템의 루트 인증서). 적지 않으면 `prefer`다. v0.2의 써 보는 길부터는 프록시 구간도 이를 따르므로, `sslmode`를 적지 않은 설정의 에이전트 세션은 서버가 TLS를 받으면 TLS로 간다.
   - `sslrootcert`는 두 구간에 함께 쓴다. `sslcert`와 `sslkey`(클라이언트 인증서)는 Stet 자신의 연결에만 쓴다. 중계하는 세션에는 인증서를 내지 않는다. 호스트가 IP가 아니면 TLS 인사에 서버 이름(SNI)을 넣고, `sslsni=0`이면 넣지 않는다.
   - 받지 않는 것: `sslmode=allow`, `sslnegotiation=direct`. 설정 검증에서 거부한다.
   - 호스트와 포트는 URL에 하나만 적는다. 프록시는 URL의 호스트와 포트(없으면 5432)로 중계한다. 질의 파라미터의 `host`·`hostaddr`·`port`, 호스트 여럿, `PGHOST`·`PGPORT`·서비스 파일, 비밀번호의 인코딩하지 않은 특수 문자 때문에 Stet 자신의 연결이 다른 곳에 닿는 URL은 거부한다(`stet's own connections and the proxy would reach different hosts or ports for this address; …`). Stet이 만든 `upstream`의 에러는 URL을 인용하지 않는다. 비밀번호가 들어 있기 때문이다. pgconn이 읽지 못하는 URL(예: `sslmode=foo`)은 pgconn의 에러가 그대로 나오고, 그 에러는 비밀번호를 `xxxxx`로 가린 채 URL을 인용한다(``upstream: cannot parse `postgres://app:xxxxx@…`: …``). pgx는 이 가림을 best effort라고 적는다.
   - 호스트가 이 기기(`localhost`, 루프백 IP)가 아닌데 평문이 될 수 있거나(`disable`, `prefer`, 적지 않음) 인증서를 확인하지 않으면(`require`에 `sslrootcert` 없음) 시작할 때 경고한다.
-- `listen`이 루프백 주소가 아니면 시작할 때 경고한다. 클라이언트와 Stet 사이는 암호화되지 않는다.
+- `listen`이 루프백 주소가 아니고 `listen_tls`가 없으면 시작할 때 경고한다. 클라이언트와 Stet 사이는 암호화되지 않는다.
+- `listen_tls`(선택)는 클라이언트 쪽 TLS다(spec-v0.2-server 3장). `cert`와 `key`(PEM)를 둘 다 적는다(`listen_tls: cert and key are both required`). 있으면 클라이언트의 SSLRequest에 `S`로 답하고 TLS 1.2 이상으로 인사한다. 없으면 지금처럼 `N`이다. 루프백이 아닌 주소에서 TLS 없이 세션을 시작한 클라이언트는 `FATAL`(`28000`, `stet: this server requires TLS; connect with sslmode=require or stronger`)로 끝낸다. 루프백에서 온 접속과 취소 요청은 평문도 받는다. 시작할 때 두 파일을 읽지 못하거나 짝이 맞지 않으면 시작하지 않고, 키를 소유자 말고 다른 사용자가 읽을 수 있으면 경고한다. 파일이 바뀌면 다음 인사부터 새 인증서를 쓰고, 다시 읽지 못하면 쓰던 것을 쓴다. 자격 증명 보관 없이 켜고 `upstream`도 TLS를 청하면, SCRAM 계정은 클라이언트가 `channel_binding=disable`을 적어야 로그인한다고 시작할 때 경고한다.
+- `agents.credentials`(선택)는 자격 증명 파일의 경로다. 있으면 자격 증명 보관이 켜진다(spec-v0.2-server 4~6장, [deploy](deploy.md)). Stet이 에이전트를 계정 이름과 토큰(SCRAM-SHA-256)으로 직접 인증하고, 그 계정의 진짜 비밀번호로 DB에 로그인해 세션을 잇는다. 파일은 `stet agent`가 쓴다.
+  - 에이전트 계정은 파일의 계정들이다. `agents.roles`는 적지 않아도 되고(enforce에서도), 적으면 파일의 계정들과 같아야 한다. 파일에 없는 계정은 Stet을 거쳐 로그인하지 못한다.
+  - 설정을 읽을 때 두 가지를 본다. `upstream`의 호스트가 루프백이 아니면 서버를 확인해야 한다(`verify-full`, `verify-ca`, `sslrootcert`가 있는 `require`. 아니면 `upstream: with agents.credentials the server must be verified, …`). `listen`이 루프백이 아니면 `listen_tls`가 있어야 한다(`listen: with agents.credentials a listen address that is not loopback needs listen_tls: …`). 위의 두 경고가 거부로 바뀐다.
+  - 파일을 여는 일은 `stet proxy`가 시작할 때 한다(설정 검증은 파일을 열지 않는다). 파일의 권한(Stet을 돌리는 사용자의 것이면 `0600`, root의 것이면 `0640`까지)과 모양, 계정이 하나 이상인지, `agents.roles`와 같은지, Stet 자신의 계정(`upstream`의 계정)이 없는지 본다. 어기면 시작하지 않는다.
+- `agents.credentials`, `listen_tls.cert`, `listen_tls.key`의 상대 경로는 설정 파일이 있는 디렉터리에 대해 읽는다. `upstream`의 `sslrootcert`는 Stet이 도는 작업 디렉터리에 대해 읽는다.
 
 ## 10. 실패 처리와 보안
 

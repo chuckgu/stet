@@ -12,8 +12,17 @@ mode: shadow                 # shadow | enforce
 # Stet의 계정은 각 에이전트 계정의 구성원이어야 하고(GRANT agent_x TO <Stet 계정>) superuser가 아니어야 한다.
 # 승인된 쓰기를 Stet의 연결에서 그 에이전트 계정으로 실행하기 때문이다. enforce로 시작할 때 둘 다 확인해 경고한다.
 # 운영자가 DB에서 해 둘 일은 docs/spec-v0.2-enforce.md 8장과 docs/spec-v0.2-approve.md 6·10장에 있다.
+# credentials를 적으면 자격 증명 보관이 켜진다(docs/deploy.md). Stet이 에이전트를 계정 이름과 토큰으로 직접 인증하고,
+# 그 계정의 진짜 비밀번호로 DB에 로그인한다. 값은 stet agent가 쓰는 자격 증명 파일의 경로이고, 상대 경로는 이 설정
+# 파일이 있는 디렉터리에 대해 읽는다. 에이전트 계정은 그 파일의 계정들이라 roles는 적지 않아도 되고(enforce에서도),
+# 적으면 파일의 계정들과 같아야 한다. 파일에 없는 계정은 Stet을 거쳐 로그인하지 못한다. upstream의 계정은 파일에
+# 넣을 수 없다. 파일은 Stet을 돌리는 사용자의 것이면 0600, root의 것이면 0640까지만 받는다. 보관을 켜면 upstream의
+# 호스트가 루프백이 아닐 때 서버를 확인해야 하고(verify-full, verify-ca, sslrootcert가 있는 require), listen이
+# 루프백이 아니면 listen_tls가 있어야 한다. 어기면 시작하지 않는다. 토큰과 파일에 둔 비밀번호를 바꾸거나 계정을
+# 지우는 것은 다시 띄우지 않고 다음 로그인부터 적용되고, 계정을 더하는 것은 다시 띄워야 적용된다.
 # agents:
 #   roles: [agent_enricher, agent_support]
+#   credentials: agents.yaml
 # 동시에 판단 중인 쓰기의 상한. 상태 읽기, 영향 측정, 모델 호출을 합친 수다. 기본 32
 # limits:
 #   max_inflight: 32
@@ -28,12 +37,24 @@ mode: shadow                 # shadow | enforce
 #   GRANT USAGE ON SCHEMA stet TO reviewer;
 #   GRANT SELECT ON stet.review TO reviewer;
 #   GRANT EXECUTE ON FUNCTION stet.approve(uuid, text, bigint), stet.reject(uuid, text) TO reviewer;
-# 클라이언트(에이전트)를 받는 주소. 클라이언트와 Stet 사이는 암호화되지 않는다. 루프백(127.0.0.1)이 아니면 시작할 때
-# 경고한다. 믿는 네트워크 안에서만 연다. 같은 기기에서 써 보는 길은 127.0.0.1:6432이고, 컨테이너 안에서는
-# 0.0.0.0:6432로 받고 포트는 127.0.0.1에만 연다(docs/quickstart.md 4장).
+# 클라이언트(에이전트)를 받는 주소. listen_tls가 없으면 클라이언트와 Stet 사이는 암호화되지 않고, 루프백(127.0.0.1)이
+# 아니면 시작할 때 경고한다. 그때는 믿는 네트워크 안에서만 연다. 같은 기기에서 써 보는 길은 127.0.0.1:6432이고,
+# 컨테이너 안에서는 0.0.0.0:6432로 받고 포트는 127.0.0.1에만 연다(docs/quickstart.md 4장).
 listen: 0.0.0.0:6432
+# 클라이언트 쪽 TLS(docs/deploy.md 3장). 적으면 클라이언트의 TLS 요청에 이 인증서로 답하고(TLS 1.2 이상), 루프백이
+# 아닌 주소에서 TLS 없이 세션을 시작한 클라이언트는 거절한다(SQLSTATE 28000). 루프백에서 온 접속은 평문도 받는다.
+# cert와 key는 둘 다 적는다. PEM 파일이고, 인증서 파일에는 중간 인증서를 이어 넣을 수 있다. 상대 경로는 이 설정
+# 파일이 있는 디렉터리에 대해 읽는다. 시작할 때 읽지 못하거나 짝이 맞지 않으면 시작하지 않고, 키를 소유자 말고 다른
+# 사용자가 읽을 수 있으면 경고한다. 파일이 바뀌면 다음 TLS 인사부터 새 인증서를 쓴다. 자격 증명 보관
+# (agents.credentials) 없이 켜고 upstream도 TLS면, SCRAM 계정은 클라이언트가 channel_binding=disable을 적어야
+# 로그인한다(시작할 때 경고한다).
+# listen_tls:
+#   cert: tls/server.crt
+#   key: tls/server.key
 # Stet이 붙는 DB. 주소의 계정은 Stet 자신의 연결(상태 조회, 판단 기록)에 쓴다. 에이전트의 세션은 자기 계정 그대로
-# 같은 서버에 중계된다(프록시 구간). TLS는 주소의 질의 파라미터로 정하고, 두 구간이 같은 값을 따른다.
+# 같은 서버에 중계된다(프록시 구간). agents.credentials를 적으면 Stet이 같은 서버에 에이전트 계정의 진짜 비밀번호로
+# 로그인한다. TLS는 주소의 질의 파라미터로 정하고, 두 구간(보관을 켜면 Stet의 로그인도)이 같은 값을 따른다.
+# sslrootcert의 상대 경로는 Stet이 도는 작업 디렉터리에 대해 읽으므로 절대 경로로 적는다.
 #   sslmode=disable      평문
 #   sslmode=prefer       TLS를 청하고, 서버가 거절하면 평문으로 간다. 인증서는 확인하지 않는다. 적지 않으면 이것이다
 #   sslmode=require      TLS가 아니면 붙지 않는다. 인증서는 확인하지 않는다. sslrootcert가 있으면 verify-ca와 같다
@@ -46,7 +67,8 @@ listen: 0.0.0.0:6432
 # 호스트와 포트는 주소에 하나만 적는다. 질의 파라미터의 host·hostaddr·port, 호스트 여럿, PGHOST·PGPORT·서비스
 # 파일로 정한 호스트와 포트처럼 Stet 자신의 연결과 프록시 구간이 다른 서버에 닿을 수 있는 주소는 거부한다.
 # 호스트가 이 기기가 아닌데 평문이 될 수 있거나(disable, prefer, 적지 않음) 인증서를 확인하지 않으면(require에
-# sslrootcert 없음) 시작할 때 경고한다. 다른 기기의 DB에는 verify-full을 쓴다.
+# sslrootcert 없음) 시작할 때 경고한다. agents.credentials를 적었으면 경고가 아니라 시작하지 않는다. 다른 기기의
+# DB에는 verify-full을 쓴다.
 upstream: postgres://app@db:5432/crm?sslmode=verify-full
 
 # jev는 환경 변수 TYPESAFE_API_KEY가 필요하다. 키는 이 파일에 두지 않는다.
