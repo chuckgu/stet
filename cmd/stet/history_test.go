@@ -77,9 +77,9 @@ type decisionRow struct {
 	DoneBefore *time.Time
 }
 
-// decisionsOn waits until n decisions on table are recorded, which happens in
+// decisionsRecorded waits until n decisions on table are recorded, which happens in
 // the background once each write has ended, and returns them oldest first.
-func decisionsOn(t *testing.T, pool *pgxpool.Pool, table string, n int, log fmt.Stringer) []decisionRow {
+func decisionsRecorded(t *testing.T, pool *pgxpool.Pool, table string, n int, log fmt.Stringer) []decisionRow {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -219,7 +219,7 @@ func TestChangeIsLinkedToItsDecision(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ds := decisionsOn(t, pool, table, 3, r.log)
+	ds := decisionsRecorded(t, pool, table, 3, r.log)
 	lines := historyOn(t, pool, table)
 	for key, what := range map[string]string{"1": "simple protocol", "2": "extended protocol", "3": "explicit transaction"} {
 		d := decisionFor(t, ds, key)
@@ -247,7 +247,7 @@ func TestCascadedChildIsLinkedToTheParentsDecision(t *testing.T) {
 	r, agent := shadowOver(t, pg, db, table)
 
 	mustExec(t, agent, "delete from "+table+" where id = 1")
-	d := decisionsOn(t, pool, table, 1, r.log)[0]
+	d := decisionsRecorded(t, pool, table, 1, r.log)[0]
 
 	parent := historyOn(t, pool, table)
 	children := historyOn(t, pool, child)
@@ -274,7 +274,7 @@ func TestWriteThroughAFunctionIsNotLinked(t *testing.T) {
 
 	mustExec(t, agent, "update "+table+" set name = 'direct' where id = 1")
 	mustExec(t, agent, "select "+table+"_rename(2, 'through a function')")
-	ds := decisionsOn(t, pool, table, 1, r.log)
+	ds := decisionsRecorded(t, pool, table, 1, r.log)
 
 	lines := historyOn(t, pool, table)
 	wantLinkedTo(t, "the direct write", lineFor(t, lines, "1"), decisionFor(t, ds, "1"))
@@ -321,7 +321,7 @@ func TestBatchedSameTextWritesShowTheirCandidatesNotADecision(t *testing.T) {
 			recorded += 2
 			// Which write made a change, and which write a decision judged, is
 			// told by the name the write set: its first bind value.
-			ds := decisionsOn(t, pool, table, recorded, r.log)
+			ds := decisionsRecorded(t, pool, table, recorded, r.log)
 			byValue := map[string]decisionRow{}
 			for _, d := range ds {
 				if d.FirstValue != nil {
@@ -397,7 +397,7 @@ func TestApprovedWriteIsLinkedThroughItsHeldWrite(t *testing.T) {
 	if err := admin.QueryRow(ctx, "select decision_id::text from stet.held_writes where id = $1", id).Scan(&decisionID); err != nil {
 		t.Fatal(err)
 	}
-	d := decisionsOn(t, pool, table, 1, r.log)[0]
+	d := decisionsRecorded(t, pool, table, 1, r.log)[0]
 	if d.ID != decisionID || d.Executed || d.Verdict != "hold" {
 		t.Fatalf("the decision is %+v; want %s, the held write's, not executed, hold", d, decisionID)
 	}
@@ -438,7 +438,7 @@ func TestStatementTextMatchesWhatTheServerSaw(t *testing.T) {
 			t.Fatalf("%q: %v", w.sql, err)
 		}
 	}
-	ds := decisionsOn(t, pool, table, len(writes), r.log)
+	ds := decisionsRecorded(t, pool, table, len(writes), r.log)
 	lines := historyOn(t, pool, table)
 	for _, w := range writes {
 		protocol := "simple protocol"

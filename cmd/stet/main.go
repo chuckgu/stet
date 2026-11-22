@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"github.com/stetdb/stet/internal/decide"
 	"github.com/stetdb/stet/internal/decide/jev"
 	"github.com/stetdb/stet/internal/gate"
+	"github.com/stetdb/stet/internal/lines"
 	"github.com/stetdb/stet/internal/proxy"
 	"github.com/stetdb/stet/internal/store"
 	"github.com/stetdb/stet/internal/undo"
@@ -28,7 +30,8 @@ import (
 const usage = `usage: stet <command> [flags]
 
 commands:
-  proxy      run the pgwire proxy (stet proxy -config stet.yaml)
+  proxy      run the pgwire proxy (stet proxy -config stet.yaml [-decisions auto|on|off]);
+             -decisions prints a line per judged write on standard output (auto: only on a terminal)
   undo-sql   print the SQL a table owner runs to capture undo.tables (stet undo-sql -config stet.yaml [-drop]),
              or with -grant <role> the grants that let a role review and undo
   bench-jev  time single Jev calls (needs TYPESAFE_API_KEY)
@@ -63,8 +66,13 @@ func runProxy(args []string) error {
 	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
 	path := fs.String("config", "stet.yaml", "config file")
 	verbose := fs.Bool("v", false, "debug logging")
+	decisions := fs.String("decisions", "auto", "print a line per judged write on standard output: auto (only on a terminal), on or off")
 	fs.Parse(args)
 
+	show, err := decisionsOn(*decisions, os.Stdout)
+	if err != nil {
+		return err
+	}
 	cfg, err := config.Load(*path)
 	if err != nil {
 		return err
@@ -81,7 +89,32 @@ func runProxy(args []string) error {
 	if err != nil {
 		return err
 	}
-	return run(ctx, cfg, ln, log)
+	var out io.Writer
+	if show {
+		out = os.Stdout
+	}
+	return runWith(ctx, cfg, ln, log, out)
+}
+
+// decisionsOn reports whether stet proxy prints decision lines: flag is
+// auto, on or off; auto means only when out is a character device.
+func decisionsOn(flag string, out *os.File) (bool, error) {
+	switch flag {
+	case "on":
+		return true, nil
+	case "off":
+		return false, nil
+	case "auto":
+		if out == nil {
+			return false, nil
+		}
+		fi, err := out.Stat()
+		if err != nil {
+			return false, nil
+		}
+		return fi.Mode()&os.ModeCharDevice != 0, nil
+	}
+	return false, fmt.Errorf("-decisions: %q must be auto, on or off", flag)
 }
 
 // onGate, when set, is called by run with the gate it opened (nil when there
@@ -95,6 +128,14 @@ var onGate func(*gate.Gate)
 // with undo, the purge of old change records, waiting for a delete in
 // progress; then Stet's own pool.
 func run(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog.Logger) error {
+	return runWith(ctx, cfg, ln, log, nil)
+}
+
+// runWith is run with decision lines written to out; nil: none. The lines
+// are told by the gate once a decision was recorded (or failed to be), and
+// queued for out without waiting for it (rule 1: the output is not part of
+// judging). The start banner is the first line, queued as soon as run is about to serve.
+func runWith(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog.Logger, out io.Writer) error {
 	g, closeGate, err := openGate(ctx, cfg, log)
 	if err != nil {
 		ln.Close()
@@ -103,8 +144,21 @@ func run(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog.Log
 	if onGate != nil {
 		onGate(g)
 	}
-	// Deferred so it runs last, once the proxy's Close below has returned.
-	defer closeGate()
+	var lw *lines.Writer
+	if out != nil {
+		lw = lines.NewWriter(out)
+		if g != nil {
+			g.Decided = func(d *store.Decision) { lw.Offer(lines.Format(d, time.Local)) }
+		}
+	}
+	// Deferred so it runs last, once the proxy's Close below has returned; the
+	// lines' writer closes after the gate, which tells it of its last decisions.
+	defer func() {
+		closeGate()
+		if lw != nil {
+			lw.Close()
+		}
+	}()
 
 	var pg proxy.Gate
 	if g != nil {
@@ -123,6 +177,9 @@ func run(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog.Log
 	for _, w := range transportWarnings(cfg) {
 		log.Warn(w)
 	}
+	if lw != nil {
+		lw.Offer(startBanner(cfg, ln.Addr())) // queued like the lines: a stuck output must not stop the start
+	}
 	log.Info("stet proxy listening", "listen", ln.Addr(), "upstream", cfg.UpstreamAddr(),
 		"mode", cfg.Mode, "agent_roles", cfg.AgentRoles, "gated_tables", len(cfg.Tables), "model", cfg.Model.Adapter)
 	err = srv.Serve(ln)
@@ -133,6 +190,19 @@ func run(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog.Log
 	stop()
 	<-closed
 	return err
+}
+
+// startBanner is the first line decisions are printed under.
+func startBanner(cfg *config.Config, addr net.Addr) string {
+	tables := fmt.Sprintf("%d tables", len(cfg.Tables))
+	if len(cfg.Tables) == 1 {
+		tables = "1 table"
+	}
+	mode := "(shadow: nothing is blocked)"
+	if cfg.Mode == config.ModeEnforce {
+		mode = "(enforce)"
+	}
+	return fmt.Sprintf("stet: watching %s on %s %s", tables, addr, mode)
 }
 
 // openGate opens Stet's pool, brings the stet schema up to date, checks the

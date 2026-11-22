@@ -450,7 +450,7 @@ func TestUndoEndToEnd(t *testing.T) {
 	for _, w := range writes {
 		mustExec(t, agent, w)
 	}
-	ds := decisionsOn(t, pool, table, len(writes), r.log)
+	ds := decisionsRecorded(t, pool, table, len(writes), r.log)
 	if err := r.stop(t); err != nil {
 		t.Fatalf("run = %v, want nil", err)
 	}

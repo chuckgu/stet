@@ -82,6 +82,12 @@ type Gate struct {
 	stateRead func(table string)
 
 	warnedRoles sync.Map // client roles Stet could not assume, logged once each
+
+	// Decided, when set, is called with each decision once the gate has tried
+	// to record it, whether or not the insert succeeded. Set it before the gate
+	// is handed to the proxy. It runs where the write was judged, so it must
+	// not block, and it must not keep or change d.
+	Decided func(d *store.Decision)
 }
 
 type named struct {
@@ -675,6 +681,9 @@ func (g *Gate) judge(p *pending, o proxy.Outcome) {
 	cancel()
 	if err != nil {
 		g.log.Error("decision not recorded", "id", d.ID, "table", d.TargetTable, "err", err)
+	}
+	if g.Decided != nil {
+		g.Decided(d)
 	}
 	g.settleHeld(p, o)
 }

@@ -1277,3 +1277,55 @@ func TestBlockedAnswersAndLogs(t *testing.T) {
 		t.Errorf("%d decisions recorded for the session, want none", n)
 	}
 }
+
+func TestDecidedIsToldOfEachDecision(t *testing.T) {
+	e := setup(t, calm())
+	e.seed(t)
+	var mu sync.Mutex
+	var told []store.Decision
+	e.gate.Decided = func(d *store.Decision) {
+		mu.Lock()
+		defer mu.Unlock()
+		told = append(told, *d)
+	}
+	conn := e.connect(t, "a")
+	mustExec(t, conn, "update "+e.table+" set title = 'CTO' where id = 1")
+	mustExec(t, conn, "update "+e.table+" set title = 'CEO' where id = 2")
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		n := len(told)
+		mu.Unlock()
+		if n >= 2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(told) != 2 {
+		t.Fatalf("Decided was called %d times, want 2", len(told))
+	}
+	rows, err := e.admin.Query(context.Background(),
+		"select id::text, verdict from stet.decisions where target_table = $1", e.table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorded := map[string]string{}
+	for rows.Next() {
+		var id, verdict string
+		if err := rows.Scan(&id, &verdict); err != nil {
+			t.Fatal(err)
+		}
+		recorded[id] = verdict
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range told {
+		if v, ok := recorded[d.ID]; !ok || v != string(d.Verdict) {
+			t.Errorf("told of %s %s; recorded %q (found %v)", d.ID, d.Verdict, v, ok)
+		}
+	}
+}
