@@ -541,12 +541,28 @@ func resolveUndo(ru *rawUndo, tables map[string]Table, fail func(string, ...any)
 // logged-in session, to the wrong party. It sees only what the file alone
 // shows. Its errors never quote an address.
 func (c *Config) checkCustody(hasListenTLS, upstreamRead bool, fail func(string, ...any)) {
-	if upstreamRead && !LoopbackHost(hostOf(c.UpstreamAddr())) && c.UpstreamTransport() != TransportVerified {
-		fail("upstream: with agents.credentials the server must be verified, or stet could hand a database password to whoever answers; use sslmode=verify-full (and sslrootcert=<CA file> when the server's CA is not a public one)")
+	if upstreamRead && !LoopbackHost(hostOf(c.UpstreamAddr())) && !c.upstreamVerifiedForCustody() {
+		fail("upstream: with agents.credentials the server must be verified, or stet could hand a database password to whoever answers; use sslmode=verify-full, or verify-ca with sslrootcert=<CA file>")
 	}
 	if c.Listen != "" && !LoopbackHost(hostOf(c.Listen)) && !hasListenTLS {
 		fail("listen: with agents.credentials a listen address that is not loopback needs listen_tls: on a plaintext connection whoever sits in between can take over a session once the agent has logged in")
 	}
+}
+
+// upstreamVerifiedForCustody reports whether the leg to upstream checks the
+// server well enough to send it a password: verify-full (the chain and the
+// host name), or verify-ca or require with an sslrootcert of its own (the
+// chain, against that CA). verify-ca without sslrootcert checks the chain
+// alone against the system's roots, which any publicly trusted certificate
+// passes, whatever its name; libpq refuses that combination, pgx takes it.
+// Read from UpstreamTLS as pgconn set it up: verify-full leaves
+// InsecureSkipVerify off; verify-ca, and require with sslrootcert, turn it on
+// and verify the chain themselves against RootCAs, nil without sslrootcert.
+func (c *Config) upstreamVerifiedForCustody() bool {
+	if c.UpstreamTransport() != TransportVerified {
+		return false
+	}
+	return !c.UpstreamTLS.InsecureSkipVerify || c.UpstreamTLS.RootCAs != nil
 }
 
 func hostOf(addr string) string {

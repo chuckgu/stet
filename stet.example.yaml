@@ -17,8 +17,8 @@ mode: shadow                 # shadow | enforce
 # 파일이 있는 디렉터리에 대해 읽는다. 에이전트 계정은 그 파일의 계정들이라 roles는 적지 않아도 되고(enforce에서도),
 # 적으면 파일의 계정들과 같아야 한다. 파일에 없는 계정은 Stet을 거쳐 로그인하지 못한다. upstream의 계정은 파일에
 # 넣을 수 없다. 파일은 Stet을 돌리는 사용자의 것이면 0600, root의 것이면(Stet이 root가 아닐 때) 0640까지만 받는다.
-# 보관을 켜면 upstream의 호스트가 루프백이 아닐 때 서버를 확인해야 하고(verify-full, verify-ca, sslrootcert가
-# 있는 require), listen이 루프백이 아니면 listen_tls가 있어야 한다. 어기면 시작하지 않는다. 토큰과 파일에 둔
+# 보관을 켜면 upstream의 호스트가 루프백이 아닐 때 서버를 확인해야 하고(verify-full, 또는 sslrootcert를 준
+# verify-ca나 require), listen이 루프백이 아니면 listen_tls가 있어야 한다. 어기면 시작하지 않는다. 토큰과 파일에 둔
 # 비밀번호를 바꾸거나 계정을 지우는 것은 다시 띄우지 않고 다음 로그인부터 적용되고, 계정을 더하는 것은 다시 띄워야
 # 적용된다.
 # agents:

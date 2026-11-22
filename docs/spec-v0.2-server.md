@@ -238,7 +238,8 @@ stet agent list     [-config stet.yaml]
 - `listen_tls`는 `cert`와 `key`가 모두 있어야 한다.
 - `agents.credentials`가 있으면(보관을 켜면):
   - 에이전트 계정은 자격 증명 파일의 계정들이다. `agents.roles`는 적지 않아도 된다(enforce에서도. 보관이 없으면 enforce는 `agents.roles`가 필수다). 적었으면 파일의 계정들과 같아야 한다. 다르면 시작하지 않고 어느 계정이 한쪽에만 있는지 말한다(`agents.roles and the credentials file name different accounts: only in agents.roles: […]; only in the file: […]`). 섀도와 enforce 모두 같다. 이 비교는 시작할 때 한다.
-  - **업스트림의 서버를 확인해야 한다.** `upstream`의 호스트가 루프백이 아니면 `sslmode`가 `verify-ca`, `verify-full`, 또는 `sslrootcert`가 있는 `require`여야 한다. 아니면 시작하지 않는다(`upstream: with agents.credentials the server must be verified, or stet could hand a database password to whoever answers; use sslmode=verify-full (and sslrootcert=<CA file> when the server's CA is not a public one)`). 확인하지 않는 연결에서는 중간에 선 누군가가 비밀번호를 평문으로 달라고 할 수 있고, 클라이언트는 그것을 따른다. 첫 부분의 경고를 여기서는 거부로 올린다.
+  - **업스트림의 서버를 확인해야 한다.** `upstream`의 호스트가 루프백이 아니면 `sslmode`가 `verify-full`이거나, `sslrootcert`를 준 `verify-ca`나 `require`여야 한다. 아니면 시작하지 않는다(`upstream: with agents.credentials the server must be verified, or stet could hand a database password to whoever answers; use sslmode=verify-full, or verify-ca with sslrootcert=<CA file>`). 확인하지 않는 연결에서는 중간에 선 누군가가 비밀번호를 평문으로 달라고 할 수 있고, 클라이언트는 그것을 따른다. 첫 부분의 경고를 여기서는 거부로 올린다.
+  - `sslrootcert` 없는 `verify-ca`는 받지 않는다(마지막 검토 뒤에 고쳤다. 처음에는 받았다). 그것은 시스템의 루트 인증서에 대해 발급자만 확인하고 호스트 이름은 보지 않는다. 공개 CA가 내준 인증서를 가진 누구나 통과해 비밀번호를 받을 수 있다. libpq는 이 조합을 거부하고 pgx는 받는다. 시작 줄의 `upstream_tls`는 이 조합도 `verified`로 적는다(첫 부분의 구분 그대로다).
   - **`listen`이 루프백이 아니면 `listen_tls`가 있어야 한다.** 없으면 시작하지 않는다(`listen: with agents.credentials a listen address that is not loopback needs listen_tls: on a plaintext connection whoever sits in between can take over a session once the agent has logged in`). 토큰은 SCRAM이라 평문에서도 드러나지 않지만, 로그인이 끝난 평문 연결에는 중간에 선 누군가가 문장을 끼워 넣을 수 있다. 그것은 토큰 없이 세션을 얻는 것이다(1장).
 
 **시작할 때** (`stet proxy`). 이 순서다.
@@ -308,7 +309,7 @@ stet agent list     [-config stet.yaml]
 | 게이트 | 보관을 켠 세션의 쓰기가 섀도에서 기록되고 enforce에서 막힌다. `login_role`이 그 계정이다. 승인된 쓰기가 실행된다. 낡은 쓰기 탐지가 돈다 |
 | 다시 읽기 | `stet agent token` 뒤에 예전 토큰은 다음 로그인에서 거절되고 열린 세션은 계속 간다. 다시 띄우지 않는다. 띄운 뒤에 더한 계정은 받지 않는다 |
 | 파일 | 권한 규칙의 줄마다(자기 파일 `0600`, `0640`은 거부, 누구나 읽는 파일은 거부. root 소유의 경우는 판단하는 자리의 단위 테스트). `password_env`. 반쯤 쓰인 파일이 남지 않는다. 바꿔 쓴 뒤에 권한이 그대로다 |
-| 확인 안 된 업스트림 | 보관을 켜고 원격 `sslmode=require`(루트 없음)면 시작하지 않는다 |
+| 확인 안 된 업스트림 | 보관을 켜고 원격 `sslmode=require`나 `verify-ca`(루트 없음)면 시작하지 않는다 |
 | 평문 `listen` | 보관을 켜고 루프백이 아닌 `listen`에 `listen_tls`가 없으면 시작하지 않는다 |
 | 보관 없는 양쪽 TLS | SCRAM 계정이 기본 설정의 `psql`로는 로그인하지 못하고 `channel_binding=disable`로는 로그인한다. md5 계정은 로그인한다 |
 | 비밀 | 로그인 성공·실패, 업스트림 실패, `stet agent`의 모든 출력과 로그에 토큰·검증값·비밀번호가 없다(토큰을 만든 그 출력 한 번은 뺀다) |
@@ -341,7 +342,7 @@ stet agent list     [-config stet.yaml]
 - [x] `latency_test.go`의 예산을 지킨다. 로그인에 드는 시간을 적는다. `TestLoginLatencyBudget`(internal/proxy, `-race`): 보관을 켠 세션의 `select 1` 2,000회 왕복에서 더해진 p95가 45.6µs(Task 6), 44.1µs(2026-11-23 다시 잼)다. 예산은 2ms다. 로그인 한 번(21번의 중앙값)은 직접 TLS로 8.5ms, 양쪽이 TLS인 Stet을 거쳐 17.8ms(Task 6), 다시 잰 값은 8.7ms와 18.1ms다.
 - [x] `docs/deploy.md`의 두 가지 놓는 법(바이너리, Docker 이미지)을 처음부터 끝까지 그대로 따라 해서 토큰으로 붙은 에이전트의 쓰기가 판단되는 것을 본다. 2026-11-23, macOS에서 `go build`한 바이너리와 이 기기에서 빌드한 이미지(Docker Desktop 28.0.1)로 했다. 이 기기에 맞춰 바꾼 것(서비스 계정·`sudo`·systemd 없이 이 기기의 사용자로, 빈 디렉터리, 포트, 인증서의 이름, 같은 기기의 시험 서버)은 deploy 11장·12장의 "확인한 것"에 적었다. 처음 따라 했을 때 여러 행의 쓰기가 `unsupported`(`not_single_row`)로 기록됐다. Stet의 계정이 에이전트 역할의 구성원이 아니었다(5장). 문서의 "필요한 것"에 `GRANT`를 더하고 처음부터 다시 했다. 이미지와 컨테이너, 데이터베이스와 역할은 지웠다.
 - [ ] (확인하지 못한다) `psql`과 pgx 밖의 클라이언트(JDBC, psycopg, node-postgres)의 로그인. 이 기기에 있는 것만 해 보고, 못 한 것은 적는다. 이 기기에 있던 pgjdbc 42.7.14(Java 17.0.21)와 node-postgres 8.17.2(Node 24.22.2)는 `sslmode=verify-full`과 Stet의 인증서로, 토큰만으로 그 계정의 세션을 얻었고(`pg_stat_ssl.ssl` 참), 틀린 토큰에는 `28P01`을 받았다. psycopg(`psycopg`, `psycopg2`)는 이 기기에 없어 해 보지 않았다. 그래서 체크하지 않는다.
-- [ ] (계정이 있어야 한다) Neon, Supabase, RDS 가운데 하나에서 `stet agent add`부터 판단까지 된다. 하지 않았다. 소유자가 로컬 TLS 서버로 먼저 확인하고 매니지드 프로젝트는 뒤에 시험하기로 했다(2026-11-22). 원격 호스트로 가는 길(`verify-ca`로 서버를 확인하는 업스트림)은 컨테이너에서 `host.docker.internal`로 로컬 시험 서버에 붙어서만 봤다.
+- [ ] (계정이 있어야 한다) Neon, Supabase, RDS 가운데 하나에서 `stet agent add`부터 판단까지 된다. 하지 않았다. 소유자가 로컬 TLS 서버로 먼저 확인하고 매니지드 프로젝트는 뒤에 시험하기로 했다(2026-11-22). 원격 호스트로 가는 길(`sslrootcert`를 준 `verify-ca`로 서버를 확인하는 업스트림)은 컨테이너에서 `host.docker.internal`로 로컬 시험 서버에 붙어서만 봤다.
 
 ## 15. 정한 것과 남긴 것
 
@@ -352,7 +353,7 @@ stet agent list     [-config stet.yaml]
 - 신원은 DB 계정 그대로다. 계정 하나에 토큰 하나다.
 - 에이전트는 SCRAM으로 Stet에 로그인한다. 클라이언트를 고치지 않는다.
 - 보관을 켠 Stet은 파일에 있는 계정만 받는다.
-- 보관을 켜면 원격 업스트림의 서버 확인은 필수다. 루프백이 아닌 `listen`의 TLS도 필수다.
+- 보관을 켜면 원격 업스트림의 서버 확인은 필수다(`verify-full`, 또는 `sslrootcert`를 준 `verify-ca`나 `require`). 루프백이 아닌 `listen`의 TLS도 필수다.
 - 자격 증명 파일의 권한은 PostgreSQL의 키 파일 규칙을 따른다. `stet agent`는 바꿔 쓸 때 소유자와 권한을 그대로 둔다.
 - 환경 변수에 둔 비밀번호는 다시 띄워야 바뀐다. 다시 읽는 파일 자리(`password_file`)는 만들지 않는다.
 - 클라이언트 쪽 인증서는 운영자가 준다.
@@ -376,6 +377,10 @@ stet agent list     [-config stet.yaml]
 - 3장: 바뀐 인증서를 다시 읽지 못할 때마다 남기고, 반쯤 쓰인 짝은 쓰던 인증서를 쓴다. 보관 없이 양쪽이 TLS일 때의 경고는 `sslmode`가 `disable`이 아니면 나온다. `listen_tls`가 있으면 루프백이 아닌 `listen`의 "암호화되지 않는다" 경고는 없다. 설계의 "돌려 보지 않았다"는 돌려서 확인했다(`TestRelayWithTLSOnBothSides`).
 - 9장: 거절의 갈래에 `exchange failed`를 더했다. 교환 도중에 끊은 클라이언트와 복제 접속의 거절은 디버그에만 남는다.
 - 5장·deploy: 보관을 켜면 Stet의 계정과 에이전트 계정이 다르므로, 여러 행의 쓰기를 재려면 `GRANT <에이전트> TO <Stet 계정>`이 섀도에서도 필요하다(지금의 동작이다. deploy를 따라 하다 문서에 더했다).
+
+**마지막 검토 뒤에 고친 것** (2026-11-23. 해당 장에 옮겨 적었다)
+
+- 8장: 보관을 켜면 원격 업스트림은 `verify-full`이거나 `sslrootcert`를 준 `verify-ca`나 `require`여야 한다. `sslrootcert` 없는 `verify-ca`는 받지 않는다. 거부의 문구도 그렇게 바꿨다.
 
 **남긴 것**
 

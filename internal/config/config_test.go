@@ -1021,15 +1021,19 @@ func TestCustodyNeedsAVerifiedUpstream(t *testing.T) {
 	clearPGEnv(t)
 	root, _ := writeCert(t, t.TempDir())
 	const remote = "postgres://app:s3cret-pw@db.example.com:5432/crm"
-	const want = "upstream: with agents.credentials the server must be verified"
+	const want = "upstream: with agents.credentials the server must be verified, or stet could hand a database password " +
+		"to whoever answers; use sslmode=verify-full, or verify-ca with sslrootcert=<CA file>"
 	for query, ok := range map[string]bool{
-		"?sslmode=disable":                       false,
-		"":                                       false,
-		"?sslmode=prefer":                        false,
-		"?sslmode=require":                       false,
-		"?sslmode=verify-full":                   true,
-		"?sslmode=verify-ca&sslrootcert=" + root: true,
-		"?sslmode=require&sslrootcert=" + root:   true,
+		"?sslmode=disable":     false,
+		"":                     false,
+		"?sslmode=prefer":      false,
+		"?sslmode=require":     false,
+		"?sslmode=verify-full": true,
+		// verify-ca checks the chain alone: against the system's roots, any
+		// publicly trusted certificate passes.
+		"?sslmode=verify-ca":                       false,
+		"?sslmode=verify-ca&sslrootcert=" + root:   true,
+		"?sslmode=require&sslrootcert=" + root:     true,
 		"?sslmode=verify-full&sslrootcert=" + root: true,
 	} {
 		c, err := Parse(custodyYAML("127.0.0.1:6432", remote+query, ""))

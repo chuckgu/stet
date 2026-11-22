@@ -40,7 +40,7 @@
 - Stet은 에이전트가 닿을 수 있는 주소에서 받는다(`listen`, 보통 `0.0.0.0:6432`나 서버의 사설 주소). 루프백이 아닌 주소로 받으면 `listen_tls`가 있어야 한다. 없으면 시작하지 않는다(4장).
 - `listen_tls`가 있으면, 루프백이 아닌 주소에서 TLS 없이 세션을 시작하려는 클라이언트는 `FATAL`(SQLSTATE `28000`, `stet: this server requires TLS; connect with sslmode=require or stronger`)을 받는다. 루프백(`127.0.0.1`, `::1`)에서 온 접속은 평문도 받는다. 취소 요청은 평문으로도 받는다(libpq 16까지는 취소를 늘 평문으로 보낸다).
 - **Stet 앞에 같은 기기의 TCP 전달자를 두지 않는다.** 사이드카 프록시, `ssh -L`, `kubectl port-forward`처럼 같은 기기에서 연결을 넘겨주는 것을 Stet 앞에 두면, 모든 클라이언트가 루프백에서 온 것으로 보여 평문도 받는다.
-- Stet은 DB에 TLS로 붙고 서버를 확인해야 한다. `upstream`의 호스트가 루프백이 아니면 `sslmode`가 `verify-full`, `verify-ca`, 또는 `sslrootcert`가 있는 `require`여야 한다. 아니면 시작하지 않는다(4장). 확인하지 않는 연결에서는 중간에 선 누군가가 비밀번호를 평문으로 달라고 할 수 있고, Stet의 DB 클라이언트(pgx)는 그것을 따른다.
+- Stet은 DB에 TLS로 붙고 서버를 확인해야 한다. `upstream`의 호스트가 루프백이 아니면 `sslmode`가 `verify-full`이거나, `sslrootcert`를 준 `verify-ca`나 `require`여야 한다. 아니면 시작하지 않는다(4장). 확인하지 않는 연결에서는 중간에 선 누군가가 비밀번호를 평문으로 달라고 할 수 있고, Stet의 DB 클라이언트(pgx)는 그것을 따른다.
 - 에이전트가 DB에 직접 닿지 못하게 막을 수 있으면 막는다(방화벽, `pg_hba.conf`). 매니지드 Postgres처럼 막을 수 없으면, 에이전트가 진짜 비밀번호를 모르게 하는 것(8장)이 막는 길이다.
 - 연결 풀러를 거친 DB 주소는 지금처럼 지원하지 않는다(quickstart 10장).
 
@@ -105,10 +105,10 @@ tables:
 
 **보관이 요구하는 것 둘.** 설정을 읽을 때 본다. 어기면 시작하지 않는다.
 
-- `upstream`의 호스트가 루프백이 아니면 서버를 확인해야 한다(`verify-full`, `verify-ca`, `sslrootcert`가 있는 `require`): `upstream: with agents.credentials the server must be verified, or stet could hand a database password to whoever answers; use sslmode=verify-full (and sslrootcert=<CA file> when the server's CA is not a public one)`
+- `upstream`의 호스트가 루프백이 아니면 서버를 확인해야 한다(`verify-full`, 또는 `sslrootcert`를 준 `verify-ca`나 `require`): `upstream: with agents.credentials the server must be verified, or stet could hand a database password to whoever answers; use sslmode=verify-full, or verify-ca with sslrootcert=<CA file>`
 - `listen`이 루프백이 아니면 `listen_tls`가 있어야 한다: `listen: with agents.credentials a listen address that is not loopback needs listen_tls: on a plaintext connection whoever sits in between can take over a session once the agent has logged in`
 
-`verify-full`은 서버 인증서의 발급자와 호스트 이름을 확인한다. `verify-ca`(그리고 `sslrootcert`가 있는 `require`)는 발급자만 확인한다. 인증서가 접속하는 호스트의 이름을 담고 있으면 `verify-full`을 쓴다. 이름이 맞지 않는 경우(예: 같은 기기의 DB에 컨테이너에서 `host.docker.internal`로 붙는데 인증서에는 `localhost`만 있을 때)에만 `verify-ca`를 쓴다.
+`verify-full`은 서버 인증서의 발급자와 호스트 이름을 확인한다(`sslrootcert`가 없으면 시스템의 루트 인증서로). `verify-ca`(그리고 `sslrootcert`가 있는 `require`)는 `sslrootcert`로 준 CA에 대해 발급자만 확인한다. `sslrootcert` 없는 `verify-ca`는 받지 않는다. 시스템의 루트 인증서에 대해 발급자만 보면 공개 CA가 내준 인증서를 가진 누구나 통과하기 때문이다. 인증서가 접속하는 호스트의 이름을 담고 있으면 `verify-full`을 쓴다. 이름이 맞지 않는 경우(예: 같은 기기의 DB에 컨테이너에서 `host.docker.internal`로 붙는데 인증서에는 `localhost`만 있을 때)에만 `verify-ca`를 쓴다.
 
 **시작할 때**(`stet proxy`) 보관에 대해 하는 것:
 
@@ -469,7 +469,7 @@ docker run --rm -v /srv/stet:/etc/stet stet:local agent token -config /etc/stet/
 
 계정을 더한 뒤에는 `docker restart stet`.
 
-**확인한 것** (2026-11-23, macOS의 Docker Desktop 28.0.1, 이 기기에서 빌드한 이미지). "필요한 것"의 `GRANT`부터 이 장의 명령을 그대로 쳤다(`add`는 `printf … | docker run --rm -i …`의 형식으로). 달랐던 것: 태그는 `stet:deploy-test`, 컨테이너 이름은 `dp-stet`, 디렉터리는 `/srv/stet` 대신 빈 디렉터리였고, `sudo install -o 65532 -g 65532` 대신 이 기기의 사용자로 파일을 놓았다. 포트는 `127.0.0.1:16433`에만 열었고, `-decisions on`을 더했다. `upstream`은 같은 기기의 시험 서버를 `host.docker.internal`로 가리켜 `verify-ca`로 확인했다(그 서버의 인증서는 `localhost`와 `127.0.0.1`만 담는다). 토큰으로 붙은 `psql`의 쓰기가 판단되어 그 계정으로 기록됐고, 평문 접속은 `28000`으로 거절됐다(`reason="tls required"`). 다른 컨테이너에서 돌린 `stet agent token` 뒤에, 읽기 전용으로 마운트한 채 도는 컨테이너가 다시 띄우지 않고(시작 시각과 재시작 수가 그대로) 예전 토큰을 거절하고 새 토큰을 받았다.
+**확인한 것** (2026-11-23, macOS의 Docker Desktop 28.0.1, 이 기기에서 빌드한 이미지). "필요한 것"의 `GRANT`부터 이 장의 명령을 그대로 쳤다(`add`는 `printf … | docker run --rm -i …`의 형식으로). 달랐던 것: 태그는 `stet:deploy-test`, 컨테이너 이름은 `dp-stet`, 디렉터리는 `/srv/stet` 대신 빈 디렉터리였고, `sudo install -o 65532 -g 65532` 대신 이 기기의 사용자로 파일을 놓았다. 포트는 `127.0.0.1:16433`에만 열었고, `-decisions on`을 더했다. `upstream`은 같은 기기의 시험 서버를 `host.docker.internal`로 가리켜 `sslrootcert`를 준 `verify-ca`로 확인했다(그 서버의 인증서는 자기 서명이고 `localhost`와 `127.0.0.1`만 담는다). 토큰으로 붙은 `psql`의 쓰기가 판단되어 그 계정으로 기록됐고, 평문 접속은 `28000`으로 거절됐다(`reason="tls required"`). 다른 컨테이너에서 돌린 `stet agent token` 뒤에, 읽기 전용으로 마운트한 채 도는 컨테이너가 다시 띄우지 않고(시작 시각과 재시작 수가 그대로) 예전 토큰을 거절하고 새 토큰을 받았다.
 
 **확인하지 못한 것.** Docker Desktop(macOS)에서는 바인드 마운트한 파일이 컨테이너 안에서 컨테이너를 돌린 사용자의 것으로 보였다(호스트에서 이 기기의 사용자 파일이 컨테이너 안에서는 uid 65532의 것). 그래서 위의 소유자 설정이 맞는지, 틀리면 Stet이 거부하는지는 이 기기에서 시험되지 않는다. Linux의 Docker Engine에서는 돌려 보지 않았다. `-it`로 묻는 형식도 돌려 보지 않았다(묻는 동작은 테스트로만 확인했다).
 
