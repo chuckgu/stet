@@ -35,25 +35,33 @@ const sslQuery = "select ssl from pg_stat_ssl where pid = pg_backend_pid()"
 // password goes in PGPASSWORD. It returns what psql printed to stdout.
 func runPsql(t *testing.T, addr, user, password, query string) (string, error) {
 	t.Helper()
-	psql, err := exec.LookPath("psql")
-	if err != nil {
-		t.Skip("psql is not on PATH; the test of libpq through TLS to the server cannot run")
-	}
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return psqlWith(t, fmt.Sprintf("host=%s port=%s user=%s dbname=stet_test sslmode=disable", host, port, user),
+		query, "PGPASSWORD="+password)
+}
+
+// psqlWith runs psql with conninfo (key/value pairs or a URI) and the
+// environment stripped of its PG* variables, with env added. It returns what
+// psql printed to stdout.
+func psqlWith(t *testing.T, conninfo, query string, env ...string) (string, error) {
+	t.Helper()
+	psql, err := exec.LookPath("psql")
+	if err != nil {
+		t.Skip("psql is not on PATH; the test of libpq through stet cannot run")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, psql, "-X", "-w", "-At", "-c", query,
-		fmt.Sprintf("host=%s port=%s user=%s dbname=stet_test sslmode=disable", host, port, user))
+	cmd := exec.CommandContext(ctx, psql, "-X", "-w", "-At", "-c", query, conninfo)
 	cmd.Env = []string{} // never nil, which would pass the whole environment
 	for _, kv := range os.Environ() {
 		if !strings.HasPrefix(kv, "PG") {
 			cmd.Env = append(cmd.Env, kv)
 		}
 	}
-	cmd.Env = append(cmd.Env, "PGPASSWORD="+password)
+	cmd.Env = append(cmd.Env, env...)
 	var out, errOut bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errOut
 	if err := cmd.Run(); err != nil {

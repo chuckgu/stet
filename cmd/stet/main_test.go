@@ -279,6 +279,12 @@ func start(t *testing.T, cfg *config.Config) *running {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return startOn(t, cfg, ln)
+}
+
+// startOn is start serving on ln.
+func startOn(t *testing.T, cfg *config.Config, ln net.Listener) *running {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &running{addr: ln.Addr().String(), log: &syncBuffer{}, cancel: cancel, done: make(chan struct{})}
 	log := slog.New(slog.NewTextHandler(r.log, nil))

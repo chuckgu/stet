@@ -30,6 +30,9 @@ import (
 const usage = `usage: stet <command> [flags]
 
 commands:
+  init       read the database and write a shadow-mode config for stet proxy (stet init [-config stet.yaml]
+             [-listen 127.0.0.1:6432] [-tables a,b,c] [-yes] [-force] [<database address>]);
+             the address defaults to DATABASE_URL, which is safer: an argument stays in the shell's history
   proxy      run the pgwire proxy (stet proxy -config stet.yaml [-decisions auto|on|off]);
              -decisions prints a line per judged write on standard output (auto: only on a terminal)
   undo-sql   print the SQL a table owner runs to capture undo.tables (stet undo-sql -config stet.yaml [-drop]),
@@ -47,6 +50,8 @@ func main() {
 
 	var err error
 	switch os.Args[1] {
+	case "init":
+		err = runInit(os.Args[2:], os.Stdin, os.Stdout, terminal(os.Stdin), os.Getenv)
 	case "proxy":
 		err = runProxy(os.Args[2:])
 	case "undo-sql":
@@ -108,16 +113,19 @@ func decisionsOn(flag string, out *os.File) (bool, error) {
 	case "off":
 		return false, nil
 	case "auto":
-		if out == nil {
-			return false, nil
-		}
-		fi, err := out.Stat()
-		if err != nil {
-			return false, nil
-		}
-		return fi.Mode()&os.ModeCharDevice != 0, nil
+		return terminal(out), nil
 	}
 	return false, fmt.Errorf("-decisions: %q must be auto, on or off", flag)
+}
+
+// terminal reports whether f is a character device, which stet takes for a
+// terminal (plan correction P7).
+func terminal(f *os.File) bool {
+	if f == nil {
+		return false
+	}
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
 
 // onGate, when set, is called by run with the gate it opened (nil when there
