@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/stetdb/stet/internal/decide"
 	"github.com/stetdb/stet/internal/store"
@@ -15,6 +16,14 @@ import (
 const (
 	verdictWidth = 12
 	maxStatement = 80
+	// statementScan is how many bytes of a statement statement reads. 80
+	// runes are at most 320 bytes of UTF-8; the rest leaves room for the
+	// white space and unsafe characters that collapse into one space
+	// (indentation, line breaks). So a statement of megabytes costs the
+	// judging goroutine no more than one of 4 KiB. One longer than that
+	// whose first 4 KiB collapse to fewer than 80 characters is shown as
+	// those characters and "…".
+	statementScan = 4096
 )
 
 var shadowNames = map[string]string{
@@ -169,10 +178,24 @@ func plain(s string) string {
 
 // statement makes s one line: unsafe characters and runs of white space
 // become one space, the ends are trimmed, and it is cut to maxStatement runes.
+// Only its first statementScan bytes are read, cut back to the start of a
+// rune.
 func statement(s string) string {
+	cut := len(s) > statementScan
+	if cut {
+		i := statementScan
+		for j := 1; j < utf8.UTFMax && !utf8.RuneStart(s[i]); j++ {
+			i--
+		}
+		s = s[:i]
+	}
 	s = strings.Join(strings.Fields(plain(s)), " ")
-	if r := []rune(s); len(r) > maxStatement {
+	r := []rune(s)
+	switch {
+	case len(r) > maxStatement, cut && len(r) == maxStatement:
 		return string(r[:maxStatement-1]) + "…"
+	case cut:
+		return s + "…"
 	}
 	return s
 }

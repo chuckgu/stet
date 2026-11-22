@@ -1,6 +1,7 @@
 package lines
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -153,6 +154,45 @@ func TestFormatCutsTheStatement(t *testing.T) {
 	}
 	if got := get(k + "한"); got != strings.Repeat("한", 79)+"…" || utf8.RuneCountInString(got) != 80 {
 		t.Errorf("81 hangul: %q", got)
+	}
+}
+
+// allocated is how many bytes a call of f allocates, on average over runs.
+func allocated(runs int, f func()) uint64 {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for range runs {
+		f()
+	}
+	runtime.ReadMemStats(&after)
+	return (after.TotalAlloc - before.TotalAlloc) / uint64(runs)
+}
+
+// A statement of megabytes is cut as a short one is, from a prefix of
+// statementScan bytes: what making it one line costs on the judging
+// goroutine does not grow with the statement.
+func TestStatementWorkDoesNotGrowWithTheStatement(t *testing.T) {
+	for _, row := range []string{"(1, 'a value'),\n\t", "('한국어 값', 2),\n  "} {
+		head := "insert   into contacts\n values "
+		small := head + strings.Repeat(row, 10)
+		want := string([]rune(strings.Join(strings.Fields(small), " "))[:maxStatement-1]) + "…"
+		for _, size := range []int{1 << 12, 1 << 16, 1 << 24} {
+			big := head + strings.Repeat(row, size/len(row)+1)
+			if got := statement(big); got != want {
+				t.Errorf("%d bytes: statement = %q, want %q", len(big), got, want)
+			}
+			// Cleaning the whole statement would allocate several times its size.
+			if n := allocated(5, func() { statement(big) }); n > 64<<10 {
+				t.Errorf("%d bytes: statement allocates %d bytes a call, want at most 64 KiB", len(big), n)
+			}
+		}
+	}
+
+	// A statement whose prefix collapses to fewer than 80 characters is
+	// shown as those, cut.
+	if got, want := statement("update"+strings.Repeat(" ", statementScan)+"contacts set x = 1"), "update…"; got != want {
+		t.Errorf("statement = %q, want %q", got, want)
 	}
 }
 
