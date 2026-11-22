@@ -14,7 +14,7 @@
   GRANT agent_enricher TO stet;
   ```
 
-  여러 행에 쓰는 쓰기의 영향 측정은 섀도에서도 에이전트의 역할로 돈다. 빠지면 그 쓰기는 `unsupported`(`not_single_row`)로 기록되고 로그에 `impact not measured: Stet's account is not a member of the client's role`이 남는다. enforce에서는 승인된 쓰기도 그 역할로 실행한다(spec-v0.2-enforce 8장). quickstart의 길(계정 하나)에서는 필요 없던 것이다.
+  여러 행에 쓰는 쓰기의 영향 측정은 섀도에서도 에이전트의 역할로 돈다. 빠지면 그 쓰기는 `unsupported`(`not_single_row`)로 기록되고 로그에 `impact not measured: Stet's account is not a member of the client's role`이 남는다. Stet은 시작할 때 섀도에서도 빠진 부여를 경고한다(`Stet's account "stet" is not a member of agent role "agent_enricher": …; fix: GRANT "agent_enricher" TO "stet"`). enforce에서는 승인된 쓰기도 그 역할로 실행한다(spec-v0.2-enforce 8장). quickstart의 길(계정 하나)에서는 필요 없던 것이다.
 
   **이 부여가 Stet의 계정에 주는 것.** Stet의 계정은 그 에이전트 계정으로 `SET ROLE`할 수 있다. 역할을 만들 때의 기본값(`INHERIT`)이면 `SET ROLE` 없이도 그 에이전트 계정의 테이블 권한을 함께 가진다. 둘 다 시험 서버(PostgreSQL 14.18)에서 확인했다. 그 위에 Stet의 계정은 판단 기록이 있는 `stet` 스키마의 소유자다. 그래서 Stet의 계정의 비밀번호(`upstream`의 비밀번호)는 모든 에이전트 계정을 합친 것에 기록을 고칠 수 있는 힘까지 더한 무게다. 어느 에이전트도 그것을 알아서는 안 된다(8장).
 
@@ -327,6 +327,7 @@ host=stet.internal port=6432 dbname=crm user=agent_enricher password=<token> ssl
 | `agent login refused` `account=… remote=… reason=…` | WARN | 거절했다. `reason`은 아래 다섯 가운데 하나다 |
 | `an account of the credentials file cannot log in to the database: its agent's logins are refused until it can` | WARN | 시작할 때의 확인에서 그 계정으로 DB에 로그인하지 못했다. `err`에 갈래가 있다 |
 | `the start ran out of time to log in as these accounts, so they are not checked` | WARN | 시작할 때의 확인이 30초를 넘겼다. 확인하지 못한 계정들을 적는다 |
+| `Stet's account "…" is not a member of agent role "…": …` | WARN | 시작할 때 본 것이다. Stet의 계정에 그 에이전트 계정의 `GRANT`가 없다("필요한 것"). 게이트 대상 테이블이 있을 때 섀도에서도 본다 |
 | `the environment variable for an account's password is empty or not set` | WARN | 시작할 때 `password_env`의 변수가 비었다 |
 | `the credentials file now names an environment variable that was not read when stet started; keeping the password in use until stet restarts` | WARN | 띄운 뒤에 파일의 `password_env`가 시작할 때 읽지 않은 변수로 바뀌었다. 그 계정과 변수마다 한 번 남기고, 다시 띄울 때까지 쓰던 비밀번호를 쓴다 |
 | `the credentials file has no mock_secret: …` | WARN | 손으로 쓴 파일에 `mock_secret`이 없다(5장) |

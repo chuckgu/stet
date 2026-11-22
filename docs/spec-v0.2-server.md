@@ -160,7 +160,7 @@ listen_tls:
 
 **세션과 게이트.** 게이트는 이 세션을 처음부터 인증된 세션으로 본다. 접속 계정은 Stet이 확인했고, 서버도 그 계정으로 인증했다. 서버 프로세스 번호와 세션 설정(시간대, 날짜 형식)은 넘겨받은 값에서 채운다. 그 뒤의 판단, 기록, 한도, 낡은 쓰기 탐지, 되돌리기는 바뀌지 않는다. `stet.decisions`의 `login_role`은 그 계정이다.
 
-**Stet 자신의 연결과 승인된 쓰기의 실행.** 바뀌지 않는다. Stet은 `upstream`의 계정으로 붙고, 승인된 쓰기는 지금처럼 그 연결에서 에이전트 계정으로 바꿔 실행한다. 여러 행에 쓰는 쓰기의 영향 측정도 지금처럼 에이전트의 역할로 하므로, Stet의 계정은 에이전트 계정마다 그 역할의 구성원이어야 한다(`GRANT agent_x TO stet`. spec-v0.2-enforce 8장). 섀도에서도 그렇다. 빠지면 그 쓰기는 `unsupported`(`not_single_row`)로 기록된다. 보관을 켜면 Stet의 계정과 에이전트 계정이 반드시 다르므로(8장), 계정 하나로 도는 quickstart의 길에서 옮겨 오면 이 부여가 새로 필요하다. deploy를 따라 하다 찾았다(14장). 이 부여가 Stet의 계정에 주는 것과 그 비밀번호의 무게는 12장에 있다.
+**Stet 자신의 연결과 승인된 쓰기의 실행.** 바뀌지 않는다. Stet은 `upstream`의 계정으로 붙고, 승인된 쓰기는 지금처럼 그 연결에서 에이전트 계정으로 바꿔 실행한다. 여러 행에 쓰는 쓰기의 영향 측정도 지금처럼 에이전트의 역할로 하므로, Stet의 계정은 에이전트 계정마다 그 역할의 구성원이어야 한다(`GRANT agent_x TO stet`. spec-v0.2-enforce 8장). 섀도에서도 그렇다. 빠지면 그 쓰기는 `unsupported`(`not_single_row`)로 기록되고, 보관을 켠 Stet은 섀도에서도 시작할 때 경고한다(8장). 보관을 켜면 Stet의 계정과 에이전트 계정이 반드시 다르므로(8장), 계정 하나로 도는 quickstart의 길에서 옮겨 오면 이 부여가 새로 필요하다. deploy를 따라 하다 찾았다(14장). 이 부여가 Stet의 계정에 주는 것과 그 비밀번호의 무게는 12장에 있다.
 
 ## 6. 자격 증명 파일
 
@@ -249,7 +249,7 @@ stet agent list     [-config stet.yaml]
 2. 자격 증명 파일의 권한과 모양을 본다(6장). 읽지 못하면 시작하지 않는다(`agents.credentials: …`). 계정이 하나도 없으면 시작하지 않는다(`the credentials file has no account; add one with stet agent add`). `password_env`가 가리키는 변수가 비어 있으면 그 계정을 경고한다. `mock_secret`이 없으면 경고한다.
 3. **Stet 자신의 계정이 파일에 있으면 시작하지 않는다**(진행 중의 판단): `agents.credentials: "<계정>" is Stet's own account (the upstream user)`. 그 계정은 pgconn이 `upstream`을 읽어 정하는 사용자다(주소, `PGUSER`, Stet을 돌리는 사용자). 그 토큰을 가진 쪽은 게이트가 보지 않는 세션을 얻는다. `stet` 스키마의 소유자이고 모든 에이전트 역할의 구성원인 계정이다. 설정 검증의 같은 확인(`agents.roles`의 계정)은 주소에 계정이 적혔을 때만 보므로, 파일의 계정은 여기서 본다. `stet agent add`도 그 계정을 받지 않는다(7장).
 4. `agents.roles`가 있으면 파일의 계정들과 비교한다.
-5. 게이트를 연다. 지금의 에이전트 계정 확인(spec-v0.2-enforce 8장. enforce에서)은 그대로 돈다. 대상이 파일의 계정들이다. 게이트 대상 테이블이 있는데 DB에 닿지 않으면 여기서 곧바로 멈춘다. 그래서 계정마다의 로그인(6)은 게이트를 연 뒤에 한다.
+5. 게이트를 연다. 지금의 에이전트 계정 확인(spec-v0.2-enforce 8장. enforce에서)은 그대로 돈다. 대상이 파일의 계정들이다. 섀도에서도 Stet의 계정이 계정마다 그 역할의 구성원인지는 보고, 아니면 enforce와 같은 문구로 경고한다(`Stet's account "<Stet의 계정>" is not a member of agent role "<계정>": an approved write of that role ends as failed, and its multi-row writes are not measured; fix: GRANT "<계정>" TO "<Stet의 계정>"`. 마지막 검토 뒤에 더했다). 보관을 켜면 두 계정이 반드시 달라서, 이 부여가 없으면 여러 행의 쓰기가 모두 `unsupported`로 기록되고 운영자는 그것을 기록에서야 알게 되기 때문이다. DB에 없는 계정은 여기서 말하지 않는다(6의 로그인이 경고한다). 보관이 없는 섀도는 그대로 이것을 보지 않는다. 게이트 대상 테이블이 있는데 DB에 닿지 않으면 여기서 곧바로 멈춘다. 그래서 계정마다의 로그인(6)은 게이트를 연 뒤에 한다.
 6. 계정마다 업스트림에 한 번 로그인해 본다(계정마다 5초, 합쳐 30초까지). 되지 않으면 그 계정과 이유의 갈래를 경고한다(`an account of the credentials file cannot log in to the database: its agent's logins are refused until it can`). 시작은 한다. 다른 계정은 일해야 하고, 그 계정의 로그인은 DB가 그 비밀번호를 받을 때까지 어차피 거절된다(`08001`). Stet은 그 계정을 따로 표시하지 않는다. DB가 받게 되면 그다음 로그인부터 된다. 합친 시간이 다 되면 그때 확인 중이던 계정과 닿지 못한 계정들을 한 경고에 적는다(`the start ran out of time to log in as these accounts, so they are not checked`).
 7. 받기 시작할 때의 로그 줄에 클라이언트 쪽의 상태를 더한다(`listen_tls=on|off`, `custody=on|off`). 처음 설계의 `agents=<수>`는 빼었다(진행 중의 판단). `agent_roles`가 이미 계정들을 적고, 보관을 켜면 그 값이 파일의 계정들이다.
 
@@ -383,6 +383,7 @@ stet agent list     [-config stet.yaml]
 
 - 8장: 보관을 켜면 원격 업스트림은 `verify-full`이거나 `sslrootcert`를 준 `verify-ca`나 `require`여야 한다. `sslrootcert` 없는 `verify-ca`는 받지 않는다. 거부의 문구도 그렇게 바꿨다.
 - 8장: 키만 있고 값이 빈 `listen_tls`와 `agents.credentials`(공백뿐인 값 포함)는 설정 검증에서 거부한다. 없는 것으로 읽지 않는다.
+- 8장: 보관을 켜면 섀도에서도 시작할 때 Stet의 계정이 에이전트 계정마다 그 역할의 구성원인지 보고 경고한다(enforce와 같은 문구). 보관이 없는 섀도는 그대로다.
 
 **남긴 것**
 

@@ -286,6 +286,8 @@ func custodyEndToEnd(t *testing.T) *custodyRun {
 	pg := testPG(t)
 	ctx := context.Background()
 	account, password := newAgentRole(t, pg)
+	// As deploy's "필요한 것" has it: Stet measures the agent's writes as it.
+	mustExec(t, superuser(t, pg), "grant "+account+" to stet_scram")
 	db := cleanDatabase(t, pg)
 	admin := connectTo(t, pg, db, "stet_scram", "scram-pw")
 	table := freshTable(t, admin, 2)
@@ -335,6 +337,28 @@ func custodyEndToEnd(t *testing.T) *custodyRun {
 		t.Errorf("warnings, want none:\n%s", strings.Join(w, "\n"))
 	}
 	return &custodyRun{r: r, out: out, c: c, decisions: admin}
+}
+
+// Started in shadow mode with custody over a gated table, without the GRANT
+// of the agent account to Stet's: the log warns of it once, as enforce does.
+func TestShadowCustodyWarnsOfAMissingMembership(t *testing.T) {
+	pg := testPG(t)
+	account, password := newAgentRole(t, pg)
+	db := cleanDatabase(t, pg)
+	table := freshTable(t, connectTo(t, pg, db, "stet_scram", "scram-pw"), 1)
+	c := newCustody(t, pg, map[string]string{account: password})
+	r, _, _ := startCustody(t, c.config(t, "shadow", pg, db, "tables:\n  "+table+": {pk: id}\n"))
+	waitListening(t, r)
+	want := fmt.Sprintf(`Stet's account \"stet_scram\" is not a member of agent role \"%s\"`, account)
+	var told []string
+	for _, w := range warnings(r.log.String()) {
+		if strings.Contains(w, want) {
+			told = append(told, w)
+		}
+	}
+	if len(told) != 1 {
+		t.Errorf("%d warnings that %s, want 1; log:\n%s", len(told), want, r.log)
+	}
 }
 
 func TestCustodyEnforce(t *testing.T) { custodyEnforce(t) }

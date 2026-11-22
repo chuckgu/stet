@@ -28,18 +28,23 @@ var checkTimeout = 10 * time.Second
 // be made is never a pass: under enforce, one whose finding would stop the
 // start stops it (ruling 26); any other is a warning that says so. In shadow
 // mode it only reads the server's version and Stet's own account, and a
-// failure to read them only warns.
+// failure to read them only warns; with custody it also checks that Stet's
+// account is a member of each agent account (stetMembers), since custody
+// keeps the two apart and shadow mode measures multi-row writes as the agent.
 func check(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config) (warnings []string, err error) {
 	ctx, cancel := context.WithTimeout(ctx, checkTimeout)
 	defer cancel()
 	c := &checker{ctx: ctx, pool: pool, cfg: cfg}
 	c.serverVersion()
 	own := c.ownAccount()
-	if cfg.Mode == config.ModeEnforce {
+	switch {
+	case cfg.Mode == config.ModeEnforce:
 		c.userNamespace()
 		c.passSettings()
 		c.stetSuperuser()
 		c.agentRoles(own)
+	case cfg.Credentials != "":
+		c.stetMembers(own)
 	}
 	return c.warnings, errors.Join(c.errs...)
 }
@@ -378,6 +383,28 @@ func (c *checker) agentRole(role string, tables []ownedTable, stetPath, database
 	}
 
 	c.searchPath(role, stetPath, database, pathErr)
+}
+
+// stetMembers is stetMember for each agent role but own, in shadow mode
+// with custody: agentRoles does it in enforce. A role that is not there is
+// left to the start's login as it (checkAccounts), which warns of it.
+func (c *checker) stetMembers(own map[string]bool) {
+	for _, role := range c.cfg.AgentRoles {
+		if own[role] {
+			continue
+		}
+		var oid uint32
+		err := c.read(func(tx pgx.Tx) error {
+			return tx.QueryRow(c.ctx, "select oid from pg_roles where rolname = $1", role).Scan(&oid)
+		})
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+		case err != nil:
+			c.warn("whether Stet's account is a member of agent role %q could not be checked: %v", role, err)
+		default:
+			c.stetMember(role, pgx.Identifier{role}.Sanitize(), oid)
+		}
+	}
 }
 
 // stetMember warns when Stet's account cannot act as the agent role: an

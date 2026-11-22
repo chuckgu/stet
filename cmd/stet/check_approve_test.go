@@ -99,6 +99,52 @@ func TestCheckWarnsWhenStetIsNotAMemberOfAnAgentRole(t *testing.T) {
 	}
 }
 
+// With custody, Stet's account is never an agent's, and the guide's path is
+// shadow mode: an agent account Stet's account is not a member of has every
+// multi-row write recorded unsupported, so shadow mode warns of it too, in
+// enforce's words. A role that is not there is the start's login check's to
+// warn of. Without custody, shadow mode stays silent about it
+// (TestCheckInShadowSaysNothingOfApprovals).
+func TestCheckWarnsOfMembershipInShadowWithCustody(t *testing.T) {
+	pg := testPG(t)
+	ctx := context.Background()
+	su := superuser(t, pg)
+	pool := stetPool(t, pg)
+	table := freshTable(t, connect(t, pg, "stet_scram", "scram-pw"), 1)
+	const part = "is not a member of agent role"
+	agent := createRole(t, su, "agent", "login")
+	shadow := func(custody bool, roles ...string) *config.Config {
+		cfg := enforceConfig(roles[0], table)
+		cfg.AgentRoles = roles
+		cfg.Mode = config.ModeShadow
+		if custody {
+			cfg.Credentials = "agents.yaml"
+		}
+		return cfg
+	}
+
+	warnings, err := check(ctx, pool, shadow(true, agent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fix := fmt.Sprintf(`GRANT "%s" TO "stet_scram"`, agent)
+	if _, ok := warningWith(warnings, `Stet's account "stet_scram"`, part, fmt.Sprintf("%q", agent), fix); !ok {
+		t.Errorf("custody, shadow: warnings %q, want one that stet_scram is not a member of %s, with %s", warnings, agent, fix)
+	}
+	if warnings, err = check(ctx, pool, shadow(false, agent)); err != nil {
+		t.Fatal(err)
+	} else if w, ok := warningWith(warnings, part); ok {
+		t.Errorf("no custody, shadow: warning %q", w)
+	}
+
+	mustExec(t, su, fmt.Sprintf("grant %s to stet_scram", agent))
+	if warnings, err = check(ctx, pool, shadow(true, agent, "stet_no_such_role")); err != nil {
+		t.Fatal(err)
+	} else if w, ok := warningWith(warnings, part); ok {
+		t.Errorf("custody, shadow, after the GRANT and with a role that is not there: warning %q", w)
+	}
+}
+
 func TestCheckInShadowSaysNothingOfApprovals(t *testing.T) {
 	pg := testPG(t)
 	su := superuser(t, pg)
