@@ -101,6 +101,7 @@ tables:
 - **`agents.credentials`**: 자격 증명 파일의 경로다(5장). 이 키가 있으면 보관이 켜진다. 키만 적고 값이 비면(템플릿이 빈 값을 낸 경우 등) 시작하지 않는다: `agents.credentials: present but empty; give the file's path, or remove it`. `listen_tls`도 같다(`listen_tls: present but empty; give cert and key, or remove it`).
 - **상대 경로.** `agents.credentials`, `listen_tls.cert`, `listen_tls.key`의 상대 경로는 설정 파일이 있는 디렉터리에 대해 읽는다. `upstream`의 `sslrootcert`는 그렇지 않다. Stet이 도는 작업 디렉터리에 대해 읽으므로 절대 경로로 적는다. `~`는 풀지 않는다.
 - **`upstream`.** 주소의 계정은 Stet 자신의 연결(상태 조회, 판단 기록, 승인된 쓰기의 실행)에 쓴다. 지금과 같다. 설정 파일에 그 비밀번호가 있으면 파일을 `0600`으로 둔다. 서비스의 CA가 공개 CA가 아니면 그 CA 파일을 `sslrootcert`로 준다.
+- **`require_auth=scram-sha-256`.** 주소에 이것을 더하면, Stet이 에이전트 계정으로 하는 로그인(세션을 열 때, 시작할 때의 확인, `stet agent`의 확인)은 평문 비밀번호를 달라는 서버에 비밀번호를 보내지 않고 실패한다. 서버 확인(아래) 위에 한 겹 더 막는 것이다. pgx v5.11.0이 이 파라미터를 따르는 것을 그 소스와 테스트(`TestLoginsHonourRequireAuth`)로 확인했다. Stet 자신의 연결도 따르므로, 에이전트 계정과 Stet의 계정이 모두 DB에서 SCRAM으로 로그인해야 한다. md5나 `password` 방식의 계정은 로그인하지 못한다.
 - **`agents.roles`** 는 적지 않아도 된다. 에이전트 계정은 자격 증명 파일의 계정들이다. enforce에서도 그렇다. 적었으면 파일의 계정들과 같아야 하고, 다르면 시작하지 않는다: `agents.roles and the credentials file name different accounts: only in agents.roles: ["…"]; only in the file: ["…"]`
 
 **보관이 요구하는 것 둘.** 설정을 읽을 때 본다. 어기면 시작하지 않는다.
@@ -164,9 +165,8 @@ agents:
 **다시 읽기.** `stet proxy`는 로그인마다 파일이 바뀌었는지(바뀐 시각, 크기, 권한, 파일 자체가 갈렸는지) 보고, 바뀌었으면 다시 읽는다.
 
 - 토큰과 `password`를 바꾼 것, 계정을 지운 것은 다음 로그인부터 적용된다. 열려 있는 세션은 그대로 간다.
-- 다시 읽지 못하면(모양이 깨짐, 권한이 풀림, 파일이 사라짐) 쓰던 계정들을 그대로 쓰고 `could not read the credentials file again; keeping the accounts as they were`를 에러로 한 번 남긴다. 실패하는 동안은 파일이 그대로여도 로그인 때마다(200ms에 한 번까지) 다시 읽어 본다. 다시 읽히면 `read the credentials file again; following it once more`를 남긴다.
-- 띄운 뒤에 파일에 생긴 계정은 받지 않는다. 처음 볼 때 경고한다: `account "<계정>" was added after stet started; restart stet proxy to accept it`
-
+- 다시 읽지 못하면(모양이 깨짐, 권한이 풀림, 파일이 사라짐) 쓰던 계정들을 그대로 쓰고 `could not read the credentials file again; keeping the accounts as they were`를 에러로 남긴다. 실패가 이어지는 동안 원인마다 한 번이다. 실패하는 동안은 파일이 그대로여도 로그인 때마다(200ms에 한 번까지) 다시 읽어 본다. 다시 읽히면 `read the credentials file again; following it once more`를 남긴다.
+- `stet proxy`가 시작할 때 파일에 없던 계정은 받지 않는다. 처음 볼 때 경고한다: `account "<계정>" was added after stet started; restart stet proxy to accept it`. 시작할 때 있었던 계정을 지웠다가 다시 더한 것은 다시 띄우지 않고 다음 로그인부터 받는다.
 ## 6. `stet agent`
 
 ```
@@ -214,7 +214,7 @@ next:
 4. 토큰을 만들고, 파일에 검증값과 비밀번호를 쓴다. 파일이 없으면 만든다.
 5. 토큰을 표준 출력에 한 번 보인다. 다시 볼 수 없다. 잃어버리면 `stet agent token`으로 새로 만든다. 이어서 할 일을 알린다. 설정에 `agents.roles`가 있으면 거기에도 계정을 더하라고 알린다.
 
-**`add`는 Stet을 다시 띄워야 적용된다.** 띄운 뒤에 더한 계정은 받지 않는다(5장).
+**`add`는 Stet을 다시 띄워야 적용된다.** `stet proxy`가 시작할 때 파일에 없던 계정은 받지 않는다(5장). 시작할 때 있었고 지웠던 계정을 다시 더한 것만 다시 띄우지 않고 받는다(출력의 "restart stet proxy"는 새 계정에 대한 말이다).
 
 `-password-env NAME`이면 비밀번호를 묻지 않는다. 그 환경 변수의 값을 이 명령의 환경에서 읽어 3의 확인에만 쓰고, 파일에는 변수의 이름만 적는다. `stet proxy`의 환경에도 같은 변수가 있어야 한다(출력이 알린다). 변수의 이름이 아닌 것을 주면 `-password-env takes the name of an environment variable, not its value`로 멈추고, 준 글자는 다시 보이지 않는다.
 
@@ -308,17 +308,18 @@ host=stet.internal port=6432 dbname=crm user=agent_enricher password=<token> ssl
 | 파일에 둔 진짜 비밀번호 | DB에서 바꾸고 `stet agent password` | 필요 없다 |
 | `password_env`인 진짜 비밀번호 | DB에서 바꾸고 `stet proxy`의 환경을 고친다 | 필요하다 |
 | 계정 지우기 | `stet agent remove` | 필요 없다. 다음 로그인부터 거절된다 |
-| 계정 더하기 | `stet agent add` | 필요하다 |
+| 계정 더하기 | `stet agent add` | 필요하다. `stet proxy`가 시작할 때 있었고 지웠던 계정을 다시 더한 것은 필요 없다 |
 | `listen_tls`의 인증서와 키 | 두 파일을 바꾼다 | 필요 없다. 다음 TLS 인사부터 쓴다 |
 | 설정 파일 | 고친다 | 필요하다 |
 
 - 계정 하나에 토큰 하나다. 토큰을 바꾸면 예전 토큰을 쓰던 에이전트는 다음 로그인에서 거절된다. 겹쳐 쓰는 기간이 없다. 새 토큰을 에이전트에게 주는 시점에 맞춰 돌린다.
 - 다시 띄우는 동안 에이전트의 접속은 끊긴다. 끌 때는 판단 중인 쓰기를 기록하고 끝난다(SIGTERM이나 Ctrl-C).
-- 다시 띄우지 않고 적용되는 것들은 열려 있는 세션에 손대지 않는다. 지운 계정의 열린 세션도 끝날 때까지 간다.
+- 다시 띄우지 않고 적용되는 것들은 열려 있는 세션에 손대지 않는다. 지운 계정의 열린 세션도 끝날 때까지 간다. 그 세션을 바로 끝내려면 DB의 관리 계정으로 `select pg_terminate_backend(pid) from pg_stat_activity where usename = 'agent_enricher';`를 실행하거나 `stet proxy`를 다시 띄운다. 토큰을 바꾼 계정의 열린 세션도 같다.
+- 자격 증명 파일을 지우는 것은 아무것도 거두지 않는다. 도는 `stet proxy`는 파일을 다시 읽지 못하면 마지막으로 읽은 내용을 그대로 쓰고 에러를 남길 뿐이다(5장). 계정을 거두는 것은 `stet agent remove`다.
 
 ## 10. 로그에서 보는 것
 
-로그는 표준 에러로 간다(quickstart 4장). 계정 이름은 시작 패킷에서 온 글자라 제어 문자를 걸러 적는다. 토큰, 검증값, 진짜 비밀번호는 어느 줄에도 없다(`-v`의 디버그 로그도).
+로그는 표준 에러로 간다(quickstart 4장). 계정 이름은 시작 패킷이나 자격 증명 파일에서 온 글자라 제어 문자를 걸러 적는다. 토큰, 검증값, 진짜 비밀번호는 어느 줄에도 없다(`-v`의 디버그 로그도).
 
 | 줄(`msg`) | 수준 | 뜻 |
 |---|---|---|
@@ -331,7 +332,7 @@ host=stet.internal port=6432 dbname=crm user=agent_enricher password=<token> ssl
 | `the environment variable for an account's password is empty or not set` | WARN | 시작할 때 `password_env`의 변수가 비었다 |
 | `the credentials file now names an environment variable that was not read when stet started; keeping the password in use until stet restarts` | WARN | 띄운 뒤에 파일의 `password_env`가 시작할 때 읽지 않은 변수로 바뀌었다. 그 계정과 변수마다 한 번 남기고, 다시 띄울 때까지 쓰던 비밀번호를 쓴다 |
 | `the credentials file has no mock_secret: …` | WARN | 손으로 쓴 파일에 `mock_secret`이 없다(5장) |
-| `account "…" was added after stet started; restart stet proxy to accept it` | WARN | 띄운 뒤에 파일에 생긴 계정이다 |
+| `account "…" was added after stet started; restart stet proxy to accept it` | WARN | `stet proxy`가 시작할 때 파일에 없던 계정이 생겼다 |
 | `could not read the credentials file again; keeping the accounts as they were` | ERROR | 다시 읽지 못했다. 고쳐지면 `read the credentials file again; following it once more`(INFO) |
 | `read listen_tls again; serving the new certificate from the next handshake` | INFO | 인증서를 갈았다 |
 | `could not read listen_tls again; serving the certificate in use` | ERROR | 바뀐 인증서 파일을 읽지 못했다 |
@@ -524,7 +525,7 @@ spec:
 - **루프백은 평문도 받는다.** 같은 기기의 TCP 전달자를 Stet 앞에 두면 모든 클라이언트가 루프백으로 보인다(2장). 서비스 메시의 사이드카도 그렇게 보일 수 있다(13장, 돌려 보지 않았다).
 - **`password_env`인 계정의 진짜 비밀번호를 바꾸려면 다시 띄워야 한다.**
 - **계정 하나에 토큰 하나다.** 토큰을 바꾸면 예전 토큰을 쓰던 에이전트는 다음 로그인에서 거절된다. 겹쳐 쓰는 기간이 없다.
-- **계정을 더하면 다시 띄워야 한다.** 그동안 에이전트의 접속이 끊긴다. 가용성은 다음 단계다.
+- **시작할 때 없던 계정을 더하면 다시 띄워야 한다.** 그동안 에이전트의 접속이 끊긴다. 가용성은 다음 단계다.
 - **로그인이 한 번 더 든다.** 세션을 열 때 Stet이 DB에 로그인하는 시간이 더해진다. 시험 서버에서 한 번의 로그인은 직접 TLS로 붙을 때 중앙값 8.5ms, 양쪽이 TLS인 Stet을 거쳐 17.8ms였다. 세션을 자주 여닫는 클라이언트에서 보인다. 연결 풀은 만들지 않는다. 로그인 뒤의 중계는 지연 예산(2ms) 안이다.
 - **Stet은 프로토콜 3.0으로 답한다.** 더 높은 버전을 청한 클라이언트는 3.0으로 내려 받는다.
 - **`stet agent`의 잠금은 한 기기 안에서만 통한다.** 네트워크 파일 시스템의 자격 증명 파일을 두 기기에서 바꾸면 서로 막지 못한다.

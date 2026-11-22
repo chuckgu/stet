@@ -882,6 +882,62 @@ func trusting(t *testing.T, versions chan<- uint32) string {
 	})
 }
 
+// cleartextAsker serves in the server's place: it asks every login for a
+// cleartext password, reports whether a password message came, and closes.
+func cleartextAsker(t *testing.T, sent chan<- bool) string {
+	return fakeUpstream(t, func(c net.Conn) {
+		var head [8]byte
+		if _, err := io.ReadFull(c, head[:]); err != nil {
+			return
+		}
+		n := binary.BigEndian.Uint32(head[0:4])
+		if n < 8 || n > 10000 {
+			return
+		}
+		if _, err := io.CopyN(io.Discard, c, int64(n-8)); err != nil {
+			return
+		}
+		ask, _ := (&pgproto3.AuthenticationCleartextPassword{}).Encode(nil)
+		c.Write(ask)
+		c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		var typ [1]byte
+		_, err := io.ReadFull(c, typ[:])
+		sent <- err == nil && typ[0] == 'p'
+	})
+}
+
+// require_auth=scram-sha-256 in the upstream address reaches the logins Stet
+// makes for agents (pgconn checks it before it answers the server): a server
+// that asks for a cleartext password gets none. Without it the password is
+// sent, as libpq would.
+func TestLoginsHonourRequireAuth(t *testing.T) {
+	for _, tc := range []struct {
+		query string
+		sent  bool
+	}{
+		{"?sslmode=disable&require_auth=scram-sha-256", false},
+		{"?sslmode=disable", true},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			sent := make(chan bool, 1)
+			up := "postgres://stet@" + cleartextAsker(t, sent) + "/db" + tc.query
+			l := newLogin(t, storeOf(t, map[string]string{"agent_a": "not-to-be-sent"}), up, nil, false)
+			if op, err := l.Open(testCtx(t), "agent_a", "db", nil); err == nil {
+				op.Conn.Close()
+				t.Error("Open logged in to a server that never said AuthenticationOk")
+			}
+			select {
+			case got := <-sent:
+				if got != tc.sent {
+					t.Errorf("the password was sent: %v, want %v", got, tc.sent)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("the fake server never heard back")
+			}
+		})
+	}
+}
+
 // Every login speaks protocol 3.0, which Stet speaks to clients, whatever
 // the address or Stet's environment asks for: a 3.2 session would hand a
 // 3.0 client a cancel key it cannot read.

@@ -127,7 +127,7 @@ listen_tls:
 
 진짜 비밀번호를 토큰 자리에 넣은 것과 한 계정의 토큰으로 다른 계정 이름을 댄 것도 첫 줄이다.
 
-- 모르는 계정에도 같은 교환을 끝까지 한다. 계정 이름과 비밀값에서 만든 가짜 검증값을 쓴다. 메시지의 수와 모양으로 계정이 있는지 알 수 없어야 한다.
+- 모르는 계정에도 같은 교환을 끝까지 한다. 계정 이름과 비밀값에서 만든 가짜 검증값을 쓴다. 메시지의 수와 모양으로 계정이 있는지 알 수 없어야 한다. 증명이 맞아도 모르는 계정은 `28P01`로 거절한다. 가짜 검증값이 늘 실패하는 것(`internal/scram`)과 따로 프록시가 지키는 규칙이다(마지막 검토 뒤에 더했다).
 - **가짜 검증값의 비밀값은 자격 증명 파일에 둔다**(보정 V6). 처음 설계는 "프로세스마다 정한 비밀값"이었다. 그러면 다시 띄울 때 가짜 검증값의 salt가 바뀌고 진짜 계정의 salt는 그대로라서, 다시 띄우기 전후로 같은 이름을 대 보면 계정이 있는지 알 수 있다. 그래서 파일의 맨 위 키 `mock_secret`(무작위 32바이트, base64)을 쓴다(6장). 파일에 없으면 프로세스마다 무작위 값을 쓰고 시작할 때 경고한다. 가짜 검증값은 비밀값과 계정 이름의 HMAC에서 만든다.
 - 증명의 비교는 걸리는 시간이 값에 따라 달라지지 않는 방식으로 한다.
 - 업스트림 로그인이 실패한 이유(진짜 비밀번호가 틀림, 서버에 닿지 못함, 인증서 확인 실패)는 Stet의 로그에만 남긴다. 에이전트는 믿지 않는 상대다.
@@ -154,7 +154,7 @@ listen_tls:
 
 **클라이언트가 받는 것.** AuthenticationSASLFinal 뒤에 AuthenticationOk, 서버가 알린 세션 설정(ParameterStatus, 이름 순서), BackendKeyData(서버의 진짜 프로세스 번호와 취소 키), ReadyForQuery다. 로그인 동안 서버가 보낸 알림(NoticeResponse)은 전하지 않는다. 직접 붙었을 때와 다른 것은 세션 설정의 순서와 그 알림뿐이다.
 
-**잇는 방식**(보정 V3). 프록시가 위의 메시지들(AuthenticationOk부터 ReadyForQuery까지)을 만들어 넘겨받은 업스트림 연결의 앞머리로 붙이고, 그 연결을 지금의 중계에 넣는다. 세션은 그것을 서버가 보낸 것으로 읽고, 서버 프로세스 번호, 첫 ReadyForQuery, 세션 설정(enforce에서)을 거기서 얻는다. 세션의 코드는 바꾸지 않았다.
+**잇는 방식**(보정 V3). 프록시가 위의 메시지들(AuthenticationOk부터 ReadyForQuery까지)을 만들어 넘겨받은 업스트림 연결의 앞머리로 붙이고, 그 연결을 지금의 중계에 넣는다. 세션은 그것을 서버가 보낸 것으로 읽고, 서버 프로세스 번호, 첫 ReadyForQuery, 세션 설정(enforce에서)을 거기서 얻는다. 세션의 코드는 바꾸지 않았다. 넘겨받은 세션의 취소 키가 4바이트가 아니거나 트랜잭션 상태가 `I`, `T`, `E`가 아니면 잇지 않는다. 업스트림 로그인 실패(`08001`)로 다루고 그 연결을 닫는다. `Login.Open`이 에러와 함께 세션을 돌려주면 그 연결도 닫는다(둘 다 마지막 검토 뒤에 더했다).
 
 **취소 요청.** 지금과 같다. 클라이언트가 받은 키가 서버의 진짜 키이므로 그대로 업스트림에 전한다. 인증이 없다(PostgreSQL과 같다).
 
@@ -195,10 +195,10 @@ agents:
 - **권한.** PostgreSQL이 서버 키 파일에 두는 규칙 그대로다(진행 중의 판단). 파일의 소유자가 Stet의 실효 uid면(root로 돌리면 root) 그룹과 다른 사용자에게 아무 권한이 없어야 한다. 소유자가 root면(Stet은 다른 사용자로 돈다) 그룹 읽기까지(`0640`)다. 그 밖의 소유자이거나 그보다 열려 있으면 Stet은 시작하지 않는다. 처음 설계의 "root의 파일이면 `0640` 이하"는 root로 도는 Stet에게는 `0600` 이하로 좁혀진다. 컨테이너에 비밀을 넣는 흔한 방식(root 소유, 그룹 읽기)을 받기 위해서다. 일반 파일이 아니거나(FIFO는 열 때 막히지 않게 연다) 1 MiB보다 크면 받지 않는다.
 - 파일은 `stet agent`가 쓴다. 손으로 고쳐도 된다. 쓰는 방식은 `init`과 같다(같은 디렉터리의 임시 파일에 다 쓰고 sync한 뒤 이름을 바꾸고, 디렉터리를 sync한다). 반쯤 쓰인 파일은 남지 않는다. 경로가 심볼릭 링크면 링크가 가리키는 파일을 바꾼다. 이미 있는 파일을 바꿔 쓸 때는 그 파일의 소유자, 그룹, 권한을 그대로 둔다(소유자를 바꾼 뒤에 권한을 맞춘다). 그대로 둘 수 없으면(다른 사용자의 파일인데 root가 아님) 쓰지 않고 멈춘다. `sudo`로 돌린 뒤에 Stet이 파일을 다시 읽지 못하는 일을 막는다. 새로 만드는 파일은 돌린 사용자의 `0600`이다.
 - **바꿀 수 있는 사람과 파일**(진행 중의 판단). `stet agent`는 파일을 그 소유자나 root로 바꾼다. 읽는 규칙은 `stet proxy`의 것과 다르다: 이미 있는 파일이 그 이상 열려 있지 않아야 한다(소유자가 root면 `0640`까지, 그 밖이면 그룹과 다른 사용자에게 권한이 없어야 한다). 그래서 root는 자기의 `0640` 파일과 다른 사용자의 파일을, `sudo`는 Stet을 돌리는 사용자의 파일을 바꿀 수 있다. Read의 규칙으로 읽으면 둘 다 거부됐다. 너무 열린 파일에는 비밀번호를 쓰지 않는다.
-- **잠금**(진행 중의 판단). `stet agent`의 변경은 파일이 있는 디렉터리에 건 `flock(LOCK_EX)` 안에서 읽고, 바꾸고, 쓴다. 두 `stet agent`가 동시에 돌아도 서로의 변경을 지우지 않는다. 잠금 파일은 남지 않는다. `stet proxy`의 읽기는 잠금을 쓰지 않는다(이름 바꾸기가 원자적이다). NFS 같은 네트워크 파일 시스템에서는 잠금이 한 기기 안에서만 통한다.
+- **잠금**(진행 중의 판단). `stet agent`의 변경은 파일이 있는 디렉터리에 건 `flock(LOCK_EX)` 안에서 읽고, 바꾸고, 쓴다. 두 `stet agent`가 동시에 돌아도 서로의 변경을 지우지 않는다. 잠금 파일은 남지 않는다. 디렉터리는 디렉터리로만 연다(`O_DIRECTORY`. 그 자리에 FIFO가 있으면 기다리지 않고 실패한다. 마지막 검토 뒤에 고쳤다). `stet proxy`의 읽기는 잠금을 쓰지 않는다(이름 바꾸기가 원자적이다). NFS 같은 네트워크 파일 시스템에서는 잠금이 한 기기 안에서만 통한다.
 - 컨테이너에는 파일 하나가 아니라 **디렉터리를 마운트한다**. 파일 하나를 마운트하면 이름 바꾸기가 되지 않거나, 바깥에서 바꾼 것이 안에서 보이지 않는다. 읽기 전용으로 마운트한 `stet proxy`가 다른 컨테이너의 `stet agent token`을 다시 띄우지 않고 받는 것을 확인했다(14장).
-- **다시 읽기.** Stet은 로그인마다 그 경로의 파일이 바뀌었는지(바뀐 시각, 크기, 권한, 파일 자체가 갈렸는지. 처음 설계에는 권한이 없었다) 보고, 바뀌었으면 다시 읽는다. 토큰과 비밀번호를 바꾼 것은 다음 로그인부터 적용된다. 열려 있는 세션은 그대로 간다. 지운 계정은 다음 로그인부터 거절한다. 다시 읽지 못하거나 권한이 풀려 있으면 쓰던 것을 계속 쓰고 에러 로그(`could not read the credentials file again; keeping the accounts as they were`)를 한 번 남긴다. 실패하는 동안은 파일이 그대로 보여도 로그인 때마다(200ms에 한 번까지) 다시 읽어 본다. 실패의 원인이 stat에 보이지 않을 수 있기 때문이다(진행 중의 판단. 처음에는 다시 시도하지 않아, 지운 계정이 계속 로그인할 수 있었다). 다시 읽히면 INFO(`read the credentials file again; following it once more`)를 남긴다.
-- **계정을 더하는 것은 다시 띄워야 적용된다.** 시작할 때의 확인(8장)이 계정마다 돌고, 게이트가 보는 계정 목록이 시작할 때 정해지기 때문이다. 띄운 뒤에 파일에 생긴 계정은 받지 않고, 처음 볼 때 경고를 한 번 남긴다(`account "<계정>" was added after stet started; restart stet proxy to accept it`).
+- **다시 읽기.** Stet은 로그인마다 그 경로의 파일이 바뀌었는지(바뀐 시각, 크기, 권한, 파일 자체가 갈렸는지. 처음 설계에는 권한이 없었다) 보고, 바뀌었으면 다시 읽는다. 토큰과 비밀번호를 바꾼 것은 다음 로그인부터 적용된다. 열려 있는 세션은 그대로 간다. 지운 계정은 다음 로그인부터 거절한다. 다시 읽지 못하거나 권한이 풀려 있으면 쓰던 것을 계속 쓰고 에러 로그(`could not read the credentials file again; keeping the accounts as they were`)를 남긴다. 실패가 이어지는 동안 원인(에러의 글자)마다 한 번이다(마지막 검토 뒤에 고쳤다. 처음에는 첫 원인만 남겨, 지운 파일을 `0644`로 되돌린 것이 에러 하나로 끝났다). 파일을 지우는 것은 아무것도 거두지 않는다. 쓰던 계정들이 그대로 로그인한다. 실패하는 동안은 파일이 그대로 보여도 로그인 때마다(200ms에 한 번까지) 다시 읽어 본다. 실패의 원인이 stat에 보이지 않을 수 있기 때문이다(진행 중의 판단. 처음에는 다시 시도하지 않아, 지운 계정이 계속 로그인할 수 있었다). 다시 읽히면 INFO(`read the credentials file again; following it once more`)를 남긴다.
+- **시작할 때 없던 계정을 더하는 것은 다시 띄워야 적용된다.** 시작할 때의 확인(8장)이 계정마다 돌고, 게이트가 보는 계정 목록이 시작할 때 정해지기 때문이다. 시작할 때 파일에 없던 계정은 받지 않고, 처음 볼 때 경고를 한 번 남긴다(`account "<계정>" was added after stet started; restart stet proxy to accept it`). 시작할 때 있었고 지웠다가 다시 더한 계정은 그 목록에 있으므로 다시 띄우지 않고 다음 로그인부터 받는다(`TestStoreFollowsTheFile`). `stet agent add`의 "restart stet proxy"는 새 계정에 대한 말이다.
 
 ## 7. `stet agent`
 
@@ -255,7 +255,7 @@ stet agent list     [-config stet.yaml]
 
 ## 9. 기록과 로그
 
-- 로그인이 되면 INFO `agent logged in`으로 계정, 상대 주소, 클라이언트 쪽 구간의 TLS 여부(`tls=true|false`)를 남긴다. 거절하면 WARN `agent login refused`로 계정, 상대 주소, 이유의 갈래(`reason`)를 남긴다. 갈래는 `unknown account`, `bad token`, `upstream login failed`, `exchange failed`, `tls required`다. 처음 설계에는 `exchange failed`가 없었다. `upstream login failed`와 `exchange failed`에는 `err`가 붙는다(업스트림 로그인 실패의 갈래 `wrong password`, `cannot reach the server`, `certificate`, `refused TLS`, `other`와 서버의 문구). 계정 이름은 시작 패킷에서 온 글자다. 제어 문자를 걸러 적는다(`internal/safetext`).
+- 로그인이 되면 INFO `agent logged in`으로 계정, 상대 주소, 클라이언트 쪽 구간의 TLS 여부(`tls=true|false`)를 남긴다. 거절하면 WARN `agent login refused`로 계정, 상대 주소, 이유의 갈래(`reason`)를 남긴다. 갈래는 `unknown account`, `bad token`, `upstream login failed`, `exchange failed`, `tls required`다. 처음 설계에는 `exchange failed`가 없었다. `upstream login failed`와 `exchange failed`에는 `err`가 붙는다(업스트림 로그인 실패의 갈래 `wrong password`, `cannot reach the server`, `certificate`, `refused TLS`, `other`와 서버의 문구). 계정 이름은 시작 패킷이나 자격 증명 파일에서 온 글자다. 제어 문자를 걸러 적는다(`internal/safetext`. 파일에서 온 이름은 마지막 검토 뒤에 더했다).
 - 디버그(`-v`)에만 남는 것(진행 중의 판단): 교환 도중에 클라이언트가 끊은 것(`agent left during login`. `psql`은 비밀번호 없이 먼저 붙어 보고 끊는다), 복제 접속을 거절한 것(`replication connection refused`). 교환이 10초를 넘긴 것은 WARN `exchange failed`이고 클라이언트에 `FATAL`을 보내지 않는다.
 - `tls required`의 WARN은 보관을 켠 Stet만 남긴다(3장).
 - 토큰, 검증값, 진짜 비밀번호는 어디에도 적지 않는다. pgx가 돌려준 에러도 그대로 적지 않는다. 업스트림 로그인의 에러는 실패의 갈래와 서버가 보낸 문구(SQLSTATE 포함, 제어 문자를 거름)로 다시 만든다. pgconn의 에러는 주소를 인용하고, 그 접속 에러는 비밀번호가 든 설정을 쥐고 있어서 감싸지도 않는다.
@@ -287,7 +287,7 @@ stet agent list     [-config stet.yaml]
 - **루프백은 평문도 받는다.** 루프백인지는 접속의 상대 주소로 본다. 같은 기기의 TCP 전달자(사이드카 프록시, `ssh -L`, `kubectl port-forward`)를 Stet 앞에 두면 모든 클라이언트가 루프백으로 보여, 루프백이 아닌 `listen`의 TLS 요구가 무력해진다(3장). 서비스 메시(Istio, Linkerd)의 사이드카도 받은 연결을 파드 안에서 넘겨주므로 그렇게 보일 수 있다(돌려 보지 않았다. deploy 13장).
 - **`password_env`인 계정의 진짜 비밀번호를 바꾸려면 다시 띄워야 한다.**
 - **계정 하나에 토큰 하나다.** 토큰을 바꾸면 예전 토큰을 쓰던 에이전트는 다음 로그인에서 거절된다. 겹쳐 쓰는 기간이 없다.
-- **계정을 더하면 다시 띄워야 한다.** 그동안 에이전트의 접속이 끊긴다(가용성은 셋째 부분이다).
+- **시작할 때 없던 계정을 더하면 다시 띄워야 한다.** 그동안 에이전트의 접속이 끊긴다(가용성은 셋째 부분이다).
 - **로그인이 한 번 더 든다.** 세션을 열 때 Stet이 업스트림에 로그인하는 시간이 더해진다. 시험 서버에서 한 번의 로그인은 중앙값으로 직접 TLS로 8.5ms, 양쪽이 TLS인 Stet을 거쳐 17.8ms였다(14장). 세션을 자주 여닫는 클라이언트에서 보인다. 연결 풀은 만들지 않는다.
 - **Stet은 프로토콜 3.0으로 답한다.** 더 높은 부 버전을 청한 클라이언트는 3.0으로 내려 받는다.
 - **`stet agent`의 잠금은 한 기기 안에서만 통한다.** 네트워크 파일 시스템의 자격 증명 파일을 두 기기에서 바꾸면 서로 막지 못한다(6장).
@@ -308,7 +308,7 @@ stet agent list     [-config stet.yaml]
 | 클라이언트 쪽 TLS | SSLRequest에 `S`. 루프백이 아닌 평문은 거절(판단하는 자리의 단위 테스트). 인증서 파일을 바꾸면 다음 인사에 새 인증서. 보관 없이 켠 경우의 중계(md5 계정) |
 | 프로토콜 | 첫 부분의 시나리오 표(확장 질의, COPY, 큰 결과, 취소, 알림, 파이프라인)를 보관을 켠 세션으로 돌린다 |
 | 게이트 | 보관을 켠 세션의 쓰기가 섀도에서 기록되고 enforce에서 막힌다. `login_role`이 그 계정이다. 승인된 쓰기가 실행된다. 낡은 쓰기 탐지가 돈다 |
-| 다시 읽기 | `stet agent token` 뒤에 예전 토큰은 다음 로그인에서 거절되고 열린 세션은 계속 간다. 다시 띄우지 않는다. 띄운 뒤에 더한 계정은 받지 않는다 |
+| 다시 읽기 | `stet agent token` 뒤에 예전 토큰은 다음 로그인에서 거절되고 열린 세션은 계속 간다. 다시 띄우지 않는다. 시작할 때 없던 계정은 받지 않는다 |
 | 파일 | 권한 규칙의 줄마다(자기 파일 `0600`, `0640`은 거부, 누구나 읽는 파일은 거부. root 소유의 경우는 판단하는 자리의 단위 테스트). `password_env`. 반쯤 쓰인 파일이 남지 않는다. 바꿔 쓴 뒤에 권한이 그대로다 |
 | 확인 안 된 업스트림 | 보관을 켜고 원격 `sslmode=require`나 `verify-ca`(루트 없음)면 시작하지 않는다 |
 | 평문 `listen` | 보관을 켜고 루프백이 아닌 `listen`에 `listen_tls`가 없으면 시작하지 않는다 |
@@ -326,7 +326,7 @@ stet agent list     [-config stet.yaml]
   - `TestCustodyEndToEnd`(cmd/stet): `listen_tls`와 자격 증명 파일로 띄운 Stet에 `psql`과 pgx가 `verify-full`로 붙어 게이트 대상 테이블을 고친다. 경고는 없다.
   - 따라 하기: 두 놓는 법 모두 에이전트 쪽 셸은 토큰(`PGPASSWORD`)과 Stet의 인증서만 가졌다. `current_user`가 그 계정이었다.
 - [x] 그 토큰으로는 DB에 직접 로그인할 수 없다. `TestTokenIsNoDatabasePassword`(internal/proxy). 따라 하기: 토큰으로 시험 서버(55432)에 바로 붙자 서버가 `28P01`로 거부했다.
-- [x] 틀린 토큰과 모르는 계정은 같은 답을 받는다. `TestLoginRefusals`(internal/proxy): 틀린 토큰, 모르는 계정, 진짜 비밀번호를 토큰 자리에 넣은 것, 다른 계정의 토큰이 모두 `28P01`이고, 모르는 계정과 틀린 토큰이 받는 메시지의 수와 모양이 같다(`SameAnswers`). 가짜 검증값: `TestVerifierKnownAndMock`, `TestStoreMockSecret`(internal/custody), `TestMockNeverSucceeds`(internal/scram). 따라 하기: 두 경우의 `psql` 출력이 계정 이름 말고 같았다.
+- [x] 틀린 토큰과 모르는 계정은 같은 답을 받는다. `TestLoginRefusals`(internal/proxy): 틀린 토큰, 모르는 계정, 진짜 비밀번호를 토큰 자리에 넣은 것, 다른 계정의 토큰이 모두 `28P01`이고, 모르는 계정과 틀린 토큰이 받는 메시지의 수와 모양이 같다(`SameAnswers`). 증명이 맞아도 모르는 계정은 프록시가 거절한다: `TestUnknownAccountIsRefusedWhateverItsProof`(internal/proxy. 마지막 검토 뒤에 더했다). 가짜 검증값: `TestVerifierKnownAndMock`, `TestStoreMockSecret`(internal/custody), `TestMockNeverSucceeds`(internal/scram). 따라 하기: 두 경우의 `psql` 출력이 계정 이름 말고 같았다.
 - [x] 양쪽 구간이 TLS다(클라이언트 쪽은 인사로, 서버 쪽은 `pg_stat_ssl`로 확인한다). `TestAgentLogsInWithAToken`(internal/proxy)과 `TestCustodyEndToEnd`(cmd/stet)가 pgx의 연결이 `*tls.Conn`이고 `pg_stat_ssl.ssl`이 참인 것을 본다. 따라 하기: Stet의 로그 `tls=true`, `pg_stat_ssl`의 `TLSv1.3`.
 - [x] 보관을 켠 세션에서 섀도의 기록, enforce의 차단, 보류와 승인, 낡은 쓰기 탐지, 되돌리기가 지금과 같이 돈다. `login_role`이 그 계정이다.
   - 섀도의 기록과 `login_role`: `TestCustodyEndToEnd`(cmd/stet). 따라 하기: 두 놓는 법 모두 판단 줄과 `stet.decisions`의 `login_role`이 그 계정이었다(바이너리: `stet.decisions`에서 `commit`, `hold`, `hold`. Docker: `stet.decisions`에서 `commit`, `commit`을 봤다. 그 조회는 세 번째 쓰기 전에 했고, 토큰을 바꾼 뒤의 세 번째 쓰기는 판단 줄의 `would hold`로만 봤다).
@@ -335,10 +335,10 @@ stet agent list     [-config stet.yaml]
 - [x] 첫 부분의 프로토콜 시나리오가 보관을 켠 세션에서 통과한다. 취소가 전달된다. `TestScenariosThroughALogin`(취소 요청이 서버에 닿는다), `TestWatchedScenariosThroughALogin`, 보관 없이 클라이언트 쪽 TLS만 켠 `TestScenariosOverClientTLS`(internal/proxy).
 - [x] `stet agent add`, `token`, `password`, `remove`, `list`가 7장대로 돈다. 토큰과 비밀번호 바꾸기는 다시 띄우지 않고 적용된다.
   - 명령마다: `TestAgentAdd`, `TestAgentAddRefusesAWrongPassword`, `TestAgentAddPasswordEnv`, `TestAgentToken`, `TestAgentPassword`, `TestAgentRemove`, `TestAgentList`, `TestAgentPromptsWithoutEcho`, `TestAgentStops`, `TestAgentKeepsTheFileMode`, `TestAgentKeepsChangesMadeWhileItAsks`, `TestAgentTouchesOnlyItsAccount`, `TestAgentChecksAgainWhenItWrites`, `TestAgentWritesNothingWhenTheWriteFails`, `TestAgentGoesOnWhenTheDirectoryIsNotSynced`, `TestAgentSaysWhatStopsTheProxy`, `TestOnInterruptRestoresTheTerminal`(cmd/stet). 잠금: `TestUpdatesDoNotInterleave`, `TestUpdateLocksAcrossProcesses`(internal/custody).
-  - 다시 띄우지 않고: `TestTokenRotationNeedsNoRestart`(cmd/stet. 예전 토큰은 거절, 열린 세션은 계속, 띄운 뒤에 더한 계정은 거절과 경고 한 번), `TestStoreFollowsTheFile`(internal/custody. 새 토큰과 새 비밀번호, 지운 계정).
+  - 다시 띄우지 않고: `TestTokenRotationNeedsNoRestart`(cmd/stet. 예전 토큰은 거절, 열린 세션은 계속, 시작할 때 없던 계정은 거절과 경고 한 번), `TestStoreFollowsTheFile`(internal/custody. 새 토큰과 새 비밀번호, 지운 계정, 지웠다가 다시 더한 계정). 다시 읽지 못하는 동안 쓰던 계정들로 로그인이 계속되고 원인마다 에러 하나: `TestCredentialsFileReReadFails`(cmd/stet), `TestStoreLogsEachNewCauseOfAFailure`(internal/custody).
   - 따라 하기: 두 놓는 법 모두 `stet agent token` 뒤에 예전 토큰은 거절되고 새 토큰은 받아졌고, 예전 토큰으로 열어 둔 세션은 계속 갔다. Stet의 프로세스(컨테이너의 시작 시각과 재시작 수)는 그대로였다. 바이너리에서 DB의 비밀번호를 바꾼 뒤 `stet agent password` 전의 로그인은 `08001`, 뒤의 로그인은 성공했다.
-- [x] 권한이 풀린 자격 증명 파일, 확인되지 않는 원격 업스트림, TLS 없는 원격 `listen`으로는 시작하지 않는다(뒤의 둘은 보관을 켰을 때). `TestRolesMustMatchTheFile`(cmd/stet. 다른 사용자가 읽을 수 있는 파일, 계정이 없는 파일, 한쪽에만 있는 계정), `TestCheckMode`, `TestStoreOpenRefusesABadFile`(internal/custody), `TestCustodyNeedsAVerifiedUpstream`, `TestCustodyNeedsTLSOnARemoteListen`(internal/config). 따라 하기 전에 빌드한 `stet proxy`로 `0640` 파일과 `listen: 0.0.0.0:…`에 `listen_tls`가 없는 설정을 띄워 봤고, 둘 다 4장·8장의 문구로 시작하지 않았다.
-- [x] 토큰, 검증값, 진짜 비밀번호가 로그와 에러에 없다. `TestNoSecretInAnyLog`(cmd/stet. 디버그 로그, 판단 줄, `stet.decisions`), `TestAgentOutputShowsTheTokenOnce`(cmd/stet), `TestNoSecretInTheProxyLog`(internal/proxy), `TestLoginErrorsCarryNoSecrets`(internal/custody), `TestVerifierNeverFormatsItsSecret`(internal/scram). 따라 하기: 두 놓는 법의 Stet 로그와 출력(`docker logs` 포함)에서 쓴 토큰 넷과 비밀번호 넷을 찾았고 없었다.
+- [x] 권한이 풀린 자격 증명 파일, 확인되지 않는 원격 업스트림, TLS 없는 원격 `listen`으로는 시작하지 않는다(뒤의 둘은 보관을 켰을 때). `TestRolesMustMatchTheFile`(cmd/stet. 다른 사용자가 읽을 수 있는 파일, 계정이 없는 파일, 한쪽에만 있는 계정), `TestCheckMode`, `TestStoreOpenRefusesABadFile`(internal/custody), `TestCustodyNeedsAVerifiedUpstream`(`sslrootcert` 없는 `verify-ca`의 거부는 마지막 검토 뒤에 더했다), `TestCustodyNeedsTLSOnARemoteListen`, `TestPresentButEmptyCustodyKeys`(키만 있고 값이 빈 `listen_tls`와 `agents.credentials`. 마지막 검토 뒤에 더했다)(internal/config). 따라 하기 전에 빌드한 `stet proxy`로 `0640` 파일과 `listen: 0.0.0.0:…`에 `listen_tls`가 없는 설정을 띄워 봤고, 둘 다 4장·8장의 문구로 시작하지 않았다.
+- [x] 토큰, 검증값, 진짜 비밀번호가 로그와 에러에 없다. `TestNoSecretInAnyLog`(cmd/stet. 디버그 로그, 판단 줄, `stet.decisions`. 마지막 검토 뒤에 `mock_secret`(base64와 그 바이트의 hex)과 `password_env` 변수의 값도 찾고, 도는 Stet이 파일을 다시 읽지 못하는 경우를 더했다), `TestAgentOutputShowsTheTokenOnce`(cmd/stet. 같은 것을 더 찾는다), `TestNoSecretInTheProxyLog`(internal/proxy), `TestLoginErrorsCarryNoSecrets`(internal/custody), `TestVerifierNeverFormatsItsSecret`(internal/scram). 따라 하기: 두 놓는 법의 Stet 로그와 출력(`docker logs` 포함)에서 쓴 토큰 넷과 비밀번호 넷을 찾았고 없었다.
 - [x] 기존 테스트가 단언을 고치지 않고 통과한다. 보관을 켜지 않은 Stet의 동작은 이 단계 전과 같다(`listen_tls`를 적지 않았을 때 클라이언트가 받는 바이트 포함). 전체 실행(`STET_TEST_PG=127.0.0.1:55432 go test -race ./...`)에서 테스트가 있는 22개 패키지가 모두 `ok`다. `TestWithoutCustodyNothingChanges`(cmd/stet. 시작 줄의 키와 값, TLS 요청에 `N`), `TestClientTLSDeclinedWithoutACertificate`(internal/proxy). 이 단계 전부터 있던 테스트 파일에서 고친 것은 헬퍼뿐이고 단언은 그대로다: `proxy.New`의 서버를 따로 띄우는 헬퍼와 TLS·토큰으로 붙는 헬퍼(`proxy_test.go`, `upstream_test.go`), 옮겨 간 함수의 이름(`printable` → `safetext.Printable`, `init_test.go`), `loopbackHost`와 그 테스트를 `internal/config`로 옮긴 것(`TestLoopbackHost`, Task 4). `latency_test.go`에는 함수를 더하기만 했다.
 - [x] `latency_test.go`의 예산을 지킨다. 로그인에 드는 시간을 적는다. `TestLoginLatencyBudget`(internal/proxy, `-race`): 보관을 켠 세션의 `select 1` 2,000회 왕복에서 더해진 p95가 45.6µs(Task 6), 44.1µs(2026-11-23 다시 잼)다. 예산은 2ms다. 로그인 한 번(21번의 중앙값)은 직접 TLS로 8.5ms, 양쪽이 TLS인 Stet을 거쳐 17.8ms(Task 6), 다시 잰 값은 8.7ms와 18.1ms다.
 - [x] `docs/deploy.md`의 두 가지 놓는 법(바이너리, Docker 이미지)을 처음부터 끝까지 그대로 따라 해서 토큰으로 붙은 에이전트의 쓰기가 판단되는 것을 본다. 2026-11-23, macOS에서 `go build`한 바이너리와 이 기기에서 빌드한 이미지(Docker Desktop 28.0.1)로 했다. 이 기기에 맞춰 바꾼 것(서비스 계정·`sudo`·systemd 없이 이 기기의 사용자로, 빈 디렉터리, 포트, 인증서의 이름, 같은 기기의 시험 서버)은 deploy 11장·12장의 "확인한 것"에 적었다. 처음 따라 했을 때 여러 행의 쓰기가 `unsupported`(`not_single_row`)로 기록됐다. Stet의 계정이 에이전트 역할의 구성원이 아니었다(5장). 문서의 "필요한 것"에 `GRANT`를 더하고 처음부터 다시 했다. 이미지와 컨테이너, 데이터베이스와 역할은 지웠다.
@@ -386,12 +386,15 @@ stet agent list     [-config stet.yaml]
 - 8장: 보관을 켜면 섀도에서도 시작할 때 Stet의 계정이 에이전트 계정마다 그 역할의 구성원인지 보고 경고한다(enforce와 같은 문구). 보관이 없는 섀도는 그대로다.
 - 3장: `listen_tls`를 다시 읽지 못한 동안은 파일이 그대로 보여도 인사 때마다(200ms에 한 번까지) 다시 읽어 본다. 실패는 파일이 바뀔 때마다, 그리고 원인이 달라질 때마다 한 번 남긴다.
 - 7장: `password_env`인 계정에 `-password-env` 없이 돌린 `stet agent password`는 그 알림을 에러로 내고 1로 끝난다.
+- 4장: 증명이 맞아도 `Login`이 모르는 계정은 프록시가 거절한다. 5장: 취소 키가 4바이트가 아니거나 트랜잭션 상태가 `I`, `T`, `E`가 아닌 세션, 에러와 함께 돌려받은 세션은 잇지 않고 닫는다.
+- 6장: 파일을 다시 읽지 못하는 동안 에러는 원인마다 한 번 남긴다. 파일에서 온 계정 이름도 제어 문자를 걸러 적는다(9장). `stet agent`의 잠금은 디렉터리를 `O_DIRECTORY`로 연다.
+- 6장: 시작할 때 있었고 지웠다가 다시 더한 계정은 다시 띄우지 않고 받는다(그렇게 동작하던 것을 문서가 다르게 적고 있었다). deploy: 지운 계정의 열린 세션을 끝내는 법, 파일을 지워도 거두는 것이 없다는 것, `require_auth=scram-sha-256`, `stet agent`의 `docker run`에 `--log-driver none`.
 
 **남긴 것**
 
 - 가용성: 상태 확인, 세션을 기다리는 종료, 장애 넘김, 여러 인스턴스.
 - Stet이 DB 계정의 비밀번호를 만들고 돌리기(2장의 2). 바깥 비밀 보관소.
-- 계정 하나에 토큰 여럿(겹쳐 쓰는 교체), 다시 띄우지 않고 계정 더하기.
+- 계정 하나에 토큰 여럿(겹쳐 쓰는 교체), 시작할 때 없던 계정을 다시 띄우지 않고 더하기.
 - 클라이언트 쪽 채널 바인딩, 클라이언트 인증서로 하는 에이전트 인증.
 - 로그인 기록 테이블, 로그인 횟수 제한.
 - 업스트림 연결 풀.
