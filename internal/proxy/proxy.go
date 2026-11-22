@@ -223,8 +223,28 @@ func (s *Server) watch(pkt []byte) *session {
 // opens, so Close also ends a dial still waiting on the server's answer to
 // the TLS request or its handshake. release, called once conn is closed,
 // gives up that tracking.
+//
+// When the dial does not succeed, the tracking is given up here, from a
+// defer, so also when dial panics (in a certificate check, say): the tracked
+// connection holds a count in s.wg, which Close would wait for forever. The
+// connection is closed first, which dial does not do when it panics.
 func (s *Server) dialUpstream() (conn net.Conn, secure bool, release func(), err error) {
 	var raw net.Conn
+	untrack := func() {
+		if raw != nil {
+			s.untrack(raw)
+			s.wg.Done()
+		}
+	}
+	dialed := false
+	defer func() {
+		if !dialed {
+			if raw != nil {
+				raw.Close()
+			}
+			untrack()
+		}
+	}()
 	up := s.up
 	up.opened = func(c net.Conn) bool {
 		if !s.track(c) {
@@ -234,18 +254,11 @@ func (s *Server) dialUpstream() (conn net.Conn, secure bool, release func(), err
 		return true
 	}
 	conn, secure, err = up.dial()
-	release = func() {}
-	if raw != nil {
-		release = func() {
-			s.untrack(raw)
-			s.wg.Done()
-		}
-	}
 	if err != nil {
-		release()
 		return nil, false, nil, err
 	}
-	return conn, secure, release, nil
+	dialed = true
+	return conn, secure, untrack, nil
 }
 
 // forwardCancel passes a CancelRequest to upstream on a fresh connection,

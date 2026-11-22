@@ -468,6 +468,52 @@ func TestCloseDoesNotWaitForASilentUpstream(t *testing.T) {
 	}
 }
 
+// A panic inside the dial (here in a certificate check) ends that session
+// and leaves nothing behind: the connection to the server is closed and no
+// longer counted, so Close returns.
+func TestPanicInDialLeavesNothingBehind(t *testing.T) {
+	cert := selfSigned(t)
+	handshake := make(chan error, 1) // the fake's
+	fake := fakeUpstream(t, func(c net.Conn) {
+		if _, ssl := readOpening(c); !ssl {
+			return
+		}
+		c.Write([]byte{'S'})
+		tc := tls.Server(c, &tls.Config{Certificates: []tls.Certificate{cert}})
+		tc.SetDeadline(time.Now().Add(5 * time.Second))
+		select { // pgx may try more than once: the first is kept
+		case handshake <- tc.Handshake():
+		default:
+		}
+	})
+	panicking := &tls.Config{
+		InsecureSkipVerify: true, // still calls VerifyPeerCertificate
+		VerifyPeerCertificate: func([][]byte, [][]*x509.Certificate) error {
+			panic("the certificate check panicked")
+		},
+	}
+	addr, srv := startProxyTo(t, proxy.Upstream{Addr: fake, TLS: panicking}, nil, proxy.Policy{})
+	if err := connectErr(addr); err == nil {
+		t.Fatal("the session connected, want it ended")
+	}
+	select {
+	case err := <-handshake:
+		if err == nil {
+			t.Error("the server completed the handshake with a proxy whose check panicked")
+		}
+	case <-time.After(3 * time.Second):
+		t.Error("the connection to the server was left open after the panic")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- srv.Close() }()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return: the dial that panicked left its connection counted")
+	}
+}
+
 // A cancel request goes to the server only under the same rule as a
 // session: a server that declines TLS, when TLS is required, is not sent it.
 func TestCancelOverTLSNeedsTLS(t *testing.T) {
