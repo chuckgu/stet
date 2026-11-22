@@ -92,7 +92,7 @@ listen_tls:
 - 인증서와 키는 운영자가 준다. PEM 파일이다. 인증서 파일에는 체인을 함께 넣을 수 있다. TLS 1.2 이상만 받는다.
 - `cert`와 `key`의 상대 경로는 설정 파일이 있는 디렉터리에 대해 읽는다(`config.Load`. `config.Parse`는 적힌 그대로 둔다. 보정 V2). `~`는 풀지 않는다.
 - 시작할 때(`stet proxy`) 두 파일을 읽지 못하거나 짝이 맞지 않으면 시작하지 않는다(`listen_tls: …`). 설정 검증은 두 키가 다 있는지만 본다(`listen_tls: cert and key are both required`). 키 파일을 소유자 말고 다른 사용자가 읽을 수 있으면 경고한다(`listen_tls.key <경로> gives users other than its owner access (mode 0640): whoever can read it can pose as stet to the agents; fix: chmod 600 <경로>`).
-- 파일이 바뀌면(바뀐 시각, 크기, 권한, 파일 자체) 다음 인사에서 다시 읽고 그 인사부터 새 인증서를 쓴다(INFO `read listen_tls again; serving the new certificate from the next handshake`). 다시 읽지 못하면 쓰던 것을 계속 쓰고 에러 로그(`could not read listen_tls again; serving the certificate in use`)를 남긴다. 바뀔 때마다의 실패를 남기고, 파일을 볼 수 없는(stat이 실패하는) 동안은 한 번만 남긴다. 반쯤 쓰인 짝(인증서만 바뀌고 키는 아직)도 쓰던 인증서를 계속 쓴다. 인증서를 갈 때 Stet을 다시 띄우지 않기 위해서다.
+- 파일이 바뀌면(바뀐 시각, 크기, 권한, 파일 자체) 다음 인사에서 다시 읽고 그 인사부터 새 인증서를 쓴다(INFO `read listen_tls again; serving the new certificate from the next handshake`). 다시 읽지 못하면 쓰던 것을 계속 쓰고 에러 로그(`could not read listen_tls again; serving the certificate in use`)를 남긴다. 바뀔 때마다의 실패를 남기고, 파일을 볼 수 없는(stat이 실패하는) 동안은 한 번만 남긴다. 다시 읽지 못한 동안은 파일이 그대로 보여도 인사 때마다(200ms에 한 번까지) 다시 읽어 본다. 실패의 원인이 stat에 보이지 않을 수 있기 때문이다(Stet이 읽지 못하던 키를 `chown`으로 고친 것. 마지막 검토 뒤에 더했다. 처음에는 파일이 바뀌어야만 다시 읽었다). 그 다시 읽기의 실패는 원인(에러의 글자)이 달라졌을 때만 다시 남긴다. 반쯤 쓰인 짝(인증서만 바뀌고 키는 아직)도 쓰던 인증서를 계속 쓴다. 인증서를 갈 때 Stet을 다시 띄우지 않기 위해서다.
 - `listen_tls`가 있을 때, 루프백이 아닌 주소에서 온 접속이 TLS 없이 세션을 시작하려 하면 `FATAL`(SQLSTATE `28000`, `stet: this server requires TLS; connect with sslmode=require or stronger`)로 끝낸다. 업스트림에는 아무것도 보내지 않는다. 루프백에서 온 접속은 평문을 받는다. 루프백인지는 접속의 상대 주소로 본다. 그래서 같은 기기의 TCP 전달자(사이드카 프록시, `ssh -L`, `kubectl port-forward`)를 Stet 앞에 두면 모든 클라이언트가 루프백으로 보여 평문도 받는다(12장). 취소 요청은 평문으로도 받는다(libpq 16까지는 취소를 늘 평문으로 보낸다).
 - 인사에는 접속의 시작과 같은 시간 제한(10초)이 걸린다. 그사이 멈춘 클라이언트는 다른 접속을 막지 않는다.
 - `listen_tls`가 있으면 루프백이 아닌 `listen`에 대한 "암호화되지 않는다" 경고(spec-v0.2-tryout 3장)는 나오지 않는다.
@@ -384,6 +384,7 @@ stet agent list     [-config stet.yaml]
 - 8장: 보관을 켜면 원격 업스트림은 `verify-full`이거나 `sslrootcert`를 준 `verify-ca`나 `require`여야 한다. `sslrootcert` 없는 `verify-ca`는 받지 않는다. 거부의 문구도 그렇게 바꿨다.
 - 8장: 키만 있고 값이 빈 `listen_tls`와 `agents.credentials`(공백뿐인 값 포함)는 설정 검증에서 거부한다. 없는 것으로 읽지 않는다.
 - 8장: 보관을 켜면 섀도에서도 시작할 때 Stet의 계정이 에이전트 계정마다 그 역할의 구성원인지 보고 경고한다(enforce와 같은 문구). 보관이 없는 섀도는 그대로다.
+- 3장: `listen_tls`를 다시 읽지 못한 동안은 파일이 그대로 보여도 인사 때마다(200ms에 한 번까지) 다시 읽어 본다. 실패는 파일이 바뀔 때마다, 그리고 원인이 달라질 때마다 한 번 남긴다.
 
 **남긴 것**
 

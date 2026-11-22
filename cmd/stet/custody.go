@@ -167,9 +167,19 @@ func printable(names []string) []string {
 	return out
 }
 
+// certRetryEvery is how soon a load of the listen_tls files that failed is
+// tried again when they still look the same, as custody.Store retries its
+// file; loadKeyPair loads them. Variables so a test can shorten the one and
+// make the other fail.
+var (
+	certRetryEvery = 200 * time.Millisecond
+	loadKeyPair    = tls.LoadX509KeyPair
+)
+
 // certReloader serves the certificate at certPath and keyPath, and reads
-// them again when either file changes; a reload that fails keeps the
-// certificate in use and logs the error.
+// them again when either file changes, or, while the last reload failed,
+// now and then; a reload that fails keeps the certificate in use and logs
+// the error.
 func certReloader(certPath, keyPath string, log *slog.Logger) (*tls.Config, error) {
 	r := &certFiles{certPath: certPath, keyPath: keyPath, log: log}
 	var err error
@@ -179,7 +189,7 @@ func certReloader(certPath, keyPath string, log *slog.Logger) (*tls.Config, erro
 	if r.keySeen, err = os.Stat(keyPath); err != nil {
 		return nil, err
 	}
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	cert, err := loadKeyPair(certPath, keyPath)
 	if err != nil {
 		return nil, err
 	}
@@ -201,13 +211,17 @@ type certFiles struct {
 	cert              *tls.Certificate
 	certSeen, keySeen os.FileInfo // as last read, or tried; nil when they could not be looked at
 	missing           bool        // they could not be looked at, which was logged
+	failure           string      // the error of the last reload, which failed; "" when it did not
+	lastTry           time.Time   // when that reload was tried
 }
 
 // get is the tls.Config's GetCertificate: the certificate in use, read again
-// first when either file looks different from the last time. A reload is
-// tried, and a failed one logged, once per change; files that cannot be
-// looked at are logged once for as long as that lasts, since every
-// handshake looks.
+// first when either file looks different from the last time, or, while the
+// last reload failed, at most every certRetryEvery: what made it fail (a key
+// Stet could not read until a chown) may not show in the files' stat. A
+// failed reload is logged once per change of the files, and once more when
+// a retry fails for another reason; files that cannot be looked at are
+// logged once for as long as that lasts, since every handshake looks.
 func (r *certFiles) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -222,16 +236,20 @@ func (r *certFiles) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 		return r.cert, nil
 	}
 	r.missing = false
-	if unchanged(r.certSeen, certNow) && unchanged(r.keySeen, keyNow) {
+	changed := !unchanged(r.certSeen, certNow) || !unchanged(r.keySeen, keyNow)
+	if !changed && (r.failure == "" || time.Since(r.lastTry) < certRetryEvery) {
 		return r.cert, nil
 	}
-	r.certSeen, r.keySeen = certNow, keyNow
-	cert, err := tls.LoadX509KeyPair(r.certPath, r.keyPath)
+	r.certSeen, r.keySeen, r.lastTry = certNow, keyNow, time.Now()
+	cert, err := loadKeyPair(r.certPath, r.keyPath)
 	if err != nil {
-		r.failed(err)
+		if changed || err.Error() != r.failure {
+			r.failed(err)
+		}
+		r.failure = err.Error()
 		return r.cert, nil
 	}
-	r.cert = &cert
+	r.cert, r.failure = &cert, ""
 	r.log.Info("read listen_tls again; serving the new certificate from the next handshake")
 	return r.cert, nil
 }

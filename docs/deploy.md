@@ -72,7 +72,7 @@ Stet이 하는 것:
 
 - 시작할 때 두 파일을 읽지 못하거나 짝이 맞지 않으면 시작하지 않는다(`stet: listen_tls: …`).
 - 키 파일을 소유자 말고 다른 사용자가 읽을 수 있으면 경고한다: `listen_tls.key <경로> gives users other than its owner access (mode 0640): whoever can read it can pose as stet to the agents; fix: chmod 600 <경로>`
-- 두 파일 가운데 하나라도 바뀌면(바뀐 시각, 크기, 권한, 파일 자체) 다음 TLS 인사에서 다시 읽고, 그 인사부터 새 인증서를 쓴다. 로그에 `read listen_tls again; serving the new certificate from the next handshake`가 남는다. 다시 읽지 못하면(반쯤 쓰인 파일, 짝이 맞지 않는 두 파일) 쓰던 인증서를 계속 쓰고 `could not read listen_tls again; serving the certificate in use`를 에러로 남긴다. 인증서를 갈 때 Stet을 다시 띄우지 않아도 된다. 두 파일을 함께 바꾼다.
+- 두 파일 가운데 하나라도 바뀌면(바뀐 시각, 크기, 권한, 파일 자체) 다음 TLS 인사에서 다시 읽고, 그 인사부터 새 인증서를 쓴다. 로그에 `read listen_tls again; serving the new certificate from the next handshake`가 남는다. 다시 읽지 못하면(반쯤 쓰인 파일, 짝이 맞지 않는 두 파일, Stet이 읽을 수 없는 키) 쓰던 인증서를 계속 쓰고 `could not read listen_tls again; serving the certificate in use`를 에러로 남긴다. 그동안은 파일이 그대로여도 인사 때마다(200ms에 한 번까지) 다시 읽어 보므로, 키의 소유자를 `chown`으로 고친 것도 다시 띄우지 않고 쓰인다. 인증서를 갈 때 Stet을 다시 띄우지 않아도 된다. 두 파일을 함께 바꾼다.
 
 `listen_tls`는 자격 증명 보관(`agents.credentials`) 없이도 켤 수 있다. 그때 인증은 지금처럼 중계한다. `upstream`도 TLS면 SCRAM 계정은 클라이언트가 `channel_binding=disable`을 적어야 로그인한다. 클라이언트가 SCRAM을 Stet의 인증서에 묶고, 서버는 자기 인증서로 확인하기 때문이다. md5와 `password` 계정은 그대로 로그인한다. Stet은 시작할 때 이 조합을 경고한다(`listen_tls is set without agents.credentials and the upstream's sslmode asks for TLS: …`). 이 문서의 길은 보관을 켠다.
 

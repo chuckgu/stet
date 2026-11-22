@@ -934,6 +934,77 @@ func TestCertificateReload(t *testing.T) {
 	})
 }
 
+// A load that failed is tried again on later handshakes, at most every
+// certRetryEvery, though the files look the same: a key Stet could not read
+// until its owner was changed (a chown, which is not among what a change is
+// seen by) is then picked up. A failure is logged once per change of the
+// files, and once more for each new cause.
+func TestCertificateReloadIsRetried(t *testing.T) {
+	certPath, keyPath, _ := pgtest.LocalCert(t)
+	var log syncBuffer
+	cfg, err := certReloader(certPath, keyPath, slog.New(slog.NewTextHandler(&log, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := func() []byte {
+		t.Helper()
+		c, err := cfg.GetCertificate(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c.Certificate[0]
+	}
+	count := func(s string) int { return strings.Count(log.String(), s) }
+	first := certificateIn(t, certPath)
+
+	load, every := loadKeyPair, certRetryEvery
+	t.Cleanup(func() { loadKeyPair, certRetryEvery = load, every })
+	loads, why := 0, "permission denied" // why: "" once the key can be read
+	loadKeyPair = func(certFile, keyFile string) (tls.Certificate, error) {
+		loads++
+		if why != "" {
+			return tls.Certificate{}, errors.New("open " + keyFile + ": " + why)
+		}
+		return load(certFile, keyFile)
+	}
+
+	// A new pair, whose key Stet cannot read yet.
+	otherCert, otherKey, _ := pgtest.LocalCert(t)
+	copyFile(t, otherKey, keyPath)
+	copyFile(t, otherCert, certPath)
+	second := certificateIn(t, otherCert)
+	certRetryEvery = time.Hour
+	for range 5 {
+		if !bytes.Equal(served(), first) {
+			t.Fatal("stet serves another certificate than the one in use")
+		}
+	}
+	if loads != 1 || count("level=ERROR") != 1 {
+		t.Errorf("%d loads and %d errors logged for one change and five handshakes, want 1 and 1; log:\n%s", loads, count("level=ERROR"), &log)
+	}
+
+	certRetryEvery = 0
+	why = "too many open files" // another cause: logged once more
+	served()
+	served()
+	if loads != 3 || count("level=ERROR") != 2 {
+		t.Errorf("%d loads and %d errors logged, want 3 and 2; log:\n%s", loads, count("level=ERROR"), &log)
+	}
+
+	// The key's owner is changed: the files look as they did.
+	why = ""
+	if !bytes.Equal(served(), second) {
+		t.Errorf("a key that can be read now is not picked up; log:\n%s", &log)
+	}
+	if count("level=ERROR") != 2 || count(`msg="read listen_tls again`) != 1 {
+		t.Errorf("want 2 errors and one line that the certificate was read again; log:\n%s", &log)
+	}
+	served()
+	if loads != 4 {
+		t.Errorf("%d loads, want 4: a load that worked is not tried again", loads)
+	}
+}
+
 // A key file that users other than its owner can read is warned of; one
 // only its owner can is not.
 func TestWarnsOfAKeyOthersCanRead(t *testing.T) {
