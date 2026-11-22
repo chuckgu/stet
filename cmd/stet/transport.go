@@ -7,8 +7,8 @@ import (
 )
 
 // transportWarnings returns what stet warns of at start about the two legs
-// (spec-v0.2-tryout 3). It stops nothing. The upstream's password is never in
-// them: only its host is named.
+// (spec-v0.2-tryout 3, spec-v0.2-server 3). It stops nothing. The upstream's
+// password is never in them: only its host is named.
 func transportWarnings(cfg *config.Config) []string {
 	var warnings []string
 	host, _, err := net.SplitHostPort(cfg.UpstreamAddr())
@@ -27,8 +27,16 @@ func transportWarnings(cfg *config.Config) []string {
 	if err != nil {
 		listenHost = cfg.Listen
 	}
-	if !config.LoopbackHost(listenHost) {
+	// With listen_tls a client from another machine must use TLS
+	// (spec-v0.2-server 3).
+	if !config.LoopbackHost(listenHost) && cfg.ListenTLS == nil {
 		warnings = append(warnings, "listen "+cfg.Listen+" is not a loopback address: the connection between clients and stet is not encrypted; fix: listen on 127.0.0.1, or keep clients and stet on a network you trust")
+	}
+	// Relayed SCRAM fails with TLS on both legs: the client binds its proof to
+	// stet's certificate, the server checks it against its own
+	// (spec-v0.2-server 3).
+	if cfg.ListenTLS != nil && cfg.Credentials == "" && cfg.UpstreamTransport() != config.TransportPlain {
+		warnings = append(warnings, "listen_tls is set without agents.credentials and the upstream's sslmode asks for TLS: SCRAM accounts cannot log in through stet with TLS on both sides unless the client sets channel_binding=disable; fix: add agents.credentials, or reach upstream without TLS on a private network")
 	}
 	return warnings
 }

@@ -152,7 +152,17 @@ func run(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog.Log
 // are told by the gate once a decision was recorded (or failed to be), and
 // queued for out without waiting for it (rule 1: the output is not part of
 // judging). The start banner is the first line, queued as soon as run is about to serve.
+//
+// Before the gate, run sets up the clients' side (openClientSide): listen_tls
+// and the credentials file, whose accounts are then the agent roles. Once the
+// gate is open it logs in as each account (checkAccounts), and serves with
+// TLS and with the accounts' Login as configured.
 func runWith(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog.Logger, out io.Writer) error {
+	client, cfg, err := openClientSide(cfg, log)
+	if err != nil {
+		ln.Close()
+		return err
+	}
 	g, closeGate, err := openGate(ctx, cfg, log)
 	if err != nil {
 		ln.Close()
@@ -177,11 +187,19 @@ func runWith(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog
 		}
 	}()
 
+	if client.login != nil {
+		checkAccounts(ctx, client, log)
+	}
+
 	var pg proxy.Gate
 	if g != nil {
 		pg = g
 	}
 	srv := proxy.New(proxy.Upstream{Addr: cfg.UpstreamAddr(), TLS: cfg.UpstreamTLS, PlainFallback: cfg.UpstreamPlainFallback}, log, pg, proxy.Policy{Agents: cfg.AgentRoles, Enforce: cfg.Mode == config.ModeEnforce})
+	srv.ClientTLS = client.tls
+	if client.login != nil { // never a nil *custody.Login in the interface
+		srv.Login = client.login
+	}
 	ctx, stop := context.WithCancel(ctx)
 	defer stop()
 	closed := make(chan struct{})
@@ -199,7 +217,8 @@ func runWith(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog
 	}
 	log.Info("stet proxy listening", "listen", ln.Addr(), "upstream", cfg.UpstreamAddr(),
 		"upstream_tls", cfg.UpstreamTransport().String(), "mode", cfg.Mode, "agent_roles", cfg.AgentRoles,
-		"gated_tables", len(cfg.Tables), "model", cfg.Model.Adapter)
+		"gated_tables", len(cfg.Tables), "model", cfg.Model.Adapter,
+		"listen_tls", onOff(client.tls != nil), "custody", onOff(client.login != nil))
 	err = srv.Serve(ln)
 	// Serve returns once the listener is closed, while sessions may still be
 	// reporting their last statements to the gate. Wait for Close, which waits
@@ -208,6 +227,13 @@ func runWith(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog
 	stop()
 	<-closed
 	return err
+}
+
+func onOff(on bool) string {
+	if on {
+		return "on"
+	}
+	return "off"
 }
 
 // formatLine makes a decision's line. A variable so a test can make it panic.
