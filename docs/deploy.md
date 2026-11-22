@@ -8,13 +8,17 @@
 
 - Stet을 띄울 Linux 서버 한 대. 에이전트가 거기에 닿고, 거기서 DB에 닿는다.
 - 에이전트마다 따로 있는 DB 계정과 그 비밀번호. Stet 자신의 계정(`upstream`의 계정)은 에이전트 계정과 달라야 한다.
-- Stet 자신의 계정이 에이전트 계정마다 그 역할의 구성원일 것. DB에서 에이전트 계정마다 한 번 실행한다.
+- Stet 자신의 계정이 에이전트 계정마다 그 역할의 구성원일 것. DB의 관리 계정이 에이전트 계정마다 한 번 실행한다. Stet의 계정이 superuser도 `CREATEROLE`도 아니면 스스로 하지 못한다(`must have admin option on role "agent_enricher"`).
 
   ```sql
   GRANT agent_enricher TO stet;
   ```
 
   여러 행에 쓰는 쓰기의 영향 측정은 섀도에서도 에이전트의 역할로 돈다. 빠지면 그 쓰기는 `unsupported`(`not_single_row`)로 기록되고 로그에 `impact not measured: Stet's account is not a member of the client's role`이 남는다. enforce에서는 승인된 쓰기도 그 역할로 실행한다(spec-v0.2-enforce 8장). quickstart의 길(계정 하나)에서는 필요 없던 것이다.
+
+  **이 부여가 Stet의 계정에 주는 것.** Stet의 계정은 그 에이전트 계정으로 `SET ROLE`할 수 있다. 역할을 만들 때의 기본값(`INHERIT`)이면 `SET ROLE` 없이도 그 에이전트 계정의 테이블 권한을 함께 가진다. 둘 다 시험 서버(PostgreSQL 14.18)에서 확인했다. 그 위에 Stet의 계정은 판단 기록이 있는 `stet` 스키마의 소유자다. 그래서 Stet의 계정의 비밀번호(`upstream`의 비밀번호)는 모든 에이전트 계정을 합친 것에 기록을 고칠 수 있는 힘까지 더한 무게다. 어느 에이전트도 그것을 알아서는 안 된다(8장).
+
+  PostgreSQL 16부터는 superuser가 아닌 계정이 역할을 주려면 그 역할의 `ADMIN OPTION`이 있어야 하고 `CREATEROLE`만으로는 되지 않는다(PostgreSQL 16 릴리스 노트의 동작이다. 이 기기의 14.18에서는 돌려 보지 않았다).
 - 에이전트가 Stet의 이름으로 확인할 수 있는 TLS 인증서와 키(3장).
 
 ## 1. 무엇이 달라지는가
@@ -38,7 +42,7 @@
 - **Stet 앞에 같은 기기의 TCP 전달자를 두지 않는다.** 사이드카 프록시, `ssh -L`, `kubectl port-forward`처럼 같은 기기에서 연결을 넘겨주는 것을 Stet 앞에 두면, 모든 클라이언트가 루프백에서 온 것으로 보여 평문도 받는다.
 - Stet은 DB에 TLS로 붙고 서버를 확인해야 한다. `upstream`의 호스트가 루프백이 아니면 `sslmode`가 `verify-full`, `verify-ca`, 또는 `sslrootcert`가 있는 `require`여야 한다. 아니면 시작하지 않는다(4장). 확인하지 않는 연결에서는 중간에 선 누군가가 비밀번호를 평문으로 달라고 할 수 있고, Stet의 DB 클라이언트(pgx)는 그것을 따른다.
 - 에이전트가 DB에 직접 닿지 못하게 막을 수 있으면 막는다(방화벽, `pg_hba.conf`). 매니지드 Postgres처럼 막을 수 없으면, 에이전트가 진짜 비밀번호를 모르게 하는 것(8장)이 막는 길이다.
-- 연결 풀러를 거친 DB 주소는 지금처럼 받지 않는다(quickstart 10장).
+- 연결 풀러를 거친 DB 주소는 지금처럼 지원하지 않는다(quickstart 10장).
 
 ## 3. 인증서
 
@@ -111,7 +115,7 @@ tables:
 1. 자격 증명 파일의 권한과 모양을 본다(5장). 읽지 못하면 시작하지 않는다(`stet: agents.credentials: …`). 계정이 하나도 없으면 시작하지 않는다(`the credentials file has no account; add one with stet agent add`).
 2. Stet 자신의 계정(`upstream`의 계정. 주소에 없으면 pgx가 정하는 대로 `PGUSER`나 Stet을 돌리는 사용자)이 파일에 있으면 시작하지 않는다: `agents.credentials: "<계정>" is Stet's own account (the upstream user)`. 그 토큰을 가진 쪽은 게이트가 보지 않는 세션을 얻기 때문이다.
 3. `agents.roles`가 있으면 파일의 계정들과 비교한다.
-4. Stet 자신의 연결로 DB를 확인한 뒤, 계정마다 DB에 한 번 로그인해 본다. 계정마다 5초, 합쳐 30초까지다. 되지 않는 계정은 경고하고 시작은 한다. 그 계정의 로그인은 거절되고, 다른 계정은 일한다(10장).
+4. Stet 자신의 연결로 DB를 확인한 뒤, 계정마다 DB에 한 번 로그인해 본다. 계정마다 5초, 합쳐 30초까지다. 되지 않는 계정은 경고하고 시작은 한다. 그 계정의 로그인은 DB에 로그인할 수 있게 될 때까지 거절되고(`08001`), 다른 계정은 일한다(10장). Stet은 그 계정을 따로 표시해 두지 않는다. DB가 그 비밀번호를 받게 되면 그다음 로그인부터 된다.
 5. 받기 시작하는 로그 줄에 `listen_tls=on custody=on`이 붙는다. `agent_roles`는 파일의 계정들이다.
 
 ## 5. 자격 증명 파일
@@ -276,6 +280,14 @@ host=stet.internal port=6432 dbname=crm user=agent_enricher password=<token> ssl
 
 계정을 Stet 뒤로 옮겨도, 그 계정의 예전 비밀번호를 아는 에이전트는 DB에 직접 붙어 Stet을 건너뛸 수 있다. 그래서 옮긴 뒤에 DB에서 비밀번호를 바꾼다. Stet은 이것이 됐는지 알 수 없다.
 
+**Stet 자신의 계정이 먼저다.** Stet의 계정(`upstream`의 계정)의 비밀번호는 어느 에이전트도 알아서는 안 된다. 그 계정은 모든 에이전트 역할의 구성원이고 `stet` 스키마의 소유자다("필요한 것"). quickstart의 길에서 옮겨 오면 에이전트는 그 계정으로 붙어 왔으므로 그 비밀번호를 안다(그 길의 `DATABASE_URL`). 예전 주소를 쥔 에이전트는 Stet을 건너뛰어 어느 에이전트 계정의 권한으로든 쓰고 `stet.decisions`를 고칠 수 있다. 그래서 토큰을 나눠 주기 전에 이렇게 한다.
+
+1. DB에서 Stet의 계정의 비밀번호를 바꾼다. psql이면 관리 계정으로 `\password stet`다.
+2. Stet이 그 비밀번호를 읽는 곳을 고친다. 설정의 `upstream` 주소, 또는 그것을 주는 `PGPASSWORD`나 `.pgpass`다.
+3. Stet을 다시 띄운다. 그 비밀번호는 시작할 때 읽는다.
+
+그다음 에이전트 계정마다 이렇게 한다.
+
 1. `stet agent add`로 계정을 더하고, Stet을 다시 띄우고, 에이전트의 접속 문자열을 토큰으로 바꾼다(6장, 7장).
 2. DB에서 그 계정의 비밀번호를 바꾼다. psql이면 관리 계정으로 `\password agent_enricher`다(입력이 화면에 보이지 않고, 서버에는 비밀번호 대신 검증값을 보낸다). 매니지드 서비스면 그 콘솔에서 바꿔도 된다.
 3. 새 비밀번호를 Stet에 넣는다. Stet을 다시 띄우지 않는다.
@@ -286,7 +298,7 @@ host=stet.internal port=6432 dbname=crm user=agent_enricher password=<token> ssl
 
 2와 3 사이에는 그 계정의 새 로그인이 `08001`(`stet: could not open a database session for "agent_enricher"`)로 거절된다. Stet이 쥔 비밀번호가 아직 예전 것이기 때문이다. 열려 있는 세션은 그대로 간다. 로그에는 `reason="upstream login failed"`와 `wrong password`가 남는다.
 
-새 비밀번호는 운영자와 Stet만 안다. 에이전트가 볼 수 있는 곳(에이전트의 환경 변수, 같은 기기의 파일)에 두지 않는다.
+새 비밀번호는 운영자와 Stet만 안다. 에이전트가 볼 수 있는 곳(에이전트의 환경 변수, 같은 기기의 파일)에 두지 않는다. Stet의 계정의 비밀번호도 같다.
 
 ## 9. 돌리기와 다시 띄우기
 
@@ -315,7 +327,9 @@ host=stet.internal port=6432 dbname=crm user=agent_enricher password=<token> ssl
 | `agent login refused` `account=… remote=… reason=…` | WARN | 거절했다. `reason`은 아래 다섯 가운데 하나다 |
 | `an account of the credentials file cannot log in to the database: its agent's logins are refused until it can` | WARN | 시작할 때의 확인에서 그 계정으로 DB에 로그인하지 못했다. `err`에 갈래가 있다 |
 | `the start ran out of time to log in as these accounts, so they are not checked` | WARN | 시작할 때의 확인이 30초를 넘겼다. 확인하지 못한 계정들을 적는다 |
-| `the environment variable for an account's password is empty or not set` | WARN | `password_env`의 변수가 비었다 |
+| `the environment variable for an account's password is empty or not set` | WARN | 시작할 때 `password_env`의 변수가 비었다 |
+| `the credentials file now names an environment variable that was not read when stet started; keeping the password in use until stet restarts` | WARN | 띄운 뒤에 파일의 `password_env`가 시작할 때 읽지 않은 변수로 바뀌었다. 그 계정과 변수마다 한 번 남기고, 다시 띄울 때까지 쓰던 비밀번호를 쓴다 |
+| `the credentials file has no mock_secret: …` | WARN | 손으로 쓴 파일에 `mock_secret`이 없다(5장) |
 | `account "…" was added after stet started; restart stet proxy to accept it` | WARN | 띄운 뒤에 파일에 생긴 계정이다 |
 | `could not read the credentials file again; keeping the accounts as they were` | ERROR | 다시 읽지 못했다. 고쳐지면 `read the credentials file again; following it once more`(INFO) |
 | `read listen_tls again; serving the new certificate from the next handshake` | INFO | 인증서를 갈았다 |
@@ -464,12 +478,13 @@ docker run --rm -v /srv/stet:/etc/stet stet:local agent token -config /etc/stet/
 **돌려 보지 않았다.** 놓는 모양만 적는다.
 
 - 설정, 인증서와 키, DB의 CA, 자격 증명 파일을 비밀(Secret) 하나에 넣고, 그 비밀을 디렉터리로 마운트한다(`/etc/stet`). `subPath`로 파일 하나씩 마운트하지 않는다. `subPath`는 비밀이 바뀌어도 갱신되지 않는다.
-- 비밀의 파일은 서로 다른 디렉터리에 둘 수 없으므로 설정의 경로도 평평하게 적는다(`cert: server.crt`, `key: server.key`, `credentials: agents.yaml`, `sslrootcert=/etc/stet/db-ca.crt`).
+- 비밀의 키는 기본으로 마운트한 디렉터리 바로 아래의 파일이 된다. `items[].path`로 하위 디렉터리(`tls/server.crt`)에 둘 수도 있다. 아래 예는 평평하게 두기로 하고, 설정의 경로도 그렇게 적는다(`cert: server.crt`, `key: server.key`, `credentials: agents.yaml`, `sslrootcert=/etc/stet/db-ca.crt`).
 - 파드는 uid 65532로 돌리고 `fsGroup: 65532`를 준다. 비밀 볼륨의 파일은 root가 소유하고 `fsGroup`의 그룹이 된다(Kubernetes의 동작이다). Stet은 root가 소유한 그룹 읽기 파일(`0640`, `0440`)을 받는다(5장). 그래서 `defaultMode: 0440`을 준다. 이 모양에서는 키 파일을 그룹이 읽을 수 있으므로 시작할 때 `listen_tls.key … gives users other than its owner access (mode 0440)` 경고가 나온다. 키를 소유자만 읽게 하면 uid 65532가 읽지 못한다.
 - 비밀을 바꾸면 kubelet이 마운트한 파일을 바꾼다(곧바로는 아니다). Stet은 다음 로그인에서 바뀐 것을 본다. 토큰, 파일에 둔 비밀번호, 지운 계정, 인증서는 다시 띄우지 않고 적용된다. 계정을 더한 뒤에는 `kubectl rollout restart`로 다시 띄운다.
-- 비밀 볼륨은 읽기 전용이라 `stet agent`가 그 자리에서 쓰지 못한다. `stet agent`는 DB에 닿는 곳에서 자격 증명 파일의 사본에 돌리고, 그 사본으로 비밀을 바꾼다. 사본에는 모든 진짜 비밀번호가 있다. 다 쓰면 지운다.
+- 비밀 볼륨은 읽기 전용이라 `stet agent`가 그 자리에서 쓰지 못한다. `stet agent`는 DB에 닿는 곳에서 자격 증명 파일의 사본에 돌리고, 그 사본으로 비밀을 바꾼다. 사본은 `umask 077`로 만들거나 만든 뒤 `chmod 600`한다. 그룹이나 다른 사용자가 읽을 수 있는 사본(`umask 022`면 `0644`)은 `stet agent`가 `mode 0644 is too open: allow no access for group or others (0600)`로 거부한다(5장). 사본에는 모든 진짜 비밀번호가 있다. 다 쓰면 지운다.
 - `replicas: 1`로 둔다. 여러 인스턴스와 가용성은 이 단계의 범위가 아니다.
 - 서비스(Service)로 받으면 에이전트의 주소는 파드 밖의 것이라 TLS가 필요하다. `kubectl port-forward`로 붙으면 Stet에는 루프백으로 보여 평문도 받는다(2장).
+- 서비스 메시의 사이드카(Istio, Linkerd)를 Stet의 파드에 붙이면, 사이드카가 받은 연결을 파드 안에서 Stet에 넘겨주므로 Stet에는 상대 주소가 루프백으로 보일 수 있다. 그러면 2장의 같은 기기의 전달자처럼 평문도 받는다. 메시를 쓰면 Stet의 파드는 사이드카에서 빼거나, 에이전트가 `sslmode=verify-full`로 붙게 해 둔다.
 
 ```yaml
 spec:
@@ -499,12 +514,13 @@ spec:
 
 ## 14. 한계
 
-- **진짜 비밀번호가 Stet 서버에 있다.** 파일이나 환경 변수에 평문으로 있고, 프로세스의 메모리에 있다. Stet 서버가 뚫리면 에이전트 계정의 비밀번호가 모두 나간다. 운영자도 그 값을 안다.
+- **진짜 비밀번호가 Stet 서버에 있다.** 파일이나 환경 변수에 평문으로 있고, 프로세스의 메모리에 있다. Stet 서버가 뚫리면 에이전트 계정의 비밀번호가 모두 나간다. Stet 자신의 계정의 비밀번호(`upstream`)도 나간다. 그 계정은 모든 에이전트 역할의 구성원이고 `stet` 스키마의 소유자라, 판단 기록까지 고칠 수 있다. `listen_tls`의 키도 나간다. 그 키를 가진 쪽은 에이전트에게 Stet인 척할 수 있다. 운영자도 비밀번호들을 안다.
+- **Stet 자신의 계정은 모든 에이전트 계정을 합친 것보다 무겁다.** 에이전트 역할을 모두 가지고(`GRANT … TO stet`, "필요한 것") 판단 기록을 소유한다. 그 비밀번호를 아는 쪽은 Stet을 건너뛰어 어느 에이전트의 권한으로든 쓰고 기록을 고칠 수 있다. quickstart의 길에서 옮겨 오면 에이전트가 그 비밀번호를 알고 있으므로 먼저 바꾼다(8장).
 - **예전 비밀번호를 아는 에이전트는 건너뛸 수 있다.** 계정을 Stet 뒤로 옮길 때 DB에서 비밀번호를 바꿔야 한다(8장). Stet은 그것이 됐는지 알 수 없다.
 - **운영 규칙은 그대로 전제다.** 누군가 에이전트에게 서비스나 사람의 자격 증명을 주면 Stet은 그 쓰기를 보지 못한다.
 - **채널 바인딩을 요구하는 클라이언트는 붙지 못한다.** 에이전트는 Stet의 인증서를 `sslmode=verify-full`로 확인한다.
 - **에이전트가 `sslmode=require`로 붙으면 Stet이 진짜인지 확인하지 않는다.** 중간에 선 누군가가 로그인을 그대로 흘려보낸 뒤 세션을 차지할 수 있다. Stet은 클라이언트의 `sslmode`를 알 수 없어 막지 못한다. `verify-full`을 쓴다(7장).
-- **루프백은 평문도 받는다.** 같은 기기의 TCP 전달자를 Stet 앞에 두면 모든 클라이언트가 루프백으로 보인다(2장).
+- **루프백은 평문도 받는다.** 같은 기기의 TCP 전달자를 Stet 앞에 두면 모든 클라이언트가 루프백으로 보인다(2장). 서비스 메시의 사이드카도 그렇게 보일 수 있다(13장, 돌려 보지 않았다).
 - **`password_env`인 계정의 진짜 비밀번호를 바꾸려면 다시 띄워야 한다.**
 - **계정 하나에 토큰 하나다.** 토큰을 바꾸면 예전 토큰을 쓰던 에이전트는 다음 로그인에서 거절된다. 겹쳐 쓰는 기간이 없다.
 - **계정을 더하면 다시 띄워야 한다.** 그동안 에이전트의 접속이 끊긴다. 가용성은 다음 단계다.
@@ -512,4 +528,5 @@ spec:
 - **Stet은 프로토콜 3.0으로 답한다.** 더 높은 버전을 청한 클라이언트는 3.0으로 내려 받는다.
 - **`stet agent`의 잠금은 한 기기 안에서만 통한다.** 네트워크 파일 시스템의 자격 증명 파일을 두 기기에서 바꾸면 서로 막지 못한다.
 - **실제 매니지드 서비스에서 확인하지 못했다.** 시험과 이 문서의 따라 하기는 로컬의 TLS 서버로 했다.
+- **컨테이너의 파일 소유자 규칙은 Linux에서 확인하지 못했다.** 따라 한 기기(macOS의 Docker Desktop)는 바인드 마운트한 파일을 컨테이너 안에서 컨테이너를 돌린 사용자의 것으로 보였다. 그래서 12장의 소유자 설정이 맞는지, 틀리면 Stet이 거부하는지는 시험되지 않았다(12장).
 - **연결 풀러, 스키마를 적은 테이블 이름 등 quickstart의 한계는 그대로다**(quickstart 10장. "통제가 아니다"와 "에이전트와 Stet 사이는 평문이다"는 이 문서의 길에는 해당하지 않는다).

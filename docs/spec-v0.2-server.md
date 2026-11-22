@@ -146,7 +146,7 @@ listen_tls:
 - 데이터베이스는 클라이언트의 시작 패킷에 적힌 것이다(지금과 같다).
 - 클라이언트의 시작 파라미터는 `user`, `database`, `replication`을 빼고 그대로 업스트림의 시작 패킷에 넣는다(`application_name`, `client_encoding`, `options` 등).
 - `upstream`의 클라이언트 인증서(`sslcert`, `sslkey`)는 이 로그인에 쓰지 않는다(첫 부분과 같다). Stet 자신의 연결에만 쓴다.
-- 환경 변수와 `.pgpass`의 비밀번호는 이 로그인에 쓰이지 않는다. 자격 증명 파일이 정한 값만 쓴다. 값이 비어 있으면 로그인하지 않는다.
+- `PGPASSWORD`와 `.pgpass`의 비밀번호는 이 로그인에 쓰이지 않는다. 자격 증명 파일이 정한 값(`password`의 값, 또는 `password_env`가 가리키는 변수를 시작할 때 읽은 값)만 쓴다. 값이 비어 있으면 로그인하지 않는다.
 - **프로토콜 3.0으로 고정한다.** 주소나 환경(`PGMAXPROTOCOLVERSION` 등)이 무엇을 청하든 업스트림 로그인은 3.0으로 한다. 3.2 세션의 취소 키는 3.0 클라이언트가 읽지 못하는 길이이기 때문이다.
 - `upstream` 주소는 Stet 자신의 연결 풀이 읽는 대로(`pgxpool.ParseConfig`) 읽는다. 그래서 pgx와 pgxpool의 키(`pool_max_conns` 등)는 시작 파라미터로 보내지 않는다. 시작할 때와 `stet agent`의 확인 로그인(8장, 7장)은 주소에 적힌 실행 파라미터(`application_name`, `options`)를 보낸다. Stet 자신의 풀이 그 위에 더하는 설정은 보내지 않는다.
 - **`prefer`의 평문 되돌아가기.** 업스트림이 `sslmode=prefer`(또는 적지 않음)면, 이 로그인은 pgconn을 따라 TLS 시도가 어떤 이유로든 실패하면 평문으로 다시 붙는다. 중계하는 구간은 서버가 `N`으로 답할 때만 평문으로 간다(spec-v0.2-tryout 3장). 보관을 켜면 원격 업스트림은 서버 확인이 필수라 되돌아가기가 없으므로(8장), 이것은 루프백 업스트림에서만 일어난다.
@@ -160,7 +160,7 @@ listen_tls:
 
 **세션과 게이트.** 게이트는 이 세션을 처음부터 인증된 세션으로 본다. 접속 계정은 Stet이 확인했고, 서버도 그 계정으로 인증했다. 서버 프로세스 번호와 세션 설정(시간대, 날짜 형식)은 넘겨받은 값에서 채운다. 그 뒤의 판단, 기록, 한도, 낡은 쓰기 탐지, 되돌리기는 바뀌지 않는다. `stet.decisions`의 `login_role`은 그 계정이다.
 
-**Stet 자신의 연결과 승인된 쓰기의 실행.** 바뀌지 않는다. Stet은 `upstream`의 계정으로 붙고, 승인된 쓰기는 지금처럼 그 연결에서 에이전트 계정으로 바꿔 실행한다. 여러 행에 쓰는 쓰기의 영향 측정도 지금처럼 에이전트의 역할로 하므로, Stet의 계정은 에이전트 계정마다 그 역할의 구성원이어야 한다(`GRANT agent_x TO stet`. spec-v0.2-enforce 8장). 섀도에서도 그렇다. 빠지면 그 쓰기는 `unsupported`(`not_single_row`)로 기록된다. 보관을 켜면 Stet의 계정과 에이전트 계정이 반드시 다르므로(8장), 계정 하나로 도는 quickstart의 길에서 옮겨 오면 이 부여가 새로 필요하다. deploy를 따라 하다 찾았다(14장).
+**Stet 자신의 연결과 승인된 쓰기의 실행.** 바뀌지 않는다. Stet은 `upstream`의 계정으로 붙고, 승인된 쓰기는 지금처럼 그 연결에서 에이전트 계정으로 바꿔 실행한다. 여러 행에 쓰는 쓰기의 영향 측정도 지금처럼 에이전트의 역할로 하므로, Stet의 계정은 에이전트 계정마다 그 역할의 구성원이어야 한다(`GRANT agent_x TO stet`. spec-v0.2-enforce 8장). 섀도에서도 그렇다. 빠지면 그 쓰기는 `unsupported`(`not_single_row`)로 기록된다. 보관을 켜면 Stet의 계정과 에이전트 계정이 반드시 다르므로(8장), 계정 하나로 도는 quickstart의 길에서 옮겨 오면 이 부여가 새로 필요하다. deploy를 따라 하다 찾았다(14장). 이 부여가 Stet의 계정에 주는 것과 그 비밀번호의 무게는 12장에 있다.
 
 ## 6. 자격 증명 파일
 
@@ -248,7 +248,7 @@ stet agent list     [-config stet.yaml]
 3. **Stet 자신의 계정이 파일에 있으면 시작하지 않는다**(진행 중의 판단): `agents.credentials: "<계정>" is Stet's own account (the upstream user)`. 그 계정은 pgconn이 `upstream`을 읽어 정하는 사용자다(주소, `PGUSER`, Stet을 돌리는 사용자). 그 토큰을 가진 쪽은 게이트가 보지 않는 세션을 얻는다. `stet` 스키마의 소유자이고 모든 에이전트 역할의 구성원인 계정이다. 설정 검증의 같은 확인(`agents.roles`의 계정)은 주소에 계정이 적혔을 때만 보므로, 파일의 계정은 여기서 본다. `stet agent add`도 그 계정을 받지 않는다(7장).
 4. `agents.roles`가 있으면 파일의 계정들과 비교한다.
 5. 게이트를 연다. 지금의 에이전트 계정 확인(spec-v0.2-enforce 8장. enforce에서)은 그대로 돈다. 대상이 파일의 계정들이다. 게이트 대상 테이블이 있는데 DB에 닿지 않으면 여기서 곧바로 멈춘다. 그래서 계정마다의 로그인(6)은 게이트를 연 뒤에 한다.
-6. 계정마다 업스트림에 한 번 로그인해 본다(계정마다 5초, 합쳐 30초까지). 되지 않으면 그 계정과 이유의 갈래를 경고한다(`an account of the credentials file cannot log in to the database: its agent's logins are refused until it can`). 시작은 한다. 다른 계정은 일해야 하고, 그 계정의 로그인은 어차피 거절된다. 합친 시간이 다 되면 그때 확인 중이던 계정과 닿지 못한 계정들을 한 경고에 적는다(`the start ran out of time to log in as these accounts, so they are not checked`).
+6. 계정마다 업스트림에 한 번 로그인해 본다(계정마다 5초, 합쳐 30초까지). 되지 않으면 그 계정과 이유의 갈래를 경고한다(`an account of the credentials file cannot log in to the database: its agent's logins are refused until it can`). 시작은 한다. 다른 계정은 일해야 하고, 그 계정의 로그인은 DB가 그 비밀번호를 받을 때까지 어차피 거절된다(`08001`). Stet은 그 계정을 따로 표시하지 않는다. DB가 받게 되면 그다음 로그인부터 된다. 합친 시간이 다 되면 그때 확인 중이던 계정과 닿지 못한 계정들을 한 경고에 적는다(`the start ran out of time to log in as these accounts, so they are not checked`).
 7. 받기 시작할 때의 로그 줄에 클라이언트 쪽의 상태를 더한다(`listen_tls=on|off`, `custody=on|off`). 처음 설계의 `agents=<수>`는 빼었다(진행 중의 판단). `agent_roles`가 이미 계정들을 적고, 보관을 켜면 그 값이 파일의 계정들이다.
 
 ## 9. 기록과 로그
@@ -276,12 +276,13 @@ stet agent list     [-config stet.yaml]
 
 ## 12. 한계
 
-- **진짜 비밀번호가 Stet 서버에 있다.** 파일이나 환경 변수에 평문으로 있고, 프로세스의 메모리에 있다. Stet 서버가 뚫리면 에이전트 계정의 비밀번호가 모두 나간다. 운영자도 그 값을 안다.
+- **진짜 비밀번호가 Stet 서버에 있다.** 파일이나 환경 변수에 평문으로 있고, 프로세스의 메모리에 있다. Stet 서버가 뚫리면 에이전트 계정의 비밀번호가 모두 나간다. Stet 자신의 계정의 비밀번호(`upstream`)도 나가는데, 그 계정은 아래처럼 모든 에이전트 역할을 가지고 판단 기록을 소유한다. `listen_tls`의 키도 나가고, 그 키를 가진 쪽은 에이전트에게 Stet인 척할 수 있다. 운영자도 비밀번호들을 안다.
+- **Stet 자신의 계정은 모든 에이전트 계정을 합친 것보다 무겁다.** 영향 측정과 승인된 쓰기의 실행 때문에 에이전트 계정마다 `GRANT agent_x TO stet`을 한다(5장). 그 부여로 Stet의 계정은 각 에이전트 계정으로 `SET ROLE`할 수 있고, 역할의 기본값(`INHERIT`)이면 `SET ROLE` 없이도 그 테이블 권한을 가진다(PostgreSQL 14.18에서 확인했다). 그 위에 `stet` 스키마의 소유자다. 그 비밀번호를 아는 쪽은 Stet을 건너뛰어 어느 에이전트의 권한으로든 쓰고 `stet.decisions`를 고칠 수 있다. 계정 하나로 도는 quickstart의 길에서 옮겨 오면 에이전트가 이 비밀번호를 알고 있으므로, 토큰을 나눠 주기 전에 DB와 `upstream`에서 바꾸고 다시 띄워야 한다(deploy 8장). Stet은 그것이 됐는지 알 수 없다. 부여는 DB의 관리 계정이 한다(Stet의 계정이 superuser도 `CREATEROLE`도 아니면 스스로 하지 못한다: `must have admin option on role …`). PostgreSQL 16부터는 superuser가 아닌 관리 계정에 그 역할의 `ADMIN OPTION`이 있어야 한다(릴리스 노트의 동작이다. 돌려 보지 않았다).
 - **예전 비밀번호를 아는 에이전트는 건너뛸 수 있다.** 계정을 Stet 뒤로 옮길 때 DB에서 비밀번호를 바꿔야 한다. Stet은 그것이 됐는지 알 수 없다.
 - **운영 규칙은 그대로 전제다.** 누군가 에이전트에게 서비스나 사람의 자격 증명을 주면 Stet은 그 쓰기를 보지 못한다(concept-v0.2 5장).
 - **채널 바인딩을 요구하는 클라이언트는 붙지 못한다.** 에이전트는 Stet의 인증서를 `sslmode=verify-full`로 확인한다.
 - **에이전트가 `sslmode=require`로 붙으면 Stet이 진짜인지 확인하지 않는다.** 중간에 선 누군가가 로그인을 그대로 흘려보낸 뒤 세션을 차지할 수 있다. Stet은 클라이언트의 `sslmode`를 알 수 없어 막지 못한다. 문서가 `verify-full`을 쓰라고 말한다. 채널 바인딩을 제안하면 막을 수 있지만 남긴다(15장).
-- **루프백은 평문도 받는다.** 루프백인지는 접속의 상대 주소로 본다. 같은 기기의 TCP 전달자(사이드카 프록시, `ssh -L`, `kubectl port-forward`)를 Stet 앞에 두면 모든 클라이언트가 루프백으로 보여, 루프백이 아닌 `listen`의 TLS 요구가 무력해진다(3장).
+- **루프백은 평문도 받는다.** 루프백인지는 접속의 상대 주소로 본다. 같은 기기의 TCP 전달자(사이드카 프록시, `ssh -L`, `kubectl port-forward`)를 Stet 앞에 두면 모든 클라이언트가 루프백으로 보여, 루프백이 아닌 `listen`의 TLS 요구가 무력해진다(3장). 서비스 메시(Istio, Linkerd)의 사이드카도 받은 연결을 파드 안에서 넘겨주므로 그렇게 보일 수 있다(돌려 보지 않았다. deploy 13장).
 - **`password_env`인 계정의 진짜 비밀번호를 바꾸려면 다시 띄워야 한다.**
 - **계정 하나에 토큰 하나다.** 토큰을 바꾸면 예전 토큰을 쓰던 에이전트는 다음 로그인에서 거절된다. 겹쳐 쓰는 기간이 없다.
 - **계정을 더하면 다시 띄워야 한다.** 그동안 에이전트의 접속이 끊긴다(가용성은 셋째 부분이다).
@@ -326,9 +327,9 @@ stet agent list     [-config stet.yaml]
 - [x] 틀린 토큰과 모르는 계정은 같은 답을 받는다. `TestLoginRefusals`(internal/proxy): 틀린 토큰, 모르는 계정, 진짜 비밀번호를 토큰 자리에 넣은 것, 다른 계정의 토큰이 모두 `28P01`이고, 모르는 계정과 틀린 토큰이 받는 메시지의 수와 모양이 같다(`SameAnswers`). 가짜 검증값: `TestVerifierKnownAndMock`, `TestStoreMockSecret`(internal/custody), `TestMockNeverSucceeds`(internal/scram). 따라 하기: 두 경우의 `psql` 출력이 계정 이름 말고 같았다.
 - [x] 양쪽 구간이 TLS다(클라이언트 쪽은 인사로, 서버 쪽은 `pg_stat_ssl`로 확인한다). `TestAgentLogsInWithAToken`(internal/proxy)과 `TestCustodyEndToEnd`(cmd/stet)가 pgx의 연결이 `*tls.Conn`이고 `pg_stat_ssl.ssl`이 참인 것을 본다. 따라 하기: Stet의 로그 `tls=true`, `pg_stat_ssl`의 `TLSv1.3`.
 - [x] 보관을 켠 세션에서 섀도의 기록, enforce의 차단, 보류와 승인, 낡은 쓰기 탐지, 되돌리기가 지금과 같이 돈다. `login_role`이 그 계정이다.
-  - 섀도의 기록과 `login_role`: `TestCustodyEndToEnd`(cmd/stet). 따라 하기: 두 놓는 법 모두 판단 줄과 `stet.decisions`의 `login_role`이 그 계정이었다(바이너리: `commit`, `hold`, `hold`. Docker: `commit`, `commit`, `hold`).
+  - 섀도의 기록과 `login_role`: `TestCustodyEndToEnd`(cmd/stet). 따라 하기: 두 놓는 법 모두 판단 줄과 `stet.decisions`의 `login_role`이 그 계정이었다(바이너리: `stet.decisions`에서 `commit`, `hold`, `hold`. Docker: `stet.decisions`에서 `commit`, `commit`을 봤다. 그 조회는 세 번째 쓰기 전에 했고, 토큰을 바꾼 뒤의 세 번째 쓰기는 판단 줄의 `would hold`로만 봤다).
   - enforce의 차단(`ST001`), 보류와 승인(검토자가 승인한 쓰기가 실행된다), 낡은 쓰기 탐지(`fresh`): `TestCustodyEnforce`(cmd/stet). 게이트가 로그인한 세션을 처음부터 인증된 세션으로 보는 것(첫 쓰기에 계정과 서버 프로세스, enforce에서 서버가 알린 설정): `TestWatchedSessionKnowsItsAccount`. 게이트가 보는 세션의 시나리오: `TestWatchedScenariosThroughALogin`(internal/proxy).
-  - 되돌리기: 보관을 켠 세션으로 돌린 테스트는 없다. 2026-11-23에 손으로 확인했다. 따라 하기의 바이너리 설정에 `undo.tables.contacts`를 더하고 `stet undo-sql`의 출력을 테이블 소유자로 실행한 뒤, 토큰으로 붙은 `psql`이 한 행을 고쳤다. `stet.history`에 `agent_role`이 그 계정인 변경이 남았고, `stet.undo_plan`이 `would_restore`, `stet.undo`가 `restored`를 돌려주고 행이 돌아왔다.
+  - 되돌리기: 근거는 아래의 손으로 한 확인 하나다. 보관을 켠 세션의 되돌리기를 지키는 테스트는 없다. 2026-11-23에 손으로 확인했다. 따라 하기의 바이너리 설정에 `undo.tables.contacts`를 더하고 `stet undo-sql`의 출력을 테이블 소유자로 실행한 뒤, 토큰으로 붙은 `psql`이 한 행을 고쳤다. `stet.history`에 `agent_role`이 그 계정인 변경이 남았고, `stet.undo_plan`이 `would_restore`, `stet.undo`가 `restored`를 돌려주고 행이 돌아왔다.
 - [x] 첫 부분의 프로토콜 시나리오가 보관을 켠 세션에서 통과한다. 취소가 전달된다. `TestScenariosThroughALogin`(취소 요청이 서버에 닿는다), `TestWatchedScenariosThroughALogin`, 보관 없이 클라이언트 쪽 TLS만 켠 `TestScenariosOverClientTLS`(internal/proxy).
 - [x] `stet agent add`, `token`, `password`, `remove`, `list`가 7장대로 돈다. 토큰과 비밀번호 바꾸기는 다시 띄우지 않고 적용된다.
   - 명령마다: `TestAgentAdd`, `TestAgentAddRefusesAWrongPassword`, `TestAgentAddPasswordEnv`, `TestAgentToken`, `TestAgentPassword`, `TestAgentRemove`, `TestAgentList`, `TestAgentPromptsWithoutEcho`, `TestAgentStops`, `TestAgentKeepsTheFileMode`, `TestAgentKeepsChangesMadeWhileItAsks`, `TestAgentTouchesOnlyItsAccount`, `TestAgentChecksAgainWhenItWrites`, `TestAgentWritesNothingWhenTheWriteFails`, `TestAgentGoesOnWhenTheDirectoryIsNotSynced`, `TestAgentSaysWhatStopsTheProxy`, `TestOnInterruptRestoresTheTerminal`(cmd/stet). 잠금: `TestUpdatesDoNotInterleave`, `TestUpdateLocksAcrossProcesses`(internal/custody).
