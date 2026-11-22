@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -31,13 +32,13 @@ tables:
   items: {pk: id, send_fields: [n], impact: {max_rows: 3}, unsupported: reject}
 `
 
-// startStet starts Stet in enforce mode inside the test, in front of a
-// database of the test's own that holds items(id, n) with ten rows (n = 10).
-// Statements go to addr as n.Role(tasks.RoleV); Stet's decisions are in
-// database's stet schema. Everything is dropped when the test ends.
-func startStet(t *testing.T) (addr, database string, n Names) {
+// itemsDatabase makes a database of the test's own, owned by n.Owner(),
+// that holds items(id, n) with ten rows (n = 10) which n.Role(tasks.RoleV)
+// may read and change, and where n.Gate() may create the stet schema.
+// Everything is dropped when the test ends.
+func itemsDatabase(t *testing.T) (a Admin, database string, n Names) {
 	t.Helper()
-	a := testAdmin(t)
+	a = testAdmin(t)
 	ctx := context.Background()
 	n = testNames(t) // its cleanup drops the database too: the owner has it
 	su := connectAs(t, a, a.User, a.Password, "postgres")
@@ -64,8 +65,19 @@ func startStet(t *testing.T) (addr, database string, n Names) {
 			t.Fatalf("%s: %v", sql, err)
 		}
 	}
+	return a, database, n
+}
 
-	cfg, err := config.Parse(fmt.Appendf(nil, stetConfig, n.Gate(), GatePassword, a.Addr, database, agent))
+// startStet starts Stet in enforce mode inside the test, in front of a
+// database of the test's own that holds items(id, n) with ten rows (n = 10).
+// Statements go to addr as n.Role(tasks.RoleV); Stet's decisions are in
+// database's stet schema. Everything is dropped when the test ends.
+func startStet(t *testing.T) (addr, database string, n Names) {
+	t.Helper()
+	a, database, n := itemsDatabase(t)
+	ctx := context.Background()
+
+	cfg, err := config.Parse(fmt.Appendf(nil, stetConfig, n.Gate(), GatePassword, a.Addr, database, n.Role(tasks.RoleV)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,6 +122,34 @@ func startStet(t *testing.T) (addr, database string, n Names) {
 		}
 	})
 	return ln.Addr().String(), database, n
+}
+
+// startInProcess's proxy reaches the server as the config's upstream says,
+// as stet proxy's does: with sslmode=require the agent's session is TLS on
+// the server.
+func TestStartInProcessRelaysAsTheUpstreamSays(t *testing.T) {
+	a, database, n := itemsDatabase(t)
+	ctx := context.Background()
+	agent := n.Role(tasks.RoleV)
+	yaml := strings.Replace(stetConfig, "sslmode=disable", "sslmode=require", 1)
+	cfg, err := config.Parse(fmt.Appendf(nil, yaml, n.Gate(), GatePassword, a.Addr, database, agent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := startInProcess(ctx, cfg, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.close)
+	var ssl bool
+	err = connectAs(t, Admin{Addr: s.addr}, agent, AgentPassword, database).
+		QueryRow(ctx, "select ssl from pg_stat_ssl where pid = pg_backend_pid()").Scan(&ssl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ssl {
+		t.Error("the agent's session through startInProcess's proxy is not TLS on the server, want it as sslmode=require says")
+	}
 }
 
 // lockedBuffer is a log destination read while Stet writes to it.

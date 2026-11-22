@@ -80,7 +80,8 @@ func startInProcess(ctx context.Context, cfg *config.Config, log *slog.Logger) (
 		}
 		return fail(err)
 	}
-	srv := proxy.New(proxy.Upstream{Addr: cfg.UpstreamAddr()}, log, g, proxy.Policy{Agents: cfg.AgentRoles, Enforce: enforce})
+	srv := proxy.New(proxy.Upstream{Addr: cfg.UpstreamAddr(), TLS: cfg.UpstreamTLS, PlainFallback: cfg.UpstreamPlainFallback},
+		log, g, proxy.Policy{Agents: cfg.AgentRoles, Enforce: enforce})
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(ln) }()
 	s.addr = ln.Addr().String()
