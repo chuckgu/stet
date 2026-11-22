@@ -6,11 +6,14 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
+	"net"
 	"net/url"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -226,6 +229,43 @@ func TestChooseSSLModeAgainstTheTestServer(t *testing.T) {
 			t.Errorf("upstream %q, notice %q, err %v; want the address as it is", upstream, notice, err)
 		}
 	})
+}
+
+// connectError knows a server that refuses TLS by pgconn's words for it.
+// Here a real listener answers the TLS request with N, and stet init's own
+// connection (openPool, through chooseSSLMode) meets it with sslmode=require:
+// a rewording in pgx fails this test instead of turning the advice into the
+// raw error.
+func TestChooseSSLModeKnowsAServerThatRefusesTLS(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				c.SetDeadline(time.Now().Add(5 * time.Second))
+				var req [8]byte // the SSLRequest
+				if _, err := io.ReadFull(c, req[:]); err == nil {
+					c.Write([]byte{'N'})
+				}
+			}()
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	raw := "postgres://app:" + initPassword + "@" + ln.Addr().String() + "/crm?sslmode=require"
+	_, _, err = chooseSSLMode(ctx, raw, connectOnce)
+	if err == nil || err.Error() != errNoTLS {
+		t.Errorf("err = %v, want %q", err, errNoTLS)
+	}
 }
 
 // initPool is Stet's pool (openPool) in database db as user, without the
