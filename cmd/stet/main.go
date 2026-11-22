@@ -71,6 +71,11 @@ func main() {
 }
 
 func runProxy(args []string) error {
+	// A write to standard output or error after its reader has gone (stet
+	// proxy | head -1) then fails with EPIPE, which the lines' writer and the
+	// log drop, instead of the Go runtime ending the process with SIGPIPE: the
+	// output must not end the agents' sessions (spec-v0.2-tryout 6).
+	signal.Ignore(syscall.SIGPIPE)
 	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
 	path := fs.String("config", "stet.yaml", "config file")
 	verbose := fs.Bool("v", false, "debug logging")
