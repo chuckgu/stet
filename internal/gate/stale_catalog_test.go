@@ -135,3 +135,19 @@ func TestFailedCatalogReadingForgetsNothing(t *testing.T) {
 	gate.ReadCatalog(e.gate, false)
 	e.wantResult(t, "agent", "", deals, "1", e.xmin(t, deals, "id", "1"), decide.ReadNone)
 }
+
+// TracksKeyType answers for a base type what the catalog reading does: stet
+// init writes stale only for a table whose key it would track.
+func TestTracksKeyType(t *testing.T) {
+	for oid, want := range map[uint32]bool{
+		23:   true,  // int4
+		2950: true,  // uuid
+		25:   true,  // text
+		1082: false, // date
+		1700: false, // numeric
+	} {
+		if got := gate.TracksKeyType(oid); got != want {
+			t.Errorf("TracksKeyType(%d) = %v, want %v", oid, got, want)
+		}
+	}
+}

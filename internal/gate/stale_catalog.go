@@ -29,6 +29,13 @@ var keyTypes = map[uint32]proxy.KeyType{
 	19:   proxy.KeyText, // name
 }
 
+// TracksKeyType reports whether stale-write detection tracks a table whose
+// key column has base type oid (keyTypes).
+func TracksKeyType(oid uint32) bool {
+	_, ok := keyTypes[oid]
+	return ok
+}
+
 // tracked is what the catalog says of a table that remembers reads.
 type tracked struct {
 	oid  uint32
