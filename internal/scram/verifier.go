@@ -9,7 +9,11 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"strconv"
 	"strings"
 )
@@ -25,21 +29,52 @@ const keyLen = sha256.Size
 // saltLen is the length of the salts this package makes, as PostgreSQL's.
 const saltLen = 16
 
+// minMockSecret is the shortest secret Mock takes.
+const minMockSecret = 32
+
 // tokenPrefix starts every token NewToken makes.
 const tokenPrefix = "stet_"
 
 // Verifier is what a server keeps of a password: enough to check a client's
-// proof, not enough to log in as the client.
+// proof, not enough to log in as the client. Make one with NewVerifier,
+// ParseVerifier, NewToken or Mock.
+//
+// Text is the only way to its salt and keys. Everything that formats a value
+// (String, every fmt verb, log/slog, encoding/json, YAML) gets the redacted
+// form "SCRAM-SHA-256$<iterations>:<redacted>".
 type Verifier struct {
-	Iterations           int
-	Salt                 []byte
-	StoredKey, ServerKey []byte
+	// The values sit in a closure, which reflection cannot look into. fmt
+	// prints a Verifier it reaches by reflection (in an unexported field,
+	// where it cannot call Format) field by field, and would follow a pointer
+	// there too (for %s, its bad-verb message prints the pointer's target),
+	// but it prints a function as an address. The function also keeps
+	// Verifier not comparable, as == would not compare the values.
+	get func() material
+}
+
+type material struct {
+	iterations           int
+	salt                 []byte
+	storedKey, serverKey []byte
+}
+
+func verifierOf(x material) Verifier {
+	return Verifier{get: func() material { return x }}
+}
+
+// values returns v's values, all empty for the zero Verifier.
+func (v Verifier) values() material {
+	if v.get == nil {
+		return material{}
+	}
+	return v.get()
 }
 
 var errVerifierForm = errors.New("scram: verifier: not of the form " + Mechanism + "$<iterations>:<salt>$<StoredKey>:<ServerKey>")
 
 // ParseVerifier reads "SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>"
-// (base64), the form PostgreSQL keeps in pg_authid. Its errors never quote s.
+// (base64), the form PostgreSQL keeps in pg_authid and Text writes. Its errors
+// never quote s.
 func ParseVerifier(s string) (Verifier, error) {
 	mechanism, rest, ok := strings.Cut(s, "$")
 	if !ok || mechanism != Mechanism {
@@ -58,21 +93,21 @@ func ParseVerifier(s string) (Verifier, error) {
 		return Verifier{}, errVerifierForm
 	}
 
-	var v Verifier
+	var x material
 	var err error
-	if v.Iterations, err = parseIterations(iterText); err != nil {
+	if x.iterations, err = parseIterations(iterText); err != nil {
 		return Verifier{}, err
 	}
-	if v.Salt, err = decodeBase64(saltText); err != nil || len(v.Salt) == 0 {
+	if x.salt, err = decodeBase64(saltText); err != nil || len(x.salt) == 0 {
 		return Verifier{}, errors.New("scram: verifier: the salt is not non-empty base64")
 	}
-	if v.StoredKey, err = decodeBase64(storedText); err != nil || len(v.StoredKey) != keyLen {
+	if x.storedKey, err = decodeBase64(storedText); err != nil || len(x.storedKey) != keyLen {
 		return Verifier{}, errors.New("scram: verifier: StoredKey is not base64 of 32 bytes")
 	}
-	if v.ServerKey, err = decodeBase64(serverText); err != nil || len(v.ServerKey) != keyLen {
+	if x.serverKey, err = decodeBase64(serverText); err != nil || len(x.serverKey) != keyLen {
 		return Verifier{}, errors.New("scram: verifier: ServerKey is not base64 of 32 bytes")
 	}
-	return v, nil
+	return verifierOf(x), nil
 }
 
 // parseIterations reads a positive decimal count, digits only.
@@ -97,11 +132,38 @@ func decodeBase64(s string) ([]byte, error) {
 	return base64.StdEncoding.Strict().DecodeString(s)
 }
 
-func (v Verifier) String() string {
+// Text returns "SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>"
+// (base64), what ParseVerifier reads: the form to store, and nothing else.
+func (v Verifier) Text() string {
+	x := v.values()
 	b64 := base64.StdEncoding.EncodeToString
-	return Mechanism + "$" + strconv.Itoa(v.Iterations) + ":" + b64(v.Salt) +
-		"$" + b64(v.StoredKey) + ":" + b64(v.ServerKey)
+	return Mechanism + "$" + strconv.Itoa(x.iterations) + ":" + b64(x.salt) +
+		"$" + b64(x.storedKey) + ":" + b64(x.serverKey)
 }
+
+// String returns the redacted form, "SCRAM-SHA-256$<iterations>:<redacted>".
+func (v Verifier) String() string {
+	return Mechanism + "$" + strconv.Itoa(v.values().iterations) + ":<redacted>"
+}
+
+// Format writes the redacted form for every verb (quoted for %q), so that
+// no fmt verb, %#v and %x among them, reaches the salt or the keys.
+func (v Verifier) Format(f fmt.State, verb rune) {
+	s := v.String()
+	if verb == 'q' {
+		s = strconv.Quote(s)
+	}
+	io.WriteString(f, s)
+}
+
+// LogValue gives log/slog the redacted form.
+func (v Verifier) LogValue() slog.Value { return slog.StringValue(v.String()) }
+
+// MarshalJSON writes the redacted form as a JSON string.
+func (v Verifier) MarshalJSON() ([]byte, error) { return json.Marshal(v.String()) }
+
+// MarshalYAML writes the redacted form (go.yaml.in/yaml/v3's Marshaler).
+func (v Verifier) MarshalYAML() (any, error) { return v.String(), nil }
 
 // NewVerifier derives the verifier of password under salt. The password is
 // used as given, without SASLprep: the same as PostgreSQL for ASCII
@@ -117,12 +179,12 @@ func NewVerifier(password string, salt []byte, iterations int) Verifier {
 		panic("scram: " + err.Error())
 	}
 	storedKey := sha256.Sum256(hmacSum(salted, "Client Key"))
-	return Verifier{
-		Iterations: iterations,
-		Salt:       bytes.Clone(salt),
-		StoredKey:  storedKey[:],
-		ServerKey:  hmacSum(salted, "Server Key"),
-	}
+	return verifierOf(material{
+		iterations: iterations,
+		salt:       bytes.Clone(salt),
+		storedKey:  storedKey[:],
+		serverKey:  hmacSum(salted, "Server Key"),
+	})
 }
 
 // NewToken returns a new token, "stet_" and 43 base64url characters of 32
@@ -142,8 +204,13 @@ func NewToken() (token string, v Verifier, err error) {
 
 // Mock returns a verifier for an account that has none, so that an exchange
 // with it looks like any other and always fails: the same account and secret
-// give the same salt.
+// give the same salt. secret must be at least 32 random bytes, or Mock
+// panics: with a short or known secret anyone could compute the salts and
+// tell the accounts that exist from those that do not.
 func Mock(account string, secret []byte) Verifier {
+	if len(secret) < minMockSecret {
+		panic("scram: Mock needs a secret of at least 32 bytes")
+	}
 	derive := func(label string) []byte {
 		m := hmac.New(sha256.New, secret)
 		m.Write([]byte(label))
@@ -151,12 +218,12 @@ func Mock(account string, secret []byte) Verifier {
 		m.Write([]byte(account))
 		return m.Sum(nil)
 	}
-	return Verifier{
-		Iterations: Iterations,
-		Salt:       derive("salt")[:saltLen],
-		StoredKey:  derive("StoredKey"),
-		ServerKey:  derive("ServerKey"),
-	}
+	return verifierOf(material{
+		iterations: Iterations,
+		salt:       derive("salt")[:saltLen],
+		storedKey:  derive("StoredKey"),
+		serverKey:  derive("ServerKey"),
+	})
 }
 
 func hmacSum(key []byte, msg string) []byte {

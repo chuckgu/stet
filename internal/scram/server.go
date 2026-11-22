@@ -98,9 +98,10 @@ func (s *Server) First(clientFirst []byte) (serverFirst []byte, err error) {
 	s.gs2Header = gs2Header
 	s.clientFirstBare = bare
 	s.nonce = attrs[1][2:] + s.newNonce()
+	x := s.v.values()
 	s.serverFirst = "r=" + s.nonce +
-		",s=" + base64.StdEncoding.EncodeToString(s.v.Salt) +
-		",i=" + strconv.Itoa(s.v.Iterations)
+		",s=" + base64.StdEncoding.EncodeToString(x.salt) +
+		",i=" + strconv.Itoa(x.iterations)
 	s.stage = stageFirst
 	return []byte(s.serverFirst), nil
 }
@@ -148,13 +149,14 @@ func (s *Server) Final(clientFinal []byte) (serverFinal []byte, ok bool, err err
 	// ClientKey = proof XOR HMAC(StoredKey, AuthMessage); it must hash to
 	// StoredKey. A mock does the same work and fails.
 	authMessage := s.clientFirstBare + "," + s.serverFirst + "," + withoutProof
-	clientKey := hmacSum(s.v.StoredKey, authMessage)
+	x := s.v.values()
+	clientKey := hmacSum(x.storedKey, authMessage)
 	subtle.XORBytes(clientKey, clientKey, proof)
 	storedKey := sha256.Sum256(clientKey)
-	if subtle.ConstantTimeCompare(storedKey[:], s.v.StoredKey) != 1 || s.mock {
+	if subtle.ConstantTimeCompare(storedKey[:], x.storedKey) != 1 || s.mock {
 		return nil, false, nil
 	}
-	return []byte("v=" + base64.StdEncoding.EncodeToString(hmacSum(s.v.ServerKey, authMessage))), true, nil
+	return []byte("v=" + base64.StdEncoding.EncodeToString(hmacSum(x.serverKey, authMessage))), true, nil
 }
 
 // checkMessage refuses what no well-formed message is: nothing, more than

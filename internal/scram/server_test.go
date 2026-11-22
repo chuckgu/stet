@@ -130,16 +130,34 @@ func TestWrongPasswordFails(t *testing.T) {
 // salt and iterations.
 var serverFirstShape = regexp.MustCompile(`^r=([!-+\--~]+),s=([A-Za-z0-9+/]+={0,2}),i=([0-9]+)$`)
 
+// panics reports whether f panics.
+func panics(f func()) (did bool) {
+	defer func() { did = recover() != nil }()
+	f()
+	return false
+}
+
 func TestMockNeverSucceeds(t *testing.T) {
-	secret := []byte("a secret of the running server")
+	// A secret shorter than 32 bytes is refused: anyone could compute the
+	// salts and tell accounts that exist from those that do not.
+	for _, short := range [][]byte{nil, {}, make([]byte, 31)} {
+		if !panics(func() { scram.Mock("alice", short) }) {
+			t.Errorf("Mock with a %d-byte secret did not panic", len(short))
+		}
+	}
+
+	secret, another := make([]byte, 32), make([]byte, 32)
+	rand.Read(secret)
+	rand.Read(another)
 	a1, a2 := scram.Mock("alice", secret), scram.Mock("alice", secret)
-	if !bytes.Equal(a1.Salt, a2.Salt) {
+	_, salt1, _, _ := pieces(t, a1)
+	if _, salt2, _, _ := pieces(t, a2); !bytes.Equal(salt1, salt2) {
 		t.Error("Mock gave the same account and secret different salts")
 	}
-	if b := scram.Mock("bob", secret); bytes.Equal(a1.Salt, b.Salt) {
+	if _, salt, _, _ := pieces(t, scram.Mock("bob", secret)); bytes.Equal(salt1, salt) {
 		t.Error("Mock gave different accounts the same salt")
 	}
-	if c := scram.Mock("alice", []byte("another secret")); bytes.Equal(a1.Salt, c.Salt) {
+	if _, salt, _, _ := pieces(t, scram.Mock("alice", another)); bytes.Equal(salt1, salt) {
 		t.Error("Mock gave different secrets the same salt")
 	}
 
@@ -226,6 +244,12 @@ func TestServerRefusesBrokenMessages(t *testing.T) {
 		{"empty nonce", "n,,n=,r="},
 		{"unknown binding flag", "x,,n=,r=" + testClientNonce},
 		{"mandatory extension", "n,,m=ext,n=,r=" + testClientNonce},
+		{"NUL byte", "n,,n=us\x00er,r=" + testClientNonce},
+		{"control character in the nonce", "n,,n=,r=abc\x01def"},
+		{"space in the nonce", "n,,n=,r=abc def"},
+		{"non-ASCII nonce", "n,,n=,r=abcédef"},
+		{"comma in the nonce (an extension that is no attribute)", "n,,n=,r=abc,def"},
+		{"malformed extension", "n,,n=,r=" + testClientNonce + ",1=x"},
 		{"empty", ""},
 		{"1MiB", "n,,n=,r=" + huge},
 	}
@@ -241,6 +265,9 @@ func TestServerRefusesBrokenMessages(t *testing.T) {
 	finals := []struct{ name, first, final string }{
 		{"other server nonce", "n,,", "c=biws,r=" + testClientNonce + "other,p=" + anyProof},
 		{"c= other than the first's flag", "y,,", "c=biws,r=" + nonce + ",p=" + anyProof},
+		{"c= other than the first's flag, reversed", "n,,", "c=eSws,r=" + nonce + ",p=" + anyProof},
+		{"malformed extension", "n,,", "c=biws,r=" + nonce + ",not-an-attribute,p=" + anyProof},
+		{"NUL byte", "n,,", "c=biws,r=" + nonce + ",x=\x00,p=" + anyProof},
 		{"broken base64 proof", "n,,", "c=biws,r=" + nonce + ",p=!!not*base64!!"},
 		{"31-byte proof", "n,,", "c=biws,r=" + nonce + ",p=" + base64.StdEncoding.EncodeToString(make([]byte, 31))},
 		{"33-byte proof", "n,,", "c=biws,r=" + nonce + ",p=" + base64.StdEncoding.EncodeToString(make([]byte, 33))},
@@ -282,6 +309,16 @@ func TestServerIsUsedOnce(t *testing.T) {
 	}
 	if _, err := s.First(first); err == nil {
 		t.Error("a second First: no error")
+	}
+
+	// After a failed First nothing was agreed, so empty c= and r= would match
+	// what the server holds: only the exchange's state refuses this.
+	s = scram.NewServer(v, false, nil)
+	if _, err := s.First([]byte("p=tls-server-end-point,,n=,r=" + testClientNonce)); err == nil {
+		t.Fatal("First with p=: no error")
+	}
+	if _, ok, err := s.Final([]byte("c=,r=,p=" + base64.StdEncoding.EncodeToString(make([]byte, 32)))); err == nil || ok {
+		t.Errorf("Final after a failed First: ok %v, err %v; want an error", ok, err)
 	}
 
 	s = scram.NewServer(v, false, nil)
