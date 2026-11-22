@@ -27,10 +27,13 @@ func addedLatency(t *testing.T, gate proxy.Gate, label string) time.Duration {
 // connections logged in as user.
 func addedLatencyWith(t *testing.T, gate proxy.Gate, policy proxy.Policy, user, label string) time.Duration {
 	t.Helper()
-	return addedLatencyOf(t, gate, policy, user, label, func(ctx context.Context, conn *pgx.Conn, _ int) error {
-		var one int
-		return conn.QueryRow(ctx, "select 1").Scan(&one)
-	})
+	return addedLatencyOf(t, gate, policy, user, label, selectOne)
+}
+
+// selectOne is the round trip of addedLatency: select 1.
+func selectOne(ctx context.Context, conn *pgx.Conn, _ int) error {
+	var one int
+	return conn.QueryRow(ctx, "select 1").Scan(&one)
 }
 
 // addedLatencyOf is addedLatencyWith for the round trip trip, which is
@@ -44,35 +47,7 @@ func addedLatencyOf(t *testing.T, gate proxy.Gate, policy proxy.Policy, user, la
 	addr, _ := startProxyWith(t, up, gate, policy)
 	direct := connect(t, up, user, nil)
 	proxied := connect(t, addr, user, nil)
-	ctx := testCtx(t)
-
-	n := 0
-	roundTrip := func(conn *pgx.Conn) time.Duration {
-		n++
-		start := time.Now()
-		if err := trip(ctx, conn, n); err != nil {
-			t.Fatal(err)
-		}
-		return time.Since(start)
-	}
-	for range latencyWarmUp { // warm up both paths
-		roundTrip(direct)
-		roundTrip(proxied)
-	}
-	d := make([]time.Duration, latencyTrips)
-	p := make([]time.Duration, latencyTrips)
-	for i := range latencyTrips {
-		d[i] = roundTrip(direct)
-		p[i] = roundTrip(proxied)
-	}
-	slices.Sort(d)
-	slices.Sort(p)
-	pct := func(xs []time.Duration, q float64) time.Duration { return xs[int(q*float64(len(xs)-1))] }
-
-	added := pct(p, 0.95) - pct(d, 0.95)
-	t.Logf("%s, %d round trips: direct p50=%v p95=%v, proxied p50=%v p95=%v, added p95=%v",
-		label, latencyTrips, pct(d, 0.5), pct(d, 0.95), pct(p, 0.5), pct(p, 0.95), added)
-	return added
+	return measureAdded(t, label, direct, proxied, trip)
 }
 
 // addedLatencyOverTLS is addedLatency with no gate, where the direct
@@ -87,12 +62,21 @@ func addedLatencyOverTLS(t *testing.T, label string) time.Duration {
 	addr, _ := startProxyTo(t, up, nil, proxy.Policy{})
 	direct := connect(t, up.Addr, "stet_scram", url.Values{"sslmode": {"require"}})
 	proxied := connect(t, addr, "stet_scram", nil)
+	return measureAdded(t, label, direct, proxied, selectOne)
+}
+
+// measureAdded times trip on direct and on proxied, interleaving the two so
+// drift hits both equally, logs both under label, and returns how much
+// proxied adds at p95. trip is handed the round trip's number.
+func measureAdded(t *testing.T, label string, direct, proxied *pgx.Conn, trip func(ctx context.Context, conn *pgx.Conn, i int) error) time.Duration {
+	t.Helper()
 	ctx := testCtx(t)
 
+	n := 0
 	roundTrip := func(conn *pgx.Conn) time.Duration {
+		n++
 		start := time.Now()
-		var one int
-		if err := conn.QueryRow(ctx, "select 1").Scan(&one); err != nil {
+		if err := trip(ctx, conn, n); err != nil {
 			t.Fatal(err)
 		}
 		return time.Since(start)
