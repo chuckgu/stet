@@ -438,15 +438,15 @@ sudo install -m 0600 -o 65532 -g 65532 stet.yaml /srv/stet/
 
 `stet.yaml`의 경로는 컨테이너 안의 것으로 적는다. `/srv/stet`을 `/etc/stet`에 마운트하므로 4장의 예가 그대로 맞는다(`sslrootcert=/etc/stet/db-ca.crt`). 컨테이너 안에서는 모든 주소(`0.0.0.0:6432`)로 받아야 바깥에 연 포트가 닿으므로 `listen_tls`가 반드시 있다.
 
-**계정 더하기.** 같은 이미지로 `stet agent`를 돌린다. `-it`면 비밀번호를 화면에 보이지 않게 묻는다. 스크립트에서는 `-t` 없이 `-i`로 표준 입력의 첫 줄을 준다.
+**계정 더하기.** 같은 이미지로 `stet agent`를 돌린다. `-it`면 비밀번호를 화면에 보이지 않게 묻는다. 스크립트에서는 `-t` 없이 `-i`로 표준 입력의 첫 줄을 준다. `add`와 `token`은 토큰을 컨테이너의 표준 출력에 내고, Docker는 그 출력을 설정된 로그 드라이버(journald, fluentd, awslogs 등)에도 보낸다. 그래서 `stet agent`를 돌리는 `docker run`에는 늘 `--log-driver none`을 붙여 토큰이 로그에 남지 않게 한다.
 
 ```sh
-docker run --rm -it -v /srv/stet:/etc/stet stet:local agent add -config /etc/stet/stet.yaml agent_enricher
+docker run --rm -it --log-driver none -v /srv/stet:/etc/stet stet:local agent add -config /etc/stet/stet.yaml agent_enricher
 ```
 
 ```sh
 read -rs PW
-printf '%s\n' "$PW" | docker run --rm -i -v /srv/stet:/etc/stet stet:local agent add -config /etc/stet/stet.yaml agent_enricher
+printf '%s\n' "$PW" | docker run --rm -i --log-driver none -v /srv/stet:/etc/stet stet:local agent add -config /etc/stet/stet.yaml agent_enricher
 ```
 
 `add`는 DB에 한 번 로그인해 보므로 이 컨테이너에서도 DB에 닿아야 한다.
@@ -465,12 +465,12 @@ docker logs -f stet
 **토큰 돌리기.** 도는 컨테이너는 그대로 둔다.
 
 ```sh
-docker run --rm -v /srv/stet:/etc/stet stet:local agent token -config /etc/stet/stet.yaml agent_enricher
+docker run --rm --log-driver none -v /srv/stet:/etc/stet stet:local agent token -config /etc/stet/stet.yaml agent_enricher
 ```
 
 계정을 더한 뒤에는 `docker restart stet`.
 
-**확인한 것** (2026-11-23, macOS의 Docker Desktop 28.0.1, 이 기기에서 빌드한 이미지). "필요한 것"의 `GRANT`부터 이 장의 명령을 그대로 쳤다(`add`는 `printf … | docker run --rm -i …`의 형식으로). 달랐던 것: 태그는 `stet:deploy-test`, 컨테이너 이름은 `dp-stet`, 디렉터리는 `/srv/stet` 대신 빈 디렉터리였고, `sudo install -o 65532 -g 65532` 대신 이 기기의 사용자로 파일을 놓았다. 포트는 `127.0.0.1:16433`에만 열었고, `-decisions on`을 더했다. `upstream`은 같은 기기의 시험 서버를 `host.docker.internal`로 가리켜 `sslrootcert`를 준 `verify-ca`로 확인했다(그 서버의 인증서는 자기 서명이고 `localhost`와 `127.0.0.1`만 담는다). 토큰으로 붙은 `psql`의 쓰기가 판단되어 그 계정으로 기록됐고, 평문 접속은 `28000`으로 거절됐다(`reason="tls required"`). 다른 컨테이너에서 돌린 `stet agent token` 뒤에, 읽기 전용으로 마운트한 채 도는 컨테이너가 다시 띄우지 않고(시작 시각과 재시작 수가 그대로) 예전 토큰을 거절하고 새 토큰을 받았다.
+**확인한 것** (2026-11-23, macOS의 Docker Desktop 28.0.1, 이 기기에서 빌드한 이미지). "필요한 것"의 `GRANT`부터 이 장의 명령을 그대로 쳤다(`add`는 `printf … | docker run --rm -i …`의 형식으로). 달랐던 것: 태그는 `stet:deploy-test`, 컨테이너 이름은 `dp-stet`, 디렉터리는 `/srv/stet` 대신 빈 디렉터리였고, `sudo install -o 65532 -g 65532` 대신 이 기기의 사용자로 파일을 놓았다. 포트는 `127.0.0.1:16433`에만 열었고, `-decisions on`을 더했다. `upstream`은 같은 기기의 시험 서버를 `host.docker.internal`로 가리켜 `sslrootcert`를 준 `verify-ca`로 확인했다(그 서버의 인증서는 자기 서명이고 `localhost`와 `127.0.0.1`만 담는다). 토큰으로 붙은 `psql`의 쓰기가 판단되어 그 계정으로 기록됐고, 평문 접속은 `28000`으로 거절됐다(`reason="tls required"`). 다른 컨테이너에서 돌린 `stet agent token` 뒤에, 읽기 전용으로 마운트한 채 도는 컨테이너가 다시 띄우지 않고(시작 시각과 재시작 수가 그대로) 예전 토큰을 거절하고 새 토큰을 받았다. `stet agent`의 명령에 붙인 `--log-driver none`은 이 따라 하기 뒤에(마지막 검토에서) 더했고 돌려 보지 않았다. 이 기기의 `docker run --help`(Docker 28.0.1)에 있는 플래그다.
 
 **확인하지 못한 것.** Docker Desktop(macOS)에서는 바인드 마운트한 파일이 컨테이너 안에서 컨테이너를 돌린 사용자의 것으로 보였다(호스트에서 이 기기의 사용자 파일이 컨테이너 안에서는 uid 65532의 것). 그래서 위의 소유자 설정이 맞는지, 틀리면 Stet이 거부하는지는 이 기기에서 시험되지 않는다. Linux의 Docker Engine에서는 돌려 보지 않았다. `-it`로 묻는 형식도 돌려 보지 않았다(묻는 동작은 테스트로만 확인했다).
 
