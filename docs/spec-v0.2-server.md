@@ -219,7 +219,7 @@ stet agent list     [-config stet.yaml]
   4. 토큰을 만들고, 파일에 검증값과 비밀번호(또는 변수 이름)를 쓴다. 쓰기는 잠금 안에서, 그때의 파일에 대해 한다(6장). 그사이 다른 `stet agent`가 같은 계정을 더했으면 쓰지 않고 멈춘다.
   5. 토큰을 표준 출력에 한 번 보여 준다. 다시 볼 수 없다고 말한다. 이어서 할 일을 알린다: 에이전트의 접속 문자열에서 호스트를 Stet의 것으로, 비밀번호를 토큰으로 바꿀 것. 이 계정의 예전 비밀번호를 다른 곳이 알고 있으면 DB에서 바꾸고 `stet agent password`로 새 값을 넣을 것(`-config`를 줬으면 그대로 넣은 명령을 보인다). 설정에 `agents.roles`가 있으면 거기에도 더할 것. `stet proxy`를 다시 띄울 것.
 - **`token`.** 토큰을 새로 만든다. 예전 토큰은 다음 로그인부터 통하지 않는다. 다시 띄울 필요가 없다(`the old token stops working at the next login; no restart is needed`).
-- **`password`.** 진짜 비밀번호를 바꿔 적는다. 운영자가 DB에서 비밀번호를 바꾼 뒤에 쓴다. `add`의 2와 3을 그대로 한다. 파일에 둔 비밀번호는 다시 띄울 필요가 없다(`password for "<계정>" updated; no restart is needed`). `password_env`인 계정은 `stet proxy`의 환경을 고치고 다시 띄워야 한다고 말하고 아무것도 바꾸지 않는다. `-password-env NAME`을 주면 그 계정의 비밀번호 자리를 그 변수로 옮긴다(진행 중의 판단. 다시 띄워야 한다고 말한다).
+- **`password`.** 진짜 비밀번호를 바꿔 적는다. 운영자가 DB에서 비밀번호를 바꾼 뒤에 쓴다. `add`의 2와 3을 그대로 한다. 파일에 둔 비밀번호는 다시 띄울 필요가 없다(`password for "<계정>" updated; no restart is needed`). `password_env`인 계정은 `stet proxy`의 환경을 고치고 다시 띄워야 한다고 에러로 말하고(`"<계정>" takes its password from <NAME>; change it in stet proxy's environment and restart stet proxy`, 끝 상태 1) 아무것도 바꾸지 않는다. 스크립트가 그것을 성공으로 읽지 않게 하기 위해서다(마지막 검토 뒤에 고쳤다. 처음에는 표준 출력에 알리고 0으로 끝났다). `-password-env NAME`을 주면 그 계정의 비밀번호 자리를 그 변수로 옮긴다(진행 중의 판단. 다시 띄워야 한다고 말한다).
 - **`remove`.** 계정을 지운다. 다음 로그인부터 거절한다. 설정에 `agents.roles`가 있으면 거기서도 빼라고, 마지막 계정을 지웠으면 계정을 더하기 전에는 `stet proxy`가 시작하지 않는다고 알린다.
 - **`list`.** 계정(이름 순서), 비밀번호의 자리(`file`이나 `env NAME`), 더한 때, 토큰을 만든 때(UTC, 분까지)를 보인다. 토큰과 비밀번호는 보이지 않는다. 계정이 없으면 `no accounts`다.
 
@@ -385,6 +385,7 @@ stet agent list     [-config stet.yaml]
 - 8장: 키만 있고 값이 빈 `listen_tls`와 `agents.credentials`(공백뿐인 값 포함)는 설정 검증에서 거부한다. 없는 것으로 읽지 않는다.
 - 8장: 보관을 켜면 섀도에서도 시작할 때 Stet의 계정이 에이전트 계정마다 그 역할의 구성원인지 보고 경고한다(enforce와 같은 문구). 보관이 없는 섀도는 그대로다.
 - 3장: `listen_tls`를 다시 읽지 못한 동안은 파일이 그대로 보여도 인사 때마다(200ms에 한 번까지) 다시 읽어 본다. 실패는 파일이 바뀔 때마다, 그리고 원인이 달라질 때마다 한 번 남긴다.
+- 7장: `password_env`인 계정에 `-password-env` 없이 돌린 `stet agent password`는 그 알림을 에러로 내고 1로 끝난다.
 
 **남긴 것**
 

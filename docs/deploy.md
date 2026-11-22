@@ -229,7 +229,7 @@ next:
   the old token stops working at the next login; no restart is needed
   ```
 
-- **`password`**: DB에서 바꾼 새 비밀번호를 받아 `add`의 2, 3을 그대로 한 뒤 적는다. 파일에 둔 비밀번호는 다시 띄우지 않아도 다음 로그인부터 쓰인다(`password for "agent_enricher" updated; no restart is needed`). 비밀번호가 `password_env`인 계정은 `"agent_support" takes its password from AGENT_SUPPORT_PASSWORD; change it in stet proxy's environment and restart stet proxy`라고 알리고 아무것도 바꾸지 않는다. `-password-env NAME`을 주면 그 계정의 비밀번호 자리를 그 변수로 옮긴다(다시 띄워야 한다).
+- **`password`**: DB에서 바꾼 새 비밀번호를 받아 `add`의 2, 3을 그대로 한 뒤 적는다. 파일에 둔 비밀번호는 다시 띄우지 않아도 다음 로그인부터 쓰인다(`password for "agent_enricher" updated; no restart is needed`). 비밀번호가 `password_env`인 계정은 아무것도 바꾸지 않고 에러로 멈춘다(`stet: "agent_support" takes its password from AGENT_SUPPORT_PASSWORD; change it in stet proxy's environment and restart stet proxy`, 끝 상태 1). `-password-env NAME`을 주면 그 계정의 비밀번호 자리를 그 변수로 옮긴다(다시 띄워야 한다).
 - **`remove`**: 계정을 지운다. 다음 로그인부터 거절한다(`"agent_enricher" removed; it is refused from the next login`). 마지막 계정을 지우면 `the credentials file has no account left: stet proxy will not start until one is added`를 덧붙인다.
 - **`list`**: 계정마다 비밀번호의 자리(`file`이나 `env <이름>`), 더한 때, 토큰을 만든 때(UTC, 분까지)를 보인다. 토큰과 비밀번호는 보이지 않는다.
 

@@ -324,7 +324,8 @@ func (c *agentCmd) token() error {
 // password is stet agent password: the account's new database password,
 // kept once it logs in. An account whose password is an environment
 // variable's has nothing to change in the file, unless -password-env names
-// one again: stet proxy reads the variable at start.
+// one again: stet proxy reads the variable at start. Without it, that is the
+// command's error, so that a script does not take it for a success.
 func (c *agentCmd) password() error {
 	f, err := custody.ReadForUpdate(c.cfg.Credentials)
 	if err != nil {
@@ -335,9 +336,8 @@ func (c *agentCmd) password() error {
 		return c.noAccount()
 	}
 	if c.envName == "" && e.PasswordEnv != "" {
-		fmt.Fprintf(c.io.stdout, "%q takes its password from %s; change it in stet proxy's environment and restart stet proxy\n",
+		return fmt.Errorf("%q takes its password from %s; change it in stet proxy's environment and restart stet proxy",
 			c.account, safetext.Printable(e.PasswordEnv))
-		return nil
 	}
 	_, database, err := upstreamAccount(c.cfg.Upstream)
 	if err != nil {

@@ -563,15 +563,17 @@ func TestAgentPassword(t *testing.T) {
 	untouched(t)
 
 	// An account whose password is a variable's: the file is not changed, and
-	// the operator is told where to change it.
+	// the error, which a script does not take for success, says where to
+	// change it.
 	before := fileBytes(t, ac.credentials)
 	a, buf = asking(t, nil)
-	if err := runAgent(ac.args("password", account), a); err != nil {
-		t.Fatalf("password: %v", err)
+	err = runAgent(ac.args("password", account), a)
+	if want := fmt.Sprintf("%q takes its password from %s; change it in stet proxy's environment and restart stet proxy",
+		account, name); err == nil || err.Error() != want {
+		t.Errorf("password = %v, want the error %q", err, want)
 	}
-	if want := fmt.Sprintf("%q takes its password from %s; change it in stet proxy's environment and restart stet proxy\n",
-		account, name); buf.String() != want {
-		t.Errorf("password printed %q, want %q", buf, want)
+	if buf.Len() != 0 {
+		t.Errorf("password printed %q, want nothing", buf)
 	}
 	if !bytes.Equal(fileBytes(t, ac.credentials), before) {
 		t.Error("the credentials file changed")
@@ -778,7 +780,7 @@ func TestAgentOutputShowsTheTokenOnce(t *testing.T) {
 			before: func() { mustExec(t, superuser(t, pg), "alter role "+account+" password '"+changed+"'") }},
 		{args: []string{"password", account}, stdin: changed + "\n", ok: true},
 		{args: []string{"password", "-password-env", name, account}, env: map[string]string{name: changed}, ok: true},
-		{args: []string{"password", account}, ok: true},
+		{args: []string{"password", account}}, // its password is the variable's
 		{args: []string{"list"}, ok: true},
 		{args: []string{"token", account}, ok: true, tokens: 1},
 		{args: []string{"remove", account}, ok: true},
