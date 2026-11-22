@@ -11,9 +11,14 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
+	"maps"
 	"math/big"
 	"net"
+	"os"
+	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -216,7 +221,11 @@ func TestUpstreamDeclinesTLS(t *testing.T) {
 
 // otherCert is a self-signed certificate for the test server's names that
 // did not sign the test server's.
-func otherCert(t *testing.T) *x509.Certificate {
+func otherCert(t *testing.T) *x509.Certificate { return selfSigned(t).Leaf }
+
+// selfSigned is a self-signed certificate for the test server's names, with
+// its key, for a fake upstream to present.
+func selfSigned(t *testing.T) tls.Certificate {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -241,7 +250,7 @@ func otherCert(t *testing.T) *x509.Certificate {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return cert
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: cert}
 }
 
 // The server's certificate is checked as the TLS setting says: another
@@ -480,6 +489,230 @@ func TestCancelOverTLSNeedsTLS(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("the cancel request never reached the fake upstream")
 			}
+		})
+	}
+}
+
+// dialPlain opens a plaintext connection to addr, closed when the test ends.
+func dialPlain(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	return c
+}
+
+// dialTLS opens a connection to the server at addr and asks it for TLS with
+// cfg, as libpq does.
+func dialTLS(t *testing.T, addr string, cfg *tls.Config) net.Conn {
+	t.Helper()
+	c := dialPlain(t, addr)
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	var req [8]byte
+	binary.BigEndian.PutUint32(req[0:4], 8)
+	binary.BigEndian.PutUint32(req[4:8], 80877103)
+	if _, err := c.Write(req[:]); err != nil {
+		t.Fatal(err)
+	}
+	var answer [1]byte
+	if _, err := io.ReadFull(c, answer[:]); err != nil {
+		t.Fatal(err)
+	}
+	if answer[0] != 'S' {
+		t.Fatalf("the server at %s answered the TLS request with %q", addr, answer[0])
+	}
+	tc := tls.Client(c, cfg)
+	if err := tc.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	return tc
+}
+
+// firstAnswer starts a session for user on the test database over c and
+// returns the first message it is sent back: type, length and body.
+func firstAnswer(t *testing.T, c net.Conn, user string) []byte {
+	t.Helper()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	pkt, err := (&pgproto3.StartupMessage{
+		ProtocolVersion: pgproto3.ProtocolVersionNumber,
+		Parameters:      map[string]string{"user": user, "database": "stet_test"},
+	}).Encode(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Write(pkt); err != nil {
+		t.Fatal(err)
+	}
+	var hdr [5]byte
+	if _, err := io.ReadFull(c, hdr[:]); err != nil {
+		t.Fatal(err)
+	}
+	n := binary.BigEndian.Uint32(hdr[1:])
+	if n < 4 || n > 1<<16 {
+		t.Fatalf("first message %q has length %d", hdr[0], n)
+	}
+	msg := make([]byte, 1+n)
+	copy(msg, hdr[:])
+	if _, err := io.ReadFull(c, msg[5:]); err != nil {
+		t.Fatal(err)
+	}
+	return msg
+}
+
+// mechanisms reads the list of an AuthenticationSASL message.
+func mechanisms(t *testing.T, msg []byte) []string {
+	t.Helper()
+	var sasl pgproto3.AuthenticationSASL
+	if msg[0] != 'R' || sasl.Decode(msg[5:]) != nil {
+		t.Fatalf("got % x, want an AuthenticationSASL", msg)
+	}
+	return sasl.AuthMechanisms
+}
+
+// Each session through the proxy as a plain passthrough, watched by a gate
+// that sees every session, and watched by one that enforces.
+var gates = []struct {
+	name   string
+	gate   func() proxy.Gate
+	policy proxy.Policy
+}{
+	{"Relayed", func() proxy.Gate { return nil }, proxy.Policy{}},
+	{"Watched", func() proxy.Gate { return newRecordingGate(isWrite) }, proxy.Policy{}},
+	{"Enforced", func() proxy.Gate { return closedPointGate(isWrite) }, proxy.Policy{Enforce: true}},
+}
+
+// Over TLS the server offers SCRAM-SHA-256-PLUS, which a client on the
+// proxy's plaintext leg cannot use: the proxy takes it out of the list.
+func TestSASLListOverTLSHasNoPlus(t *testing.T) {
+	up := tlsUpstream(t)
+	direct := mechanisms(t, firstAnswer(t, dialTLS(t, up.Addr, up.TLS), "stet_scram"))
+	if !slices.Contains(direct, "SCRAM-SHA-256-PLUS") {
+		t.Fatalf("the test server offers %q over TLS, without SCRAM-SHA-256-PLUS: nothing to take out", direct)
+	}
+	for _, g := range gates {
+		t.Run(g.name, func(t *testing.T) {
+			addr, _ := startProxyTo(t, up, g.gate(), g.policy)
+			got := mechanisms(t, firstAnswer(t, dialPlain(t, addr), "stet_scram"))
+			if want := []string{"SCRAM-SHA-256"}; !slices.Equal(got, want) {
+				t.Errorf("the client is offered %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// Over a plaintext upstream the client gets the server's list as it was
+// sent, byte for byte.
+func TestSASLListOverPlaintextIsTheServers(t *testing.T) {
+	server := upstream(t)
+	direct := firstAnswer(t, dialPlain(t, server), "stet_scram")
+	for _, g := range gates {
+		t.Run(g.name, func(t *testing.T) {
+			addr, _ := startProxyTo(t, proxy.Upstream{Addr: server}, g.gate(), g.policy)
+			if got := firstAnswer(t, dialPlain(t, addr), "stet_scram"); !bytes.Equal(got, direct) {
+				t.Errorf("the client got % x, the server sends % x", got, direct)
+			}
+		})
+	}
+}
+
+// A server that offers channel-bound SCRAM alone leaves a plaintext client
+// nothing to log in with: the proxy ends the session with an error that says
+// why.
+func TestOnlyChannelBoundAuthIsRefused(t *testing.T) {
+	cert := selfSigned(t)
+	offer, err := (&pgproto3.AuthenticationSASL{AuthMechanisms: []string{"SCRAM-SHA-256-PLUS"}}).Encode(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := fakeUpstream(t, func(c net.Conn) {
+		if _, ssl := readOpening(c); !ssl {
+			return
+		}
+		c.Write([]byte{'S'})
+		tc := tls.Server(c, &tls.Config{Certificates: []tls.Certificate{cert}})
+		tc.SetDeadline(time.Now().Add(5 * time.Second))
+		var n [4]byte // the startup message's length
+		if _, err := io.ReadFull(tc, n[:]); err != nil {
+			return
+		}
+		if _, err := io.CopyN(io.Discard, tc, int64(binary.BigEndian.Uint32(n[:]))-4); err != nil {
+			return
+		}
+		tc.Write(offer)
+		io.Copy(io.Discard, tc)
+	})
+	for _, g := range gates {
+		t.Run(g.name, func(t *testing.T) {
+			addr, _ := startProxyTo(t, proxy.Upstream{Addr: fake, TLS: unverified()}, g.gate(), g.policy)
+			const want = "stet: the server offers only channel-bound authentication, which cannot pass through stet"
+			err := connectErr(addr)
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) {
+				t.Fatalf("err = %v, want FATAL 28000 %q", err, want)
+			}
+			if pgErr.Severity != "FATAL" || pgErr.Code != "28000" || pgErr.Message != want {
+				t.Errorf("got %s %s %q, want FATAL 28000 %q", pgErr.Severity, pgErr.Code, pgErr.Message, want)
+			}
+		})
+	}
+}
+
+// runPsql runs select 1 with psql through addr as user, in plaintext,
+// giving password in PGPASSWORD. No other PG variable of the environment
+// reaches it.
+func runPsql(t *testing.T, psql, addr, user, password string) (stdout, stderr string, err error) {
+	t.Helper()
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(testCtx(t), psql, "-X", "-w", "-At", "-c", "select 1",
+		fmt.Sprintf("host=%s port=%s user=%s dbname=stet_test sslmode=disable", host, port, user))
+	cmd.Env = []string{} // never nil, which would pass the whole environment
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "PG") {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
+	if password != "" {
+		cmd.Env = append(cmd.Env, "PGPASSWORD="+password)
+	}
+	var out, errOut bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errOut
+	err = cmd.Run()
+	return out.String(), errOut.String(), err
+}
+
+// psql (libpq) refuses SCRAM-SHA-256-PLUS on a connection without TLS, so
+// through a TLS upstream it logs in only once the proxy takes that out of
+// the list. Every auth method logs in; a wrong password is still the
+// server's to refuse.
+func TestPsqlLogsInThroughTLSUpstream(t *testing.T) {
+	psql, err := exec.LookPath("psql")
+	if err != nil {
+		t.Skipf("psql is not in PATH, so this test cannot run: %v", err)
+	}
+	up := tlsUpstream(t)
+	for _, g := range gates {
+		t.Run(g.name, func(t *testing.T) {
+			addr, _ := startProxyTo(t, up, g.gate(), g.policy)
+			for _, user := range slices.Sorted(maps.Keys(testUsers)) {
+				t.Run(user, func(t *testing.T) {
+					out, errOut, err := runPsql(t, psql, addr, user, testUsers[user])
+					if err != nil || out != "1\n" {
+						t.Errorf("psql as %s: %v, stdout %q, stderr %q", user, err, out, errOut)
+					}
+				})
+			}
+			t.Run("WrongPassword", func(t *testing.T) {
+				_, errOut, err := runPsql(t, psql, addr, "stet_scram", "wrong")
+				const want = `password authentication failed for user "stet_scram"`
+				if err == nil || !strings.Contains(errOut, want) {
+					t.Errorf("psql with a wrong password: %v, stderr %q, want it to fail with %s", err, errOut, want)
+				}
+			})
 		})
 	}
 }

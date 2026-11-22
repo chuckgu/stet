@@ -3,6 +3,7 @@ package proxy_test
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"slices"
 	"testing"
 	"time"
@@ -50,6 +51,48 @@ func addedLatencyOf(t *testing.T, gate proxy.Gate, policy proxy.Policy, user, la
 		n++
 		start := time.Now()
 		if err := trip(ctx, conn, n); err != nil {
+			t.Fatal(err)
+		}
+		return time.Since(start)
+	}
+	for range latencyWarmUp { // warm up both paths
+		roundTrip(direct)
+		roundTrip(proxied)
+	}
+	d := make([]time.Duration, latencyTrips)
+	p := make([]time.Duration, latencyTrips)
+	for i := range latencyTrips {
+		d[i] = roundTrip(direct)
+		p[i] = roundTrip(proxied)
+	}
+	slices.Sort(d)
+	slices.Sort(p)
+	pct := func(xs []time.Duration, q float64) time.Duration { return xs[int(q*float64(len(xs)-1))] }
+
+	added := pct(p, 0.95) - pct(d, 0.95)
+	t.Logf("%s, %d round trips: direct p50=%v p95=%v, proxied p50=%v p95=%v, added p95=%v",
+		label, latencyTrips, pct(d, 0.5), pct(d, 0.95), pct(p, 0.5), pct(p, 0.95), added)
+	return added
+}
+
+// addedLatencyOverTLS is addedLatency with no gate, where the direct
+// connection and the proxy's leg to the server are TLS; the client's leg to
+// the proxy stays plaintext.
+func addedLatencyOverTLS(t *testing.T, label string) time.Duration {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("latency measurement skipped in -short mode")
+	}
+	up := tlsUpstream(t)
+	addr, _ := startProxyTo(t, up, nil, proxy.Policy{})
+	direct := connect(t, up.Addr, "stet_scram", url.Values{"sslmode": {"require"}})
+	proxied := connect(t, addr, "stet_scram", nil)
+	ctx := testCtx(t)
+
+	roundTrip := func(conn *pgx.Conn) time.Duration {
+		start := time.Now()
+		var one int
+		if err := conn.QueryRow(ctx, "select 1").Scan(&one); err != nil {
 			t.Fatal(err)
 		}
 		return time.Since(start)
@@ -174,5 +217,14 @@ func TestEnforcedSessionSettingsLatencyBudget(t *testing.T) {
 		})
 	if added > 2*time.Millisecond {
 		t.Errorf("an enforced session following its settings adds %v at p95, budget is 2ms", added)
+	}
+}
+
+// Spec 3 of the try-out spec: over a TLS upstream the proxy looks at the
+// server's messages only until the session is ready, so a session there stays
+// inside the same 2ms budget at p95. The direct connection is TLS too.
+func TestTLSUpstreamLatencyBudget(t *testing.T) {
+	if added := addedLatencyOverTLS(t, "select 1 over a TLS upstream"); added > 2*time.Millisecond {
+		t.Errorf("a session over a TLS upstream adds %v at p95, budget is 2ms", added)
 	}
 }

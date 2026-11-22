@@ -172,10 +172,28 @@ func (s *Server) handle(client net.Conn) {
 	}
 	start := time.Now()
 	s.log.Debug("session started", "remote", client.RemoteAddr(), "upstream_tls", secure)
+	// Over a TLS upstream the server offers SCRAM-SHA-256-PLUS, which the
+	// client, on a plaintext leg, cannot use: authTap takes it out.
 	if ss := s.watch(pkt); ss == nil {
-		relay(client, server, nil, nil, nil, nil, nil)
+		var fromServer *tap
+		var ended func() []byte
+		if secure {
+			fromServer, ended = authTap(nil)
+		}
+		relay(client, server, nil, fromServer, ended, nil, nil)
 	} else {
-		relay(client, server, ss.clientTap(), ss.serverTap(), ss.ended, func(v any, stack []byte) {
+		fromServer, ended := ss.serverTap(), ss.ended
+		if secure {
+			var refused func() []byte
+			fromServer, refused = authTap(fromServer)
+			ended = func() []byte {
+				if fatal := refused(); fatal != nil {
+					return fatal
+				}
+				return ss.ended()
+			}
+		}
+		relay(client, server, ss.clientTap(), fromServer, ended, func(v any, stack []byte) {
 			s.log.Error("session ended by a panic", "session", ss.info.ID, "login_role", ss.info.User,
 				"database", ss.info.Database, "agent", ss.info.ApplicationName, "panic", fmt.Sprint(v), "stack", string(stack))
 		}, ss.stuck)
@@ -381,7 +399,8 @@ func relay(client, server net.Conn, fromClient, fromServer *tap, ended func() []
 
 // tap observes messages in one direction. For message types it wants, see
 // gets the whole body before the message is forwarded (nil past
-// maxInspect), plus a way to flush what is already queued for the peer.
+// maxInspect), plus a way to flush what is already queued for the peer. A
+// nil want wants nothing.
 // each, when set, gets the type of every message as soon as its header is
 // read. It runs for every result row, so for a row (DataRow, CopyData) it may
 // do no more than increment a counter; for the few other types it acts on
@@ -429,7 +448,7 @@ func pump(dst io.Writer, src io.Reader, tp *tap) error {
 		if tp != nil && tp.each != nil {
 			tp.each(hdr[0])
 		}
-		if tp != nil && tp.want(hdr[0]) {
+		if tp != nil && tp.want != nil && tp.want(hdr[0]) {
 			read := size <= maxInspect // past it, see is shown no body
 			var shown []byte
 			if read {
