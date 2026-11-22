@@ -503,6 +503,12 @@ func TestInitOutputNeverShowsThePassword(t *testing.T) {
 		{name: "# in the password", password: initPassword, address: "postgres://app:#" + initPassword + "@127.0.0.1:1/crm", args: []string{"-yes"}},
 		{name: "? in the password", password: initPassword, address: "postgres://app:12?" + initPassword + "@127.0.0.1:1/crm", args: []string{"-yes"}},
 		{name: "? in the user name", password: initPassword, address: "postgres://h?x:" + initPassword + "@/crm", args: []string{"-yes"}},
+		// The user name is the host: both reach db:5432, but net/url takes
+		// what follows the ? or # for the query or the fragment.
+		{name: "? first in the password", password: initPassword, address: "postgres://db:?" + initPassword + "@db/crm", args: []string{"-yes"}},
+		{name: "? first in the password, with a port", password: initPassword,
+			address: "postgres://db:5432?" + initPassword + "@db:5432/crm", args: []string{"-yes"}},
+		{name: "# first in the password", password: initPassword, address: "postgres://db:#" + initPassword + "@db/crm", args: []string{"-yes"}},
 		{name: "PGPORT", password: initPassword, address: "postgres://app:" + initPassword + "@127.0.0.1/crm", args: []string{"-yes"},
 			setup: func(t *testing.T) { t.Setenv("PGPORT", "1") }},
 		{name: "a space before the password key", password: initPassword,
@@ -539,6 +545,7 @@ func TestInitStops(t *testing.T) {
 		inQuery  = "the database address sets host, hostaddr or port in its query; write the host and port in the address itself"
 		manyHost = "the database address lists more than one host; stet relays to one server, so give one host"
 		space    = "the database address contains a space; percent-encode it (%20) or remove it"
+		userInfo = "the database address has a ? or # in its user or password; percent-encode it (%3F, %23)"
 		twoWays  = "stet's own connections and the proxy would reach different hosts or ports for this address; " +
 			"write one host and one port in the address itself (not in its query, PGHOST, PGPORT or a service file), " +
 			"and percent-encode special characters in the password"
@@ -571,6 +578,12 @@ func TestInitStops(t *testing.T) {
 		{"# in the password", []string{"postgres://app:#hunter2@127.0.0.1:1/crm"}, twoWays},
 		{"? in the password", []string{"postgres://app:12?34@127.0.0.1:1/crm"}, twoWays},
 		{"? in the user name", []string{"postgres://h?@/crm"}, twoWays},
+		// The two agree on the host and port (the user name is the host) but
+		// not on the user and password: net/url reads the query or fragment
+		// from the ? or #, and the agent's address would show the rest.
+		{"? first in the password", []string{"postgres://db:?s3cret@db/crm"}, userInfo},
+		{"? first in the password, with a port", []string{"postgres://db:5432?s3cret@db:5432/crm"}, userInfo},
+		{"# first in the password", []string{"postgres://db:#s3cret@db/crm"}, userInfo},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out, err := initOut(append([]string{"-config", filepath.Join(t.TempDir(), "stet.yaml")}, tc.args...), "", false)
