@@ -66,11 +66,23 @@ func tlsUpstream(t *testing.T) proxy.Upstream {
 // startProxyTo serves a proxy to up on loopback until the test ends.
 func startProxyTo(t *testing.T, up proxy.Upstream, gate proxy.Gate, policy proxy.Policy) (string, *proxy.Server) {
 	t.Helper()
+	srv := proxy.New(up, slog.New(slog.DiscardHandler), gate, policy)
+	return serveProxy(t, srv, listenLoopback(t)), srv
+}
+
+// listenLoopback listens on a free port of 127.0.0.1.
+func listenLoopback(t *testing.T) net.Listener {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := proxy.New(up, slog.New(slog.DiscardHandler), gate, policy)
+	return ln
+}
+
+// serveProxy serves srv on ln until the test ends, and returns ln's address.
+func serveProxy(t *testing.T, srv *proxy.Server, ln net.Listener) string {
+	t.Helper()
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(ln) }()
 	t.Cleanup(func() {
@@ -79,7 +91,21 @@ func startProxyTo(t *testing.T, up proxy.Upstream, gate proxy.Gate, policy proxy
 			t.Errorf("Serve: %v", err)
 		}
 	})
-	return ln.Addr().String(), srv
+	return ln.Addr().String()
+}
+
+// tlsTo, while a test sets it (useTLSTo), makes connURL give a connection to
+// addr that sets no sslmode of its own params in place of sslmode=disable:
+// the scenarios then run over a proxy's TLS client leg unchanged.
+var tlsTo struct {
+	addr   string
+	params url.Values
+}
+
+// useTLSTo sets tlsTo until the test ends.
+func useTLSTo(t *testing.T, addr string, params url.Values) {
+	tlsTo.addr, tlsTo.params = addr, params
+	t.Cleanup(func() { tlsTo.addr, tlsTo.params = "", nil })
 }
 
 func connURL(addr, user, password string, params url.Values) string {
@@ -93,7 +119,13 @@ func connURL(addr, user, password string, params url.Values) string {
 		params = url.Values{}
 	}
 	if params.Get("sslmode") == "" {
-		params.Set("sslmode", "disable")
+		if addr != "" && addr == tlsTo.addr {
+			for k, v := range tlsTo.params {
+				params[k] = v
+			}
+		} else {
+			params.Set("sslmode", "disable")
+		}
 	}
 	u.RawQuery = params.Encode()
 	return u.String()

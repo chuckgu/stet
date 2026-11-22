@@ -4,11 +4,16 @@
 package pgtest
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/pem"
 	"io"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
@@ -59,4 +64,57 @@ func ServerCert(t testing.TB, addr string) (cert *x509.Certificate, pemPath stri
 		t.Fatal(err)
 	}
 	return cert, pemPath
+}
+
+// LocalCert makes a self-signed certificate for localhost and 127.0.0.1
+// (as a DNS name too: libpq 14 does not match IP entries), writes it and its
+// key as PEM files in t.TempDir(), and returns the paths and a pool that
+// trusts it.
+func LocalCert(t testing.TB) (certPath, keyPath string, roots *x509.CertPool) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 127))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: "localhost"},
+		DNSNames:              []string{"localhost", "127.0.0.1"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkcs8, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	certPath = filepath.Join(dir, "local.crt")
+	keyPath = filepath.Join(dir, "local.key")
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots = x509.NewCertPool()
+	roots.AddCert(cert)
+	return certPath, keyPath, roots
 }

@@ -743,12 +743,19 @@ func TestOnlyChannelBoundAuthIsRefused(t *testing.T) {
 // reaches it.
 func runPsql(t *testing.T, psql, addr, user, password string) (stdout, stderr string, err error) {
 	t.Helper()
+	return runPsqlWith(t, psql, addr, user, password, "sslmode=disable")
+}
+
+// runPsqlWith is runPsql with opts (conninfo keywords, sslmode among them)
+// in place of sslmode=disable.
+func runPsqlWith(t *testing.T, psql, addr, user, password, opts string) (stdout, stderr string, err error) {
+	t.Helper()
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cmd := exec.CommandContext(testCtx(t), psql, "-X", "-w", "-At", "-c", "select 1",
-		fmt.Sprintf("host=%s port=%s user=%s dbname=stet_test sslmode=disable", host, port, user))
+		fmt.Sprintf("host=%s port=%s user=%s dbname=stet_test %s", host, port, user, opts))
 	cmd.Env = []string{} // never nil, which would pass the whole environment
 	for _, kv := range os.Environ() {
 		if !strings.HasPrefix(kv, "PG") {

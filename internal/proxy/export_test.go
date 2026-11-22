@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"net"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -59,6 +60,19 @@ func SetDialTimeout(d time.Duration) (restore func()) {
 	dialTimeout = d
 	return func() { dialTimeout = old }
 }
+
+// SetStartupTimeout changes how long a client has to send its startup
+// packet, a TLS handshake included, until restore is called; as
+// SetMaxInspect.
+func SetStartupTimeout(d time.Duration) (restore func()) {
+	old := startupTimeout
+	startupTimeout = d
+	return func() { startupTimeout = old }
+}
+
+// PlaintextAllowed reports whether a proxy with ClientTLS lets a session
+// from addr start without TLS.
+func PlaintextAllowed(addr net.Addr) bool { return plaintextAllowed(addr) }
 
 // SetServerHook makes every session call f with the type of each server
 // message it follows, with the session's lock held, until restore is called:

@@ -8,6 +8,7 @@ package proxy
 
 import (
 	"bufio"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -29,12 +30,20 @@ const (
 	// Postgres refuses startup packets larger than this (MAX_STARTUP_PACKET_LENGTH).
 	maxStartupLen = 10000
 
-	startupTimeout = 10 * time.Second
-	fatalTimeout   = 5 * time.Second // to write the error of a session the proxy ends
-	bufSize        = 32 << 10
+	fatalTimeout = 5 * time.Second // to write the error of a session the proxy ends
+	bufSize      = 32 << 10
 )
 
+// startupTimeout bounds what a client sends before its session starts: the
+// encryption requests, a TLS handshake and the startup packet, on one clock.
+// A variable only so tests can shorten it (SetStartupTimeout).
+var startupTimeout = 10 * time.Second
+
 type Server struct {
+	// ClientTLS, when set, is what the proxy answers a client's SSLRequest
+	// with. nil: the request is declined and the client goes on in plaintext.
+	ClientTLS *tls.Config
+
 	up     Upstream
 	log    *slog.Logger
 	gate   Gate
@@ -142,14 +151,18 @@ func (s *Server) untrack(c net.Conn) {
 	s.mu.Unlock()
 }
 
-func (s *Server) handle(client net.Conn) {
-	defer client.Close()
+// handle serves one client connection, c. Server.Close ends it by closing c,
+// the TCP connection, also when the session runs over TLS on top of it.
+func (s *Server) handle(c net.Conn) {
+	defer c.Close()
 
-	pkt, err := readStartup(client)
+	client, pkt, err := readStartup(c, s.ClientTLS)
 	if err != nil {
-		s.log.Debug("startup failed", "remote", client.RemoteAddr(), "err", err)
+		s.log.Debug("startup failed", "remote", c.RemoteAddr(), "err", err)
 		return
 	}
+	defer client.Close() // over TLS, says close_notify first
+	_, clientTLS := client.(*tls.Conn)
 	if binary.BigEndian.Uint32(pkt[4:8]) == cancelRequestCode {
 		s.forwardCancel(pkt)
 		return
@@ -171,19 +184,21 @@ func (s *Server) handle(client net.Conn) {
 		return
 	}
 	start := time.Now()
-	s.log.Debug("session started", "remote", client.RemoteAddr(), "upstream_tls", secure)
+	s.log.Debug("session started", "remote", client.RemoteAddr(), "upstream_tls", secure, "client_tls", clientTLS)
 	// Over a TLS upstream the server offers SCRAM-SHA-256-PLUS, which the
-	// client, on a plaintext leg, cannot use: authTap takes it out.
+	// client, on a plaintext leg, cannot use: authTap takes it out. A client
+	// on TLS gets the list as the server sent it (spec-v0.2-server 3).
+	takePlusOut := secure && !clientTLS
 	if ss := s.watch(pkt); ss == nil {
 		var fromServer *tap
 		var ended func() []byte
-		if secure {
+		if takePlusOut {
 			fromServer, ended = authTap(nil)
 		}
 		relay(client, server, nil, fromServer, ended, nil, nil)
 	} else {
 		fromServer, ended := ss.serverTap(), ss.ended
-		if secure {
+		if takePlusOut {
 			var refused func() []byte
 			fromServer, refused = authTap(fromServer)
 			ended = func() []byte {
@@ -283,30 +298,51 @@ func (s *Server) forwardCancel(pkt []byte) {
 	io.Copy(io.Discard, c)
 }
 
-// readStartup returns the client's StartupMessage or CancelRequest packet.
-// SSL and GSS encryption requests are declined so the client continues in
-// plaintext.
-func readStartup(c net.Conn) ([]byte, error) {
-	c.SetReadDeadline(time.Now().Add(startupTimeout))
-	defer c.SetReadDeadline(time.Time{})
+// readStartup returns the client's StartupMessage or CancelRequest packet,
+// and the connection to go on with: c, or TLS over c.
+//
+// Without cfg, SSL and GSS encryption requests are declined (N) so the client
+// continues in plaintext. With cfg, an SSLRequest is answered S and TLS is
+// set up with cfg; what follows is read inside TLS, where another SSLRequest
+// ends the connection. A GSSENCRequest is always declined. With cfg, a
+// session (not a cancel request) that starts without TLS from an address
+// other than loopback is refused with a FATAL. The handshake shares the one
+// startupTimeout.
+func readStartup(c net.Conn, cfg *tls.Config) (net.Conn, []byte, error) {
+	c.SetDeadline(time.Now().Add(startupTimeout))
+	defer c.SetDeadline(time.Time{})
 
+	conn := c
 	for range 3 { // GSSENCRequest, SSLRequest, then the real packet
-		pkt, err := readStartupPacket(c)
+		pkt, err := readStartupPacket(conn)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		switch code := binary.BigEndian.Uint32(pkt[4:8]); {
-		case code == sslRequestCode, code == gssEncRequestCode:
-			if _, err := c.Write([]byte{'N'}); err != nil {
-				return nil, err
+		case code == sslRequestCode && cfg != nil:
+			if conn != c {
+				return nil, nil, errTLSTwice
 			}
-		case code == cancelRequestCode, code>>16 == 3:
-			return pkt, nil
+			if conn, err = startClientTLS(c, cfg); err != nil {
+				return nil, nil, err
+			}
+		case code == sslRequestCode, code == gssEncRequestCode:
+			if _, err := conn.Write([]byte{'N'}); err != nil {
+				return nil, nil, err
+			}
+		case code == cancelRequestCode:
+			return conn, pkt, nil
+		case code>>16 == 3:
+			if cfg != nil && conn == c && !plaintextAllowed(c.RemoteAddr()) {
+				writeFatal(c, "28000", needsTLS)
+				return nil, nil, errNeedsTLS
+			}
+			return conn, pkt, nil
 		default:
-			return nil, fmt.Errorf("unsupported protocol code %d", code)
+			return nil, nil, fmt.Errorf("unsupported protocol code %d", code)
 		}
 	}
-	return nil, errors.New("too many encryption requests")
+	return nil, nil, errors.New("too many encryption requests")
 }
 
 func readStartupPacket(r io.Reader) ([]byte, error) {
