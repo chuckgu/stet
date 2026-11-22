@@ -809,6 +809,22 @@ const (
 	TransportVerified                    // verify-ca, verify-full, require with sslrootcert
 )
 
+// String is how stet proxy's start line names t (upstream_tls): off,
+// preferred, unverified or verified.
+func (t Transport) String() string {
+	switch t {
+	case TransportPlain:
+		return "off"
+	case TransportPreferred:
+		return "preferred"
+	case TransportUnverified:
+		return "unverified"
+	case TransportVerified:
+		return "verified"
+	}
+	return fmt.Sprintf("Transport(%d)", int(t))
+}
+
 func (c *Config) UpstreamTransport() Transport {
 	switch {
 	case c.UpstreamTLS == nil:

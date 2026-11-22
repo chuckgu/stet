@@ -198,7 +198,8 @@ func runWith(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog
 		lw.Offer(startBanner(cfg, ln.Addr())) // queued like the lines: a stuck output must not stop the start
 	}
 	log.Info("stet proxy listening", "listen", ln.Addr(), "upstream", cfg.UpstreamAddr(),
-		"mode", cfg.Mode, "agent_roles", cfg.AgentRoles, "gated_tables", len(cfg.Tables), "model", cfg.Model.Adapter)
+		"upstream_tls", cfg.UpstreamTransport().String(), "mode", cfg.Mode, "agent_roles", cfg.AgentRoles,
+		"gated_tables", len(cfg.Tables), "model", cfg.Model.Adapter)
 	err = srv.Serve(ln)
 	// Serve returns once the listener is closed, while sessions may still be
 	// reporting their last statements to the gate. Wait for Close, which waits

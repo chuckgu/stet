@@ -863,6 +863,21 @@ func TestUpstreamTransport(t *testing.T) {
 	}
 }
 
+// The words stet proxy's start line gives the leg to upstream (upstream_tls).
+func TestTransportString(t *testing.T) {
+	for tr, want := range map[Transport]string{
+		TransportPlain:      "off",
+		TransportPreferred:  "preferred",
+		TransportUnverified: "unverified",
+		TransportVerified:   "verified",
+		Transport(9):        "Transport(9)",
+	} {
+		if got := tr.String(); got != want {
+			t.Errorf("Transport(%d).String() = %q, want %q", int(tr), got, want)
+		}
+	}
+}
+
 func TestSendFieldsOptionalWithoutAModel(t *testing.T) {
 	c, err := Parse([]byte(minimal + "model: {adapter: none}\ntables: {contacts: {pk: id}}\n"))
 	if err != nil {

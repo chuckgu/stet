@@ -55,6 +55,33 @@ func TestTransportWarnings(t *testing.T) {
 	}
 }
 
+// The start line says how the leg to upstream is protected: an upstream
+// with no sslmode written is preferred (TLS when the server takes it,
+// unverified), which INFO shows to whoever upgrades from plaintext.
+func TestListeningLineSaysHowUpstreamIsProtected(t *testing.T) {
+	for query, want := range map[string]string{
+		"?sslmode=disable":     "off",
+		"":                     "preferred",
+		"?sslmode=prefer":      "preferred",
+		"?sslmode=require":     "unverified",
+		"?sslmode=verify-full": "verified",
+	} {
+		t.Run(want+query, func(t *testing.T) {
+			r := start(t, parseConfig(t, "mode: shadow\nlisten: 127.0.0.1:0\nupstream: postgres://stet@127.0.0.1:1/db%s\n", query))
+			waitListening(t, r)
+			var line string
+			for l := range strings.SplitSeq(r.log.String(), "\n") {
+				if strings.Contains(l, `msg="stet proxy listening"`) {
+					line = l
+				}
+			}
+			if !strings.Contains(line, " upstream=127.0.0.1:1 upstream_tls="+want+" mode=shadow ") {
+				t.Errorf("the start line %q, want upstream_tls=%s after upstream", line, want)
+			}
+		})
+	}
+}
+
 func TestTransportWarningsNameNoPassword(t *testing.T) {
 	for _, mode := range []string{"disable", "prefer", "require"} {
 		cfg := parseConfig(t, "mode: shadow\nlisten: 0.0.0.0:6432\nupstream: postgres://stet:hunter2-secret@db.example.com:5432/d?sslmode=%s\n", mode)
