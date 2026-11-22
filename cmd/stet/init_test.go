@@ -221,12 +221,15 @@ func TestInitThenProxy(t *testing.T) {
 	mustExec(t, owner, "insert into deals (contact_id) select g from generate_series(1, 1000) g")
 	mustExec(t, owner, "analyze contacts, deals")
 
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	// stet init only writes the address down, so the port is held open from
+	// here to stet proxy, which is given this listener: no other process can
+	// take the port in between.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	listen := probe.Addr().String()
-	probe.Close()
+	t.Cleanup(func() { ln.Close() })
+	listen := ln.Addr().String()
 	path := filepath.Join(t.TempDir(), "stet.yaml")
 	out, err := initOut([]string{"-yes", "-config", path, "-listen", listen, dbAddress(pg, db, role, password)}, "", false)
 	if err != nil {
@@ -243,9 +246,8 @@ func TestInitThenProxy(t *testing.T) {
 		t.Error("the stet schema is there after stet init, want it made only by stet proxy")
 	}
 
-	ln, err := net.Listen("tcp", cfg.Listen)
-	if err != nil {
-		t.Fatal(err)
+	if cfg.Listen != listen {
+		t.Fatalf("the config listens on %q, want %q, given to -listen", cfg.Listen, listen)
 	}
 	r := startOn(t, cfg, ln)
 	waitListening(t, r)
