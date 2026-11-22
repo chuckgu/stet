@@ -219,6 +219,39 @@ func TestPlaintextFromElsewhereIsRefused(t *testing.T) {
 		}
 	})
 
+	// A GSSENCRequest is declined with N and the client goes on in plaintext:
+	// the StartupMessage after it is refused as one sent first is.
+	t.Run("AfterGSSENCRequest", func(t *testing.T) {
+		dialed := make(chan struct{}, 1)
+		fake := fakeUpstream(t, func(net.Conn) {
+			select {
+			case dialed <- struct{}{}:
+			default:
+			}
+		})
+		addr, _ := startTLSProxyOn(t, elsewhere{listenLoopback(t)}, newLocalTLS(t), proxy.Upstream{Addr: fake}, nil, proxy.Policy{})
+		c := dialPlain(t, addr)
+		c.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := c.Write(request(gssEncRequestCode)); err != nil {
+			t.Fatal(err)
+		}
+		var answer [1]byte
+		if _, err := io.ReadFull(c, answer[:]); err != nil || answer[0] != 'N' {
+			t.Fatalf("the GSSENCRequest was answered %q, %v; want N", answer[0], err)
+		}
+		fe := pgproto3.NewFrontend(c, c)
+		sendAll(t, fe, &pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber,
+			Parameters: map[string]string{"user": "stet_scram", "database": "stet_test"}})
+		if got, want := untilEnd(t, fe), []string{`ErrorResponse FATAL 28000 "` + needsTLS + `"`}; !slices.Equal(got, want) {
+			t.Errorf("after the N the client got %q, want %q and the end", got, want)
+		}
+		select {
+		case <-dialed:
+			t.Error("the refused session was sent on upstream")
+		case <-time.After(200 * time.Millisecond):
+		}
+	})
+
 	t.Run("TLSFromElsewhere", func(t *testing.T) {
 		lt := newLocalTLS(t)
 		addr, _ := startTLSProxyOn(t, elsewhere{listenLoopback(t)}, lt, proxy.Upstream{Addr: upstream(t)}, nil, proxy.Policy{})

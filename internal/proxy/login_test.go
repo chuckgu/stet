@@ -15,6 +15,7 @@ import (
 	"maps"
 	"net"
 	"net/url"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -883,6 +884,113 @@ func TestLoginInterruptedLeavesNothing(t *testing.T) {
 			t.Errorf("the client's session ended %v after the server dropped it", d)
 		}
 	})
+}
+
+// strangerLogin knows no account, and gives each the same mock verifier: one
+// that a token the test holds proves. Open fails the test.
+type strangerLogin struct {
+	t *testing.T
+	v scram.Verifier
+}
+
+func (l *strangerLogin) Verifier(string) (scram.Verifier, bool) { return l.v, false }
+
+func (l *strangerLogin) Open(context.Context, string, string, map[string]string) (*proxy.Opened, error) {
+	l.t.Error("Open was called for an account the Login does not know")
+	return nil, errors.New("not known")
+}
+
+// An account the Login does not know is refused, as an unknown account, even
+// when the client's proof matches the verifier the Login gave for it: that
+// rule is the proxy's own, not only the mock flag scram honours (which this
+// test has the exchange ignore).
+func TestUnknownAccountIsRefusedWhateverItsProof(t *testing.T) {
+	t.Cleanup(proxy.SetMockIgnored()) // registered before the proxy starts, so it runs after Close
+	token, v, err := scram.NewToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := loginSetup{login: &strangerLogin{t: t, v: v}}.start(t)
+	_, fe := startRaw(t, p.addr, "stet_nobody", nil)
+	got := append(rawLogin(t, fe, token), untilEnd(t, fe)...)
+	if want := []string{offer, saslContinue, "ErrorResponse FATAL 28P01 " + strconv.Quote(passwordFailed("stet_nobody"))}; !slices.Equal(got, want) {
+		t.Errorf("the client got %q, want %q and the end", got, want)
+	}
+	waitForLog(t, p.log, `msg="agent login refused" account=stet_nobody`)
+	if log := p.log.String(); !strings.Contains(log, `reason="unknown account"`) || strings.Contains(log, `msg="agent logged in"`) {
+		t.Errorf("the log, want the login refused as an unknown account:\n%s", log)
+	}
+}
+
+// closedSoon fails the test unless the other end of peer, a net.Pipe, is
+// closed within a few seconds: a read on peer then ends.
+func closedSoon(t *testing.T, peer net.Conn, what string) {
+	t.Helper()
+	peer.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := peer.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("%s: the session's connection was not closed (read: %v)", what, err)
+	}
+}
+
+// An Open that hands over a session the proxy cannot pass on as the server
+// would (a cancel key that is not 4 bytes, a transaction status that is not
+// I, T or E), or a session together with an error, is a failed upstream
+// login: the client gets 08001, the log says why, and the session's
+// connection is closed.
+func TestOpenedSessionsThatCannotBeHandedOver(t *testing.T) {
+	good := func(conn net.Conn) *proxy.Opened {
+		return &proxy.Opened{Conn: conn, PID: 4242, SecretKey: []byte{1, 2, 3, 4},
+			Params: map[string]string{"server_version": "14.18"}, TxStatus: 'I'}
+	}
+	for _, tc := range []struct {
+		name string
+		open func(conn net.Conn) (*proxy.Opened, error)
+		why  string // in the log's err
+	}{
+		{"KeyOf3Bytes", func(conn net.Conn) (*proxy.Opened, error) {
+			o := good(conn)
+			o.SecretKey = []byte{1, 2, 3}
+			return o, nil
+		}, "a cancel key of 3 bytes"},
+		{"KeyOf32Bytes", func(conn net.Conn) (*proxy.Opened, error) {
+			o := good(conn)
+			o.SecretKey = make([]byte, 32)
+			return o, nil
+		}, "a cancel key of 32 bytes"},
+		{"TxStatusX", func(conn net.Conn) (*proxy.Opened, error) {
+			o := good(conn)
+			o.TxStatus = 'X'
+			return o, nil
+		}, "transaction status"},
+		{"SessionAndError", func(conn net.Conn) (*proxy.Opened, error) {
+			return good(conn), errors.New("the Login's own failure")
+		}, "the Login's own failure"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			token, v, err := scram.NewToken()
+			if err != nil {
+				t.Fatal(err)
+			}
+			mine, peer := net.Pipe()
+			t.Cleanup(func() { mine.Close(); peer.Close() })
+			p := loginSetup{login: &fakeLogin{account: "stet_scram", v: v, open: func(context.Context) (*proxy.Opened, error) {
+				return tc.open(mine)
+			}}}.start(t)
+
+			_, fe := startRaw(t, p.addr, "stet_scram", nil)
+			got := append(rawLogin(t, fe, token), untilEnd(t, fe)...)
+			want := []string{offer, saslContinue, "AuthenticationSASLFinal",
+				"ErrorResponse FATAL 08001 " + strconv.Quote(`stet: could not open a database session for "stet_scram"`)}
+			if !slices.Equal(got, want) {
+				t.Errorf("the client got %q, want %q and the end", got, want)
+			}
+			closedSoon(t, peer, tc.name)
+			waitForLog(t, p.log, `reason="upstream login failed"`)
+			if log := p.log.String(); !strings.Contains(log, tc.why) {
+				t.Errorf("the log does not say %q:\n%s", tc.why, log)
+			}
+		})
+	}
 }
 
 // The client is told only that no session could be opened; why is in the

@@ -38,7 +38,9 @@ type Login interface {
 	// Open logs in upstream as account and hands the session over. params
 	// are the client's startup parameters without user, database and
 	// replication, and without protocol options (_pq_.*), which the proxy
-	// declines. Its error is for the log, never for the client.
+	// declines. Its error is for the log, never for the client. A non-nil
+	// error means no session is handed over: the proxy closes the Conn of an
+	// Opened returned with one.
 	Open(ctx context.Context, account, database string, params map[string]string) (*Opened, error)
 }
 
@@ -80,6 +82,10 @@ const (
 	reasonExchange       = "exchange failed"
 	reasonTLSRequired    = "tls required"
 )
+
+// newExchange starts the server's side of a SCRAM exchange: scram.NewServer.
+// A variable only so a test can have it ignore mock (SetMockIgnored).
+var newExchange = scram.NewServer
 
 // errWrongProof is authenticate's error for a client that did not prove it
 // holds the account's token, or named an account that is not there.
@@ -154,11 +160,15 @@ func (s *Server) logIn(client net.Conn, pkt []byte, clientTLS bool) (server net.
 	ctx, cancel := context.WithTimeout(s.closing, openTimeout)
 	opened, err := s.Login.Open(ctx, account, info.Database, params)
 	cancel()
-	if err == nil && opened == nil {
-		err = errors.New("Open returned no session")
-	}
 	var prefix []byte
-	if err == nil {
+	switch {
+	case err != nil:
+		if opened != nil && opened.Conn != nil { // handed over with an error: not a session
+			opened.Conn.Close()
+		}
+	case opened == nil:
+		err = errors.New("Open returned no session")
+	default:
 		if prefix, err = handover(opened); err != nil {
 			opened.Conn.Close()
 		}
@@ -192,7 +202,7 @@ func (s *Server) logIn(client net.Conn, pkt []byte, clientTLS bool) (server net.
 // its last message of the exchange is read.
 func (s *Server) authenticate(c net.Conn, account string) (known bool, err error) {
 	v, known := s.Login.Verifier(account)
-	ex := scram.NewServer(v, !known, nil)
+	ex := newExchange(v, !known, nil)
 	if err := writeMessage(c, &pgproto3.AuthenticationSASL{AuthMechanisms: []string{scram.Mechanism}}); err != nil {
 		return known, err
 	}
@@ -221,7 +231,9 @@ func (s *Server) authenticate(c net.Conn, account string) (known bool, err error
 	switch {
 	case err != nil:
 		return known, &exchangeError{err.Error()}
-	case !proved:
+	case !proved, !known:
+		// An unknown account never logs in, whatever its proof: the mock
+		// failing is scram's rule, and this is the proxy's own.
 		return known, errWrongProof
 	}
 	return known, writeMessage(c, &pgproto3.AuthenticationSASLFinal{Data: serverFinal})
@@ -271,8 +283,18 @@ func saslInitialResponse(body []byte) (mechanism string, data []byte, err error)
 // handover is what the server sends at the end of its own login, for the
 // session o: AuthenticationOk, a ParameterStatus for each of its settings in
 // name order, BackendKeyData and ReadyForQuery; then the bytes Open already
-// read past them.
+// read past them. It refuses a session a protocol 3.0 server could not have
+// sent: a cancel key that is not 4 bytes, a transaction status that is not
+// I, T or E.
 func handover(o *Opened) ([]byte, error) {
+	if len(o.SecretKey) != 4 {
+		return nil, fmt.Errorf("Open handed over a cancel key of %d bytes; a protocol 3.0 client reads 4", len(o.SecretKey))
+	}
+	switch o.TxStatus {
+	case 'I', 'T', 'E':
+	default:
+		return nil, fmt.Errorf("Open handed over the transaction status %q; the server sends I, T or E", o.TxStatus)
+	}
 	msgs := []pgproto3.BackendMessage{&pgproto3.AuthenticationOk{}}
 	for _, name := range slices.Sorted(maps.Keys(o.Params)) {
 		msgs = append(msgs, &pgproto3.ParameterStatus{Name: name, Value: o.Params[name]})

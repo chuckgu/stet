@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+
+	"github.com/stetdb/stet/internal/scram"
 )
 
 // MaxUnitKeys is how many keys the reads of one unit take in all.
@@ -77,6 +79,15 @@ func SetExchangeTimeout(d time.Duration) (restore func()) {
 	old := exchangeTimeout
 	exchangeTimeout = d
 	return func() { exchangeTimeout = old }
+}
+
+// SetMockIgnored makes the SCRAM exchanges of a proxy with a Login ignore
+// their mock flag, as a scram that failed to honour it would, until restore
+// is called; as SetMaxInspect.
+func SetMockIgnored() (restore func()) {
+	old := newExchange
+	newExchange = func(v scram.Verifier, _ bool, nonce func() string) *scram.Server { return old(v, false, nonce) }
+	return func() { newExchange = old }
 }
 
 // PlaintextAllowed reports whether a proxy with ClientTLS lets a session
