@@ -19,6 +19,7 @@ import (
 
 	"github.com/stetdb/stet/internal/config"
 	"github.com/stetdb/stet/internal/gate"
+	"github.com/stetdb/stet/internal/store"
 )
 
 // startOut is start with decision lines written to out, and the gate run
@@ -275,6 +276,59 @@ func TestLineWhenTheRecordFails(t *testing.T) {
 			t.Fatalf("no 'decision not recorded' in the log:\n%s", r.log)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A panic while a decision's line is made is logged once, with the
+// decision's id, and goes no further: the write after it is judged,
+// recorded and printed, and run stops as usual.
+func TestPanicInALineGoesNoFurther(t *testing.T) {
+	pg := testPG(t)
+	ctx := context.Background()
+	db := cleanDatabase(t, pg)
+	admin := connectTo(t, pg, db, "stet_scram", "scram-pw")
+	mustExec(t, admin, "create table contacts (id int primary key, name text, status text)")
+	mustExec(t, admin, "insert into contacts values (1, 'a', 'new'), (2, 'b', 'new')")
+
+	real := formatLine
+	t.Cleanup(func() { formatLine = real }) // after the stop startOut registers
+	formatLine = func(d *store.Decision, loc *time.Location) string {
+		if strings.Contains(d.Statement, "'boom'") {
+			panic("formatting failed")
+		}
+		return real(d, loc)
+	}
+	out := &syncBuffer{}
+	r, _ := startOut(t, parseConfig(t, contactsYAML, pg, db), out)
+	agent := connectTo(t, r.addr, db, "stet_scram", "scram-pw")
+	if _, err := agent.Exec(ctx, "update contacts set name = 'boom' where id = 1"); err != nil {
+		t.Fatalf("first write: %v; log:\n%s", err, r.log)
+	}
+	waitDecisions(t, admin, "contacts", 1)
+	if _, err := agent.Exec(ctx, "update contacts set name = 'fine' where id = 2"); err != nil {
+		t.Fatalf("second write: %v; log:\n%s", err, r.log)
+	}
+	waitDecisions(t, admin, "contacts", 2)
+	got := waitLines(t, out, 2, r.log)
+	if len(got) != 2 || !strings.HasSuffix(got[1], "update contacts set name = 'fine' where id = 2") {
+		t.Errorf("lines %q, want the start line and the second write's", got)
+	}
+
+	var id string
+	if err := admin.QueryRow(ctx, "select id from stet.decisions where statement like '%boom%'").Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.stop(t); err != nil {
+		t.Fatalf("run = %v, want nil", err)
+	}
+	log := r.log.String()
+	if n := strings.Count(log, "level=ERROR"); n != 1 {
+		t.Errorf("%d errors logged, want one; log:\n%s", n, log)
+	}
+	for _, line := range strings.Split(log, "\n") {
+		if strings.Contains(line, "level=ERROR") && (!strings.Contains(line, "id="+id) || !strings.Contains(line, "formatting failed")) {
+			t.Errorf("the error does not name decision %s and the panic: %s", id, line)
+		}
 	}
 }
 

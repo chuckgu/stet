@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -164,7 +165,7 @@ func runWith(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog
 	if out != nil {
 		lw = lines.NewWriter(out)
 		if g != nil {
-			g.Decided = func(d *store.Decision) { lw.Offer(lines.Format(d, time.Local)) }
+			g.Decided = decisionLine(lw, log)
 		}
 	}
 	// Deferred so it runs last, once the proxy's Close below has returned; the
@@ -206,6 +207,25 @@ func runWith(ctx context.Context, cfg *config.Config, ln net.Listener, log *slog
 	stop()
 	<-closed
 	return err
+}
+
+// formatLine makes a decision's line. A variable so a test can make it panic.
+var formatLine = lines.Format
+
+// decisionLine is the gate's Decided hook: it queues d's line for lw. It
+// runs on the goroutine that judged the write, which nothing recovers, so a
+// panic while the line is made is logged once, with the decision's id, and
+// goes no further: that line is left out, and the judging and the process go
+// on (rule 1: the output is not part of judging).
+func decisionLine(lw *lines.Writer, log *slog.Logger) func(*store.Decision) {
+	return func(d *store.Decision) {
+		defer func() {
+			if v := recover(); v != nil {
+				log.Error("decision line not printed: making it panicked", "id", d.ID, "panic", fmt.Sprint(v), "stack", string(debug.Stack()))
+			}
+		}()
+		lw.Offer(formatLine(d, time.Local))
+	}
 }
 
 // startBanner is the first line decisions are printed under.
