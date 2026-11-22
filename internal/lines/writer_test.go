@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -76,7 +77,7 @@ func dropTest(t *testing.T, extra int, notice string) {
 	close(g.release)
 	// wait for the queue to drain
 	deadline := time.Now().Add(2 * time.Second)
-	for len(g.lines()) < 1+QueueSize && time.Now().Before(deadline) {
+	for len(g.lines()) < 1+QueueSize+1 && time.Now().Before(deadline) { // the notice included
 		time.Sleep(time.Millisecond)
 	}
 	w.Offer("after1")
@@ -156,8 +157,9 @@ func TestWriterSurvivesWriteErrors(t *testing.T) {
 
 // slow is an io.Writer that takes a fixed time per Write without blocking.
 type slow struct {
-	mu    sync.Mutex
-	lines []string
+	mu      sync.Mutex
+	lines   []string
+	notices atomic.Int32
 }
 
 func spin(d time.Duration) {
@@ -170,34 +172,45 @@ func (s *slow) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.lines = append(s.lines, strings.TrimSuffix(string(p), "\n"))
+	if strings.HasPrefix(string(p), "…") {
+		s.notices.Add(1)
+	}
 	return len(p), nil
 }
 
+func (s *slow) snapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.lines...)
+}
+
+// The producer outpaces the writer until two notices have been written. What
+// is checked is only what was written, so machine speed does not matter.
 func TestWriterKeepsWritingRealLinesUnderOverload(t *testing.T) {
 	s := &slow{}
 	w := NewWriter(s)
-	const run = 1500 * time.Millisecond
-	start := time.Now()
-	n, lateOffered := 0, 0
-	for time.Since(start) < run {
-		late := time.Since(start) > run*2/3
-		w.Offer(fmt.Sprintf("real %d", n))
-		if late {
-			lateOffered++
+	deadline := time.Now().Add(30 * time.Second)
+	n := 0
+	for {
+		notices := int(s.notices.Load())
+		if notices >= 2 {
+			break
 		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no progress: %d notices written after %d lines offered", notices, n)
+		}
+		w.Offer(fmt.Sprintf("real %d", n))
 		n++
 		spin(100 * time.Microsecond)
 	}
 	w.Close()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	lateWritten, notices := 0, 0
-	last := -1
-	for i, l := range s.lines {
+	lines := s.snapshot()
+	notices, realAfterFirst, last := 0, 0, -1
+	for i, l := range lines {
 		if strings.HasPrefix(l, "…") {
 			notices++
-			if i > 0 && strings.HasPrefix(s.lines[i-1], "…") {
-				t.Errorf("adjacent notices: %q then %q", s.lines[i-1], l)
+			if i > 0 && strings.HasPrefix(lines[i-1], "…") {
+				t.Errorf("adjacent notices: %q then %q", lines[i-1], l)
 			}
 			continue
 		}
@@ -207,12 +220,12 @@ func TestWriterKeepsWritingRealLinesUnderOverload(t *testing.T) {
 			t.Errorf("out of order: %d after %d", k, last)
 		}
 		last = k
-		if k >= n-lateOffered {
-			lateWritten++
+		if notices > 0 {
+			realAfterFirst++
 		}
 	}
-	if lateWritten == 0 || notices == 0 {
-		t.Fatalf("late real lines written=%d (offered %d), notices=%d", lateWritten, lateOffered, notices)
+	if notices < 2 || realAfterFirst == 0 {
+		t.Fatalf("notices=%d, real lines after the first notice=%d", notices, realAfterFirst)
 	}
 }
 
