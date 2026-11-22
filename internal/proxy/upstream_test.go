@@ -300,14 +300,35 @@ func TestOddTLSAnswerIsRefused(t *testing.T) {
 // The proxy reads the server's answer to the TLS request alone: plaintext
 // the server (or someone in between) sent behind the S is not taken for
 // what comes inside TLS, and never reaches the client.
+//
+// The fake then answers as a real TLS server. Read alone, the S leaves the
+// plaintext first in line for the proxy's TLS handshake, which fails on it
+// at once. A proxy that read the plaintext along with the S instead
+// completes the handshake past it: it is told so, and when it then hands
+// the plaintext on, the client gets the AuthenticationOk. Either way the
+// test fails at once, not when a deadline runs out.
 func TestSSLAnswerIsReadAlone(t *testing.T) {
+	cert := selfSigned(t)
+	handshake := make(chan error, 1) // the fake's: nil once it completed
 	fake := fakeUpstream(t, func(c net.Conn) {
 		readOpening(c)
 		msg := []byte{'S'}
 		msg, _ = (&pgproto3.AuthenticationOk{}).Encode(msg)
 		msg, _ = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(msg)
 		c.Write(msg)
-		io.Copy(io.Discard, c)
+		tc := tls.Server(c, &tls.Config{Certificates: []tls.Certificate{cert}})
+		tc.SetDeadline(time.Now().Add(5 * time.Second))
+		err := tc.Handshake()
+		handshake <- err
+		if err == nil {
+			// The startup message, then nothing: the session ends with no
+			// answer from inside TLS.
+			var n [4]byte
+			if _, err := io.ReadFull(tc, n[:]); err == nil {
+				io.CopyN(io.Discard, tc, int64(binary.BigEndian.Uint32(n[:]))-4)
+			}
+			tc.Close()
+		}
 	})
 	addr, _ := startProxyTo(t, proxy.Upstream{Addr: fake, TLS: unverified()}, nil, proxy.Policy{})
 
@@ -317,6 +338,7 @@ func TestSSLAnswerIsReadAlone(t *testing.T) {
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	began := time.Now()
 	fe := pgproto3.NewFrontend(conn, conn)
 	fe.Send(&pgproto3.StartupMessage{
 		ProtocolVersion: pgproto3.ProtocolVersionNumber,
@@ -341,11 +363,22 @@ func TestSSLAnswerIsReadAlone(t *testing.T) {
 			t.Errorf("client got %T", msg)
 		}
 	}
+	select {
+	case err := <-handshake:
+		if err == nil {
+			t.Fatal("the proxy completed TLS with the server past the plaintext sent behind the S: it read that along with the S")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the fake server never got to its TLS handshake")
+	}
 	if fatal == nil {
 		t.Fatal("the client got no error")
 	}
 	if fatal.Code != "08001" || !strings.HasPrefix(fatal.Message, "stet: TLS to upstream "+fake+" failed: ") {
 		t.Errorf("got %s %q, want 08001 stet: TLS to upstream %s failed: …", fatal.Code, fatal.Message, fake)
+	}
+	if d := time.Since(began); d > 2*time.Second {
+		t.Errorf("the session took %v to be refused, want it refused at once", d)
 	}
 }
 
