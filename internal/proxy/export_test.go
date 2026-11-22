@@ -70,6 +70,15 @@ func SetStartupTimeout(d time.Duration) (restore func()) {
 	return func() { startupTimeout = old }
 }
 
+// SetExchangeTimeout changes how long a client of a proxy with a Login has
+// for its side of the SCRAM exchange, until restore is called; as
+// SetMaxInspect.
+func SetExchangeTimeout(d time.Duration) (restore func()) {
+	old := exchangeTimeout
+	exchangeTimeout = d
+	return func() { exchangeTimeout = old }
+}
+
 // PlaintextAllowed reports whether a proxy with ClientTLS lets a session
 // from addr start without TLS.
 func PlaintextAllowed(addr net.Addr) bool { return plaintextAllowed(addr) }

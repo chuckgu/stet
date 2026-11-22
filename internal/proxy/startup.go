@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"slices"
+	"strings"
 )
 
 // Policy says which sessions the gate is shown.
@@ -76,6 +77,32 @@ func startupInfo(pkt []byte) (info SessionInfo, ok bool) {
 		database = user
 	}
 	return SessionInfo{User: string(cutName(user)), Database: string(cutName(database)), ApplicationName: string(app)}, true
+}
+
+// startupParams reads the parameters of a StartupMessage packet that
+// startupInfo reads (ok true), the last value of a repeated key winning:
+// params are those the server would take as settings, without user and
+// database; options are the protocol options (keys starting "_pq_."), which
+// the proxy does not take; replication reports a replication key, whatever
+// its value.
+func startupParams(pkt []byte) (params map[string]string, options []string, replication bool) {
+	params = map[string]string{}
+	body := pkt[8:]
+	for off := 0; off < len(body)-1; {
+		key, rest, _ := bytes.Cut(body[off:], []byte{0})
+		val, _, _ := bytes.Cut(rest, []byte{0})
+		off += len(key) + len(val) + 2
+		switch k := string(key); {
+		case k == "user", k == "database":
+		case k == "replication":
+			replication = true
+		case strings.HasPrefix(k, "_pq_."):
+			options = append(options, k)
+		default:
+			params[k] = string(val)
+		}
+	}
+	return params, options, replication
 }
 
 // cutName keeps the bytes of a name the server keeps.

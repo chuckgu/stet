@@ -11,9 +11,11 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"os"
 	"os/exec"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -463,5 +465,159 @@ func TestSecondSSLRequestInsideTLS(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Errorf("the proxy answered % x", got)
+	}
+}
+
+// stallingListener hands the test each connection it accepts, as a
+// stallConn.
+type stallingListener struct {
+	net.Listener
+	accepted chan *stallConn
+}
+
+func (l stallingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	sc := &stallConn{Conn: c, closed: make(chan struct{})}
+	select {
+	case l.accepted <- sc:
+	default:
+	}
+	return sc, nil
+}
+
+// stallConn is the proxy's side of a client's connection. Once stall is
+// called, a write to it waits as one to a client that stopped reading with
+// every buffer full does: until the write deadline passes or the connection
+// is closed.
+type stallConn struct {
+	net.Conn
+	mu       sync.Mutex
+	stalled  bool
+	deadline time.Time // of writes
+	closed   chan struct{}
+	once     sync.Once
+}
+
+func (c *stallConn) stall() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stalled = true
+}
+
+func (c *stallConn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.deadline = t
+	c.mu.Unlock()
+	return c.Conn.SetDeadline(t)
+}
+
+func (c *stallConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.deadline = t
+	c.mu.Unlock()
+	return c.Conn.SetWriteDeadline(t)
+}
+
+func (c *stallConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	stalled, deadline := c.stalled, c.deadline
+	c.mu.Unlock()
+	if !stalled {
+		return c.Conn.Write(b)
+	}
+	var expired <-chan time.Time
+	if !deadline.IsZero() {
+		timer := time.NewTimer(time.Until(deadline))
+		defer timer.Stop()
+		expired = timer.C
+	}
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	case <-expired:
+		return 0, os.ErrDeadlineExceeded
+	}
+}
+
+func (c *stallConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+// On an end the proxy does not make, the client leaving or a panic in a
+// tap, the connection to the server is closed before the client's. Closing
+// a client's TLS connection says close_notify first, which waits up to TLS's
+// own 5s for a client that stopped reading: the server's side must not stay
+// open that long, nor, after a panic, the other side go on through the gate
+// meanwhile.
+func TestAbruptEndClosesTheServerFirst(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		gate func() proxy.Gate
+		end  func(t *testing.T, c net.Conn, fe *pgproto3.Frontend) // once the client stopped reading
+	}{
+		{"ClientLeaves", func() proxy.Gate { return nil }, func(t *testing.T, c net.Conn, _ *pgproto3.Frontend) {
+			c.Close()
+		}},
+		{"PanicInATap", func() proxy.Gate { return newRecordingGate(isWrite) }, func(t *testing.T, _ net.Conn, fe *pgproto3.Frontend) {
+			sendAll(t, fe, &pgproto3.Query{String: "select 1"}) // its completion panics
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Registered before the proxy starts, so it runs after Close.
+			t.Cleanup(proxy.SetServerHook(func(m byte) {
+				if m == 'C' {
+					panic("test hook: panic in the server's tap")
+				}
+			}))
+			upClosed := make(chan struct{})
+			fake := fakeUpstream(t, func(c net.Conn) {
+				defer close(upClosed)
+				var n [4]byte // the startup packet, then the end of a login
+				if _, err := io.ReadFull(c, n[:]); err != nil {
+					return
+				}
+				if _, err := io.CopyN(io.Discard, c, int64(binary.BigEndian.Uint32(n[:]))-4); err != nil {
+					return
+				}
+				ready, _ := (&pgproto3.AuthenticationOk{}).Encode(nil)
+				ready, _ = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(ready)
+				c.Write(ready)
+				var hdr [5]byte // a query, answered
+				if _, err := io.ReadFull(c, hdr[:]); err == nil {
+					io.CopyN(io.Discard, c, int64(binary.BigEndian.Uint32(hdr[1:]))-4)
+					done, _ := (&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}).Encode(nil)
+					c.Write(append(done, ready[len(ready)-6:]...))
+				}
+				io.Copy(io.Discard, c) // until the proxy closes it
+			})
+			lt := newLocalTLS(t)
+			ln := stallingListener{Listener: listenLoopback(t), accepted: make(chan *stallConn, 1)}
+			addr, _ := startTLSProxyOn(t, ln, lt, proxy.Upstream{Addr: fake}, tc.gate(), proxy.Policy{})
+
+			c := dialTLS(t, addr, lt.client())
+			c.SetDeadline(time.Now().Add(10 * time.Second))
+			fe := pgproto3.NewFrontend(c, c)
+			sendAll(t, fe, &pgproto3.StartupMessage{
+				ProtocolVersion: pgproto3.ProtocolVersionNumber,
+				Parameters:      map[string]string{"user": "stet_scram", "database": "stet_test"},
+			})
+			untilReady(t, fe)
+			(<-ln.accepted).stall()
+
+			began := time.Now()
+			tc.end(t, c, fe)
+			select {
+			case <-upClosed:
+				if d := time.Since(began); d > time.Second {
+					t.Errorf("the server's connection was closed %v after the session ended", d)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("the server's connection was still open 3s after the session ended")
+			}
+		})
 	}
 }

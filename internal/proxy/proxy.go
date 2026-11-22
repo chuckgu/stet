@@ -8,6 +8,7 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
@@ -20,6 +21,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+
+	"github.com/stetdb/stet/internal/safetext"
 )
 
 const (
@@ -43,11 +46,19 @@ type Server struct {
 	// ClientTLS, when set, is what the proxy answers a client's SSLRequest
 	// with. nil: the request is declined and the client goes on in plaintext.
 	ClientTLS *tls.Config
+	// Login, when set, authenticates every client and opens its upstream
+	// session (spec-v0.2-server 4, 5). nil: authentication is relayed.
+	Login Login
 
 	up     Upstream
 	log    *slog.Logger
 	gate   Gate
 	policy Policy
+
+	// closing ends when Close is called: the logins in progress (Login.Open)
+	// run under it.
+	closing    context.Context
+	stopLogins context.CancelFunc
 
 	mu     sync.Mutex
 	ln     net.Listener
@@ -60,7 +71,8 @@ type Server struct {
 // says. The gate is shown the sessions policy watches; the others, and every
 // session when gate is nil, are a plain passthrough.
 func New(up Upstream, log *slog.Logger, gate Gate, policy Policy) *Server {
-	return &Server{up: up, log: log, gate: gate, policy: policy, conns: make(map[net.Conn]struct{})}
+	closing, stop := context.WithCancel(context.Background())
+	return &Server{up: up, log: log, gate: gate, policy: policy, closing: closing, stopLogins: stop, conns: make(map[net.Conn]struct{})}
 }
 
 // Serve accepts connections on ln until Close is called, then returns nil.
@@ -105,8 +117,8 @@ func (s *Server) Serve(ln net.Listener) error {
 	}
 }
 
-// Close stops accepting, drops every open session on both sides, and waits
-// for their goroutines to finish.
+// Close stops accepting, drops every open session on both sides, gives up
+// the logins in progress, and waits for their goroutines to finish.
 func (s *Server) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -122,6 +134,7 @@ func (s *Server) Close() error {
 		c.Close()
 	}
 	s.mu.Unlock()
+	s.stopLogins()
 	s.wg.Wait()
 	return err
 }
@@ -158,6 +171,10 @@ func (s *Server) handle(c net.Conn) {
 
 	client, pkt, err := readStartup(c, s.ClientTLS)
 	if err != nil {
+		if s.Login != nil && errors.Is(err, errNeedsTLS) {
+			info, _ := startupInfo(pkt)
+			s.log.Warn("agent login refused", "account", safetext.Printable(info.User), "remote", c.RemoteAddr(), "reason", reasonTLSRequired)
+		}
 		s.log.Debug("startup failed", "remote", c.RemoteAddr(), "err", err)
 		return
 	}
@@ -168,27 +185,20 @@ func (s *Server) handle(c net.Conn) {
 		return
 	}
 
-	server, secure, release, err := s.dialUpstream()
-	if err != nil {
-		if s.isClosed() { // Close ended the dial, and closed the client too
-			return
-		}
-		s.log.Warn("upstream unreachable", "upstream", s.up.Addr, "err", err)
-		writeFatal(client, "08001", "stet: "+err.Error())
+	server, secure, release, ok := s.openSession(client, pkt, clientTLS)
+	if !ok {
 		return
 	}
 	defer release()
 	defer server.Close()
 
-	if _, err := server.Write(pkt); err != nil {
-		return
-	}
 	start := time.Now()
 	s.log.Debug("session started", "remote", client.RemoteAddr(), "upstream_tls", secure, "client_tls", clientTLS)
 	// Over a TLS upstream the server offers SCRAM-SHA-256-PLUS, which the
 	// client, on a plaintext leg, cannot use: authTap takes it out. A client
-	// on TLS gets the list as the server sent it (spec-v0.2-server 3).
-	takePlusOut := secure && !clientTLS
+	// on TLS gets the list as the server sent it (spec-v0.2-server 3). A
+	// client that logged in with the proxy's Login never sees the server's.
+	takePlusOut := s.Login == nil && secure && !clientTLS
 	if ss := s.watch(pkt); ss == nil {
 		var fromServer *tap
 		var ended func() []byte
@@ -215,6 +225,32 @@ func (s *Server) handle(c net.Conn) {
 		ss.abandon()
 	}
 	s.log.Debug("session ended", "remote", client.RemoteAddr(), "duration", time.Since(start))
+}
+
+// openSession opens upstream the session that startup packet pkt starts:
+// through s.Login, which authenticates the client itself first, or else by
+// dialing the server and sending it pkt, so that the client authenticates
+// with the server through the relay. secure reports whether server is TLS;
+// release gives up its tracking once it is closed. ok false: the session
+// ended there.
+func (s *Server) openSession(client net.Conn, pkt []byte, clientTLS bool) (server net.Conn, secure bool, release func(), ok bool) {
+	if s.Login != nil {
+		return s.logIn(client, pkt, clientTLS)
+	}
+	server, secure, release, err := s.dialUpstream()
+	if err != nil {
+		if !s.isClosed() { // else Close ended the dial, and closed the client too
+			s.log.Warn("upstream unreachable", "upstream", s.up.Addr, "err", err)
+			writeFatal(client, "08001", "stet: "+err.Error())
+		}
+		return nil, false, nil, false
+	}
+	if _, err := server.Write(pkt); err != nil {
+		server.Close()
+		release()
+		return nil, false, nil, false
+	}
+	return server, secure, release, true
 }
 
 // watch returns the session to tap when the gate is shown the session that
@@ -306,8 +342,9 @@ func (s *Server) forwardCancel(pkt []byte) {
 // set up with cfg; what follows is read inside TLS, where another SSLRequest
 // ends the connection. A GSSENCRequest is always declined. With cfg, a
 // session (not a cancel request) that starts without TLS from an address
-// other than loopback is refused with a FATAL. The handshake shares the one
-// startupTimeout.
+// other than loopback is refused with a FATAL; the error is then
+// errNeedsTLS, returned with the startup packet. The handshake shares the
+// one startupTimeout.
 func readStartup(c net.Conn, cfg *tls.Config) (net.Conn, []byte, error) {
 	c.SetDeadline(time.Now().Add(startupTimeout))
 	defer c.SetDeadline(time.Time{})
@@ -335,7 +372,7 @@ func readStartup(c net.Conn, cfg *tls.Config) (net.Conn, []byte, error) {
 		case code>>16 == 3:
 			if cfg != nil && conn == c && !plaintextAllowed(c.RemoteAddr()) {
 				writeFatal(c, "28000", needsTLS)
-				return nil, nil, errNeedsTLS
+				return nil, pkt, errNeedsTLS
 			}
 			return conn, pkt, nil
 		default:
@@ -385,6 +422,12 @@ var stuckTick = time.Second
 // side's goroutine is then left parked for the life of the process; it holds
 // no count in Server.wg, so Close does not wait for it. Either way the caller
 // reports what was pending (abandon) once relay returns.
+//
+// On an end the proxy did not make (a side closed, or a panic) the server's
+// connection is closed before the client's: closing a client's TLS
+// connection says close_notify first, which can wait out TLS's own 5s for a
+// client that stopped reading, and the server's side is not left open
+// meanwhile, nor, after a panic, the other side forwarding through the taps.
 func relay(client, server net.Conn, fromClient, fromServer *tap, ended func() []byte, panicked func(v any, stack []byte), stuck func() bool) {
 	type stop struct {
 		err      error
@@ -397,8 +440,8 @@ func relay(client, server net.Conn, fromClient, fromServer *tap, ended func() []
 				if panicked != nil {
 					panicked(v, debug.Stack())
 				}
-				client.Close()
 				server.Close()
+				client.Close()
 				done <- stop{panicked: true}
 			}
 		}()
@@ -408,8 +451,8 @@ func relay(client, server net.Conn, fromClient, fromServer *tap, ended func() []
 	go run(client, server, fromServer)
 	first := <-done
 	if first.panicked {
-		client.Close()
 		server.Close()
+		client.Close()
 		tick := time.NewTicker(stuckTick)
 		defer tick.Stop()
 		for looks := 0; looks < 2; {
@@ -427,8 +470,8 @@ func relay(client, server net.Conn, fromClient, fromServer *tap, ended func() []
 		return
 	}
 	if ended == nil || !errors.Is(first.err, errEnded) {
-		client.Close()
 		server.Close()
+		client.Close()
 		<-done
 		return
 	}

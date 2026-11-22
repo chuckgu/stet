@@ -750,11 +750,17 @@ func runPsql(t *testing.T, psql, addr, user, password string) (stdout, stderr st
 // in place of sslmode=disable.
 func runPsqlWith(t *testing.T, psql, addr, user, password, opts string) (stdout, stderr string, err error) {
 	t.Helper()
+	return runPsqlSQL(t, psql, addr, user, password, opts, "select 1")
+}
+
+// runPsqlSQL is runPsqlWith running sql in place of select 1.
+func runPsqlSQL(t *testing.T, psql, addr, user, password, opts, sql string) (stdout, stderr string, err error) {
+	t.Helper()
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.CommandContext(testCtx(t), psql, "-X", "-w", "-At", "-c", "select 1",
+	cmd := exec.CommandContext(testCtx(t), psql, "-X", "-w", "-At", "-c", sql,
 		fmt.Sprintf("host=%s port=%s user=%s dbname=stet_test %s", host, port, user, opts))
 	cmd.Env = []string{} // never nil, which would pass the whole environment
 	for _, kv := range os.Environ() {

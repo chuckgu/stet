@@ -204,6 +204,51 @@ func TestEnforcedSessionSettingsLatencyBudget(t *testing.T) {
 	}
 }
 
+// Spec-v0.2-server 13: a session an agent opened with its token, through a
+// proxy with a Login, stays inside the same 2ms budget at p95. Both of the
+// proxy's legs are TLS (sslmode=verify-full to the proxy), and so is the
+// direct connection. The median time of one login is logged, through the
+// proxy and directly, since the proxy logs in upstream on top of the
+// client's own exchange.
+func TestLoginLatencyBudget(t *testing.T) {
+	if testing.Short() {
+		t.Skip("latency measurement skipped in -short mode")
+	}
+	lt := newLocalTLS(t)
+	p := loginSetup{clientTLS: lt.server}.start(t)
+	server := tlsUpstream(t).Addr
+	direct := connect(t, server, "stet_scram", url.Values{"sslmode": {"require"}})
+	proxied, err := pgx.Connect(testCtx(t), connURL(p.addr, "stet_scram", p.tokens["stet_scram"], lt.params()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { proxied.Close(context.Background()) })
+	added := measureAdded(t, "select 1 through a login", direct, proxied, selectOne)
+
+	const logins = 21
+	median := func(dsn string) time.Duration {
+		ds := make([]time.Duration, logins)
+		for i := range ds {
+			start := time.Now()
+			conn, err := pgx.Connect(testCtx(t), dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ds[i] = time.Since(start)
+			conn.Close(context.Background())
+		}
+		slices.Sort(ds)
+		return ds[logins/2]
+	}
+	t.Logf("one login, median of %d: direct (TLS) %v, through the login (TLS on both legs) %v", logins,
+		median(connURL(server, "stet_scram", testUsers["stet_scram"], url.Values{"sslmode": {"require"}})),
+		median(connURL(p.addr, "stet_scram", p.tokens["stet_scram"], lt.params())))
+
+	if added > 2*time.Millisecond {
+		t.Errorf("a session through a login adds %v at p95, budget is 2ms", added)
+	}
+}
+
 // Spec 3 of the try-out spec: over a TLS upstream the proxy looks at the
 // server's messages only until the session is ready, so a session there stays
 // inside the same 2ms budget at p95. The direct connection is TLS too.

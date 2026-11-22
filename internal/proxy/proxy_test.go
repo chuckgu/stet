@@ -131,11 +131,34 @@ func connURL(addr, user, password string, params url.Values) string {
 	return u.String()
 }
 
+// tokensAt, while a test sets it (useTokensAt), makes connect log in to addr
+// with each account's token in place of its password: the scenarios then
+// run through a proxy's Login unchanged.
+var tokensAt struct {
+	addr   string
+	tokens map[string]string // by account
+}
+
+// useTokensAt sets tokensAt until the test ends.
+func useTokensAt(t *testing.T, addr string, tokens map[string]string) {
+	tokensAt.addr, tokensAt.tokens = addr, tokens
+	t.Cleanup(func() { tokensAt.addr, tokensAt.tokens = "", nil })
+}
+
+// passwordFor is what connect logs in to addr as user with: the account's
+// token at tokensAt.addr, its password anywhere else.
+func passwordFor(addr, user string) string {
+	if addr != "" && addr == tokensAt.addr {
+		return tokensAt.tokens[user]
+	}
+	return testUsers[user]
+}
+
 func connect(t *testing.T, addr, user string, params url.Values) *pgx.Conn {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	conn, err := pgx.Connect(ctx, connURL(addr, user, testUsers[user], params))
+	conn, err := pgx.Connect(ctx, connURL(addr, user, passwordFor(addr, user), params))
 	if err != nil {
 		t.Fatalf("connect as %s via %s: %v", user, addr, err)
 	}
