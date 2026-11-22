@@ -35,6 +35,7 @@ commands:
   undo-sql   print the SQL a table owner runs to capture undo.tables (stet undo-sql -config stet.yaml [-drop]),
              or with -grant <role> the grants that let a role review and undo
   bench-jev  time single Jev calls (needs TYPESAFE_API_KEY)
+  version    print the version, commit and Go version
 `
 
 func main() {
@@ -52,6 +53,8 @@ func main() {
 		err = runUndoSQL(os.Args[2:], os.Stdout)
 	case "bench-jev":
 		err = runBenchJev(os.Args[2:])
+	case "version":
+		fmt.Println(versionLine())
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
