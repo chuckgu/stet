@@ -286,6 +286,20 @@ type rawTable struct {
 // all; a map keeps the key.
 type presentKeys struct {
 	Tables map[string]map[string]any `yaml:"tables"`
+	Agents map[string]any            `yaml:"agents"`
+	Others map[string]any            `yaml:",inline"` // the other top-level keys
+}
+
+// listenTLS reports whether the file writes the listen_tls key, with or
+// without a value; credentials, whether it writes agents.credentials.
+func (k presentKeys) listenTLS() bool {
+	_, ok := k.Others["listen_tls"]
+	return ok
+}
+
+func (k presentKeys) credentials() bool {
+	_, ok := k.Agents["credentials"]
+	return ok
 }
 
 // present reports whether table name writes the reads key, the stale key and
@@ -412,17 +426,30 @@ func Parse(b []byte) (*Config, error) {
 		fail("model: required when tables are configured")
 	}
 
+	// A key written with no value, or only white space, is refused rather than
+	// read as absent: a template that rendered nothing would otherwise start
+	// a proxy that relays authentication in plaintext, said only on its start
+	// line.
 	if raw.ListenTLS != nil {
-		if raw.ListenTLS.Cert == "" || raw.ListenTLS.Key == "" {
+		if strings.TrimSpace(raw.ListenTLS.Cert) == "" || strings.TrimSpace(raw.ListenTLS.Key) == "" {
 			fail("listen_tls: cert and key are both required")
 		} else {
 			c.ListenTLS = &ListenTLS{Cert: raw.ListenTLS.Cert, Key: raw.ListenTLS.Key}
 		}
+	} else if keys.listenTLS() {
+		fail("listen_tls: present but empty; give cert and key, or remove it")
 	}
 	if raw.Agents != nil {
 		c.Credentials = raw.Agents.Credentials
 	}
-	c.AgentRoles = resolveRoles(raw.Agents, c.Mode, c.Upstream, c.Credentials != "", fail)
+	custody := c.Credentials != ""
+	if keys.credentials() && strings.TrimSpace(c.Credentials) == "" {
+		fail("agents.credentials: present but empty; give the file's path, or remove it")
+		// Custody was meant: enforce's need of agents.roles without it is
+		// not a second error.
+		c.Credentials, custody = "", true
+	}
+	c.AgentRoles = resolveRoles(raw.Agents, c.Mode, c.Upstream, custody, fail)
 	if c.Credentials != "" {
 		c.checkCustody(raw.ListenTLS != nil, upstreamRead, fail)
 	}

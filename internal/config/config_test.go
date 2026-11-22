@@ -1011,6 +1011,53 @@ func TestListenTLS(t *testing.T) {
 	}
 }
 
+// A listen_tls or agents.credentials that is written but empty, as a
+// template that rendered nothing leaves it, is refused: read as absent it
+// would start a relaying, plaintext proxy. A bare agents: sets nothing, as
+// before.
+func TestPresentButEmptyCustodyKeys(t *testing.T) {
+	const (
+		emptyTLS         = "listen_tls: present but empty; give cert and key, or remove it"
+		emptyCredentials = "agents.credentials: present but empty; give the file's path, or remove it"
+	)
+	for name, tc := range map[string]struct{ yaml, want string }{
+		"listen_tls, nothing after it":  {"listen_tls:\n", emptyTLS},
+		"listen_tls: ~":                 {"listen_tls: ~\n", emptyTLS},
+		"listen_tls, only a comment":    {"listen_tls:\n  # cert: c.pem\n", emptyTLS},
+		"listen_tls, cert white space":  {"listen_tls: {cert: ' ', key: k.pem}\n", "listen_tls: cert and key are both required"},
+		"credentials, nothing after it": {"agents:\n  credentials:\n", emptyCredentials},
+		"credentials: ''":               {"agents: {credentials: ''}\n", emptyCredentials},
+		"credentials: ~":                {"agents: {credentials: ~}\n", emptyCredentials},
+		"credentials, white space":      {"agents: {credentials: \" \\t\"}\n", emptyCredentials},
+		"credentials empty, enforce":    {"mode: enforce\nmodel: {adapter: none, on_failure: pass}\nagents: {credentials: ''}\n", emptyCredentials},
+		"credentials empty, with roles": {"agents: {roles: [agent_a], credentials: ''}\n", emptyCredentials},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse([]byte(minimal + tc.yaml)); err == nil || err.Error() != tc.want {
+				t.Errorf("err = %v, want %q alone", err, tc.want)
+			}
+		})
+	}
+
+	for name, yml := range map[string]string{
+		"agents, nothing after it": "agents:\n",
+		"agents: ~":                "agents: ~\n",
+		"agents: {}":               "agents: {}\n",
+		"agents with roles only":   "agents: {roles: [agent_a]}\n",
+		"neither key":              "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, err := Parse([]byte(minimal + yml))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.Credentials != "" || c.ListenTLS != nil {
+				t.Errorf("Credentials = %q, ListenTLS = %+v; want neither", c.Credentials, c.ListenTLS)
+			}
+		})
+	}
+}
+
 const custodyListen = "listen: 127.0.0.1:6432\n"
 
 func custodyYAML(listen, upstream, extra string) []byte {

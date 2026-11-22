@@ -98,7 +98,7 @@ tables:
       max_rows: 100
 ```
 
-- **`agents.credentials`**: 자격 증명 파일의 경로다(5장). 이 키가 있으면 보관이 켜진다.
+- **`agents.credentials`**: 자격 증명 파일의 경로다(5장). 이 키가 있으면 보관이 켜진다. 키만 적고 값이 비면(템플릿이 빈 값을 낸 경우 등) 시작하지 않는다: `agents.credentials: present but empty; give the file's path, or remove it`. `listen_tls`도 같다(`listen_tls: present but empty; give cert and key, or remove it`).
 - **상대 경로.** `agents.credentials`, `listen_tls.cert`, `listen_tls.key`의 상대 경로는 설정 파일이 있는 디렉터리에 대해 읽는다. `upstream`의 `sslrootcert`는 그렇지 않다. Stet이 도는 작업 디렉터리에 대해 읽으므로 절대 경로로 적는다. `~`는 풀지 않는다.
 - **`upstream`.** 주소의 계정은 Stet 자신의 연결(상태 조회, 판단 기록, 승인된 쓰기의 실행)에 쓴다. 지금과 같다. 설정 파일에 그 비밀번호가 있으면 파일을 `0600`으로 둔다. 서비스의 CA가 공개 CA가 아니면 그 CA 파일을 `sslrootcert`로 준다.
 - **`agents.roles`** 는 적지 않아도 된다. 에이전트 계정은 자격 증명 파일의 계정들이다. enforce에서도 그렇다. 적었으면 파일의 계정들과 같아야 하고, 다르면 시작하지 않는다: `agents.roles and the credentials file name different accounts: only in agents.roles: ["…"]; only in the file: ["…"]`

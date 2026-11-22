@@ -235,7 +235,8 @@ stet agent list     [-config stet.yaml]
 
 설정 검증은 파일을 열지 않는다(보정 V1). `config.Parse`는 바이트만 읽고, 테스트 수백 개가 그렇게 쓴다. 그래서 자격 증명 파일의 권한과 모양, `agents.roles`와 파일의 계정 비교, 인증서와 키의 짝은 `stet proxy`가 시작할 때 본다(아래). 다르면 시작하지 않는 것은 같다. `config.Load`는 상대 경로를 설정 파일의 디렉터리에 대해 푼다(보정 V2).
 
-- `listen_tls`는 `cert`와 `key`가 모두 있어야 한다.
+- `listen_tls`는 `cert`와 `key`가 모두 있어야 한다. 공백뿐인 값은 없는 것이다.
+- **키만 있고 값이 비면 시작하지 않는다**(마지막 검토 뒤에 고쳤다. 처음에는 키가 없는 것과 같았다). `listen_tls:` 뒤에 아무것도 없거나 `~`면 `listen_tls: present but empty; give cert and key, or remove it`, `agents.credentials`가 없음, `""`, `~`, 공백뿐이면 `agents.credentials: present but empty; give the file's path, or remove it`다. 템플릿이 빈 값을 내면 TLS도 보관도 없이 인증을 중계하는 Stet이 뜨고, 그것을 알리는 것은 시작 줄의 `listen_tls=off`와 `custody=off`뿐이기 때문이다. 아래에 아무것도 없는 `agents:`는 그대로 아무것도 정하지 않는다.
 - `agents.credentials`가 있으면(보관을 켜면):
   - 에이전트 계정은 자격 증명 파일의 계정들이다. `agents.roles`는 적지 않아도 된다(enforce에서도. 보관이 없으면 enforce는 `agents.roles`가 필수다). 적었으면 파일의 계정들과 같아야 한다. 다르면 시작하지 않고 어느 계정이 한쪽에만 있는지 말한다(`agents.roles and the credentials file name different accounts: only in agents.roles: […]; only in the file: […]`). 섀도와 enforce 모두 같다. 이 비교는 시작할 때 한다.
   - **업스트림의 서버를 확인해야 한다.** `upstream`의 호스트가 루프백이 아니면 `sslmode`가 `verify-full`이거나, `sslrootcert`를 준 `verify-ca`나 `require`여야 한다. 아니면 시작하지 않는다(`upstream: with agents.credentials the server must be verified, or stet could hand a database password to whoever answers; use sslmode=verify-full, or verify-ca with sslrootcert=<CA file>`). 확인하지 않는 연결에서는 중간에 선 누군가가 비밀번호를 평문으로 달라고 할 수 있고, 클라이언트는 그것을 따른다. 첫 부분의 경고를 여기서는 거부로 올린다.
@@ -381,6 +382,7 @@ stet agent list     [-config stet.yaml]
 **마지막 검토 뒤에 고친 것** (2026-11-23. 해당 장에 옮겨 적었다)
 
 - 8장: 보관을 켜면 원격 업스트림은 `verify-full`이거나 `sslrootcert`를 준 `verify-ca`나 `require`여야 한다. `sslrootcert` 없는 `verify-ca`는 받지 않는다. 거부의 문구도 그렇게 바꿨다.
+- 8장: 키만 있고 값이 빈 `listen_tls`와 `agents.credentials`(공백뿐인 값 포함)는 설정 검증에서 거부한다. 없는 것으로 읽지 않는다.
 
 **남긴 것**
 
